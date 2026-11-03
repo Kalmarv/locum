@@ -67,11 +67,47 @@ struct Vtbl {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) != Some("gen") {
-        eprintln!("usage: cargo xtask gen");
-        std::process::exit(2);
-    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("workspace root").to_path_buf();
+    match args.first().map(String::as_str) {
+        Some("gen") => generate_all(&root),
+        Some("smoke") => smoke(&root),
+        _ => {
+            eprintln!("usage: cargo xtask gen | smoke");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Builds the release DLLs and the smoke program, puts them in `target/smoke/` and runs it there, with locum's log
+/// in `target/smoke/log/`.
+fn smoke(root: &Path) {
+    let status = Command::new(env!("CARGO"))
+        .current_dir(root)
+        .args(["build", "--release", "-p", "locum", "-p", "locum-shim-d3d11", "-p", "locum-shim-dxgi", "-p", "locum-smoke"])
+        .status()
+        .expect("run cargo build");
+    assert!(status.success(), "build failed");
+    let release = root.join("target/release");
+    let stage = root.join("target/smoke");
+    let log_dir = stage.join("log");
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&log_dir).expect("create target/smoke");
+    for file in ["locum.dll", "d3d11.dll", "dxgi.dll", "locum-smoke.exe"] {
+        std::fs::copy(release.join(file), stage.join(file)).unwrap_or_else(|e| panic!("copy {file}: {e}"));
+    }
+    let status = Command::new(stage.join("locum-smoke.exe"))
+        .current_dir(&stage)
+        .env("LOCUM_DIR", &log_dir)
+        .status()
+        .expect("run locum-smoke");
+    println!("--- {}", log_dir.join("locum.log").display());
+    print!("{}", std::fs::read_to_string(log_dir.join("locum.log")).unwrap_or_else(|e| format!("(no log: {e})
+")));
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn generate_all(root: &Path) {
+    let root = root.to_path_buf();
     let windows = windows_source(&root);
     let mut vtbls = HashMap::new();
     let mut features = BTreeSet::new();
