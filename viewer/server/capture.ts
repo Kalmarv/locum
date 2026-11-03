@@ -256,7 +256,8 @@ export class Capture {
     return {
       id: this.id,
       path: this.path,
-      label: this.label,
+      // The capture's own name, read now: the file may have been replaced since it was opened.
+      label: meta.name != null ? String(meta.name) : this.label,
       blobs: this.blobs,
       storeExists,
       targetEvents: this.targetEventColumn,
