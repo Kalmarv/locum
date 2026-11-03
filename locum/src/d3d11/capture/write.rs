@@ -113,6 +113,17 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
 
     // Contents of the resources the frame used, as the timeline first touched them.
     let (used, written) = touched(&timeline);
+    if used.iter().any(|id| {
+        tracked.get(id).is_some_and(|t| {
+            t.dims.misc & (D3D11_RESOURCE_MISC_TILED.0 as u32 | D3D11_RESOURCE_MISC_TILE_POOL.0 as u32) != 0
+        })
+    }) {
+        gaps.entry((
+            "tiled".into(),
+            "native tile mappings and pool contents are not replayed yet".into(),
+        ))
+        .or_insert(1);
+    }
     let mut content: BTreeMap<u64, Result<Content, String>> = BTreeMap::new();
     if request.contents {
         read.extend(unsafe { contents::read_all(immediate, in_flight) });
@@ -192,6 +203,17 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         let seq = seq as u64;
         let stack = interner.id(&e.stack);
         let draw_n = e.draw.as_ref().map(|_| n);
+        if e.kind.starts_with("tile_") {
+            *gaps
+                .entry((
+                    "tiled".into(),
+                    format!(
+                        "{} recorded, but tile mappings and pool contents are not replayed yet",
+                        e.call
+                    ),
+                ))
+                .or_default() += 1;
+        }
         capture.events.push(db::Event {
             seq,
             kind: e.kind,

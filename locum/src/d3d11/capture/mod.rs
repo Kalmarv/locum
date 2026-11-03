@@ -33,6 +33,7 @@ pub mod ids;
 pub mod ops;
 mod snapshot;
 mod targets;
+pub mod tiled;
 mod write;
 
 use core::ffi::c_void;

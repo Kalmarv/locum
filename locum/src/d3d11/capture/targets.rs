@@ -204,6 +204,10 @@ unsafe fn copy_one(
 ) -> Option<Target> {
     let (view, view_format, mip, depth) = (&bound.view, bound.format, bound.mip, bound.depth);
     let resource = unsafe { view.GetResource() }.ok()?;
+    if super::tiled::special(&resource) {
+        skip("tiled target requires mapped-tile readback");
+        return None;
+    }
     let mut d = D3D11_TEXTURE2D_DESC::default();
     if bound.volume {
         let texture = resource.cast::<ID3D11Texture3D>().ok()?;

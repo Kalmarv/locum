@@ -21,6 +21,9 @@ pub type Read = Result<(String, Vec<String>), String>;
 /// # Safety
 /// `c` must be a context of the device that made `resource`.
 pub unsafe fn issue(c: &ID3D11DeviceContext4, resource: &ID3D11Resource) -> Result<Readback, String> {
+    if super::tiled::special(resource) {
+        return Err("tiled resource/pool requires mapped-tile readback; whole-resource copies can touch unmapped tiles".into());
+    }
     unsafe { readback::issue(c, resource) }
 }
 

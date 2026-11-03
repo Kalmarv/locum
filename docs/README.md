@@ -113,6 +113,14 @@ event with its box, subresource and bytes, and replay makes the same write. Such
 with no pointer back); its contents are copied before that map. One mapped already when the capture began has no
 such copy, and a `default_map` gap marks the capture incomplete.
 
+Calls on tiled resources and tile pools are recorded in order as `tile_*` events with all their arguments:
+UpdateTileMappings (an array the game passed as null stays null), CopyTileMappings, CopyTiles with its direction
+and byte offset, UpdateTiles with the bytes it wrote, ResizeTilePool and TiledResourceBarrier. A call that fails is
+not recorded, and one made on a deferred context is placed where its command list is executed. Replay doesn't
+rebuild tile mappings or pool contents yet, so a capture that uses a tiled resource or makes these calls has a
+`tiled` gap and verify won't call it complete. Tiled resources and pools aren't read back whole, as targets or as
+contents: on tier 1 hardware such a copy can touch an unmapped tile.
+
 A pass ends where the targets in effect change on the GPU's timeline: an `OMSetRenderTargets` that binds other
 targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame. Its
 targets are read there, and the capture records the event they were read after (the pass's last draw, or a clear, copy

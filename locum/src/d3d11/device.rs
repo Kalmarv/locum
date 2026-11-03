@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface};
 
 use crate::com::answer_query;
-use crate::d3d11::capture::{self, ops};
+use crate::d3d11::capture::{self, ops, tiled};
 use crate::d3d11::overrides;
 use crate::d3d11::registry;
 use crate::d3d11::shaders::{self, Stage};
@@ -1033,6 +1033,167 @@ unsafe impl ContextMethods for Context {
     unsafe fn ClearState(&self) {
         unsafe { self.targets_changing(0, core::ptr::null(), core::ptr::null_mut()) };
         unsafe { real_context::ClearState(self.inner()) }
+    }
+
+    unsafe fn UpdateTileMappings(
+        &self,
+        a0: *mut c_void,
+        a1: u32,
+        a2: *const D3D11_TILED_RESOURCE_COORDINATE,
+        a3: *const D3D11_TILE_REGION_SIZE,
+        a4: *mut c_void,
+        a5: u32,
+        a6: *const u32,
+        a7: *const u32,
+        a8: *const u32,
+        a9: u32,
+    ) -> HRESULT {
+        let hr =
+            unsafe { real_context::UpdateTileMappings(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) };
+        if capture::armed() && hr.is_ok() {
+            unsafe {
+                let dst = tiled::id(a0);
+                let pool = tiled::id(a4);
+                let number = |v: &u32| serde_json::json!(v);
+                let args = serde_json::json!({
+                    "dst": dst, "regions": a1, "starts": tiled::array(a2, a1, tiled::coordinate),
+                    "sizes": tiled::array(a3, a1, tiled::size), "pool": pool, "ranges": a5,
+                    "range_flags": tiled::array(a6, a5, number), "offsets": tiled::array(a7, a5, number),
+                    "counts": tiled::array(a8, a5, number), "flags": a9,
+                });
+                tiled::event(
+                    self.ctx(),
+                    "tile_map",
+                    "UpdateTileMappings",
+                    args,
+                    &[pool],
+                    &[dst],
+                    None,
+                );
+            }
+        }
+        hr
+    }
+    unsafe fn CopyTileMappings(
+        &self,
+        a0: *mut c_void,
+        a1: *const D3D11_TILED_RESOURCE_COORDINATE,
+        a2: *mut c_void,
+        a3: *const D3D11_TILED_RESOURCE_COORDINATE,
+        a4: *const D3D11_TILE_REGION_SIZE,
+        a5: u32,
+    ) -> HRESULT {
+        let hr = unsafe { real_context::CopyTileMappings(self.inner(), a0, a1, a2, a3, a4, a5) };
+        if capture::armed() && hr.is_ok() {
+            unsafe {
+                let dst = tiled::id(a0);
+                let src = tiled::id(a2);
+                tiled::event(
+                    self.ctx(),
+                    "tile_copy_map",
+                    "CopyTileMappings",
+                    serde_json::json!({
+                        "dst": dst, "dst_at": tiled::coord(a1), "src": src, "src_at": tiled::coord(a3),
+                        "size": tiled::region(a4), "flags": a5,
+                    }),
+                    &[src],
+                    &[dst],
+                    None,
+                );
+            }
+        }
+        hr
+    }
+    unsafe fn CopyTiles(
+        &self,
+        a0: *mut c_void,
+        a1: *const D3D11_TILED_RESOURCE_COORDINATE,
+        a2: *const D3D11_TILE_REGION_SIZE,
+        a3: *mut c_void,
+        a4: u64,
+        a5: u32,
+    ) {
+        if capture::armed() {
+            unsafe {
+                let resource = tiled::id(a0);
+                let buffer = tiled::id(a3);
+                let (src, dst) =
+                    if a5 & D3D11_TILE_COPY_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER.0 as u32 != 0 {
+                        (resource, buffer)
+                    } else {
+                        (buffer, resource)
+                    };
+                tiled::event(
+                    self.ctx(),
+                    "tile_copy",
+                    "CopyTiles",
+                    serde_json::json!({
+                        "resource": resource, "at": tiled::coord(a1), "size": tiled::region(a2),
+                        "buffer": buffer, "offset": a4, "flags": a5,
+                    }),
+                    &[src],
+                    &[dst],
+                    None,
+                );
+            }
+        }
+        unsafe { real_context::CopyTiles(self.inner(), a0, a1, a2, a3, a4, a5) };
+    }
+    unsafe fn UpdateTiles(
+        &self,
+        a0: *mut c_void,
+        a1: *const D3D11_TILED_RESOURCE_COORDINATE,
+        a2: *const D3D11_TILE_REGION_SIZE,
+        a3: *const c_void,
+        a4: u32,
+    ) {
+        if capture::armed() {
+            unsafe {
+                let dst = tiled::id(a0);
+                tiled::event(
+                    self.ctx(),
+                    "tile_update",
+                    "UpdateTiles",
+                    serde_json::json!({"dst": dst, "at": tiled::coord(a1), "size": tiled::region(a2), "flags": a4}),
+                    &[],
+                    &[dst],
+                    tiled::data(a3, a2),
+                );
+            }
+        }
+        unsafe { real_context::UpdateTiles(self.inner(), a0, a1, a2, a3, a4) };
+    }
+    unsafe fn ResizeTilePool(&self, a0: *mut c_void, a1: u64) -> HRESULT {
+        let hr = unsafe { real_context::ResizeTilePool(self.inner(), a0, a1) };
+        if capture::armed() && hr.is_ok() {
+            let pool = tiled::id(a0);
+            tiled::event(
+                self.ctx(),
+                "tile_resize",
+                "ResizeTilePool",
+                serde_json::json!({"pool": pool, "bytes": a1}),
+                &[],
+                &[pool],
+                None,
+            );
+        }
+        hr
+    }
+    unsafe fn TiledResourceBarrier(&self, a0: *mut c_void, a1: *mut c_void) {
+        if capture::armed() {
+            let before = tiled::id(a0);
+            let after = tiled::id(a1);
+            tiled::event(
+                self.ctx(),
+                "tile_barrier",
+                "TiledResourceBarrier",
+                serde_json::json!({"before": before, "after": after}),
+                &[before],
+                &[after],
+                None,
+            );
+        }
+        unsafe { real_context::TiledResourceBarrier(self.inner(), a0, a1) };
     }
 
     unsafe fn FinishCommandList(&self, a0: BOOL, a1: *mut *mut c_void) -> HRESULT {

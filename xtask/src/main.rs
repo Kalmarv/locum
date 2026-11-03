@@ -389,6 +389,32 @@ fn smoke(root: &Path, debug: bool) {
         ordered_ok &= ok && settled && plain && named;
     }
     let mut rows_ok = verified(&cli, &log_dir, "row16", false, debug, "row16: bit-exact replay").0;
+    for label in ["tiles-gpu", "tiles-warp"] {
+        if !log_dir.join(format!("captures/{label}/capture.db")).exists() {
+            continue;
+        }
+        for warp in [false, true] {
+            let mut cmd = Command::new(&cli);
+            cmd.arg("verify").arg(log_dir.join(format!("captures/{label}")));
+            if warp {
+                cmd.arg("--warp");
+            }
+            let output = cmd.output().expect("verify tiled gap");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let ok = !output.status.success() && text.contains("capture gap: tiled");
+            println!("--- verify {label} WARP={warp}\n{text}");
+            println!(
+                "{} tiles: incomplete pool state prevents a completeness claim",
+                if ok { "ok  " } else { "FAIL" }
+            );
+            rows_ok &= ok;
+        }
+    }
+
     for label in [
         "list-prefix",
         "list-bindings",
