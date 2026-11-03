@@ -133,6 +133,7 @@ fn smoke(root: &Path) {
         "d3d11.dll",
         "dxgi.dll",
         "locum-smoke.exe",
+        "locum-smoke-late.exe",
         "locum-cli.exe",
     ] {
         std::fs::copy(release.join(file), stage.join(file)).unwrap_or_else(|e| panic!("copy {file}: {e}"));
@@ -141,9 +142,7 @@ fn smoke(root: &Path) {
     std::fs::write(
         log_dir.join("settings.txt"),
         format!(
-            "dumper {}
-dumps {}
-",
+            "dumper {}\ndumps {}\n",
             stage.join("locum-cli.exe").display(),
             log_dir.join("dumps").display()
         ),
@@ -160,6 +159,15 @@ dumps {}
         std::fs::read_to_string(log_dir.join("locum.log")).unwrap_or_else(|e| format!("(no log: {e})\n"))
     );
     // Run CLI evidence checks even when a GPU/database assertion failed, so every adversarial case reports.
+    // A program that loads d3d11.dll by name only after locum started (as games that delay-load it do), in a log
+    // folder of its own.
+    let late_dir = log_dir.join("late");
+    std::fs::create_dir_all(&late_dir).expect("create the late log folder");
+    let late = Command::new(stage.join("locum-smoke-late.exe"))
+        .current_dir(&stage)
+        .env("LOCUM_DIR", &late_dir)
+        .status()
+        .expect("run locum-smoke-late");
     let cli = stage.join("locum-cli.exe");
     let cli_ok = cli_checks(&cli, &log_dir);
     let (adversarial_ok, _) = verified(
@@ -201,7 +209,7 @@ dumps {}
         );
         ordered_ok &= ok && settled;
     }
-    if !status.success() || !cli_ok || !adversarial_ok || !ordered_ok {
+    if !status.success() || !late.success() || !cli_ok || !adversarial_ok || !ordered_ok {
         std::process::exit(1);
     }
 }

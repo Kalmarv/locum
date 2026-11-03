@@ -1,5 +1,5 @@
 //! The real `d3d11.dll` and `dxgi.dll`, loaded from the system folder by full path: our own `d3d11.dll` and
-//! `dxgi.dll` are already loaded under those names, so a bare name would give them back.
+//! `dxgi.dll` are loaded under those names first, so a bare name gives back ours.
 
 use core::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
@@ -33,16 +33,29 @@ pub fn system() -> &'static System {
         let mut buf = [0u16; 260];
         let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
         let folder = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
+        // Windows gives a DLL asked for by name the module already loaded under that name. A game that loads one of
+        // ours only later, by name (Unreal Engine 5 delay-loads d3d11.dll), would be given the real one loaded below,
+        // and its device would never reach locum: so ours beside locum.dll go in first.
+        if let Some(own) = module_of(system as *const c_void).map(module_path)
+            && let Some(own) = own.parent()
+        {
+            for name in ["d3d11.dll", "dxgi.dll"] {
+                if own.join(name).is_file() && !same_folder(own, &folder) {
+                    load(own, name);
+                }
+            }
+        }
         let d3d11 = load(&folder, "d3d11.dll").unwrap_or_default();
         let dxgi = load(&folder, "dxgi.dll").unwrap_or_default();
         System { folder, d3d11, dxgi }
     })
 }
 
-/// The address of `name` in `module`, as the function type `F`.
-///
-/// # Safety
-/// `F` must be the export's real function pointer type.
+/// Whether two folders are the same (Windows paths compare without case).
+fn same_folder(a: &std::path::Path, b: &std::path::Path) -> bool {
+    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
 /// Loads `name` from `folder` by full path.
 fn load(folder: &std::path::Path, name: &str) -> Option<HMODULE> {
     let path = folder.join(name);
@@ -71,6 +84,10 @@ pub fn load_system_dll(name: &'static str) -> Option<HMODULE> {
     Some(h)
 }
 
+/// The address of `name` in `module`, as the function type `F`.
+///
+/// # Safety
+/// `F` must be the export's real function pointer type.
 pub unsafe fn export<F: Copy>(module: HMODULE, name: &'static core::ffi::CStr) -> Option<F> {
     assert_eq!(size_of::<F>(), size_of::<usize>());
     let f = unsafe { GetProcAddress(module, PCSTR(name.as_ptr().cast())) }?;
