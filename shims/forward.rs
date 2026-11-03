@@ -9,7 +9,8 @@ fn forward(dll: &str, exports: &[(&str, u32)]) {
     let def = out.join(format!("{dll}.def"));
     let mut text = format!("LIBRARY {dll}\nEXPORTS\n");
     for (name, ordinal) in exports {
-        text.push_str(&format!("    {name}=locum.{name} @{ordinal}\n"));
+        let noname = if *name == "D3D12Ordinal99" { " NONAME" } else { "" };
+        text.push_str(&format!("    {name}=locum.{name} @{ordinal}{noname}\n"));
     }
     std::fs::write(&def, text).expect("write the .def");
     let target = std::env::var("TARGET").expect("TARGET");

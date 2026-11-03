@@ -1,0 +1,16 @@
+[package]
+name = "locum-shim-d3d12"
+description = "d3d12.dll for locum: its exports forward to locum.dll."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "d3d12"
+crate-type = ["cdylib"]
+
+[build-dependencies]
+find-msvc-tools = "0.1"

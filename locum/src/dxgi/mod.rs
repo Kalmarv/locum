@@ -32,13 +32,33 @@ pub struct Factory {
     inner: IDXGIFactory7,
 }
 
+/// Keeps the presentation owner alive without treating a D3D12 queue as a D3D11 device.
+enum SwapChainOwner {
+    None,
+    D3d11(*const Device),
+    D3d12(IUnknown),
+}
+impl Drop for SwapChainOwner {
+    fn drop(&mut self) {
+        match self {
+            Self::D3d11(d) => unsafe {
+                crate::vtables::device::DeviceMethods::Release(&**d);
+            },
+            Self::D3d12(queue) => {
+                let _ = queue.as_raw();
+            } // the owned reference drops normally
+            Self::None => {}
+        }
+    }
+}
+
 #[repr(C)]
 pub struct SwapChain {
     vtbl: *const IDXGISwapChain4_Vtbl,
     refs: AtomicU32,
     inner: IDXGISwapChain4,
     /// Our device, with one reference, or null when the swap chain was made for a device we do not wrap.
-    device: *const Device,
+    owner: SwapChainOwner,
     /// The factory that made it, with one reference, or null.
     factory: *const Factory,
 }
@@ -114,13 +134,17 @@ impl Factory {
             return hr;
         }
         let real = unsafe { IUnknown::from_raw(*out) };
-        let ours = Device::from_raw(device);
-        if ours.is_none() {
-            log!("swap chain made for a device locum does not wrap ({device:p}): left unwrapped");
+        let owner = if let Some(d) = Device::from_raw(device) {
+            unsafe { crate::vtables::device::DeviceMethods::AddRef(d) };
+            SwapChainOwner::D3d11(d as *const Device)
+        } else if crate::d3d12::is_wrapped(device) {
+            SwapChainOwner::D3d12(unsafe { IUnknown::from_raw_borrowed(&device) }.unwrap().clone())
+        } else {
+            log!("swap chain made for an unwrapped owner ({device:p}): left unwrapped");
             unsafe { *out = real.into_raw() };
             return hr;
-        }
-        match SwapChain::wrap(real, ours, Some(self)) {
+        };
+        match SwapChain::wrap_owned(real, owner, Some(self)) {
             Ok(w) => unsafe { *out = w.cast() },
             Err(real) => unsafe { *out = real.into_raw() },
         }
@@ -202,14 +226,21 @@ impl SwapChain {
         device: Option<&Device>,
         factory: Option<&Factory>,
     ) -> Result<*mut SwapChain, IUnknown> {
+        let owner = device.map_or(SwapChainOwner::None, |d| {
+            unsafe { crate::vtables::device::DeviceMethods::AddRef(d) };
+            SwapChainOwner::D3d11(d as *const Device)
+        });
+        Self::wrap_owned(swapchain, owner, factory)
+    }
+    fn wrap_owned(
+        swapchain: IUnknown,
+        owner: SwapChainOwner,
+        factory: Option<&Factory>,
+    ) -> Result<*mut SwapChain, IUnknown> {
         let Ok(inner) = swapchain.cast::<IDXGISwapChain4>() else {
             log!("swap chain is not an IDXGISwapChain4: left unwrapped");
             return Err(swapchain);
         };
-        let device = device.map_or(core::ptr::null(), |d| {
-            unsafe { crate::vtables::device::DeviceMethods::AddRef(d) };
-            d as *const Device
-        });
         let factory = factory.map_or(core::ptr::null(), |f| {
             unsafe { f.AddRef() };
             f as *const Factory
@@ -218,7 +249,7 @@ impl SwapChain {
             vtbl: &SWAPCHAIN_VTBL,
             refs: AtomicU32::new(1),
             inner,
-            device,
+            owner,
             factory,
         }));
         log!("wrapped swap chain {:p} as {wrapper:p}", swapchain.as_raw());
@@ -266,7 +297,12 @@ unsafe impl FactoryMethods for Factory {
         a2: *mut *mut c_void,
     ) -> HRESULT {
         unsafe {
-            let hr = real_factory::CreateSwapChain(self.inner(), Device::unwrap_raw(a0), a1, a2);
+            let hr = real_factory::CreateSwapChain(
+                self.inner(),
+                crate::d3d12::unwrap(Device::unwrap_raw(a0)),
+                a1,
+                a2,
+            );
             self.wrap_swapchain(hr, a0, a2)
         }
     }
@@ -283,7 +319,7 @@ unsafe impl FactoryMethods for Factory {
         unsafe {
             let hr = real_factory::CreateSwapChainForHwnd(
                 self.inner(),
-                Device::unwrap_raw(a0),
+                crate::d3d12::unwrap(Device::unwrap_raw(a0)),
                 a1,
                 a2,
                 a3,
@@ -305,7 +341,7 @@ unsafe impl FactoryMethods for Factory {
         unsafe {
             let hr = real_factory::CreateSwapChainForCoreWindow(
                 self.inner(),
-                Device::unwrap_raw(a0),
+                crate::d3d12::unwrap(Device::unwrap_raw(a0)),
                 a1,
                 a2,
                 a3,
@@ -323,8 +359,13 @@ unsafe impl FactoryMethods for Factory {
         a3: *mut *mut c_void,
     ) -> HRESULT {
         unsafe {
-            let hr =
-                real_factory::CreateSwapChainForComposition(self.inner(), Device::unwrap_raw(a0), a1, a2, a3);
+            let hr = real_factory::CreateSwapChainForComposition(
+                self.inner(),
+                crate::d3d12::unwrap(Device::unwrap_raw(a0)),
+                a1,
+                a2,
+                a3,
+            );
             self.wrap_swapchain(hr, a0, a3)
         }
     }
@@ -437,12 +478,9 @@ unsafe impl SwapChainMethods for SwapChain {
     unsafe fn Release(&self) -> u32 {
         let left = self.refs.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
-            let (device, factory) = (self.device, self.factory);
+            let factory = self.factory;
             drop(unsafe { Box::from_raw(self as *const SwapChain as *mut SwapChain) });
             unsafe {
-                if !device.is_null() {
-                    crate::vtables::device::DeviceMethods::Release(&*device);
-                }
                 if !factory.is_null() {
                     (*factory).Release();
                 }
@@ -452,10 +490,24 @@ unsafe impl SwapChainMethods for SwapChain {
     }
 
     unsafe fn GetDevice(&self, a0: *const GUID, a1: *mut *mut c_void) -> HRESULT {
-        if self.device.is_null() {
-            return unsafe { real_swapchain::GetDevice(self.inner(), a0, a1) };
+        match &self.owner {
+            SwapChainOwner::D3d11(device) => unsafe {
+                crate::vtables::device::DeviceMethods::QueryInterface(&**device, a0, a1)
+            },
+            SwapChainOwner::D3d12(_) => unsafe {
+                let hr = real_swapchain::GetDevice(self.inner(), a0, a1);
+                crate::d3d12::wrap_output(hr, a0, a1);
+                hr
+            },
+            SwapChainOwner::None => unsafe { real_swapchain::GetDevice(self.inner(), a0, a1) },
         }
-        unsafe { crate::vtables::device::DeviceMethods::QueryInterface(&*self.device, a0, a1) }
+    }
+    unsafe fn GetBuffer(&self, index: u32, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        let hr = unsafe { real_swapchain::GetBuffer(self.inner(), index, iid, out) };
+        if matches!(self.owner, SwapChainOwner::D3d12(_)) {
+            unsafe { crate::d3d12::wrap_output(hr, iid, out) };
+        }
+        hr
     }
 
     unsafe fn GetParent(&self, a0: *const GUID, a1: *mut *mut c_void) -> HRESULT {
@@ -499,7 +551,20 @@ unsafe impl SwapChainMethods for SwapChain {
         a6: *const *mut c_void,
     ) -> HRESULT {
         capture::abandon("the game resized its swap chain");
-        unsafe { real_swapchain::ResizeBuffers1(self.inner(), a0, a1, a2, a3, a4, a5, a6) }
+        // Zero preserves the existing buffer count; the queue array still has
+        // that many entries. Do not hand DXGI an empty temporary array.
+        let count = if a0 == 0 && !a6.is_null() {
+            let mut desc = DXGI_SWAP_CHAIN_DESC::default();
+            let hr = unsafe { real_swapchain::GetDesc(self.inner(), &mut desc) };
+            if hr.is_err() {
+                return hr;
+            }
+            desc.BufferCount
+        } else {
+            a0
+        };
+        let queues = unsafe { crate::d3d12::inputs::objects(a6, count) };
+        unsafe { real_swapchain::ResizeBuffers1(self.inner(), a0, a1, a2, a3, a4, a5, queues.ptr()) }
     }
 }
 
@@ -507,12 +572,18 @@ impl SwapChain {
     /// A present: the frame boundary for the frame counter and for captures. `TEST` presents show nothing and are
     /// passed straight through.
     fn present(&self, flags: DXGI_PRESENT, real: impl FnOnce() -> HRESULT) -> HRESULT {
-        if flags.contains(DXGI_PRESENT_TEST) || self.device.is_null() {
+        if flags.contains(DXGI_PRESENT_TEST) || matches!(self.owner, SwapChainOwner::None) {
             return real();
         }
         let frame = count_frame();
+        let SwapChainOwner::D3d11(device) = self.owner else {
+            if frame == 1 {
+                log!("D3D12 first proxied Present");
+            }
+            return real();
+        };
         crate::d3d11::overrides::poll(frame);
-        let immediate = unsafe { (*self.device).immediate() };
+        let immediate = unsafe { (*device).immediate() };
         capture::end_frame(immediate.real());
         let finished = capture::before_present();
         let hr = real();

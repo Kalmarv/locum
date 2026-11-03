@@ -219,6 +219,17 @@ Constants are named from each shader's reflection, as `cbuffer.variable[index].c
 one-channel images are stretched from their smallest to largest value, float colour is tone-mapped, and `--range
 LO:HI` sets the mapping.
 
+## Direct3D 12 (in progress)
+
+A third DLL, `d3d12.dll`, passes every Direct3D 12 call through to the system's, as `d3d11.dll` does for Direct3D 11;
+it keeps the system DLL's exports by name and ordinal (Elden Ring imports `D3D12CreateDevice` by ordinal 101). Devices,
+queues, command lists and every other object a game gets are wrapped, and `locum.log` records which were made and
+used. It does not capture yet: a capture you can read with the CLI and the viewer comes next, then replay.
+
+`cargo xtask smoke --api d3d12` runs a program through it on WARP with the debug layer on (copies, dispatches, fences,
+pipeline states and libraries, placed resources, barriers, swap chain present and resize); `cargo xtask smoke` stays
+the Direct3D 11 suite. The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
+
 ## References
 
 DXVK and RenderDoc are both open source and solve the same problems (object identity, DXGI, deferred contexts); when

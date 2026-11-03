@@ -284,6 +284,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "locum-shim-d3d12"
+version = "0.1.0"
+dependencies = [
+ "find-msvc-tools",
+]
+
+[[package]]
 name = "locum-shim-dxgi"
 version = "0.1.0"
 dependencies = [
@@ -297,6 +304,13 @@ dependencies = [
  "locum-capture",
  "rusqlite",
  "serde_json",
+ "windows",
+]
+
+[[package]]
+name = "locum-smoke-d3d12"
+version = "0.1.0"
+dependencies = [
  "windows",
 ]
 

@@ -30,6 +30,8 @@ fn log_state() -> &'static Log {
 pub fn folder() -> Option<PathBuf> {
     match std::env::var_os("LOCUM_DIR") {
         Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        // Unit tests must not truncate a real application's default log.
+        _ if cfg!(test) => Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/test-log")),
         _ => std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("locum")),
     }
 }

@@ -39,7 +39,7 @@ pub fn system() -> &'static System {
         if let Some(own) = module_of(system as *const c_void).map(module_path)
             && let Some(own) = own.parent()
         {
-            for name in ["d3d11.dll", "dxgi.dll"] {
+            for name in ["d3d11.dll", "dxgi.dll", "d3d12.dll"] {
                 if own.join(name).is_file() && !same_folder(own, &folder) {
                     load(own, name);
                 }
@@ -49,6 +49,15 @@ pub fn system() -> &'static System {
         let dxgi = load(&folder, "dxgi.dll").unwrap_or_default();
         System { folder, d3d11, dxgi }
     })
+}
+
+/// The real `d3d12.dll`, loaded from the system folder the first time a D3D12 export is called (a D3D11 game never
+/// gets it).
+pub fn system_d3d12() -> HMODULE {
+    static D3D12: OnceLock<usize> = OnceLock::new();
+    HMODULE(
+        *D3D12.get_or_init(|| load(&system().folder, "d3d12.dll").map_or(0, |h| h.0 as usize)) as *mut c_void,
+    )
 }
 
 /// Whether two folders are the same (Windows paths compare without case).

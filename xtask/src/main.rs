@@ -10,6 +10,8 @@
 //!
 //! Regenerate after changing the `windows` version. The generated files are checked in.
 
+mod d3d12;
+
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -28,6 +30,132 @@ struct Class {
 }
 
 const CLASSES: &[Class] = &[
+    Class {
+        module: "d12_debug_base",
+        trait_name: "DebugBase12Methods",
+        interface: "ID3D12Debug",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_device",
+        trait_name: "Device12Methods",
+        interface: "ID3D12Device5",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_queue",
+        trait_name: "Queue12Methods",
+        interface: "ID3D12CommandQueue",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_list",
+        trait_name: "List12Methods",
+        interface: "ID3D12GraphicsCommandList4",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_allocator",
+        trait_name: "Allocator12Methods",
+        interface: "ID3D12CommandAllocator",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_resource",
+        trait_name: "Resource12Methods",
+        interface: "ID3D12Resource2",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_heap",
+        trait_name: "Heap12Methods",
+        interface: "ID3D12Heap1",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_fence",
+        trait_name: "Fence12Methods",
+        interface: "ID3D12Fence1",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_descriptors",
+        trait_name: "Descriptors12Methods",
+        interface: "ID3D12DescriptorHeap",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_root",
+        trait_name: "Root12Methods",
+        interface: "ID3D12RootSignature",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_pso",
+        trait_name: "Pso12Methods",
+        interface: "ID3D12PipelineState",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_signature",
+        trait_name: "Signature12Methods",
+        interface: "ID3D12CommandSignature",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_query",
+        trait_name: "Query12Methods",
+        interface: "ID3D12QueryHeap",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_library",
+        trait_name: "Library12Methods",
+        interface: "ID3D12PipelineLibrary1",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_state",
+        trait_name: "State12Methods",
+        interface: "ID3D12StateObject",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_properties",
+        trait_name: "Properties12Methods",
+        interface: "ID3D12StateObjectProperties",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_debug",
+        trait_name: "Debug12Methods",
+        interface: "ID3D12Debug1",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_info",
+        trait_name: "Info12Methods",
+        interface: "ID3D12InfoQueue",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_protected",
+        trait_name: "Protected12Methods",
+        interface: "ID3D12ProtectedResourceSession",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_meta",
+        trait_name: "Meta12Methods",
+        interface: "ID3D12MetaCommand",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_lifetime",
+        trait_name: "Lifetime12Methods",
+        interface: "ID3D12LifetimeTracker",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
     Class {
         module: "device",
         trait_name: "DeviceMethods",
@@ -68,6 +196,7 @@ const CLASSES: &[Class] = &[
 
 /// Source modules whose vtable structs are read (bases can live in another module than the interface).
 const MODULES: &[&[&str]] = &[
+    &["Win32", "Graphics", "Direct3D12"],
     &["Win32", "Graphics", "Direct3D11"],
     &["Win32", "Graphics", "Dxgi"],
 ];
@@ -93,6 +222,7 @@ fn main() {
         .to_path_buf();
     match args.first().map(String::as_str) {
         Some("gen") => generate_all(&root),
+        Some("smoke") if args.windows(2).any(|p| p[0] == "--api" && p[1] == "d3d12") => d3d12::smoke(&root),
         Some("smoke") => smoke(&root, args.iter().any(|a| a == "--debug")),
         _ => {
             eprintln!("usage: cargo xtask gen | smoke");
@@ -610,6 +740,10 @@ fn generate_all(root: &Path) {
         rustfmt(&path);
         writeln!(mods, "pub mod {};", class.module).unwrap();
     }
+    let d12 = out.join("d12_registry.rs");
+    std::fs::write(&d12, d3d12::registry(CLASSES, &vtbls)).unwrap();
+    rustfmt(&d12);
+    mods.push_str("pub mod d12_registry;\n");
     let mod_rs = out.join("mod.rs");
     std::fs::write(&mod_rs, mods).expect("write vtables/mod.rs");
     rustfmt(&mod_rs);
@@ -804,6 +938,9 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
         // Every struct of the chain lives in one of MODULES; find which by looking the name up in each source.
         for m in MODULES {
             let candidate = format!("windows::{}::{vtbl}", m.join("::"));
+            if vtbl.starts_with("ID3D12") && m.ends_with(&["Direct3D12"]) {
+                return candidate;
+            }
             if vtbl.starts_with("ID3D11") && m.ends_with(&["Direct3D11"]) {
                 return candidate;
             }
@@ -916,6 +1053,9 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
         .unwrap();
     }
     out.push_str(&thunks);
+    if class.module.starts_with("d12_") {
+        out.push_str(&d3d12::implementation(class, &levels));
+    }
 
     // The vtable literal, nested from the most derived struct down to IUnknown's.
     let mut literal = String::from(

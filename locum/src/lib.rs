@@ -11,6 +11,7 @@
 mod com;
 mod cost;
 mod d3d11;
+mod d3d12;
 mod dump;
 mod dxgi;
 mod log;
