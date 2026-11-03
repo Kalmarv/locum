@@ -1,0 +1,13 @@
+[package]
+name = "locum-shim-dxgi"
+description = "dxgi.dll for locum: its exports forward to locum.dll."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "dxgi"
+crate-type = ["cdylib"]

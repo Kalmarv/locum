@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["locum", "shims/d3d11", "shims/dxgi", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Kalmarv/locum"
+
+[workspace.dependencies]
+windows = { version = "=0.62.2", default-features = false }
+
+[profile.release]
+debug = "line-tables-only"
+panic = "abort"
