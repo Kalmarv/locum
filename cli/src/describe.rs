@@ -164,9 +164,40 @@ pub fn stack(c: &Capture, id: i64) -> Vec<String> {
 #[derive(Default)]
 pub struct Reflection {
     cache: HashMap<String, Option<Vec<ConstantBuffer>>>,
+    bindings: HashMap<String, Option<Vec<rdef::Binding>>>,
+}
+
+/// What a shader's reflection says of a register a draw bound.
+pub enum Slot {
+    /// The resource the program reads or writes there, by its name in the source.
+    Named(String),
+    /// The program does not use it (the compiler keeps only what the code reaches).
+    Unused,
+    /// No reflection to say.
+    Unknown,
 }
 
 impl Reflection {
+    /// What shader `shader` calls register `slot` (space `space`) of class `class` (`srv`, `uav`, `sampler`, `cb`).
+    pub fn slot(&mut self, c: &Capture, shader: &str, class: &str, slot: u32, space: u32) -> Slot {
+        let bindings = self.bindings.entry(shader.to_string()).or_insert_with(|| {
+            let key: String = c.row(
+                "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
+                [shader],
+                |r| r.get(0),
+            )?;
+            rdef::bindings(&c.blob(&key).ok()?)
+        });
+        let Some(bindings) = bindings else {
+            return Slot::Unknown;
+        };
+        bindings
+            .iter()
+            .filter(|b| b.class() == class && b.space == space)
+            .find_map(|b| b.name_at(slot))
+            .map_or(Slot::Unused, Slot::Named)
+    }
+
     /// The constant buffer a shader declares at register `slot` (space `space`).
     pub fn cb<'a>(
         &'a mut self,

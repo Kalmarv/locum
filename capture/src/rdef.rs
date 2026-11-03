@@ -1,5 +1,6 @@
 //! Shader reflection from a DXBC container's `RDEF` chunk: each constant buffer's name, register and variables, so a
-//! constant can be shown as `cbTexScroll.uvScale.x` instead of `b11 c0.x`.
+//! constant can be shown as `cbTexScroll.uvScale.x` instead of `b11 c0.x`, and the name and register of every resource
+//! the program reads or writes (`g_GBuffer2Texture` at t4).
 
 /// A DXBC container's chunk with the four-character code `code`.
 pub fn chunk<'a>(dxbc: &'a [u8], code: &[u8; 4]) -> Option<&'a [u8]> {
@@ -131,39 +132,92 @@ fn read_type(rdef: &[u8], at: usize, depth: u32) -> Option<Type> {
     Some(t)
 }
 
+/// A resource the program binds: what the reflection's binding record (`D3D11_SHADER_INPUT_BIND_DESC`) says.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binding {
+    pub name: String,
+    /// `D3D_SHADER_INPUT_TYPE`: 0 cbuffer, 1 tbuffer, 2 texture, 3 sampler, 4 to 13 the buffer and UAV kinds.
+    pub kind: u32,
+    /// The first register.
+    pub slot: u32,
+    /// How many registers it takes (an array); 0 for an array of unbounded size.
+    pub count: u32,
+    pub space: u32,
+}
+
+impl Binding {
+    /// The register class it takes: `cb` (b), `srv` (t), `sampler` (s) or `uav` (u), as locum names bindings.
+    pub fn class(&self) -> &'static str {
+        match self.kind {
+            0 => "cb",
+            3 => "sampler",
+            4 | 6 | 8..=11 | 13 => "uav",
+            _ => "srv",
+        }
+    }
+
+    /// Its name at register `slot` of its class: `name`, or `name[i]` in an array. None when it does not cover `slot`.
+    pub fn name_at(&self, slot: u32) -> Option<String> {
+        let i = slot.checked_sub(self.slot)?;
+        match self.count {
+            1 if i == 0 => Some(self.name.clone()),
+            1 => None,
+            n if n == 0 || i < n => Some(format!("{}[{i}]", self.name)),
+            _ => None,
+        }
+    }
+}
+
+/// The record sizes of an `RDEF` chunk: constant buffer, binding, variable.
+fn sizes(rdef: &[u8]) -> Option<(usize, usize, usize)> {
+    let major = rdef.get(17).copied()?;
+    // Shader model 5 adds an "RD11" header after the creator's name offset: its own size, then the sizes of a
+    // constant buffer, a binding, a variable, a type and a member record (24, 32 or 40 with 5.1's register space,
+    // 40, 36, 12). Before it, variables are 24 bytes and bindings 32.
+    if major >= 5 && rdef.get(28..32) == Some(b"RD11") {
+        Some((
+            u32_at(rdef, 36)? as usize,
+            u32_at(rdef, 40)? as usize,
+            u32_at(rdef, 44)? as usize,
+        ))
+    } else {
+        Some((24, 32, 24))
+    }
+}
+
+/// Every resource a shader binds (constant buffers, textures, buffers, samplers, UAVs), from its DXBC bytecode, in
+/// the reflection's order.
+pub fn bindings(dxbc: &[u8]) -> Option<Vec<Binding>> {
+    let rdef = chunk(dxbc, b"RDEF")?;
+    let (_, bind_size, _) = sizes(rdef)?;
+    let bind_count = u32_at(rdef, 8)? as usize;
+    let bind_at = u32_at(rdef, 12)? as usize;
+    (0..bind_count)
+        .map(|i| {
+            let b = bind_at + i * bind_size;
+            Some(Binding {
+                name: str_at(rdef, u32_at(rdef, b)? as usize)?,
+                kind: u32_at(rdef, b + 4)?,
+                slot: u32_at(rdef, b + 20)?,
+                count: u32_at(rdef, b + 24)?,
+                space: if bind_size >= 40 { u32_at(rdef, b + 32)? } else { 0 },
+            })
+        })
+        .collect()
+}
+
 /// The constant buffers a shader declares, from its DXBC bytecode.
 pub fn constant_buffers(dxbc: &[u8]) -> Option<Vec<ConstantBuffer>> {
     let rdef = chunk(dxbc, b"RDEF")?;
     let cb_count = u32_at(rdef, 0)? as usize;
     let cb_at = u32_at(rdef, 4)? as usize;
-    let bind_count = u32_at(rdef, 8)? as usize;
-    let bind_at = u32_at(rdef, 12)? as usize;
-    let major = rdef.get(17).copied()?;
-    // Shader model 5 adds an "RD11" header after the creator's name offset: its own size, then the sizes of a
-    // constant buffer, a binding, a variable, a type and a member record (24, 32 or 40 with 5.1's register space,
-    // 40, 36, 12). Before it, variables are 24 bytes and bindings 32.
-    let rd11 = major >= 5 && rdef.get(28..32) == Some(b"RD11");
-    let (cb_size, bind_size, var_size) = if rd11 {
-        (
-            u32_at(rdef, 36)? as usize,
-            u32_at(rdef, 40)? as usize,
-            u32_at(rdef, 44)? as usize,
-        )
-    } else {
-        (24, 32, 24)
-    };
+    let (cb_size, _, var_size) = sizes(rdef)?;
     // Constant buffers are bound by name: the binding of type 0 (cbuffer) with the same name gives the register.
-    let mut registers = Vec::new();
-    for i in 0..bind_count {
-        let b = bind_at + i * bind_size;
-        let name = str_at(rdef, u32_at(rdef, b)? as usize)?;
-        let kind = u32_at(rdef, b + 4)?;
-        let slot = u32_at(rdef, b + 20)?;
-        let space = if bind_size >= 40 { u32_at(rdef, b + 32)? } else { 0 };
-        if kind == 0 {
-            registers.push((name, slot, space));
-        }
-    }
+    let registers: Vec<(String, u32, u32)> = bindings(dxbc)?
+        .into_iter()
+        .filter(|b| b.kind == 0)
+        .map(|b| (b.name, b.slot, b.space))
+        .collect();
     let mut out = Vec::with_capacity(cb_count);
     for i in 0..cb_count {
         let c = cb_at + i * cb_size;
@@ -383,5 +437,47 @@ mod tests {
         let names: Vec<&str> = cbs[0].variables.iter().map(|v| v.name.as_str()).collect();
         assert_eq!(names, ["first", "second"]);
         assert_eq!(cbs[0].name_at(64).unwrap(), "cbCopy.second[0][0]");
+        // The binding record as a binding: one register, b6.
+        put(&mut r, 84, 1);
+        let bound = bindings(&container(&r)).expect("bindings");
+        assert_eq!(
+            bound,
+            [Binding {
+                name: "cbCopy".into(),
+                kind: 0,
+                slot: 6,
+                count: 1,
+                space: 0
+            }]
+        );
+        assert_eq!(bound[0].class(), "cb");
+    }
+
+    #[test]
+    fn a_binding_names_the_registers_it_covers() {
+        let at = |kind, slot, count| Binding {
+            name: "g_Tex".into(),
+            kind,
+            slot,
+            count,
+            space: 0,
+        };
+        assert_eq!(at(2, 4, 1).name_at(4).as_deref(), Some("g_Tex"));
+        assert_eq!(at(2, 4, 1).name_at(5), None);
+        assert_eq!(at(2, 4, 1).name_at(3), None);
+        assert_eq!(at(2, 4, 3).name_at(6).as_deref(), Some("g_Tex[2]"));
+        assert_eq!(at(2, 4, 3).name_at(7), None);
+        // An array of unbounded size covers every register from its first.
+        assert_eq!(at(2, 4, 0).name_at(90).as_deref(), Some("g_Tex[86]"));
+        let classes: Vec<&str> = [0, 1, 2, 3, 4, 5, 7, 9, 11, 12]
+            .into_iter()
+            .map(|k| at(k, 0, 1).class())
+            .collect();
+        assert_eq!(
+            classes,
+            [
+                "cb", "srv", "srv", "sampler", "uav", "srv", "srv", "uav", "uav", "srv"
+            ]
+        );
     }
 }

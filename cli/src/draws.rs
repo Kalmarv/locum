@@ -374,10 +374,20 @@ pub fn draw(c: &Capture, n: i64, all: bool) -> Result<(), String> {
 
     out!("bound:");
     let list = bindings(c, n);
+    let mut reflection = Reflection::default();
     for b in &list {
         let mut line = format!("  {} {}{}", b.stage, b.kind, b.slot);
         if b.space != 0 {
             line += &format!(" space {}", b.space);
+        }
+        if matches!(b.kind.as_str(), "srv" | "uav" | "sampler")
+            && let Some(shader) = shader_of(c, n, &b.stage)
+        {
+            match reflection.slot(c, &shader, &b.kind, b.slot, b.space) {
+                describe::Slot::Named(name) => line += &format!(" {name}"),
+                describe::Slot::Unused => line += " (the shader does not use it)",
+                describe::Slot::Unknown => {}
+            }
         }
         if let Some(v) = b.view {
             line += &format!(" view #{v}");
@@ -463,7 +473,6 @@ pub fn draw(c: &Capture, n: i64, all: bool) -> Result<(), String> {
         out!("{line}");
     }
 
-    let mut reflection = Reflection::default();
     for b in list.iter().filter(|b| b.kind == "cb") {
         constants(c, &mut reflection, n, b, all)?;
     }

@@ -789,8 +789,25 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
                     && t.contains("(upload)")
                     && t.contains("(first-use)")
                     && t.contains("topology: triangle list (4)")
+                    && t.contains("ps srv0 (the shader does not use it)")
             },
-            "locum-cli draw 0: ps b3 named Frame.value holding 1032; upload and first-use contents; topology named",
+            "locum-cli draw 0: ps b3 named Frame.value holding 1032; upload and first-use contents; topology named; \
+             the texture bound at t0 that the shader does not read says so",
+        ),
+        (
+            {
+                let other = log_dir.join("captures").join("device-write-gpu-2d");
+                let out = Command::new(cli)
+                    .arg("draw")
+                    .arg(&other)
+                    .arg("0")
+                    .output()
+                    .expect("run locum-cli draw");
+                let t = String::from_utf8_lossy(&out.stdout).into_owned();
+                println!("--- locum-cli draw device-write-gpu-2d 0\n{t}");
+                t.contains("ps srv0 t view")
+            },
+            "locum-cli draw: a texture slot the shader reads is named from its reflection (t)",
         ),
         (
             {
