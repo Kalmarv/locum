@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use locum_capture::cost::Cost;
 use locum_capture::hash::key;
 use locum_capture::layout::{self, Sub};
 use locum_capture::{stacks, writer};
@@ -233,6 +234,11 @@ pub fn set_id(object: &ID3D11DeviceChild, id: u64, capture: u64) {
 
 /// Registers a resource: gives it a number and an entry, and watches for its destruction. `initial` is the data it
 /// was created with (one per subresource), if any.
+/// Resources registered (with the initial data hashed and handed to the writer), and updates seen, on the game's
+/// threads.
+pub static REGISTERED: Cost = Cost::new();
+pub static UPDATES: Cost = Cost::new();
+
 unsafe fn register(
     resource: &ID3D11Resource,
     dims: Dims,
@@ -243,6 +249,8 @@ unsafe fn register(
     if let Some((id, _)) = id_on(&child) {
         return id;
     }
+    let started = std::time::Instant::now();
+    let mut hashed = 0u64;
     let id = next_id();
     set_id(&child, id, 0);
     let mut entry = Entry {
@@ -254,6 +262,7 @@ unsafe fn register(
         entry.sub_hashes = vec![None; subs.len()];
         if !initial.is_null() && settings().uploads != Uploads::Off {
             let (bytes, hashes) = unsafe { pack_initial(&dims, &subs, initial) };
+            hashed = bytes.len() as u64;
             let whole = key(&bytes);
             entry.sub_hashes = hashes.into_iter().map(Some).collect();
             entry.upload_stored = settings().uploads == Uploads::Store
@@ -272,6 +281,7 @@ unsafe fn register(
             ONCE.call_once(|| log!("resources have no ID3DDestructionNotifier ({e}): dead ones stay listed"));
         }
     }
+    REGISTERED.add(started, hashed);
     id
 }
 
@@ -340,6 +350,22 @@ pub fn id_of(resource: &ID3D11Resource) -> u64 {
 /// # Safety
 /// `data` must hold the region `region` (or the whole subresource) with the given pitches.
 pub unsafe fn updated(
+    resource: &ID3D11Resource,
+    sub: u32,
+    region: Option<&D3D11_BOX>,
+    data: *const c_void,
+    row_pitch: u32,
+    depth_pitch: u32,
+    keep: bool,
+) -> Option<(Vec<u8>, String)> {
+    let started = std::time::Instant::now();
+    let out = unsafe { update_entry(resource, sub, region, data, row_pitch, depth_pitch, keep) };
+    UPDATES.add(started, out.as_ref().map_or(0, |o| o.0.len() as u64));
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn update_entry(
     resource: &ID3D11Resource,
     sub: u32,
     region: Option<&D3D11_BOX>,

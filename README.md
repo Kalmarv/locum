@@ -118,6 +118,22 @@ locum-cli target last 120 rt0 -o gbuf0.png # a target read back after a pass
 locum-cli sql last "SELECT ..."            # anything else
 ```
 
+Replay runs a captured draw again offline, on the GPU or on WARP (`--warp`), with or without rules in the
+`overrides.txt` language changing it:
+
+```
+locum-cli verify last                      # replay the frame; compare every target read back with the game's
+locum-cli replay last 812                  # the draw and the earlier events it depends on; writes its targets
+locum-cli replay last last --rule "constant vs b11 c0 8 8 0 0"   # before, after and a diff picture of the change
+locum-cli replay last 812 --rules mine.txt --mode frame
+```
+
+A draw is replayed with what it depends on: walking back from it, each earlier event that wrote a resource it (or an
+event already taken) reads or writes is taken too, and every resource starts with its contents as the frame began.
+Each draw runs from the full state captured at it, with its constant buffers made from the bytes the GPU read. With
+rules, the targets are written before (`rt0.before.png`) and after (`rt0.after.png`) them, and `rt0.diff.png` shows
+the texels that changed in magenta over the unchanged ones in grey.
+
 Constants are named from each shader's reflection, as `cbuffer.variable[index].component`. PNGs of depth and other
 one-channel images are stretched from their smallest to largest value, float colour is tone-mapped, and `--range
 LO:HI` sets the mapping.

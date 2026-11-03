@@ -189,23 +189,36 @@ impl Reflection {
     }
 }
 
-/// A 4-byte constant as its type says (float when unknown).
+/// A 4-byte constant as its type says (float when unknown), at most 12 characters.
 pub fn value(bytes: [u8; 4], base: Option<u16>) -> String {
     match base {
         Some(1) => (u32::from_le_bytes(bytes) != 0).to_string(),
         Some(2) => i32::from_le_bytes(bytes).to_string(),
         Some(19 | 20) => u32::from_le_bytes(bytes).to_string(),
-        _ => {
-            let f = f32::from_le_bytes(bytes);
-            let bits = u32::from_le_bytes(bytes);
-            // A denormal or NaN that is not a plain zero is more likely an integer or packed bits.
-            if (f != 0.0 && f.abs() < 1e-30) || f.is_nan() {
-                format!("0x{bits:08x}")
-            } else {
-                format!("{f}")
-            }
-        }
+        _ => float(f32::from_le_bytes(bytes)),
     }
+}
+
+/// A float in at most 12 characters: plainly when it fits, else in exponent form; denormals and NaNs (more likely
+/// integers or packed bits) as hex.
+pub fn float(f: f32) -> String {
+    let bits = f.to_bits();
+    if (f != 0.0 && f.abs() < 1e-30) || f.is_nan() {
+        return format!("0x{bits:08x}");
+    }
+    let a = f.abs();
+    let plain = format!("{f}");
+    if plain.len() <= 12 && a < 1e7 {
+        return plain;
+    }
+    if (1e-4..1e7).contains(&a) {
+        // Round to fit: the integer digits, the point and as many decimals as are left.
+        let digits = (a.log10().floor() as i32 + 1).max(1) as usize;
+        let sign = usize::from(f < 0.0);
+        let decimals = 12usize.saturating_sub(digits + 1 + sign).min(9);
+        return format!("{f:.decimals$}");
+    }
+    format!("{f:.4e}")
 }
 
 /// The names of a register's four components, shortened to `name` when they are `name.x` to `name.w`.

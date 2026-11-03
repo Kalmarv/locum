@@ -4,6 +4,7 @@
 //! DXBC shader reflection ([`rdef`]), the rules that change what is drawn ([`rules`]), and reading contents back out: texels ([`texels`]) and DDS files ([`dds`]).
 
 pub mod blobs;
+pub mod cost;
 pub mod db;
 pub mod dds;
 pub mod format;

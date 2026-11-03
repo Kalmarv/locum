@@ -517,8 +517,8 @@ fn constants(
             values.push(value(w, base));
         }
         out!(
-            "  c{r:<4} {:<52} {}",
-            values.iter().map(|v| format!("{v:>12}")).collect::<String>(),
+            "  c{r:<4}{:<53}  {}",
+            values.iter().map(|v| format!(" {v:>12}")).collect::<String>(),
             register_name(&names)
         );
     }

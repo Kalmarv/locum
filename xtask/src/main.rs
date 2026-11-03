@@ -194,6 +194,25 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
             run(&["events", "--kind", "map"]).contains("Unmap"),
             "locum-cli events --kind map: the map in the command list",
         ),
+        (
+            run(&["verify"]).contains("3 of 3 targets identical"),
+            "locum-cli verify: the replayed frame's three targets are the game's, bit for bit",
+        ),
+        (
+            {
+                let out = log_dir.join("replay").display().to_string();
+                let t = run(&[
+                    "replay",
+                    "0",
+                    "--rule",
+                    "constant ps b3 c0 500 500 500 500",
+                    "-o",
+                    &out,
+                ]);
+                t.contains("against the game's: identical") && t.contains("4096 of 4096 texels differ")
+            },
+            "locum-cli replay 0 with a constant rule: as the game drew it before, every texel changed after",
+        ),
     ];
     let mut ok = true;
     for (passed, what) in checks {

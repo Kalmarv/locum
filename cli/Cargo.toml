@@ -14,7 +14,15 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
 locum-capture = { path = "../capture" }
+locum-d3d11 = { path = "../d3d11" }
 png = "0.18.1"
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde_json = "1"
-windows = { workspace = true, features = ["Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc"] }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+] }

@@ -7,6 +7,11 @@ use std::sync::mpsc::{Sender, channel};
 use std::sync::{Condvar, Mutex, OnceLock};
 
 use crate::blobs::Blobs;
+use crate::cost::Cost;
+
+/// Blobs written (bytes, time on the writer thread), and blobs dropped because the budget was spent.
+pub static WRITTEN: Cost = Cost::new();
+pub static DROPPED: Cost = Cost::new();
 
 /// Bytes of blobs that may wait to be written at once.
 pub const BUDGET: u64 = 1 << 30;
@@ -33,7 +38,9 @@ fn writer() -> &'static Writer {
                 for job in rx {
                     let bytes = match job {
                         Job::Blob(blobs, key, data) => {
+                            let started = std::time::Instant::now();
                             let _ = blobs.put(&key, &data);
+                            WRITTEN.add(started, data.len() as u64);
                             data.len() as u64
                         }
                         Job::Run(f) => {
@@ -76,6 +83,7 @@ pub fn blob(blobs: &Blobs, key: String, data: Vec<u8>, wait: bool) -> bool {
         let mut p = w.pending.lock().unwrap_or_else(|e| e.into_inner());
         while p.0 > 0 && p.0 + bytes > BUDGET {
             if !wait {
+                DROPPED.add(std::time::Instant::now(), bytes);
                 return false;
             }
             p = w.changed.wait(p).unwrap_or_else(|e| e.into_inner());

@@ -6,6 +6,7 @@ mod draws;
 mod export;
 mod info;
 mod open;
+mod replay;
 mod resources;
 mod shaders;
 
@@ -187,6 +188,38 @@ enum Command {
         #[arg(short, long)]
         out: PathBuf,
     },
+    /// Replays a draw offline (with what it depends on), optionally with rules changing it, and writes what it drew.
+    /// With rules, writes the draw's targets before and after them and where they differ.
+    Replay {
+        capture: String,
+        /// The draw's number, or `last`.
+        draw: String,
+        /// A rule as in overrides.txt (`constant ps b3 c0 1 0 0 1`, `skip vs=<hash>`, ...); may be given many times.
+        #[arg(long)]
+        rule: Vec<String>,
+        /// A file of rules.
+        #[arg(long)]
+        rules: Option<PathBuf>,
+        /// slice (the draw and what it depends on), frame (everything up to it), or draw (it alone).
+        #[arg(long, default_value = "slice")]
+        mode: String,
+        /// Run on WARP, the software rasterizer, instead of the GPU.
+        #[arg(long)]
+        warp: bool,
+        #[arg(short, long, default_value = "replay")]
+        out: PathBuf,
+        #[arg(long, default_value = "auto")]
+        range: String,
+    },
+    /// Replays the whole frame and compares every target the capture read back.
+    Verify {
+        capture: String,
+        #[arg(long)]
+        warp: bool,
+        /// Compare at most this many targets.
+        #[arg(long)]
+        limit: Option<i64>,
+    },
     /// Any SQL on the capture; rows tab-separated.
     Sql { capture: String, query: String },
 }
@@ -344,6 +377,34 @@ fn run(cli: Cli) -> Result<(), String> {
             range: r,
         } => export::target(&open(&capture)?, draw, &name, &out, range(&r)?),
         Command::Blob { capture, key, out } => export::blob(&open(&capture)?, &key, &out),
+        Command::Replay {
+            capture,
+            draw,
+            rule,
+            rules,
+            mode,
+            warp,
+            out,
+            range: r,
+        } => {
+            let c = open(&capture)?;
+            let n = replay::draw_number(&c, &draw)?;
+            let mode =
+                replay::Mode::parse(&mode).ok_or_else(|| format!("--mode {mode}: slice, frame or draw"))?;
+            replay::replay(
+                &c,
+                n,
+                &replay::Options {
+                    mode,
+                    rules: rule,
+                    rules_file: rules,
+                    warp,
+                    out,
+                    range: range(&r)?,
+                },
+            )
+        }
+        Command::Verify { capture, warp, limit } => replay::verify(&open(&capture)?, warp, limit),
         Command::Sql { capture, query } => sql(&open(&capture)?, &query),
     }
 }
