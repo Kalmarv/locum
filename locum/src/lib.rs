@@ -12,6 +12,7 @@ mod com;
 mod device;
 mod dxgi;
 mod log;
+mod overrides;
 mod shaders;
 mod stages;
 mod system;

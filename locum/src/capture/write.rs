@@ -86,8 +86,9 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     }
 
     let frame_line = json!({"e": "frame", "frame": frame, "draws": timeline.len(), "lists_spliced": s.lists_spliced,
-        "lists_unrecorded": s.lists_unrecorded, "copy_failures": s.copy_failures, "targets": targets,
-        "targets_skipped": s.targets_skipped});
+        "lists_unrecorded": s.lists_unrecorded, "lists_prerecorded": s.lists_prerecorded, "copy_failures": s.copy_failures, "targets": targets,
+        "targets_skipped": s.targets_skipped,
+        "targets_skipped_mib": s.targets_skipped_bytes >> 20});
     let _ = writeln!(out, "{frame_line}");
     for line in &s.objects {
         out.push_str(line);
@@ -102,13 +103,14 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     let path = dir.join("draws.jsonl");
     let written = std::fs::write(&path, out).is_ok();
     log!(
-        "capture of frame {frame}: {} draws, {} command lists spliced, {} executed without a recording, {} copy failures, {targets} targets ({} MiB, {} skipped) -> {} ({})",
+        "capture of frame {frame}: {} draws, {} command lists spliced, {} executed without a recording, {} copy failures, {targets} targets ({} MiB, {} skipped, {} MiB more needed) -> {} ({})",
         timeline.len(),
         s.lists_spliced,
         s.lists_unrecorded,
         s.copy_failures,
         target_bytes >> 20,
         s.targets_skipped,
+        s.targets_skipped_bytes >> 20,
         path.display(),
         if written { "written" } else { "NOT written" }
     );

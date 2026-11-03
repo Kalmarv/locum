@@ -483,9 +483,10 @@ impl SwapChain {
         if flags.contains(DXGI_PRESENT_TEST) || self.device.is_null() {
             return real();
         }
-        count_frame();
+        let frame = count_frame();
+        crate::overrides::poll(frame);
         let immediate = unsafe { (*self.device).immediate() };
-        immediate.end_pass();
+        capture::end_frame(immediate.real());
         let finished = capture::before_present();
         let hr = real();
         capture::after_present(finished, immediate.real());
@@ -494,7 +495,7 @@ impl SwapChain {
 }
 
 /// Counts a frame and logs the frame rate every 600.
-fn count_frame() {
+fn count_frame() -> u64 {
     static FRAMES: AtomicU64 = AtomicU64::new(0);
     static SINCE: Mutex<Option<Instant>> = Mutex::new(None);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -509,4 +510,5 @@ fn count_frame() {
         }
         *since = Some(now);
     }
+    frame
 }

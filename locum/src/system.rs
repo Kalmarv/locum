@@ -33,22 +33,8 @@ pub fn system() -> &'static System {
         let mut buf = [0u16; 260];
         let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
         let folder = PathBuf::from(String::from_utf16_lossy(&buf[..n]));
-        let load = |name: &str| -> HMODULE {
-            let path = folder.join(name);
-            let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-            match unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_FLAGS(0)) } {
-                Ok(h) => {
-                    log!("loaded {} at {:p}", path.display(), h.0);
-                    h
-                }
-                Err(e) => {
-                    log!("FAILED to load {}: {e}", path.display());
-                    HMODULE::default()
-                }
-            }
-        };
-        let d3d11 = load("d3d11.dll");
-        let dxgi = load("dxgi.dll");
+        let d3d11 = load(&folder, "d3d11.dll").unwrap_or_default();
+        let dxgi = load(&folder, "dxgi.dll").unwrap_or_default();
         System { folder, d3d11, dxgi }
     })
 }
@@ -57,6 +43,34 @@ pub fn system() -> &'static System {
 ///
 /// # Safety
 /// `F` must be the export's real function pointer type.
+/// Loads `name` from `folder` by full path.
+fn load(folder: &std::path::Path, name: &str) -> Option<HMODULE> {
+    let path = folder.join(name);
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    match unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_LIBRARY_FLAGS(0)) } {
+        Ok(h) => {
+            log!("loaded {} at {:p}", path.display(), h.0);
+            Some(h)
+        }
+        Err(e) => {
+            log!("FAILED to load {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+/// Loads a DLL from the system folder (once; later calls give the same module).
+pub fn load_system_dll(name: &'static str) -> Option<HMODULE> {
+    static LOADED: std::sync::Mutex<Vec<(&'static str, usize)>> = std::sync::Mutex::new(Vec::new());
+    let mut loaded = LOADED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, h)) = loaded.iter().find(|(n, _)| *n == name) {
+        return Some(HMODULE(h as *mut c_void));
+    }
+    let h = load(&system().folder, name)?;
+    loaded.push((name, h.0 as usize));
+    Some(h)
+}
+
 pub unsafe fn export<F: Copy>(module: HMODULE, name: &'static core::ffi::CStr) -> Option<F> {
     assert_eq!(size_of::<F>(), size_of::<usize>());
     let f = unsafe { GetProcAddress(module, PCSTR(name.as_ptr().cast())) }?;

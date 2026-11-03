@@ -3,7 +3,12 @@
 //!
 //! Requested by creating the file `capture` in locum's folder; it is removed when seen. Its lines are options:
 //! - `targets`: read back the render and depth targets at the end of each pass;
-//! - `max_mb N`: the most memory target readback may use (default 1024).
+//! - `max_mb N`: the most memory target readback may use (default 4096).
+//!
+//! A pass ends where the targets in effect change on the GPU's timeline: an `OMSetRenderTargets` (or `ClearState`)
+//! that binds other targets, a command list whose first draw uses other targets than the draw before it, or the end
+//! of the frame. Its targets are copied then, kept with its last draw: inside a command list on its deferred context,
+//! between command lists on the immediate context.
 //!
 //! The capture then runs over three presents:
 //! - **pre-recording** (from the present that sees the file): deferred contexts record their draws, so command lists
@@ -23,7 +28,7 @@ mod targets;
 mod write;
 
 use core::ffi::c_void;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -59,7 +64,7 @@ impl Request {
     fn parse(text: &str) -> Request {
         let mut r = Request {
             targets: false,
-            max_target_bytes: 1024 << 20,
+            max_target_bytes: 4096 << 20,
         };
         for line in text.lines() {
             let mut words = line.split_whitespace();
@@ -120,6 +125,18 @@ struct Draw {
     /// The targets as they were after this draw, the last of its pass (with `targets` only).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     after: Vec<targets::Target>,
+    /// The targets bound at the draw (with `targets` only).
+    #[serde(skip)]
+    bound: Vec<targets::Bound>,
+    /// Whether the pass this draw ends has been dealt with (its targets copied, or tried).
+    #[serde(skip)]
+    closed: bool,
+}
+
+/// A finished command list's draws, and whether it was finished before the captured frame.
+struct List {
+    draws: Vec<Draw>,
+    prerecorded: bool,
 }
 
 struct State {
@@ -128,14 +145,12 @@ struct State {
     request: Request,
     /// Draws recorded on a deferred context since its last FinishCommandList, by context id.
     pending: BTreeMap<u32, Vec<Draw>>,
-    /// Draws of finished command lists not yet executed, by command list address.
-    lists: BTreeMap<usize, Vec<Draw>>,
+    /// Finished command lists, by address.
+    lists: BTreeMap<usize, List>,
     timeline: Vec<Draw>,
-    /// The timeline index of the last draw on the immediate context.
-    last_immediate: Option<usize>,
-    /// Contexts that have drawn since their targets were last read back.
-    dirty: BTreeSet<u32>,
     lists_spliced: u32,
+    /// Command lists spliced in that were finished before the captured frame began.
+    lists_prerecorded: u32,
     lists_unrecorded: u32,
     /// Constant-buffer staging chunks and the bytes used in the last one.
     staging: Vec<ID3D11Buffer>,
@@ -143,6 +158,8 @@ struct State {
     copy_failures: u32,
     target_bytes: u64,
     targets_skipped: u32,
+    /// The bytes the skipped targets would have taken.
+    targets_skipped_bytes: u64,
     next_id: u64,
     /// Captures requested so far: the current capture's number.
     captures: u64,
@@ -160,15 +177,15 @@ static STATE: Mutex<State> = Mutex::new(State {
     pending: BTreeMap::new(),
     lists: BTreeMap::new(),
     timeline: Vec::new(),
-    last_immediate: None,
-    dirty: BTreeSet::new(),
     lists_spliced: 0,
+    lists_prerecorded: 0,
     lists_unrecorded: 0,
     staging: Vec::new(),
     used: 0,
     copy_failures: 0,
     target_bytes: 0,
     targets_skipped: 0,
+    targets_skipped_bytes: 0,
     next_id: 1,
     captures: 0,
     objects: Vec::new(),
@@ -194,15 +211,15 @@ impl State {
         self.pending.clear();
         self.lists.clear();
         self.timeline.clear();
-        self.last_immediate = None;
-        self.dirty.clear();
         self.lists_spliced = 0;
+        self.lists_prerecorded = 0;
         self.lists_unrecorded = 0;
         self.staging.clear();
         self.used = 0;
         self.copy_failures = 0;
         self.target_bytes = 0;
         self.targets_skipped = 0;
+        self.targets_skipped_bytes = 0;
         self.objects.clear();
     }
 }
@@ -213,8 +230,7 @@ pub fn next_context_id() -> u32 {
     NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
-/// At each present, before the real one (and after [`end_pass`] on the immediate context). Ends a frame being
-/// recorded.
+/// At each present, before the real one (and after [`end_frame`]). Ends a frame being recorded.
 pub fn before_present() -> bool {
     let mut s = state();
     s.frame += 1;
@@ -297,45 +313,88 @@ pub fn on_draw(context: &ID3D11DeviceContext4, id: u32, deferred: bool, call: &'
         blend: 0,
         depth: 0,
         after: Vec::new(),
+        bound: Vec::new(),
+        closed: false,
     };
     unsafe { snapshot::snapshot(context, compute, &mut draw) };
+    if targets && !compute {
+        draw.bound = unsafe { targets::bound(context) };
+    }
     // Constant-buffer copies, recorded on this context right now.
     for cb in &mut draw.cbs {
         cb.copy = unsafe { snapshot::copy_cb(context, cb) };
     }
     let mut s = state();
-    if targets && !compute {
-        s.dirty.insert(id);
-    }
     if deferred {
         s.pending.entry(id).or_default().push(draw);
     } else {
         s.timeline.push(draw);
-        s.last_immediate = Some(s.timeline.len() - 1);
     }
 }
 
-/// The end of a pass on a context: its targets are about to change (OMSetRenderTargets, ClearState), its command
-/// list ends (FinishCommandList), another list runs on it (ExecuteCommandList) or the frame ends (Present). With
-/// `targets`, the targets the pass drew to are copied now, on this context, and kept with its last draw.
-pub fn end_pass(context: &ID3D11DeviceContext4, id: u32, deferred: bool) {
-    {
+/// `OMSetRenderTargets` (or `ClearState`, with no targets) on a context, while armed: if it binds other targets than
+/// the context's last draw used, that draw ended a pass and its targets are copied now, on this context.
+///
+/// # Safety
+/// `rtvs` must hold null or live render target views, `dsv` null or a live depth stencil view.
+pub unsafe fn targets_changing(
+    context: &ID3D11DeviceContext4,
+    id: u32,
+    deferred: bool,
+    rtvs: &[*mut c_void],
+    dsv: *mut c_void,
+) {
+    if !state().request.targets {
+        return;
+    }
+    let next = unsafe { targets::from_raw(rtvs, dsv) };
+    if !deferred {
+        close_timeline_pass(context, Some(&next));
+        return;
+    }
+    let bound = {
         let s = state();
-        if !s.request.targets || !s.records(deferred) || !s.dirty.contains(&id) {
+        if !s.records(true) {
             return;
         }
-    }
-    let copied = unsafe { targets::copy_bound(context) };
-    let mut s = state();
-    s.dirty.remove(&id);
-    let last = if deferred {
-        s.pending.get_mut(&id).and_then(|d| d.last_mut())
-    } else {
-        let i = s.last_immediate;
-        i.and_then(|i| s.timeline.get_mut(i))
+        match s.pending.get(&id).and_then(|d| d.last()) {
+            Some(last) if !last.closed && !last.bound.is_empty() && !targets::same(&last.bound, &next) => {
+                last.bound.clone()
+            }
+            _ => return,
+        }
     };
-    if let Some(draw) = last {
-        draw.after.extend(copied);
+    let copied = unsafe { targets::copy(context, &bound) };
+    if let Some(last) = state().pending.get_mut(&id).and_then(|d| d.last_mut()) {
+        last.after = copied;
+        last.closed = true;
+    }
+}
+
+/// Copies the targets of the timeline's last draw, on the immediate context `immediate`, unless that pass is closed
+/// already or `next` (the targets about to be used) are the same ones.
+fn close_timeline_pass(immediate: &ID3D11DeviceContext4, next: Option<&[targets::Bound]>) {
+    let (index, bound) = {
+        let s = state();
+        if !s.request.targets || s.phase != Phase::Recording {
+            return;
+        }
+        let Some(last) = s.timeline.last() else { return };
+        if last.closed || last.bound.is_empty() || next.is_some_and(|n| targets::same(&last.bound, n)) {
+            return;
+        }
+        (s.timeline.len() - 1, last.bound.clone())
+    };
+    let copied = unsafe { targets::copy(immediate, &bound) };
+    let mut s = state();
+    s.timeline[index].after = copied;
+    s.timeline[index].closed = true;
+}
+
+/// At each present, before [`before_present`]: the frame's last pass ends.
+pub fn end_frame(immediate: &ID3D11DeviceContext4) {
+    if armed() {
+        close_timeline_pass(immediate, None);
     }
 }
 
@@ -343,29 +402,45 @@ pub fn end_pass(context: &ID3D11DeviceContext4, id: u32, deferred: bool) {
 pub fn on_finish_list(id: u32, list: *mut c_void) {
     let mut s = state();
     let draws = s.pending.remove(&id).unwrap_or_default();
+    let prerecorded = s.phase == Phase::PreRecording;
     if !list.is_null() {
-        s.lists.insert(list as usize, draws);
+        s.lists.insert(list as usize, List { draws, prerecorded });
     }
 }
 
-/// ExecuteCommandList. On the immediate context the list's draws join the timeline; on a deferred context (a list
-/// run from inside another) they join that context's pending draws. A list can be executed more than once, so its
-/// recording is kept until the capture ends.
-pub fn on_execute_list(id: u32, deferred: bool, list: *mut c_void) {
-    let mut s = state();
-    if !s.records(deferred) {
-        return;
-    }
-    let Some(draws) = s.lists.get(&(list as usize)).cloned() else {
-        if !deferred {
-            s.lists_unrecorded += 1;
+/// ExecuteCommandList on `context`. On the immediate context the list's draws join the timeline (after the pass
+/// before them is closed if the list starts with other targets); on a deferred context (a list run from inside
+/// another) they join that context's pending draws. A list can be executed more than once, so its recording is kept
+/// until the capture ends.
+pub fn on_execute_list(context: &ID3D11DeviceContext4, id: u32, deferred: bool, list: *mut c_void) {
+    let first = {
+        let mut s = state();
+        if !s.records(deferred) {
+            return;
         }
+        match s.lists.get(&(list as usize)) {
+            Some(l) => l.draws.first().map(|d| d.bound.clone()),
+            None => {
+                if !deferred {
+                    s.lists_unrecorded += 1;
+                }
+                return;
+            }
+        }
+    };
+    if !deferred && let Some(first) = first {
+        close_timeline_pass(context, Some(&first));
+    }
+    let mut s = state();
+    let Some(l) = s.lists.get(&(list as usize)) else {
         return;
     };
+    let (draws, prerecorded) = (l.draws.clone(), l.prerecorded);
     if deferred {
         s.pending.entry(id).or_default().extend(draws);
     } else {
         s.lists_spliced += 1;
+        s.lists_prerecorded += u32::from(prerecorded);
         s.timeline.extend(draws);
     }
 }

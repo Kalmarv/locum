@@ -24,6 +24,7 @@ use crate::capture;
 use crate::com::answer_query;
 use crate::dxgi::Adapter;
 use crate::log::log;
+use crate::overrides;
 use crate::shaders::{self, Stage};
 use crate::vtables::adapter::AdapterMethods;
 use crate::vtables::context::{ContextMethods, real as real_context};
@@ -95,6 +96,15 @@ const CONTEXT_IIDS: [GUID; 7] = [
 ];
 
 impl Context {
+    /// Runs the real draw or dispatch, with the overrides that hold for it if any are loaded.
+    fn run(&self, compute: bool, real: impl FnOnce()) {
+        if overrides::active() {
+            unsafe { overrides::around(&self.inner, compute, real) }
+        } else {
+            real()
+        }
+    }
+
     /// Records a draw or dispatch if a capture is running.
     fn draw(&self, call: &'static str, args: &[i64]) {
         if capture::armed() {
@@ -102,10 +112,15 @@ impl Context {
         }
     }
 
-    /// The end of a pass on this context, if a capture is running (see [`capture::end_pass`]).
-    pub fn end_pass(&self) {
+    /// Targets about to be bound on this context, if a capture is running (see [`capture::targets_changing`]).
+    unsafe fn targets_changing(&self, count: u32, rtvs: *const *mut c_void, dsv: *mut c_void) {
         if capture::armed() {
-            capture::end_pass(&self.inner, self.id, self.deferred);
+            let rtvs = if rtvs.is_null() || count == 0 {
+                &[][..]
+            } else {
+                unsafe { core::slice::from_raw_parts(rtvs, count.min(8) as usize) }
+            };
+            unsafe { capture::targets_changing(&self.inner, self.id, self.deferred, rtvs, dsv) };
         }
     }
 
@@ -531,17 +546,21 @@ unsafe impl ContextMethods for Context {
 
     unsafe fn Draw(&self, a0: u32, a1: u32) {
         self.draw("Draw", &[a0.into(), a1.into()]);
-        unsafe { real_context::Draw(self.inner(), a0, a1) }
+        self.run(false, || unsafe { real_context::Draw(self.inner(), a0, a1) })
     }
 
     unsafe fn DrawIndexed(&self, a0: u32, a1: u32, a2: i32) {
         self.draw("DrawIndexed", &[a0.into(), a1.into(), a2.into()]);
-        unsafe { real_context::DrawIndexed(self.inner(), a0, a1, a2) }
+        self.run(false, || unsafe {
+            real_context::DrawIndexed(self.inner(), a0, a1, a2)
+        })
     }
 
     unsafe fn DrawInstanced(&self, a0: u32, a1: u32, a2: u32, a3: u32) {
         self.draw("DrawInstanced", &[a0.into(), a1.into(), a2.into(), a3.into()]);
-        unsafe { real_context::DrawInstanced(self.inner(), a0, a1, a2, a3) }
+        self.run(false, || unsafe {
+            real_context::DrawInstanced(self.inner(), a0, a1, a2, a3)
+        })
     }
 
     unsafe fn DrawIndexedInstanced(&self, a0: u32, a1: u32, a2: u32, a3: i32, a4: u32) {
@@ -549,42 +568,50 @@ unsafe impl ContextMethods for Context {
             "DrawIndexedInstanced",
             &[a0.into(), a1.into(), a2.into(), a3.into(), a4.into()],
         );
-        unsafe { real_context::DrawIndexedInstanced(self.inner(), a0, a1, a2, a3, a4) }
+        self.run(false, || unsafe {
+            real_context::DrawIndexedInstanced(self.inner(), a0, a1, a2, a3, a4)
+        })
     }
 
     unsafe fn DrawAuto(&self) {
         self.draw("DrawAuto", &[]);
-        unsafe { real_context::DrawAuto(self.inner()) }
+        self.run(false, || unsafe { real_context::DrawAuto(self.inner()) })
     }
 
     unsafe fn DrawInstancedIndirect(&self, a0: *mut c_void, a1: u32) {
         unsafe {
             self.draw_indirect("DrawInstancedIndirect", a0, a1);
-            real_context::DrawInstancedIndirect(self.inner(), a0, a1)
+            self.run(false, || {
+                real_context::DrawInstancedIndirect(self.inner(), a0, a1)
+            })
         }
     }
 
     unsafe fn DrawIndexedInstancedIndirect(&self, a0: *mut c_void, a1: u32) {
         unsafe {
             self.draw_indirect("DrawIndexedInstancedIndirect", a0, a1);
-            real_context::DrawIndexedInstancedIndirect(self.inner(), a0, a1)
+            self.run(false, || {
+                real_context::DrawIndexedInstancedIndirect(self.inner(), a0, a1)
+            })
         }
     }
 
     unsafe fn Dispatch(&self, a0: u32, a1: u32, a2: u32) {
         self.draw("Dispatch", &[a0.into(), a1.into(), a2.into()]);
-        unsafe { real_context::Dispatch(self.inner(), a0, a1, a2) }
+        self.run(true, || unsafe {
+            real_context::Dispatch(self.inner(), a0, a1, a2)
+        })
     }
 
     unsafe fn DispatchIndirect(&self, a0: *mut c_void, a1: u32) {
         unsafe {
             self.draw_indirect("DispatchIndirect", a0, a1);
-            real_context::DispatchIndirect(self.inner(), a0, a1)
+            self.run(true, || real_context::DispatchIndirect(self.inner(), a0, a1))
         }
     }
 
     unsafe fn OMSetRenderTargets(&self, a0: u32, a1: *const *mut c_void, a2: *mut c_void) {
-        self.end_pass();
+        unsafe { self.targets_changing(a0, a1, a2) };
         unsafe { real_context::OMSetRenderTargets(self.inner(), a0, a1, a2) }
     }
 
@@ -599,7 +626,7 @@ unsafe impl ContextMethods for Context {
         a6: *const u32,
     ) {
         if a0 != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL {
-            self.end_pass();
+            unsafe { self.targets_changing(a0, a1, a2) };
         }
         unsafe {
             real_context::OMSetRenderTargetsAndUnorderedAccessViews(self.inner(), a0, a1, a2, a3, a4, a5, a6)
@@ -607,12 +634,11 @@ unsafe impl ContextMethods for Context {
     }
 
     unsafe fn ClearState(&self) {
-        self.end_pass();
+        unsafe { self.targets_changing(0, core::ptr::null(), core::ptr::null_mut()) };
         unsafe { real_context::ClearState(self.inner()) }
     }
 
     unsafe fn FinishCommandList(&self, a0: BOOL, a1: *mut *mut c_void) -> HRESULT {
-        self.end_pass();
         let hr = unsafe { real_context::FinishCommandList(self.inner(), a0, a1) };
         if capture::armed() && hr.is_ok() && !a1.is_null() {
             capture::on_finish_list(self.id, unsafe { *a1 });
@@ -621,9 +647,8 @@ unsafe impl ContextMethods for Context {
     }
 
     unsafe fn ExecuteCommandList(&self, a0: *mut c_void, a1: BOOL) {
-        self.end_pass();
         if capture::armed() {
-            capture::on_execute_list(self.id, self.deferred, a0);
+            capture::on_execute_list(&self.inner, self.id, self.deferred, a0);
         }
         unsafe { real_context::ExecuteCommandList(self.inner(), a0, a1) }
     }

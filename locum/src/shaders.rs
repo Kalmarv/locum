@@ -28,7 +28,7 @@ pub fn hash(code: &[u8]) -> u64 {
     h
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Vertex,
     Hull,

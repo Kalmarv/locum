@@ -1,5 +1,6 @@
 //! Render and depth targets read back at the end of each pass, written as DDS files in the format the pass drew in.
 
+use core::ffi::c_void;
 use std::path::Path;
 
 use serde::Serialize;
@@ -28,66 +29,129 @@ pub struct Target {
     staging: Option<ID3D11Texture2D>,
 }
 
-/// Copies the targets bound on `c` into new staging textures, on `c`.
-pub(super) unsafe fn copy_bound(c: &ID3D11DeviceContext4) -> Vec<Target> {
-    let mut copied = Vec::new();
-    let Ok(device) = (unsafe { c.GetDevice() }) else {
-        return copied;
+/// A target bound at a draw, kept with the draw so that it can be copied later, on another context.
+#[derive(Clone)]
+pub struct Bound {
+    /// `rt0` to `rt7`, or `depth`.
+    target: String,
+    view: ID3D11View,
+    format: DXGI_FORMAT,
+    dimension: i32,
+    mip: u32,
+    slice: u32,
+    depth: bool,
+}
+
+/// Whether two sets of targets are the same views in the same slots.
+pub(super) fn same(a: &[Bound], b: &[Bound]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.target == y.target && x.view.as_raw() == y.view.as_raw())
+}
+
+fn render_target(slot: usize, view: &ID3D11RenderTargetView) -> Bound {
+    let mut d = D3D11_RENDER_TARGET_VIEW_DESC::default();
+    unsafe { view.GetDesc(&mut d) };
+    let (mip, slice) = unsafe {
+        match d.ViewDimension {
+            D3D11_RTV_DIMENSION_TEXTURE2D => (d.Anonymous.Texture2D.MipSlice, 0),
+            D3D11_RTV_DIMENSION_TEXTURE2DARRAY => (
+                d.Anonymous.Texture2DArray.MipSlice,
+                d.Anonymous.Texture2DArray.FirstArraySlice,
+            ),
+            D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY => (0, d.Anonymous.Texture2DMSArray.FirstArraySlice),
+            _ => (0, 0),
+        }
     };
+    Bound {
+        target: format!("rt{slot}"),
+        view: view.cast().expect("a render target view is a view"),
+        format: d.Format,
+        dimension: d.ViewDimension.0,
+        mip,
+        slice,
+        depth: false,
+    }
+}
+
+fn depth_target(view: &ID3D11DepthStencilView) -> Bound {
+    let mut d = D3D11_DEPTH_STENCIL_VIEW_DESC::default();
+    unsafe { view.GetDesc(&mut d) };
+    let (mip, slice) = unsafe {
+        match d.ViewDimension {
+            D3D11_DSV_DIMENSION_TEXTURE2D => (d.Anonymous.Texture2D.MipSlice, 0),
+            D3D11_DSV_DIMENSION_TEXTURE2DARRAY => (
+                d.Anonymous.Texture2DArray.MipSlice,
+                d.Anonymous.Texture2DArray.FirstArraySlice,
+            ),
+            D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY => (0, d.Anonymous.Texture2DMSArray.FirstArraySlice),
+            _ => (0, 0),
+        }
+    };
+    Bound {
+        target: "depth".into(),
+        view: view.cast().expect("a depth stencil view is a view"),
+        format: d.Format,
+        dimension: d.ViewDimension.0,
+        mip,
+        slice,
+        depth: true,
+    }
+}
+
+/// The targets bound on `c`.
+pub(super) unsafe fn bound(c: &ID3D11DeviceContext4) -> Vec<Bound> {
     let mut rtvs: [Option<ID3D11RenderTargetView>; 8] = Default::default();
     let mut dsv = None;
     unsafe { c.OMGetRenderTargets(Some(&mut rtvs), Some(&mut dsv)) };
-    for (slot, view) in rtvs.iter().enumerate() {
-        let Some(view) = view else { continue };
-        let mut d = D3D11_RENDER_TARGET_VIEW_DESC::default();
-        unsafe { view.GetDesc(&mut d) };
-        let (mip, slice) = unsafe {
-            match d.ViewDimension {
-                D3D11_RTV_DIMENSION_TEXTURE2D => (d.Anonymous.Texture2D.MipSlice, 0),
-                D3D11_RTV_DIMENSION_TEXTURE2DARRAY => (
-                    d.Anonymous.Texture2DArray.MipSlice,
-                    d.Anonymous.Texture2DArray.FirstArraySlice,
-                ),
-                D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY => (0, d.Anonymous.Texture2DMSArray.FirstArraySlice),
-                _ => (0, 0),
-            }
-        };
-        let v: ID3D11View = view.cast().expect("a render target view is a view");
-        let target = format!("rt{slot}");
-        let dimension = d.ViewDimension.0;
-        copied.extend(unsafe { copy_one(c, &device, &v, target, d.Format, dimension, mip, slice, false) });
+    let mut out: Vec<Bound> = rtvs
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, v)| v.as_ref().map(|v| render_target(slot, v)))
+        .collect();
+    out.extend(dsv.as_ref().map(depth_target));
+    out
+}
+
+/// The targets an `OMSetRenderTargets` call is about to bind.
+///
+/// # Safety
+/// `rtvs` must hold null or live render target views, `dsv` null or a live depth stencil view.
+pub(super) unsafe fn from_raw(rtvs: &[*mut c_void], dsv: *mut c_void) -> Vec<Bound> {
+    let mut out = Vec::new();
+    for (slot, raw) in rtvs.iter().enumerate() {
+        if let Some(v) = unsafe { ID3D11RenderTargetView::from_raw_borrowed(raw) } {
+            out.push(render_target(slot, v));
+        }
     }
-    if let Some(view) = dsv {
-        let mut d = D3D11_DEPTH_STENCIL_VIEW_DESC::default();
-        unsafe { view.GetDesc(&mut d) };
-        let (mip, slice) = unsafe {
-            match d.ViewDimension {
-                D3D11_DSV_DIMENSION_TEXTURE2D => (d.Anonymous.Texture2D.MipSlice, 0),
-                D3D11_DSV_DIMENSION_TEXTURE2DARRAY => (
-                    d.Anonymous.Texture2DArray.MipSlice,
-                    d.Anonymous.Texture2DArray.FirstArraySlice,
-                ),
-                D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY => (0, d.Anonymous.Texture2DMSArray.FirstArraySlice),
-                _ => (0, 0),
-            }
-        };
-        let v: ID3D11View = view.cast().expect("a depth stencil view is a view");
-        let dimension = d.ViewDimension.0;
-        copied.extend(unsafe {
+    if let Some(v) = unsafe { ID3D11DepthStencilView::from_raw_borrowed(&dsv) } {
+        out.push(depth_target(v));
+    }
+    out
+}
+
+/// Copies `targets` into new staging textures, on `c`.
+pub(super) unsafe fn copy(c: &ID3D11DeviceContext4, targets: &[Bound]) -> Vec<Target> {
+    let Ok(device) = (unsafe { c.GetDevice() }) else {
+        return Vec::new();
+    };
+    targets
+        .iter()
+        .filter_map(|t| unsafe {
             copy_one(
                 c,
                 &device,
-                &v,
-                "depth".into(),
-                d.Format,
-                dimension,
-                mip,
-                slice,
-                true,
+                &t.view,
+                t.target.clone(),
+                t.format,
+                t.dimension,
+                t.mip,
+                t.slice,
+                t.depth,
             )
-        });
-    }
-    copied
+        })
+        .collect()
 }
 
 fn skip(why: &str) {
@@ -127,6 +191,7 @@ unsafe fn copy_one(
     {
         let mut s = state();
         if s.target_bytes + bytes > s.request.max_target_bytes {
+            s.targets_skipped_bytes += bytes;
             drop(s);
             skip("over the capture's memory limit (max_mb)");
             return None;

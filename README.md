@@ -5,8 +5,8 @@ locum's; every call it makes arrives at locum first, which passes it on to the r
 DLLs is patched, and the game keeps rendering on its own driver.
 
 Status: early. The wrappers forward everything, shaders are hashed and dumped, and one frame can be captured with
-each draw's state, its constant-buffer contents and the render targets at the end of each pass. Overrides are being
-built.
+each draw's state, its constant-buffer contents and the render targets at the end of each pass. Rules in a file
+change what is drawn: skip draws, swap shaders, change constants.
 
 ## What it is for
 
@@ -39,7 +39,19 @@ Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` beside the game's executable. locum
   locum removes it, records the next frames and writes the capture. Each line of the file is an option:
   - `targets`: also read back the render and depth targets at the end of each pass, to
     `captures/frame-<n>/targets/<draw>-<target>.dds` (the pass's last draw; `rt0` to `rt7` or `depth`);
-  - `max_mb N`: the most memory the target copies may use (default 1024); targets past it are skipped and counted.
+  - `max_mb N`: the most memory the target copies may use (default 4096); targets past it are skipped and counted.
+- `overrides.txt` (written by you): rules that change what is drawn, read again when the file changes and dropped when
+  it is removed. One per line:
+  - `skip vs=<hash>`: draws with that shader bound are not drawn;
+  - `solid vs=<hash> R G B A`: those draws get a pixel shader writing that colour to every target;
+  - `shader ps=<hash> FILE`: that shader is replaced by the bytecode in FILE (relative to the folder);
+  - `constant ps b3 c0 X Y Z W`: the draw sees constant 0 of its ps b3 range as X Y Z W (floats, or `0x` and 8 hex
+    digits for raw bits);
+  - any rule can end with `if vs=<hash> ps=<hash> ...`; every stage can be named (vs hs ds gs ps cs).
+
+  Rules apply at the draw, on its own context, and are undone after it. A changed constant is written into a GPU copy
+  of the bound buffer, so draws on deferred contexts get theirs when their command list runs. `locum.log` reports how
+  often each rule applied every 600 frames.
 
 A capture is one JSON object per line: a `frame` line (draw count, command lists spliced in, copy failures), a
 `resource`, `view` or `state` line for each object the frame used (with a number the draws refer to), a `cb` line for
@@ -47,6 +59,10 @@ each distinct constant-buffer content (hex), and a `draw` line for each draw and
 them: the call and its arguments, each stage's shader hash, constant buffers (slot, buffer, range, content), shader
 resource views, render targets, depth target, input assembly and the blend, raster and depth-stencil states, and with
 `targets` the files read back after it.
+
+A pass ends where the targets in effect change on the GPU's timeline: an `OMSetRenderTargets` that binds other
+targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame. Its
+targets are copied then and kept with its last draw.
 
 Target files are DDS in the format the pass drew in; depth is written as the colour format of the same bits (D24S8 as
 R24_UNORM_X8, D32 as R32_FLOAT) and typeless formats as their plain typed format. Multisampled colour targets are

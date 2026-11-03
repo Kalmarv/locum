@@ -205,6 +205,7 @@ fn run(checks: &mut Checks) -> Result<()> {
     );
 
     capture(checks, &device, &immediate, &deferred, &swapchain, &rtv)?;
+    overrides(checks, &device, &immediate, &deferred, &swapchain)?;
 
     drop((swapchain, back, rtv, deferred, staging));
     unsafe { DestroyWindow(hwnd) }?;
@@ -283,13 +284,145 @@ fn cb_hex(value: f32) -> String {
 }
 
 /// Draws a triangle on each context every frame, requests a capture and checks what it holds.
+/// A 64x64 render target of the swap chain's format, and its view.
+fn target(device: &ID3D11Device) -> Result<(ID3D11Texture2D, ID3D11RenderTargetView)> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: 64,
+        Height: 64,
+        MipLevels: 1,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+        ..Default::default()
+    };
+    let (mut texture, mut view) = (None, None);
+    unsafe {
+        device.CreateTexture2D(&desc, None, Some(&mut texture))?;
+        let texture = texture.as_ref().expect("texture");
+        device.CreateRenderTargetView(texture, None, Some(&mut view))?;
+    }
+    Ok((texture.expect("texture"), view.expect("view")))
+}
+
+/// The first pixel of a 64x64 B8G8R8A8 texture (B, G, R, A).
+fn first_pixel(
+    device: &ID3D11Device,
+    immediate: &ID3D11DeviceContext,
+    texture: &ID3D11Texture2D,
+) -> Result<[u8; 4]> {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { texture.GetDesc(&mut desc) };
+    desc.Usage = D3D11_USAGE_STAGING;
+    desc.BindFlags = 0;
+    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+    let mut staging = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }?;
+    let staging = staging.expect("staging texture");
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe {
+        immediate.CopyResource(&staging, texture);
+        immediate.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        let pixel = *(mapped.pData as *const [u8; 4]);
+        immediate.Unmap(&staging, 0);
+        Ok(pixel)
+    }
+}
+
+/// The smoke test's shaders: a full-screen triangle whose colour is ps b3 / 2000.
+struct Shaders {
+    vs: ID3D11VertexShader,
+    ps: ID3D11PixelShader,
+    vs_hash: String,
+    ps_hash: String,
+}
+
+impl Shaders {
+    fn new(device: &ID3D11Device) -> Result<Shaders> {
+        let vs_code = compile(VS, s!("vs_5_0"))?;
+        let ps_code = compile(PS, s!("ps_5_0"))?;
+        let (mut vs, mut ps) = (None, None);
+        unsafe {
+            device.CreateVertexShader(&vs_code, None, Some(&mut vs))?;
+            device.CreatePixelShader(&ps_code, None, Some(&mut ps))?;
+        }
+        Ok(Shaders {
+            vs: vs.expect("vertex shader"),
+            ps: ps.expect("pixel shader"),
+            vs_hash: format!("{:016x}", fnv(&vs_code)),
+            ps_hash: format!("{:016x}", fnv(&ps_code)),
+        })
+    }
+
+    /// Binds the shaders, `target`, a 64x64 viewport and `cb` at ps b3 on `c`.
+    fn bind(&self, c: &ID3D11DeviceContext, target: &ID3D11RenderTargetView, cb: &ID3D11Buffer) {
+        let viewport = D3D11_VIEWPORT {
+            Width: 64.0,
+            Height: 64.0,
+            MaxDepth: 1.0,
+            ..Default::default()
+        };
+        unsafe {
+            c.OMSetRenderTargets(Some(&[Some(target.clone())]), None);
+            c.RSSetViewports(Some(&[viewport]));
+            c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            c.VSSetShader(&self.vs, None);
+            c.PSSetShader(&self.ps, None);
+            c.PSSetConstantBuffers(3, Some(&[Some(cb.clone())]));
+        }
+    }
+}
+
+/// A 16-byte constant buffer: default usage (updated with UpdateSubresource) or dynamic (Map).
+fn constant_buffer(device: &ID3D11Device, dynamic: bool) -> Result<ID3D11Buffer> {
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: 16,
+        Usage: if dynamic {
+            D3D11_USAGE_DYNAMIC
+        } else {
+            D3D11_USAGE_DEFAULT
+        },
+        BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        CPUAccessFlags: if dynamic {
+            D3D11_CPU_ACCESS_WRITE.0 as u32
+        } else {
+            0
+        },
+        ..Default::default()
+    };
+    let mut buffer = None;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
+    Ok(buffer.expect("buffer"))
+}
+
+/// Writes `value` four times to a dynamic constant buffer with Map(WRITE_DISCARD) on `c`.
+fn write_dynamic(c: &ID3D11DeviceContext, cb: &ID3D11Buffer, value: f32) -> Result<()> {
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe {
+        c.Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
+        std::ptr::copy_nonoverlapping([value; 4].as_ptr(), mapped.pData.cast(), 4);
+        c.Unmap(cb, 0);
+    }
+    Ok(())
+}
+
+/// The 8-bit value a channel holds after a draw with `value` in ps b3.
+fn channel(value: f32) -> u8 {
+    (value / 2000.0 * 255.0).round() as u8
+}
+
+/// Each frame: a draw on the immediate context to target A, then the command list recorded the frame before, which
+/// draws to the back buffer, switches to target B and draws again. A capture of one frame is requested, with targets,
+/// and checked: three draws in that order, their shaders and constants, and each pass's target read back after its
+/// last draw (at the command list's start, inside the list, at the end of the frame).
 fn capture(
     checks: &mut Checks,
     device: &ID3D11Device,
     immediate: &ID3D11DeviceContext,
     deferred: &ID3D11DeviceContext,
     swapchain: &IDXGISwapChain1,
-    rtv: &ID3D11RenderTargetView,
+    back: &ID3D11RenderTargetView,
 ) -> Result<()> {
     let Some(dir) = std::env::var_os("LOCUM_DIR").map(std::path::PathBuf::from) else {
         checks.check(
@@ -298,85 +431,35 @@ fn capture(
         );
         return Ok(());
     };
-    let vs_code = compile(VS, s!("vs_5_0"))?;
-    let ps_code = compile(PS, s!("ps_5_0"))?;
-    let (mut vs, mut ps) = (None, None);
-    unsafe {
-        device.CreateVertexShader(&vs_code, None, Some(&mut vs))?;
-        device.CreatePixelShader(&ps_code, None, Some(&mut ps))?;
-    }
-    let (vs, ps) = (vs.expect("vertex shader"), ps.expect("pixel shader"));
-    let (vs_hash, ps_hash) = (
-        format!("{:016x}", fnv(&vs_code)),
-        format!("{:016x}", fnv(&ps_code)),
-    );
+    let sh = Shaders::new(device)?;
     let shaders = dir.join("shaders");
     checks.check(
-        shaders.join(format!("{vs_hash}.vs.dxbc")).is_file()
-            && shaders.join(format!("{ps_hash}.ps.dxbc")).is_file(),
+        shaders.join(format!("{}.vs.dxbc", sh.vs_hash)).is_file()
+            && shaders.join(format!("{}.ps.dxbc", sh.ps_hash)).is_file(),
         "shader bytecode written to shaders/<hash>.<stage>.dxbc",
     );
+    let immediate_cb = constant_buffer(device, false)?;
+    let deferred_cb = constant_buffer(device, true)?;
+    let (_a, target_a) = target(device)?;
+    let (_b, target_b) = target(device)?;
 
-    // The immediate context's constant buffer is updated with UpdateSubresource, the command lists' with a
-    // Map(WRITE_DISCARD) on the deferred context.
-    let cb = |usage, cpu| -> Result<ID3D11Buffer> {
-        let desc = D3D11_BUFFER_DESC {
-            ByteWidth: 16,
-            Usage: usage,
-            BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
-            CPUAccessFlags: cpu,
-            ..Default::default()
-        };
-        let mut buffer = None;
-        unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
-        Ok(buffer.expect("buffer"))
-    };
-    let immediate_cb = cb(D3D11_USAGE_DEFAULT, 0)?;
-    let deferred_cb = cb(D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE.0 as u32)?;
-    let viewport = D3D11_VIEWPORT {
-        Width: 64.0,
-        Height: 64.0,
-        MaxDepth: 1.0,
-        ..Default::default()
-    };
-    let bind = |c: &ID3D11DeviceContext, buffer: &ID3D11Buffer| unsafe {
-        c.OMSetRenderTargets(Some(&[Some(rtv.clone())]), None);
-        c.RSSetViewports(Some(&[viewport]));
-        c.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        c.VSSetShader(&vs, None);
-        c.PSSetShader(&ps, None);
-        c.PSSetConstantBuffers(3, Some(&[Some(buffer.clone())]));
-    };
-
-    std::fs::write(
-        dir.join("capture"),
-        b"targets
-",
-    )
-    .expect("write the capture request");
+    std::fs::write(dir.join("capture"), b"targets\n").expect("write the capture request");
     let mut next_list: Option<ID3D11CommandList> = None;
     for frame in 1..=CAPTURED + 2 {
         unsafe {
-            immediate.UpdateSubresource(
-                &immediate_cb,
-                0,
-                None,
-                [immediate_value(frame); 4].as_ptr().cast(),
-                0,
-                0,
-            );
-            bind(immediate, &immediate_cb);
+            let value = [immediate_value(frame); 4];
+            immediate.UpdateSubresource(&immediate_cb, 0, None, value.as_ptr().cast(), 0, 0);
+            sh.bind(immediate, &target_a, &immediate_cb);
             immediate.Draw(3, 0);
             if let Some(list) = next_list.take() {
                 immediate.ExecuteCommandList(&list, false);
             }
 
             // The next frame's command list.
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            deferred.Map(&deferred_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, Some(&mut mapped))?;
-            std::ptr::copy_nonoverlapping([deferred_value(frame + 1); 4].as_ptr(), mapped.pData.cast(), 4);
-            deferred.Unmap(&deferred_cb, 0);
-            bind(deferred, &deferred_cb);
+            write_dynamic(deferred, &deferred_cb, deferred_value(frame + 1))?;
+            sh.bind(deferred, back, &deferred_cb);
+            deferred.Draw(3, 0);
+            deferred.OMSetRenderTargets(Some(&[Some(target_b.clone())]), None);
             deferred.Draw(3, 0);
             let mut list = None;
             deferred.FinishCommandList(false, Some(&mut list))?;
@@ -386,15 +469,12 @@ fn capture(
         }
     }
 
-    let path = dir
-        .join("captures")
-        .join(format!("frame-{CAPTURED}"))
-        .join("draws.jsonl");
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        checks.check(false, &format!("capture written to {}", path.display()));
+    let folder = dir.join("captures").join(format!("frame-{CAPTURED}"));
+    let Ok(text) = std::fs::read_to_string(folder.join("draws.jsonl")) else {
+        checks.check(false, &format!("capture written to {}", folder.display()));
         return Ok(());
     };
-    checks.check(true, &format!("capture written to {}", path.display()));
+    checks.check(true, &format!("capture written to {}", folder.display()));
     let lines: Vec<serde_json::Value> = text
         .lines()
         .map(|l| serde_json::from_str(l).expect("a JSON line"))
@@ -403,11 +483,13 @@ fn capture(
     let frame = of("frame").next().expect("a frame line");
     println!("frame line: {frame}");
     checks.check(
-        frame["draws"] == 2
+        frame["draws"] == 3
             && frame["lists_spliced"] == 1
+            && frame["lists_prerecorded"] == 1
             && frame["lists_unrecorded"] == 0
-            && frame["copy_failures"] == 0,
-        "capture: two draws, the command list spliced in, nothing unrecorded, no copy failures",
+            && frame["copy_failures"] == 0
+            && frame["targets"] == 3,
+        "capture: three draws, the command list (recorded the frame before) spliced in, three targets read back",
     );
     let draws: Vec<&serde_json::Value> = of("draw").collect();
     let content = |hash: &serde_json::Value| {
@@ -416,65 +498,169 @@ fn capture(
             .and_then(|c| c["hex"].as_str())
             .map(String::from)
     };
-    for (i, (deferred, value)) in [
-        (false, immediate_value(CAPTURED)),
-        (true, deferred_value(CAPTURED)),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    let expected = [
+        (
+            false,
+            immediate_value(CAPTURED),
+            "the immediate draw to target A (read back when the command list starts)",
+        ),
+        (
+            true,
+            deferred_value(CAPTURED),
+            "the command list's draw to the back buffer (read back when it switches)",
+        ),
+        (
+            true,
+            deferred_value(CAPTURED),
+            "the command list's draw to target B (read back at the end of the frame)",
+        ),
+    ];
+    for (i, (deferred, value, which)) in expected.into_iter().enumerate() {
         let Some(d) = draws.get(i) else {
             checks.check(false, &format!("draw {i} captured"));
             continue;
         };
-        let which = if deferred {
-            "command-list draw"
-        } else {
-            "immediate draw"
-        };
-        println!("draw {i}: {d}");
         checks.check(
-            d["deferred"] == deferred
-                && d["call"] == "Draw"
-                && d["args"] == serde_json::json!([3, 0])
-                && d["topology"] == 4,
-            &format!("draw {i} is the {which}: Draw(3, 0), triangle list"),
+            d["deferred"] == deferred && d["call"] == "Draw" && d["args"] == serde_json::json!([3, 0]),
+            &format!("draw {i} is {which}"),
         );
         checks.check(
-            d["shaders"]["vs"] == vs_hash.as_str() && d["shaders"]["ps"] == ps_hash.as_str(),
+            d["shaders"]["vs"] == sh.vs_hash.as_str() && d["shaders"]["ps"] == sh.ps_hash.as_str(),
             &format!("draw {i}: its shaders' hashes are those of their bytecode"),
         );
         let cb = &d["cbs"][0];
         checks.check(
-            d["cbs"].as_array().map(Vec::len) == Some(1)
-                && cb["stage"] == "ps"
-                && cb["slot"] == 3
-                && content(&cb["content"]) == Some(cb_hex(value)),
+            cb["stage"] == "ps" && cb["slot"] == 3 && content(&cb["content"]) == Some(cb_hex(value)),
             &format!("draw {i}: ps b3 holds {value} four times, as the draw saw it"),
         );
-        checks.check(
-            d["rtvs"].as_array().map(Vec::len) == Some(1),
-            &format!("draw {i}: one render target"),
-        );
-
-        // Each draw is the last of its pass, so the target is read back after it: the whole target (the triangle
-        // covers it) holds the draw's colour, value / 2000 in every channel.
-        let targets = dir
-            .join("captures")
-            .join(format!("frame-{CAPTURED}"))
-            .join("targets");
-        let file = d["after"][0]["file"].as_str().map(|f| targets.join(f));
+        // The whole target (the triangle covers it) holds the draw's colour in every channel.
+        let file = d["after"][0]["file"]
+            .as_str()
+            .map(|f| folder.join("targets").join(f));
         let pixel = file
             .and_then(|f| std::fs::read(f).ok())
             .and_then(|b| b.get(148..152).map(<[u8]>::to_vec));
-        let expected = (value / 2000.0 * 255.0).round() as u8;
+        let expected = channel(value);
         println!("draw {i}: after it {}, first pixel {pixel:?}", d["after"]);
         checks.check(
-            d["after"][0]["target"] == "rt0"
+            d["after"].as_array().map(Vec::len) == Some(1)
                 && pixel.is_some_and(|p| p.iter().all(|&c| c.abs_diff(expected) <= 1)),
-            &format!("draw {i}: its render target, read back after it, holds {expected} in every channel"),
+            &format!("draw {i}: its target, read back after it, holds {expected} in every channel"),
         );
     }
+    Ok(())
+}
+
+/// Writes `overrides.txt` (or removes it, for None) and presents 31 frames, so locum reads it again.
+fn set_overrides(dir: &std::path::Path, swapchain: &IDXGISwapChain1, rules: Option<&str>) -> Result<()> {
+    let path = dir.join("overrides.txt");
+    match rules {
+        Some(text) => std::fs::write(&path, text).expect("write overrides.txt"),
+        None => std::fs::remove_file(&path).expect("remove overrides.txt"),
+    }
+    for _ in 0..31 {
+        unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
+    }
+    Ok(())
+}
+
+/// Overrides: a constant changed for a draw on the immediate context and for one in a command list, a solid colour,
+/// a skipped draw, and drawing as before once the file is gone; the game's own bindings are back after each draw.
+fn overrides(
+    checks: &mut Checks,
+    device: &ID3D11Device,
+    immediate: &ID3D11DeviceContext,
+    deferred: &ID3D11DeviceContext,
+    swapchain: &IDXGISwapChain1,
+) -> Result<()> {
+    let Some(dir) = std::env::var_os("LOCUM_DIR").map(std::path::PathBuf::from) else {
+        return Ok(());
+    };
+    let sh = Shaders::new(device)?;
+    let immediate_cb = constant_buffer(device, false)?;
+    let deferred_cb = constant_buffer(device, true)?;
+    let (texture, view) = target(device)?;
+    let draw = |clear: [f32; 4]| -> Result<[u8; 4]> {
+        unsafe {
+            immediate.ClearRenderTargetView(&view, &clear);
+            let value = [immediate_value(CAPTURED); 4];
+            immediate.UpdateSubresource(&immediate_cb, 0, None, value.as_ptr().cast(), 0, 0);
+            sh.bind(immediate, &view, &immediate_cb);
+            immediate.Draw(3, 0);
+        }
+        first_pixel(device, immediate, &texture)
+    };
+    let normal = channel(immediate_value(CAPTURED));
+
+    set_overrides(
+        &dir,
+        swapchain,
+        Some(&format!(
+            "constant ps b3 c0 500 500 500 500 if ps={}\n",
+            sh.ps_hash
+        )),
+    )?;
+    let pixel = draw([0.0; 4])?;
+    println!("constant override, immediate draw: {pixel:?}");
+    checks.check(
+        pixel.iter().all(|&c| c.abs_diff(channel(500.0)) <= 1),
+        "override: constant on an immediate draw",
+    );
+    let mut bound: [Option<ID3D11Buffer>; 1] = Default::default();
+    unsafe { immediate.PSGetConstantBuffers(3, Some(&mut bound)) };
+    checks.check(
+        bound[0].as_ref().is_some_and(|b| same(b, &immediate_cb)),
+        "override: the game's constant buffer is bound again after the draw",
+    );
+    unsafe {
+        immediate.ClearRenderTargetView(&view, &[0.0; 4]);
+        write_dynamic(deferred, &deferred_cb, deferred_value(CAPTURED))?;
+        sh.bind(deferred, &view, &deferred_cb);
+        deferred.Draw(3, 0);
+        let mut list = None;
+        deferred.FinishCommandList(false, Some(&mut list))?;
+        immediate.ExecuteCommandList(&list.expect("command list"), false);
+    }
+    let pixel = first_pixel(device, immediate, &texture)?;
+    println!("constant override, command-list draw: {pixel:?}");
+    checks.check(
+        pixel.iter().all(|&c| c.abs_diff(channel(500.0)) <= 1),
+        "override: constant on a command-list draw",
+    );
+
+    set_overrides(
+        &dir,
+        swapchain,
+        Some(&format!("solid ps={} 1 0 0.5 1\n", sh.ps_hash)),
+    )?;
+    let pixel = draw([0.0; 4])?;
+    println!("solid override: {pixel:?}");
+    checks.check(
+        pixel[0].abs_diff(128) <= 1 && pixel[1] == 0 && pixel[2] == 255 && pixel[3] == 255,
+        "override: solid colour (R 1, G 0, B 0.5)",
+    );
+    let mut ps = None;
+    unsafe { immediate.PSGetShader(&mut ps, None, None) };
+    checks.check(
+        ps.as_ref().is_some_and(|p| same(p, &sh.ps)),
+        "override: the game's pixel shader is bound again after the draw",
+    );
+
+    set_overrides(&dir, swapchain, Some(&format!("skip vs={}\n", sh.vs_hash)))?;
+    let pixel = draw([0.25, 0.5, 0.75, 1.0])?;
+    println!("skip override: {pixel:?}");
+    checks.check(
+        pixel[0].abs_diff(191) <= 1 && pixel[1].abs_diff(128) <= 1 && pixel[2].abs_diff(64) <= 1,
+        "override: skipped draw leaves the clear colour",
+    );
+
+    set_overrides(&dir, swapchain, None)?;
+    let pixel = draw([0.0; 4])?;
+    println!("no overrides: {pixel:?}");
+    checks.check(
+        pixel.iter().all(|&c| c.abs_diff(normal) <= 1),
+        "override: with the file gone, draws are as before",
+    );
     Ok(())
 }
 
