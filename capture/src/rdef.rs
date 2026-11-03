@@ -138,19 +138,19 @@ pub fn constant_buffers(dxbc: &[u8]) -> Option<Vec<ConstantBuffer>> {
     let cb_at = u32_at(rdef, 4)? as usize;
     let bind_count = u32_at(rdef, 8)? as usize;
     let bind_at = u32_at(rdef, 12)? as usize;
-    let (minor, major) = (rdef.get(16).copied()?, rdef.get(17).copied()?);
-    // Shader model 5 adds an "RD11" header giving the variable record size (40 bytes, 24 before); 5.1 bindings
-    // carry a register space and are 40 bytes instead of 32.
+    let major = rdef.get(17).copied()?;
+    // Shader model 5 adds an "RD11" header after the creator's name offset: its own size, then the sizes of a
+    // constant buffer, a binding, a variable, a type and a member record (24, 32 or 40 with 5.1's register space,
+    // 40, 36, 12). Before it, variables are 24 bytes and bindings 32.
     let rd11 = major >= 5 && rdef.get(28..32) == Some(b"RD11");
-    let var_size = if rd11 {
-        u32_at(rdef, 40).unwrap_or(40) as usize
+    let (cb_size, bind_size, var_size) = if rd11 {
+        (
+            u32_at(rdef, 36)? as usize,
+            u32_at(rdef, 40)? as usize,
+            u32_at(rdef, 44)? as usize,
+        )
     } else {
-        24
-    };
-    let bind_size = if major > 5 || (major == 5 && minor >= 1) {
-        40
-    } else {
-        32
+        (24, 32, 24)
     };
     // Constant buffers are bound by name: the binding of type 0 (cbuffer) with the same name gives the register.
     let mut registers = Vec::new();
@@ -166,7 +166,7 @@ pub fn constant_buffers(dxbc: &[u8]) -> Option<Vec<ConstantBuffer>> {
     }
     let mut out = Vec::with_capacity(cb_count);
     for i in 0..cb_count {
-        let c = cb_at + i * 24;
+        let c = cb_at + i * cb_size;
         let name = str_at(rdef, u32_at(rdef, c)? as usize)?;
         let var_count = u32_at(rdef, c + 4)? as usize;
         let var_at = u32_at(rdef, c + 8)? as usize;
@@ -321,5 +321,67 @@ mod tests {
 
     fn type_name_check() -> String {
         vector(4, 4).name()
+    }
+    /// A DXBC container holding only `rdef`.
+    fn container(rdef: &[u8]) -> Vec<u8> {
+        let mut d = b"DXBC".to_vec();
+        d.extend([0u8; 16]);
+        d.extend(1u32.to_le_bytes());
+        d.extend((36 + 8 + rdef.len() as u32).to_le_bytes());
+        d.extend(1u32.to_le_bytes());
+        d.extend(36u32.to_le_bytes());
+        d.extend(b"RDEF");
+        d.extend((rdef.len() as u32).to_le_bytes());
+        d.extend(rdef);
+        d
+    }
+
+    #[test]
+    fn variables_after_the_first_use_the_variable_record_size() {
+        // An SM 5.0 RDEF as fxc writes it: header and RD11 sizes, one binding, one constant buffer of two float4x4.
+        let mut r = vec![0u8; 400];
+        let put = |r: &mut Vec<u8>, at: usize, v: u32| r[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        let text = |r: &mut Vec<u8>, at: usize, t: &str| r[at..at + t.len()].copy_from_slice(t.as_bytes());
+        // cb count, cb at, binding count, binding at, version 5.0 pixel, flags, creator.
+        put(&mut r, 0, 1);
+        put(&mut r, 4, 100);
+        put(&mut r, 8, 1);
+        put(&mut r, 12, 60);
+        put(&mut r, 16, 0xffff_0500);
+        for (i, v) in [u32::from_le_bytes(*b"RD11"), 60, 24, 32, 40, 36, 12]
+            .into_iter()
+            .enumerate()
+        {
+            put(&mut r, 28 + i * 4, v);
+        }
+        // The binding: name, cbuffer, register b6.
+        put(&mut r, 60, 300);
+        put(&mut r, 64, 0);
+        put(&mut r, 80, 6);
+        // The constant buffer: name, two variables at 124, 128 bytes.
+        put(&mut r, 100, 300);
+        put(&mut r, 104, 2);
+        put(&mut r, 108, 124);
+        put(&mut r, 112, 128);
+        for (v, (name, offset)) in [(320, 0), (330, 64)].into_iter().enumerate() {
+            let at = 124 + v * 40;
+            put(&mut r, at, name);
+            put(&mut r, at + 4, offset);
+            put(&mut r, at + 8, 64);
+            put(&mut r, at + 12, 2);
+            put(&mut r, at + 16, 210);
+        }
+        // float4x4: class 3 (column matrix), base 3, 4 rows, 4 columns.
+        for (i, v) in [3u16, 3, 4, 4, 0, 0].into_iter().enumerate() {
+            r[210 + i * 2..212 + i * 2].copy_from_slice(&v.to_le_bytes());
+        }
+        text(&mut r, 300, "cbCopy");
+        text(&mut r, 320, "first");
+        text(&mut r, 330, "second");
+        let cbs = constant_buffers(&container(&r)).expect("reflection");
+        assert_eq!(cbs[0].slot, Some(6));
+        let names: Vec<&str> = cbs[0].variables.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["first", "second"]);
+        assert_eq!(cbs[0].name_at(64).unwrap(), "cbCopy.second[0][0]");
     }
 }
