@@ -103,22 +103,54 @@ pub fn load_system_dll(name: &'static str) -> Option<HMODULE> {
 /// `F` must be the export's real function pointer type.
 pub unsafe fn export<F: Copy>(module: HMODULE, name: &'static core::ffi::CStr) -> Option<F> {
     assert_eq!(size_of::<F>(), size_of::<usize>());
-    let found = unsafe { GetProcAddress(module, PCSTR(name.as_ptr().cast())) }? as usize;
+    let address = checked_export(module, Export::Name(name))?;
+    Some(unsafe { core::mem::transmute_copy(&address) })
+}
+
+/// Resolves a numbered export with the same overlay-redirection check as named exports.
+pub fn export_ordinal(module: HMODULE, ordinal: u16) -> Option<usize> {
+    checked_export(module, Export::Ordinal(ordinal))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Export {
+    Name(&'static core::ffi::CStr),
+    Ordinal(u16),
+}
+
+impl core::fmt::Display for Export {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Name(name) => write!(f, "{}", name.to_string_lossy()),
+            Self::Ordinal(ordinal) => write!(f, "ordinal {ordinal}"),
+        }
+    }
+}
+
+fn checked_export(module: HMODULE, export: Export) -> Option<usize> {
+    let name = match export {
+        Export::Name(name) => PCSTR(name.as_ptr().cast()),
+        Export::Ordinal(ordinal) => PCSTR(usize::from(ordinal) as *const u8),
+    };
+    let found = unsafe { GetProcAddress(module, name) }? as usize;
+    checked_address(module, export, found)
+}
+
+fn checked_address(module: HMODULE, export: Export, found: usize) -> Option<usize> {
     let base = module.0 as usize;
     let size = unsafe { image_size(module) };
-    let address = if (base..base + size).contains(&found) {
+    let address = if (base..base.checked_add(size)?).contains(&found) {
         found
     } else {
-        let own = own_export(module, name)?;
-        static LOGGED: std::sync::Mutex<Vec<(usize, &'static core::ffi::CStr)>> =
-            std::sync::Mutex::new(Vec::new());
+        let own = own_export(module, export)?;
+        static LOGGED: std::sync::Mutex<Vec<(usize, Export)>> = std::sync::Mutex::new(Vec::new());
         let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
-        if !logged.contains(&(base, name)) {
-            logged.push((base, name));
+        if !logged.contains(&(base, export)) {
+            logged.push((base, export));
             let by = module_of(found as *const c_void).map(module_path);
             log!(
                 "{} of {} leads to {:#x} in {}: called at its own address {:#x} instead",
-                name.to_string_lossy(),
+                export,
                 module_path(module).display(),
                 found,
                 by.map_or("no module".into(), |p| p.display().to_string()),
@@ -127,7 +159,7 @@ pub unsafe fn export<F: Copy>(module: HMODULE, name: &'static core::ffi::CStr) -
         }
         own
     };
-    Some(unsafe { core::mem::transmute_copy(&address) })
+    Some(address)
 }
 
 /// The size of a loaded module's image, from its PE headers.
@@ -145,14 +177,15 @@ unsafe fn image_size(module: HMODULE) -> usize {
 
 /// The address of `name` in `module` as the module's file exports it (what its in-memory export table said before
 /// anything changed it). None for an export forwarded to another DLL or not found.
-fn own_export(module: HMODULE, name: &core::ffi::CStr) -> Option<usize> {
+fn own_export(module: HMODULE, export: Export) -> Option<usize> {
     let file = std::fs::read(module_path(module)).ok()?;
-    let rva = pe_export_rva(&file, name.to_bytes())?;
-    Some(module.0 as usize + rva as usize)
+    let rva = pe_export_rva(&file, export)?;
+    (rva != 0 && (rva as usize) < unsafe { image_size(module) })
+        .then(|| (module.0 as usize).checked_add(rva as usize))?
 }
 
 /// The RVA of an exported function in a PE32+ file's bytes, or None (forwarded, absent or malformed).
-fn pe_export_rva(file: &[u8], name: &[u8]) -> Option<u32> {
+fn pe_export_rva(file: &[u8], export: Export) -> Option<u32> {
     let u16_at = |o: usize| Some(u16::from_le_bytes(file.get(o..o + 2)?.try_into().ok()?));
     let u32_at = |o: usize| Some(u32::from_le_bytes(file.get(o..o + 4)?.try_into().ok()?));
     let pe = u32_at(0x3c)? as usize;
@@ -184,16 +217,27 @@ fn pe_export_rva(file: &[u8], name: &[u8]) -> Option<u32> {
         u32_at(d + 32)?,
         u32_at(d + 36)?,
     );
-    let (functions, names, ordinals) = (offset(functions)?, offset(names)?, offset(ordinals)?);
-    let index = (0..count).find(|&i| {
-        u32_at(names + 4 * i)
-            .and_then(offset)
-            .and_then(|o| file.get(o..o + name.len() + 1))
-            .is_some_and(|s| &s[..name.len()] == name && s[name.len()] == 0)
-    })?;
-    let rva = u32_at(functions + 4 * u16_at(ordinals + 2 * index)? as usize)?;
+    let functions = offset(functions)?;
+    let index = match export {
+        Export::Ordinal(ordinal) => u32::from(ordinal).checked_sub(u32_at(d + 16)?)?,
+        Export::Name(name) => {
+            let name = name.to_bytes();
+            let (names, ordinals) = (offset(names)?, offset(ordinals)?);
+            let index = (0..count).find(|&i| {
+                u32_at(names + 4 * i)
+                    .and_then(offset)
+                    .and_then(|o| file.get(o..o + name.len() + 1))
+                    .is_some_and(|s| &s[..name.len()] == name && s[name.len()] == 0)
+            })?;
+            u32::from(u16_at(ordinals + 2 * index)?)
+        }
+    };
+    if index >= u32_at(d + 20)? {
+        return None;
+    }
+    let rva = u32_at(functions + 4 * index as usize)?;
     // An address inside the export directory names another DLL's export, not code.
-    (!(dir..dir + dir_size).contains(&rva)).then_some(rva)
+    (rva != 0 && !(dir..dir.checked_add(dir_size)?).contains(&rva)).then_some(rva)
 }
 
 /// The address the function calling this one will return to, i.e. its caller's code.
@@ -249,10 +293,38 @@ mod tests {
             for name in names {
                 let loader =
                     unsafe { GetProcAddress(module, PCSTR(name.as_ptr().cast())) }.expect("export") as usize;
-                assert_eq!(own_export(module, name), Some(loader), "{dll} {name:?}");
+                assert_eq!(
+                    own_export(module, Export::Name(name)),
+                    Some(loader),
+                    "{dll} {name:?}"
+                );
             }
-            assert_eq!(own_export(module, c"NoSuchExport"), None);
+            assert_eq!(own_export(module, Export::Name(c"NoSuchExport")), None);
         }
+    }
+
+    #[test]
+    fn ordinal_exports_recover_from_out_of_module_redirection() {
+        let module = load(&system_folder(), "d3d12.dll").expect("system D3D12");
+        // Every ordinal the loader knows (which ones depends on the Windows build), and none it doesn't.
+        let mut found = 0;
+        for ordinal in 0..=1024 {
+            let export = Export::Ordinal(ordinal);
+            let loader = unsafe { GetProcAddress(module, PCSTR(usize::from(ordinal) as *const u8)) }
+                .map(|f| f as usize);
+            assert_eq!(own_export(module, export), loader, "ordinal {ordinal}");
+            assert_eq!(export_ordinal(module, ordinal), loader);
+            if let Some(loader) = loader {
+                found += 1;
+                // Inject the address an overlay could return, without modifying a live system module.
+                let foreign = ordinal_exports_recover_from_out_of_module_redirection as *const () as usize;
+                assert_eq!(checked_address(module, export, foreign), Some(loader));
+            }
+        }
+        assert!(found > 0);
+        assert_eq!(own_export(module, Export::Ordinal(u16::MAX)), None);
+        let name = Export::Name(c"D3D12CreateDevice");
+        assert_eq!(checked_address(module, name, 1), own_export(module, name));
     }
 
     fn system_folder() -> PathBuf {

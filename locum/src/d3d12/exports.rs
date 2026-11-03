@@ -1,10 +1,9 @@
 //! Public D3D12 creation entrypoints; other exports are ABI-transparent tail calls.
 use crate::log::log;
-use crate::system::{export, system_d3d12};
+use crate::system::{export, export_ordinal, system_d3d12};
 use core::ffi::c_void;
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL;
-use windows::Win32::System::LibraryLoader::GetProcAddress;
-use windows::core::{GUID, HRESULT, PCSTR};
+use windows::core::{GUID, HRESULT};
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn D3D12CreateDevice(
     adapter: *mut c_void,
@@ -35,13 +34,23 @@ pub unsafe extern "system" fn D3D12GetDebugInterface(iid: *const GUID, out: *mut
 }
 // Private exports have no public ABI to guess. Preserve all argument registers,
 // the original stack and return address, then tail-call the real ordinal.
-extern "system" fn resolve_ordinal(ordinal: usize) -> usize {
-    unsafe { GetProcAddress(system_d3d12(), PCSTR(ordinal as *const u8)) }
-        .map(|f| f as usize)
-        .unwrap_or_else(|| {
-            log!("missing D3D12 ordinal {ordinal}");
-            std::process::abort()
-        })
+// Each ordinal is resolved once: some (the PIX ones) are called many times a frame, and resolving one that an overlay
+// redirected reads d3d12.dll's file.
+extern "system" fn resolve_ordinal(ordinal: u16) -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RESOLVED: [AtomicUsize; 19] = [const { AtomicUsize::new(0) }; 19];
+    let slot = &RESOLVED[usize::from(ordinal) - 99];
+    match slot.load(Ordering::Acquire) {
+        0 => {
+            let address = export_ordinal(system_d3d12(), ordinal).unwrap_or_else(|| {
+                log!("missing D3D12 ordinal {ordinal}");
+                std::process::abort()
+            });
+            slot.store(address, Ordering::Release);
+            address
+        }
+        address => address,
+    }
 }
 macro_rules! forward {
     ($name:ident,$ordinal:literal)=>{
