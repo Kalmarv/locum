@@ -40,7 +40,12 @@ const CLASSES: &[Class] = &[
         interface: "ID3D11DeviceContext4",
         source: &["Win32", "Graphics", "Direct3D11"],
     },
-    Class { module: "factory", trait_name: "FactoryMethods", interface: "IDXGIFactory7", source: &["Win32", "Graphics", "Dxgi"] },
+    Class {
+        module: "factory",
+        trait_name: "FactoryMethods",
+        interface: "IDXGIFactory7",
+        source: &["Win32", "Graphics", "Dxgi"],
+    },
     Class {
         module: "swapchain",
         trait_name: "SwapChainMethods",
@@ -50,7 +55,10 @@ const CLASSES: &[Class] = &[
 ];
 
 /// Source modules whose vtable structs are read (bases can live in another module than the interface).
-const MODULES: &[&[&str]] = &[&["Win32", "Graphics", "Direct3D11"], &["Win32", "Graphics", "Dxgi"]];
+const MODULES: &[&[&str]] = &[
+    &["Win32", "Graphics", "Direct3D11"],
+    &["Win32", "Graphics", "Dxgi"],
+];
 
 /// One vtable entry: its name, its parameters after `this`, and its return type (absolute paths).
 struct Entry {
@@ -67,7 +75,10 @@ struct Vtbl {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().expect("workspace root").to_path_buf();
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
     match args.first().map(String::as_str) {
         Some("gen") => generate_all(&root),
         Some("smoke") => smoke(&root),
@@ -83,7 +94,18 @@ fn main() {
 fn smoke(root: &Path) {
     let status = Command::new(env!("CARGO"))
         .current_dir(root)
-        .args(["build", "--release", "-p", "locum", "-p", "locum-shim-d3d11", "-p", "locum-shim-dxgi", "-p", "locum-smoke"])
+        .args([
+            "build",
+            "--release",
+            "-p",
+            "locum",
+            "-p",
+            "locum-shim-d3d11",
+            "-p",
+            "locum-shim-dxgi",
+            "-p",
+            "locum-smoke",
+        ])
         .status()
         .expect("run cargo build");
     assert!(status.success(), "build failed");
@@ -101,8 +123,13 @@ fn smoke(root: &Path) {
         .status()
         .expect("run locum-smoke");
     println!("--- {}", log_dir.join("locum.log").display());
-    print!("{}", std::fs::read_to_string(log_dir.join("locum.log")).unwrap_or_else(|e| format!("(no log: {e})
-")));
+    print!(
+        "{}",
+        std::fs::read_to_string(log_dir.join("locum.log")).unwrap_or_else(|e| format!(
+            "(no log: {e})
+"
+        ))
+    );
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -144,7 +171,9 @@ fn windows_source(root: &Path) -> PathBuf {
     assert!(output.status.success(), "cargo metadata failed");
     let text = String::from_utf8(output.stdout).expect("cargo metadata output is UTF-8");
     // The package entry reads `"name":"windows","version":"…",…,"manifest_path":"…"`; find it without a JSON parser.
-    let at = text.find("\"name\":\"windows\",\"version\":").expect("the windows package is in the dependency graph");
+    let at = text
+        .find("\"name\":\"windows\",\"version\":")
+        .expect("the windows package is in the dependency graph");
     let rest = &text[at..];
     let key = "\"manifest_path\":\"";
     let start = rest.find(key).expect("manifest_path") + key.len();
@@ -153,7 +182,12 @@ fn windows_source(root: &Path) -> PathBuf {
     Path::new(&manifest).parent().expect("crate folder").to_path_buf()
 }
 
-fn read_vtbls(file: &Path, module: &[&str], vtbls: &mut HashMap<String, Vtbl>, features: &mut BTreeSet<String>) {
+fn read_vtbls(
+    file: &Path,
+    module: &[&str],
+    vtbls: &mut HashMap<String, Vtbl>,
+    features: &mut BTreeSet<String>,
+) {
     let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
     let parsed = syn::parse_file(&text).unwrap_or_else(|e| panic!("parse {}: {e}", file.display()));
     for item in parsed.items {
@@ -178,7 +212,9 @@ fn read_vtbls(file: &Path, module: &[&str], vtbls: &mut HashMap<String, Vtbl>, f
                 base = Some(last_ident(&field.ty));
                 continue;
             }
-            let Type::BareFn(f) = &field.ty else { panic!("{name}.{field_name} is not a function pointer") };
+            let Type::BareFn(f) = &field.ty else {
+                panic!("{name}.{field_name} is not a function pointer")
+            };
             let mut inputs = f.inputs.iter();
             inputs.next().expect("this");
             let params = inputs.map(|a| absolute(&a.ty, module)).collect();
@@ -186,7 +222,11 @@ fn read_vtbls(file: &Path, module: &[&str], vtbls: &mut HashMap<String, Vtbl>, f
                 syn::ReturnType::Default => None,
                 syn::ReturnType::Type(_, t) => Some(absolute(t, module)),
             };
-            entries.push(Entry { name: field_name, params, ret });
+            entries.push(Entry {
+                name: field_name,
+                params,
+                ret,
+            });
         }
         let base = base.filter(|b| b != "IUnknown_Vtbl");
         vtbls.insert(name, Vtbl { base, entries });
@@ -217,7 +257,9 @@ fn cfg_of(attrs: &[syn::Attribute]) -> Cfg {
 }
 
 fn last_ident(ty: &Type) -> String {
-    let Type::Path(p) = ty else { panic!("base__ is not a path") };
+    let Type::Path(p) = ty else {
+        panic!("base__ is not a path")
+    };
     p.path.segments.last().expect("segment").ident.to_string()
 }
 
@@ -249,15 +291,19 @@ fn rewrite(ty: &mut Type, module: &[&str]) {
             }
             let segs: Vec<String> = p.path.segments.iter().map(|s| s.ident.to_string()).collect();
             const PRIMITIVES: &[&str] = &[
-                "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize", "f32", "f64",
-                "bool",
+                "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+                "f32", "f64", "bool",
             ];
             if segs[0] == "core" || (segs.len() == 1 && PRIMITIVES.contains(&segs[0].as_str())) {
                 return;
             }
             let full: Vec<String> = if segs[0] == "windows_core" {
                 // windows_core::X -> windows::core::X
-                ["windows", "core"].iter().map(|s| s.to_string()).chain(segs[1..].iter().cloned()).collect()
+                ["windows", "core"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .chain(segs[1..].iter().cloned())
+                    .collect()
             } else {
                 // super::super::Foundation::X, Common::X or X: relative to the source module
                 let ups = segs.iter().take_while(|s| *s == "super").count();
@@ -280,7 +326,9 @@ fn chain<'a>(top: &str, vtbls: &'a HashMap<String, Vtbl>) -> Vec<(String, &'a Vt
     let mut out = Vec::new();
     let mut name = format!("{top}_Vtbl");
     loop {
-        let v = vtbls.get(&name).unwrap_or_else(|| panic!("no vtable struct {name}"));
+        let v = vtbls
+            .get(&name)
+            .unwrap_or_else(|| panic!("no vtable struct {name}"));
         out.push((name.clone(), v));
         match &v.base {
             Some(b) => name = b.clone(),
@@ -316,7 +364,9 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
         class.interface
     )
     .unwrap();
-    out.push_str("#![allow(non_snake_case, clippy::too_many_arguments, clippy::missing_safety_doc, dead_code)]\n\n");
+    out.push_str(
+        "#![allow(non_snake_case, clippy::too_many_arguments, clippy::missing_safety_doc, dead_code)]\n\n",
+    );
     out.push_str("use core::ffi::c_void;\n\n");
     writeln!(
         out,
@@ -341,8 +391,18 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
     for (depth, (_, v)) in levels.iter().enumerate() {
         let path = "base__.".repeat(levels.len() - 1 - depth);
         for e in &v.entries {
-            assert!(seen.insert(e.name.clone()), "{} appears twice in {}", e.name, class.interface);
-            let params: Vec<String> = e.params.iter().enumerate().map(|(i, t)| format!("a{i}: {t}")).collect();
+            assert!(
+                seen.insert(e.name.clone()),
+                "{} appears twice in {}",
+                e.name,
+                class.interface
+            );
+            let params: Vec<String> = e
+                .params
+                .iter()
+                .enumerate()
+                .map(|(i, t)| format!("a{i}: {t}"))
+                .collect();
             let args: Vec<String> = (0..e.params.len()).map(|i| format!("a{i}")).collect();
             let ret = e.ret.as_ref().map(|r| format!(" -> {r}")).unwrap_or_default();
             let comma = if params.is_empty() { "" } else { ", " };
@@ -378,11 +438,18 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
     real.push_str("}\n\n");
     out.push_str(&real);
     for (name, ret) in [
-        ("QueryInterface", "iid: *const windows::core::GUID, out: *mut *mut c_void) -> windows::core::HRESULT"),
+        (
+            "QueryInterface",
+            "iid: *const windows::core::GUID, out: *mut *mut c_void) -> windows::core::HRESULT",
+        ),
         ("AddRef", ") -> u32"),
         ("Release", ") -> u32"),
     ] {
-        let (params, args) = if name == "QueryInterface" { (format!(", {ret}"), "iid, out") } else { (ret.to_string(), "") };
+        let (params, args) = if name == "QueryInterface" {
+            (format!(", {ret}"), "iid, out")
+        } else {
+            (ret.to_string(), "")
+        };
         writeln!(
             out,
             "unsafe extern \"system\" fn {name}<T: {t}>(this: *mut c_void{params} {{\n    unsafe {{ (*(this as *const T)).{name}({args}) }}\n}}",
@@ -415,6 +482,10 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
 }
 
 fn rustfmt(path: &Path) {
-    let status = Command::new("rustfmt").args(["--edition", "2024"]).arg(path).status().expect("run rustfmt");
+    let status = Command::new("rustfmt")
+        .args(["--edition", "2024"])
+        .arg(path)
+        .status()
+        .expect("run rustfmt");
     assert!(status.success(), "rustfmt failed on {}", path.display());
 }

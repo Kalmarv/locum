@@ -89,7 +89,9 @@ pub fn module_path(module: HMODULE) -> PathBuf {
 /// Whether code at `address` belongs to Windows or the graphics driver rather than the game: such callers (the
 /// real d3d11.dll asking dxgi for a factory, for one) get the real objects, unwrapped.
 pub fn is_system_caller(address: *const c_void) -> bool {
-    let Some(module) = module_of(address) else { return false };
+    let Some(module) = module_of(address) else {
+        return false;
+    };
     let path = module_path(module).to_string_lossy().to_lowercase();
     let system = system().folder.to_string_lossy().to_lowercase();
     path.starts_with(&system) || path.contains("\\driverstore\\")

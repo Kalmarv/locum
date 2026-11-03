@@ -8,11 +8,13 @@ use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::core::{GUID, HRESULT, IUnknown, Interface};
+use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface};
 
+use crate::capture;
 use crate::com::answer_query;
 use crate::log::log;
-use crate::vtables::context::ContextMethods;
+use crate::shaders::{self, Stage};
+use crate::vtables::context::{ContextMethods, real as real_context};
 use crate::vtables::device::{DeviceMethods, real};
 
 #[repr(C)]
@@ -31,6 +33,8 @@ pub struct Context {
     inner: ID3D11DeviceContext4,
     device: *const Device,
     deferred: bool,
+    /// locum's number for the context, in captures.
+    id: u32,
 }
 
 static DEVICE_VTBL: ID3D11Device5_Vtbl = crate::vtables::device::vtable::<Device>();
@@ -56,6 +60,29 @@ const CONTEXT_IIDS: [GUID; 7] = [
     ID3D11DeviceContext4::IID,
 ];
 
+impl Context {
+    /// Records a draw or dispatch if a capture is running.
+    fn draw(&self, call: &'static str, args: &[i64]) {
+        if capture::armed() {
+            capture::on_draw(&self.inner, self.id, self.deferred, call, args);
+        }
+    }
+
+    /// Records an indirect draw or dispatch if a capture is running: its arguments are the buffer's id and offset.
+    unsafe fn draw_indirect(&self, call: &'static str, buffer: *mut c_void, offset: u32) {
+        if capture::armed() {
+            let id = unsafe { capture::buffer_id(buffer) };
+            capture::on_draw(
+                &self.inner,
+                self.id,
+                self.deferred,
+                call,
+                &[id as i64, i64::from(offset)],
+            );
+        }
+    }
+}
+
 impl Device {
     /// Wraps a device the real runtime created. Takes over the caller's reference to `device` and returns the
     /// wrapper with one reference, or gives `device` back if it is not an `ID3D11Device5`.
@@ -64,13 +91,14 @@ impl Device {
             log!("device is not an ID3D11Device5: left unwrapped");
             return Err(device);
         };
-        let immediate = match unsafe { inner.GetImmediateContext3() }.and_then(|c| c.cast::<ID3D11DeviceContext4>()) {
-            Ok(c) => c,
-            Err(e) => {
-                log!("immediate context is not an ID3D11DeviceContext4 ({e}): device left unwrapped");
-                return Err(device);
-            }
-        };
+        let immediate =
+            match unsafe { inner.GetImmediateContext3() }.and_then(|c| c.cast::<ID3D11DeviceContext4>()) {
+                Ok(c) => c,
+                Err(e) => {
+                    log!("immediate context is not an ID3D11DeviceContext4 ({e}): device left unwrapped");
+                    return Err(device);
+                }
+            };
         let wrapper = Box::into_raw(Box::new(Device {
             vtbl: &DEVICE_VTBL,
             refs: AtomicU32::new(1),
@@ -81,6 +109,7 @@ impl Device {
                 inner: immediate,
                 device: core::ptr::null(),
                 deferred: false,
+                id: capture::next_context_id(),
             },
         }));
         unsafe { (*wrapper).immediate.device = wrapper };
@@ -103,6 +132,11 @@ impl Device {
         }
         let vtbl = unsafe { *(object as *const *const ID3D11Device5_Vtbl) };
         core::ptr::eq(vtbl, &DEVICE_VTBL).then(|| unsafe { &*(object as *const Device) })
+    }
+
+    /// The real immediate context.
+    pub fn real_immediate(&self) -> &ID3D11DeviceContext4 {
+        &self.immediate.inner
     }
 
     pub fn immediate_raw(&self) -> *mut c_void {
@@ -135,6 +169,7 @@ impl Device {
                     inner,
                     device: self,
                     deferred: true,
+                    id: capture::next_context_id(),
                 }));
                 unsafe { *out = wrapper.cast() };
             }
@@ -154,9 +189,17 @@ unsafe impl DeviceMethods for Device {
 
     unsafe fn QueryInterface(&self, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
         unsafe {
-            answer_query("device", self as *const _ as _, self.inner(), &DEVICE_IIDS, iid, out, || {
-                self.AddRef();
-            })
+            answer_query(
+                "device",
+                self as *const _ as _,
+                self.inner(),
+                &DEVICE_IIDS,
+                iid,
+                out,
+                || {
+                    self.AddRef();
+                },
+            )
         }
     }
 
@@ -189,6 +232,97 @@ unsafe impl DeviceMethods for Device {
         unsafe { self.give_immediate(a0) }
     }
 
+    unsafe fn CreateVertexShader(
+        &self,
+        a0: *const c_void,
+        a1: usize,
+        a2: *mut c_void,
+        a3: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateVertexShader(self.inner(), a0, a1, a2, a3) };
+        unsafe { shaders::created(Stage::Vertex, a0, a1, hr, a3) };
+        hr
+    }
+
+    unsafe fn CreateHullShader(
+        &self,
+        a0: *const c_void,
+        a1: usize,
+        a2: *mut c_void,
+        a3: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateHullShader(self.inner(), a0, a1, a2, a3) };
+        unsafe { shaders::created(Stage::Hull, a0, a1, hr, a3) };
+        hr
+    }
+
+    unsafe fn CreateDomainShader(
+        &self,
+        a0: *const c_void,
+        a1: usize,
+        a2: *mut c_void,
+        a3: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateDomainShader(self.inner(), a0, a1, a2, a3) };
+        unsafe { shaders::created(Stage::Domain, a0, a1, hr, a3) };
+        hr
+    }
+
+    unsafe fn CreateGeometryShader(
+        &self,
+        a0: *const c_void,
+        a1: usize,
+        a2: *mut c_void,
+        a3: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateGeometryShader(self.inner(), a0, a1, a2, a3) };
+        unsafe { shaders::created(Stage::Geometry, a0, a1, hr, a3) };
+        hr
+    }
+
+    unsafe fn CreateGeometryShaderWithStreamOutput(
+        &self,
+        a0: *const c_void,
+        a1: usize,
+        a2: *const D3D11_SO_DECLARATION_ENTRY,
+        a3: u32,
+        a4: *const u32,
+        a5: u32,
+        a6: u32,
+        a7: *mut c_void,
+        a8: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe {
+            real::CreateGeometryShaderWithStreamOutput(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7, a8)
+        };
+        unsafe { shaders::created(Stage::Geometry, a0, a1, hr, a8) };
+        hr
+    }
+
+    unsafe fn CreatePixelShader(
+        &self,
+        a0: *const c_void,
+        a1: usize,
+        a2: *mut c_void,
+        a3: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreatePixelShader(self.inner(), a0, a1, a2, a3) };
+        unsafe { shaders::created(Stage::Pixel, a0, a1, hr, a3) };
+        hr
+    }
+
+    unsafe fn CreateComputeShader(
+        &self,
+        a0: *const c_void,
+        a1: usize,
+        a2: *mut c_void,
+        a3: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateComputeShader(self.inner(), a0, a1, a2, a3) };
+        unsafe { shaders::created(Stage::Compute, a0, a1, hr, a3) };
+        hr
+    }
+
     unsafe fn CreateDeferredContext(&self, a0: u32, a1: *mut *mut c_void) -> HRESULT {
         unsafe { self.wrap_deferred(real::CreateDeferredContext(self.inner(), a0, a1), a1) }
     }
@@ -212,11 +346,23 @@ unsafe impl ContextMethods for Context {
     }
 
     unsafe fn QueryInterface(&self, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
-        let kind = if self.deferred { "deferred context" } else { "immediate context" };
+        let kind = if self.deferred {
+            "deferred context"
+        } else {
+            "immediate context"
+        };
         unsafe {
-            answer_query(kind, self as *const _ as _, self.inner(), &CONTEXT_IIDS, iid, out, || {
-                self.AddRef();
-            })
+            answer_query(
+                kind,
+                self as *const _ as _,
+                self.inner(),
+                &CONTEXT_IIDS,
+                iid,
+                out,
+                || {
+                    self.AddRef();
+                },
+            )
         }
     }
 
@@ -239,6 +385,75 @@ unsafe impl ContextMethods for Context {
             unsafe { (*device).Release() };
         }
         left
+    }
+
+    unsafe fn Draw(&self, a0: u32, a1: u32) {
+        self.draw("Draw", &[a0.into(), a1.into()]);
+        unsafe { real_context::Draw(self.inner(), a0, a1) }
+    }
+
+    unsafe fn DrawIndexed(&self, a0: u32, a1: u32, a2: i32) {
+        self.draw("DrawIndexed", &[a0.into(), a1.into(), a2.into()]);
+        unsafe { real_context::DrawIndexed(self.inner(), a0, a1, a2) }
+    }
+
+    unsafe fn DrawInstanced(&self, a0: u32, a1: u32, a2: u32, a3: u32) {
+        self.draw("DrawInstanced", &[a0.into(), a1.into(), a2.into(), a3.into()]);
+        unsafe { real_context::DrawInstanced(self.inner(), a0, a1, a2, a3) }
+    }
+
+    unsafe fn DrawIndexedInstanced(&self, a0: u32, a1: u32, a2: u32, a3: i32, a4: u32) {
+        self.draw(
+            "DrawIndexedInstanced",
+            &[a0.into(), a1.into(), a2.into(), a3.into(), a4.into()],
+        );
+        unsafe { real_context::DrawIndexedInstanced(self.inner(), a0, a1, a2, a3, a4) }
+    }
+
+    unsafe fn DrawAuto(&self) {
+        self.draw("DrawAuto", &[]);
+        unsafe { real_context::DrawAuto(self.inner()) }
+    }
+
+    unsafe fn DrawInstancedIndirect(&self, a0: *mut c_void, a1: u32) {
+        unsafe {
+            self.draw_indirect("DrawInstancedIndirect", a0, a1);
+            real_context::DrawInstancedIndirect(self.inner(), a0, a1)
+        }
+    }
+
+    unsafe fn DrawIndexedInstancedIndirect(&self, a0: *mut c_void, a1: u32) {
+        unsafe {
+            self.draw_indirect("DrawIndexedInstancedIndirect", a0, a1);
+            real_context::DrawIndexedInstancedIndirect(self.inner(), a0, a1)
+        }
+    }
+
+    unsafe fn Dispatch(&self, a0: u32, a1: u32, a2: u32) {
+        self.draw("Dispatch", &[a0.into(), a1.into(), a2.into()]);
+        unsafe { real_context::Dispatch(self.inner(), a0, a1, a2) }
+    }
+
+    unsafe fn DispatchIndirect(&self, a0: *mut c_void, a1: u32) {
+        unsafe {
+            self.draw_indirect("DispatchIndirect", a0, a1);
+            real_context::DispatchIndirect(self.inner(), a0, a1)
+        }
+    }
+
+    unsafe fn FinishCommandList(&self, a0: BOOL, a1: *mut *mut c_void) -> HRESULT {
+        let hr = unsafe { real_context::FinishCommandList(self.inner(), a0, a1) };
+        if capture::armed() && hr.is_ok() && !a1.is_null() {
+            capture::on_finish_list(self.id, unsafe { *a1 });
+        }
+        hr
+    }
+
+    unsafe fn ExecuteCommandList(&self, a0: *mut c_void, a1: BOOL) {
+        if capture::armed() {
+            capture::on_execute_list(self.id, self.deferred, a0);
+        }
+        unsafe { real_context::ExecuteCommandList(self.inner(), a0, a1) }
     }
 
     unsafe fn GetDevice(&self, a0: *mut *mut c_void) {

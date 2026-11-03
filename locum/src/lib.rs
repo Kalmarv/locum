@@ -4,10 +4,15 @@
 //! The exports below are what `d3d11.dll` and `dxgi.dll` beside the game forward to. Each calls the same function
 //! in the real DLL and wraps what comes back: the device and its contexts, the DXGI factory and its swap chains.
 
+// The exports are Direct3D's own entry points: their safety contract is Microsoft's documentation of each.
+#![allow(clippy::missing_safety_doc)]
+
+mod capture;
 mod com;
 mod device;
 mod dxgi;
 mod log;
+mod shaders;
 mod system;
 mod vtables;
 
@@ -30,13 +35,21 @@ use crate::vtables::device::DeviceMethods;
 fn hello() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
-        log!("locum {} in {exe} (pid {})", env!("CARGO_PKG_VERSION"), std::process::id());
+        let exe = std::env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        log!(
+            "locum {} in {exe} (pid {})",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        );
     });
 }
 
 fn caller_name(address: *const c_void) -> String {
-    module_of(address).map(|m| module_path(m).display().to_string()).unwrap_or_else(|| format!("{address:p}"))
+    module_of(address)
+        .map(|m| module_path(m).display().to_string())
+        .unwrap_or_else(|| format!("{address:p}"))
 }
 
 type CreateDeviceFn = unsafe extern "system" fn(
@@ -86,7 +99,9 @@ unsafe fn give_device(device: *mut c_void, device_out: *mut *mut c_void, context
         },
         Err(real) => unsafe {
             if !context_out.is_null() {
-                *context_out = real.GetImmediateContext().map_or(core::ptr::null_mut(), |c| c.into_raw());
+                *context_out = real
+                    .GetImmediateContext()
+                    .map_or(core::ptr::null_mut(), |c| c.into_raw());
             }
             if !device_out.is_null() {
                 *device_out = real.into_raw();
@@ -129,7 +144,11 @@ pub unsafe extern "system" fn D3D11CreateDevice(
             core::ptr::null_mut(),
         )
     };
-    log!("D3D11CreateDevice from {} flags {:#x} -> {hr:?}", caller_name(caller), flags.0);
+    log!(
+        "D3D11CreateDevice from {} flags {:#x} -> {hr:?}",
+        caller_name(caller),
+        flags.0
+    );
     if hr.is_ok() && !device.is_null() {
         unsafe { give_device(device, device_out, context_out) };
     }
@@ -170,13 +189,21 @@ pub unsafe extern "system" fn D3D11CreateDeviceAndSwapChain(
             level_count,
             sdk_version,
             swapchain_desc,
-            if swapchain_out.is_null() { core::ptr::null_mut() } else { &mut swapchain },
+            if swapchain_out.is_null() {
+                core::ptr::null_mut()
+            } else {
+                &mut swapchain
+            },
             &mut device,
             level_out,
             core::ptr::null_mut(),
         )
     };
-    log!("D3D11CreateDeviceAndSwapChain from {} flags {:#x} -> {hr:?}", caller_name(caller), flags.0);
+    log!(
+        "D3D11CreateDeviceAndSwapChain from {} flags {:#x} -> {hr:?}",
+        caller_name(caller),
+        flags.0
+    );
     if hr.is_err() || device.is_null() {
         return hr;
     }
@@ -215,7 +242,11 @@ type CreateFactory2Fn = unsafe extern "system" fn(u32, *const GUID, *mut *mut c_
 /// factory from `CreateDXGIFactory2`, and with our dxgi.dll loaded under that name the call can land here).
 unsafe fn give_factory(name: &str, caller: *const c_void, hr: HRESULT, out: *mut *mut c_void) -> HRESULT {
     let system_caller = is_system_caller(caller);
-    log!("{name} from {} -> {hr:?}{}", caller_name(caller), if system_caller { " (real factory)" } else { "" });
+    log!(
+        "{name} from {} -> {hr:?}{}",
+        caller_name(caller),
+        if system_caller { " (real factory)" } else { "" }
+    );
     if hr.is_err() || out.is_null() || unsafe { (*out).is_null() } || system_caller {
         return hr;
     }
@@ -256,7 +287,11 @@ pub unsafe extern "system" fn CreateDXGIFactory1(iid: *const GUID, out: *mut *mu
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn CreateDXGIFactory2(flags: u32, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn CreateDXGIFactory2(
+    flags: u32,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> HRESULT {
     hello();
     let caller = caller_of_caller();
     if out.is_null() {
@@ -280,7 +315,11 @@ pub unsafe extern "system" fn DXGIDeclareAdapterRemovalSupport() -> HRESULT {
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn DXGIGetDebugInterface1(flags: u32, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+pub unsafe extern "system" fn DXGIGetDebugInterface1(
+    flags: u32,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> HRESULT {
     hello();
     match unsafe { export::<CreateFactory2Fn>(system().dxgi, c"DXGIGetDebugInterface1") } {
         Some(real) => unsafe { real(flags, iid, out) },
@@ -301,14 +340,16 @@ extern "system" fn resolve_core_create_device() -> usize {
     hello();
     log!("D3D11CoreCreateDevice: passed through, device not wrapped");
     type F = unsafe extern "system" fn() -> HRESULT;
-    unsafe { export::<F>(system().d3d11, c"D3D11CoreCreateDevice") }.map_or(not_implemented as *const () as usize, |f| f as usize)
+    unsafe { export::<F>(system().d3d11, c"D3D11CoreCreateDevice") }
+        .map_or(not_implemented as *const () as usize, |f| f as usize)
 }
 
 extern "system" fn resolve_on12_create_device() -> usize {
     hello();
     log!("D3D11On12CreateDevice: passed through, device not wrapped");
     type F = unsafe extern "system" fn() -> HRESULT;
-    unsafe { export::<F>(system().d3d11, c"D3D11On12CreateDevice") }.map_or(not_implemented as *const () as usize, |f| f as usize)
+    unsafe { export::<F>(system().d3d11, c"D3D11On12CreateDevice") }
+        .map_or(not_implemented as *const () as usize, |f| f as usize)
 }
 
 #[unsafe(no_mangle)]

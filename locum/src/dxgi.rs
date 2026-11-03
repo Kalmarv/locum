@@ -13,6 +13,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
+use crate::capture;
 use crate::com::answer_query;
 use crate::device::Device;
 use crate::log::log;
@@ -72,7 +73,11 @@ impl Factory {
             log!("factory is not an IDXGIFactory7: left unwrapped");
             return Err(factory);
         };
-        let wrapper = Box::into_raw(Box::new(Factory { vtbl: &FACTORY_VTBL, refs: AtomicU32::new(1), inner }));
+        let wrapper = Box::into_raw(Box::new(Factory {
+            vtbl: &FACTORY_VTBL,
+            refs: AtomicU32::new(1),
+            inner,
+        }));
         log!("wrapped factory {:p} as {wrapper:p}", factory.as_raw());
         Ok(wrapper)
     }
@@ -99,7 +104,11 @@ impl Factory {
 
 impl SwapChain {
     /// Wraps a real swap chain, taking over the caller's reference; `device` and `factory` gain a reference each.
-    pub fn wrap(swapchain: IUnknown, device: Option<&Device>, factory: Option<&Factory>) -> Result<*mut SwapChain, IUnknown> {
+    pub fn wrap(
+        swapchain: IUnknown,
+        device: Option<&Device>,
+        factory: Option<&Factory>,
+    ) -> Result<*mut SwapChain, IUnknown> {
         let Ok(inner) = swapchain.cast::<IDXGISwapChain4>() else {
             log!("swap chain is not an IDXGISwapChain4: left unwrapped");
             return Err(swapchain);
@@ -131,9 +140,17 @@ unsafe impl FactoryMethods for Factory {
 
     unsafe fn QueryInterface(&self, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
         unsafe {
-            answer_query("factory", self as *const _ as _, self.inner(), &FACTORY_IIDS, iid, out, || {
-                self.AddRef();
-            })
+            answer_query(
+                "factory",
+                self as *const _ as _,
+                self.inner(),
+                &FACTORY_IIDS,
+                iid,
+                out,
+                || {
+                    self.AddRef();
+                },
+            )
         }
     }
 
@@ -171,7 +188,15 @@ unsafe impl FactoryMethods for Factory {
         a5: *mut *mut c_void,
     ) -> HRESULT {
         unsafe {
-            let hr = real_factory::CreateSwapChainForHwnd(self.inner(), Device::unwrap_raw(a0), a1, a2, a3, a4, a5);
+            let hr = real_factory::CreateSwapChainForHwnd(
+                self.inner(),
+                Device::unwrap_raw(a0),
+                a1,
+                a2,
+                a3,
+                a4,
+                a5,
+            );
             self.wrap_swapchain(hr, a0, a5)
         }
     }
@@ -185,7 +210,14 @@ unsafe impl FactoryMethods for Factory {
         a4: *mut *mut c_void,
     ) -> HRESULT {
         unsafe {
-            let hr = real_factory::CreateSwapChainForCoreWindow(self.inner(), Device::unwrap_raw(a0), a1, a2, a3, a4);
+            let hr = real_factory::CreateSwapChainForCoreWindow(
+                self.inner(),
+                Device::unwrap_raw(a0),
+                a1,
+                a2,
+                a3,
+                a4,
+            );
             self.wrap_swapchain(hr, a0, a4)
         }
     }
@@ -198,7 +230,8 @@ unsafe impl FactoryMethods for Factory {
         a3: *mut *mut c_void,
     ) -> HRESULT {
         unsafe {
-            let hr = real_factory::CreateSwapChainForComposition(self.inner(), Device::unwrap_raw(a0), a1, a2, a3);
+            let hr =
+                real_factory::CreateSwapChainForComposition(self.inner(), Device::unwrap_raw(a0), a1, a2, a3);
             self.wrap_swapchain(hr, a0, a3)
         }
     }
@@ -211,9 +244,17 @@ unsafe impl SwapChainMethods for SwapChain {
 
     unsafe fn QueryInterface(&self, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
         unsafe {
-            answer_query("swap chain", self as *const _ as _, self.inner(), &SWAPCHAIN_IIDS, iid, out, || {
-                self.AddRef();
-            })
+            answer_query(
+                "swap chain",
+                self as *const _ as _,
+                self.inner(),
+                &SWAPCHAIN_IIDS,
+                iid,
+                out,
+                || {
+                    self.AddRef();
+                },
+            )
         }
     }
 
@@ -253,25 +294,37 @@ unsafe impl SwapChainMethods for SwapChain {
     }
 
     unsafe fn Present(&self, a0: u32, a1: DXGI_PRESENT) -> HRESULT {
-        on_present(a1);
-        unsafe { real_swapchain::Present(self.inner(), a0, a1) }
+        self.present(a1, || unsafe { real_swapchain::Present(self.inner(), a0, a1) })
     }
 
     unsafe fn Present1(&self, a0: u32, a1: DXGI_PRESENT, a2: *const DXGI_PRESENT_PARAMETERS) -> HRESULT {
-        on_present(a1);
-        unsafe { real_swapchain::Present1(self.inner(), a0, a1, a2) }
+        self.present(a1, || unsafe {
+            real_swapchain::Present1(self.inner(), a0, a1, a2)
+        })
     }
 }
 
-/// Counts frames (presents that are not `DXGI_PRESENT_TEST`) and logs the frame rate every 600.
-fn on_present(flags: DXGI_PRESENT) {
+impl SwapChain {
+    /// A present: the frame boundary for the frame counter and for captures. `TEST` presents show nothing and are
+    /// passed straight through.
+    fn present(&self, flags: DXGI_PRESENT, real: impl FnOnce() -> HRESULT) -> HRESULT {
+        if flags.contains(DXGI_PRESENT_TEST) || self.device.is_null() {
+            return real();
+        }
+        count_frame();
+        let finished = capture::before_present();
+        let hr = real();
+        capture::after_present(finished, unsafe { (*self.device).real_immediate() });
+        hr
+    }
+}
+
+/// Counts a frame and logs the frame rate every 600.
+fn count_frame() {
     static FRAMES: AtomicU64 = AtomicU64::new(0);
     static SINCE: Mutex<Option<Instant>> = Mutex::new(None);
-    if flags.contains(DXGI_PRESENT_TEST) {
-        return;
-    }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
-    if frame == 1 || frame % 600 == 0 {
+    if frame == 1 || frame.is_multiple_of(600) {
         let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         if let Some(t) = *since {

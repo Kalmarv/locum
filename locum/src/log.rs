@@ -19,7 +19,10 @@ fn log_state() -> &'static Log {
             std::fs::create_dir_all(&dir).ok()?;
             File::create(dir.join("locum.log")).ok()
         });
-        Log { start: Instant::now(), file: Mutex::new(file) }
+        Log {
+            start: Instant::now(),
+            file: Mutex::new(file),
+        }
     })
 }
 

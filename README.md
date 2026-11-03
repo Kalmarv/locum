@@ -4,7 +4,8 @@ A stand-in `d3d11.dll` and `dxgi.dll` for looking inside a Direct3D 11 game. The
 locum's; every call it makes arrives at locum first, which passes it on to the real runtime. Nothing in the system's
 DLLs is patched, and the game keeps rendering on its own driver.
 
-Status: early. The wrappers forward everything; recording, readback and overrides are being built.
+Status: early. The wrappers forward everything, shaders are hashed and dumped, and one frame can be captured with
+each draw's state and constant-buffer contents. Texture readback and overrides are being built.
 
 ## What it is for
 
@@ -24,6 +25,27 @@ Status: early. The wrappers forward everything; recording, readback and override
   exact ABI; `cargo xtask gen` reads those structs and writes `locum/src/vtables/`: one forwarding thunk per method
   and a trait whose default methods call the real object. A wrapper overrides only the methods it cares about.
 
+## Using it
+
+Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` beside the game's executable. locum writes to the folder named by
+`LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
+
+- `locum.log`: what was wrapped, the frame rate every 600 frames, and each interface the game asked for that locum
+  passes to the real object unwrapped.
+- `shaders/<hash>.<stage>.dxbc`: the bytecode of every shader the game creates, once per distinct shader. The hash
+  is FNV-1a 64 of the bytecode.
+- `captures/frame-<n>/draws.jsonl`: a captured frame. Create an empty file named `capture` in the folder to request
+  one; locum removes it, records the next frames and writes the capture.
+
+A capture is one JSON object per line: a `frame` line (draw count, command lists spliced in, copy failures), a
+`resource`, `view` or `state` line for each object the frame used (with a number the draws refer to), a `cb` line for
+each distinct constant-buffer content (hex), and a `draw` line for each draw and dispatch in the order the GPU runs
+them: the call and its arguments, each stage's shader hash, constant buffers (slot, buffer, range, content), shader
+resource views, render targets, depth target, input assembly and the blend, raster and depth-stencil states.
+
+Draws recorded on deferred contexts are placed where their command list is executed. Constant-buffer contents are
+copied by the GPU at the draw, on the draw's own context, so each draw's constants are the ones it ran with.
+
 ## Building
 
 ```
@@ -31,7 +53,8 @@ cargo build --release
 ```
 
 The DLLs are `target/release/locum.dll`, `d3d11.dll` and `dxgi.dll`. Regenerate the vtables after changing the
-`windows` version with `cargo xtask gen`.
+`windows` version with `cargo xtask gen`. `cargo xtask smoke` builds everything and runs a small Direct3D program
+through locum's DLLs, checking identity, deferred contexts and a capture.
 
 ## References
 

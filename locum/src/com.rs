@@ -50,10 +50,17 @@ pub unsafe fn answer_query(
 fn side_door(kind: &'static str, iid: &GUID, hr: HRESULT) {
     static SEEN: Mutex<Option<HashMap<(&'static str, u128), u64>>> = Mutex::new(None);
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let count = seen.get_or_insert_with(HashMap::new).entry((kind, iid.to_u128())).or_insert(0);
+    let count = seen
+        .get_or_insert_with(HashMap::new)
+        .entry((kind, iid.to_u128()))
+        .or_insert(0);
     *count += 1;
     if *count == 1 {
-        log!("side door: {kind} QueryInterface {} ({}) -> {hr:?}, answered by the real object", guid(iid), name_of(iid));
+        log!(
+            "side door: {kind} QueryInterface {} ({}) -> {hr:?}, answered by the real object",
+            guid(iid),
+            name_of(iid)
+        );
     }
 }
 
