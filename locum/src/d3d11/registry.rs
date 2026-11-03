@@ -1,7 +1,9 @@
 //! Every resource the game creates, from its creation to its destruction: a number, its description, the stack that
 //! created it, and the hash of the data it was created with (written to the blob store with `uploads store`). Updates
-//! that cover a whole subresource are hashed the same way. A capture lists every live resource from here, and takes
-//! the contents of the immutable ones it uses from their upload instead of reading them back.
+//! that cover a whole subresource are hashed the same way, except those of constant buffers outside a capture: those
+//! are rewritten many times a frame, their bytes match no file, and a capture records its own. A capture lists every
+//! live resource from here, and takes the contents of the immutable ones it uses from their upload instead of reading
+//! them back.
 //!
 //! Nothing here holds a reference to a resource: entries are keyed by number and removed by the runtime's
 //! destruction callback, so the registry never keeps a resource alive or touches a dead one.
@@ -183,6 +185,8 @@ pub fn dims_of(resource: &ID3D11Resource) -> Option<Dims> {
 #[derive(Clone, Debug, Default)]
 pub struct Entry {
     pub dims: Dims,
+    /// Its subresources in the canonical layout (none for a format without one).
+    pub subs: Vec<Sub>,
     pub created_frame: Option<u64>,
     pub created_stack: Vec<u64>,
     /// Key of the data it was created with, and whether that data is in the blob store.
@@ -204,6 +208,14 @@ fn entries() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Entry>>> {
 /// The entry of the resource numbered `id`, if it is alive.
 pub fn entry(id: u64) -> Option<Entry> {
     entries().as_ref()?.get(&id).cloned()
+}
+
+/// What the resource numbered `id` is (`Dims::kind`) and its subresource `sub` (None for a format without a
+/// canonical layout), without copying its entry.
+pub fn sub_of(id: u64, sub: u32) -> Option<(&'static str, Option<Sub>)> {
+    let entries = entries();
+    let e = entries.as_ref()?.get(&id)?;
+    Some((e.dims.kind, e.subs.get(sub as usize).copied()))
 }
 
 /// Every live resource's number.
@@ -269,6 +281,7 @@ unsafe fn register(
                 && writer::blob(&settings().blobs, whole.clone(), bytes, false);
             entry.upload = Some(whole);
         }
+        entry.subs = subs;
     }
     entry.dims = dims;
     entries().get_or_insert_with(HashMap::new).insert(id, entry);
@@ -359,8 +372,8 @@ pub unsafe fn updated(
     keep: bool,
 ) -> Option<(Vec<u8>, String)> {
     let started = std::time::Instant::now();
-    let out = unsafe { update_entry(resource, sub, region, data, row_pitch, depth_pitch, keep) };
-    UPDATES.add(started, out.as_ref().map_or(0, |o| o.0.len() as u64));
+    let (out, hashed) = unsafe { update_entry(resource, sub, region, data, row_pitch, depth_pitch, keep) };
+    UPDATES.add(started, hashed);
     out
 }
 
@@ -373,12 +386,30 @@ unsafe fn update_entry(
     row_pitch: u32,
     depth_pitch: u32,
     keep: bool,
-) -> Option<(Vec<u8>, String)> {
+) -> (Option<(Vec<u8>, String)>, u64) {
     let id = id_of(resource);
-    let dims = entry(id)?.dims;
-    let subs = dims.subs()?;
-    let whole = *subs.get(sub as usize)?;
-    let f = locum_capture::format::layout(dims.format).unwrap_or(locum_capture::format::Layout {
+    // Counted, and what the rest needs taken, under one lock.
+    let (kind, format, whole, constant) = {
+        let mut entries = entries();
+        let Some(e) = entries.as_mut().and_then(|e| e.get_mut(&id)) else {
+            return (None, 0);
+        };
+        e.update_count += 1;
+        e.updated_frame = Some(crate::dxgi::frame());
+        let constant = e.dims.bind & D3D11_BIND_CONSTANT_BUFFER.0 as u32 != 0;
+        if constant && !keep {
+            // Its bytes are unknown from here; a capture reads them back.
+            if let Some(slot) = e.sub_hashes.get_mut(sub as usize) {
+                *slot = None;
+            }
+            return (None, 0);
+        }
+        let Some(&whole) = e.subs.get(sub as usize) else {
+            return (None, 0);
+        };
+        (e.dims.kind, e.dims.format, whole, constant)
+    };
+    let f = locum_capture::format::layout(format).unwrap_or(locum_capture::format::Layout {
         block_width: 1,
         block_height: 1,
         block_bytes: 1,
@@ -386,7 +417,7 @@ unsafe fn update_entry(
     // The region as a subresource of its own.
     let part = match region {
         None => whole,
-        Some(b) if dims.kind == "buffer" => Sub {
+        Some(b) if kind == "buffer" => Sub {
             width: b.right.saturating_sub(b.left),
             row_bytes: b.right.saturating_sub(b.left),
             ..whole
@@ -419,43 +450,44 @@ unsafe fn update_entry(
                 && part.depth == whole.depth
         }
     };
-    let (row, slice) = if dims.kind == "buffer" || dims.kind == "texture1d" {
+    let (row, slice) = if kind == "buffer" || kind == "texture1d" {
         (part.row_bytes as usize, part.slice_bytes() as usize)
     } else {
         (row_pitch as usize, depth_pitch as usize)
     };
+    // Stored for the join with files: whole uploads of anything but constant buffers.
+    let store = covers && !constant && settings().uploads == Uploads::Store;
     let hashing = covers && settings().uploads != Uploads::Off;
     let mut out = None;
     let mut new_hash = None;
+    let mut hashed = 0;
     if keep || hashing {
         let mut bytes = Vec::with_capacity(part.size as usize);
         unsafe { layout::pack(&part, data.cast(), row, slice, &mut bytes) };
+        hashed = bytes.len() as u64;
         let k = key(&bytes);
-        if hashing {
+        if covers {
             new_hash = Some(k.clone());
         }
-        let store = hashing && settings().uploads == Uploads::Store;
-        match (keep, store) {
-            (true, true) => {
+        if keep {
+            if store {
                 writer::blob(&settings().blobs, k.clone(), bytes.clone(), false);
-                out = Some((bytes, k));
             }
-            (true, false) => out = Some((bytes, k)),
-            (false, true) => {
-                writer::blob(&settings().blobs, k, bytes, false);
-            }
-            (false, false) => {}
+            out = Some((bytes, k));
+        } else if store {
+            writer::blob(&settings().blobs, k, bytes, false);
         }
     }
-    let stack = stacks::capture();
+    // A constant buffer's updates are a capture's events, each with its own stack.
+    let stack = (!constant).then(stacks::capture);
     if let Some(e) = entries().as_mut().and_then(|e| e.get_mut(&id)) {
-        e.update_count += 1;
-        e.updated_frame = Some(crate::dxgi::frame());
-        e.updated_stack = stack;
+        if let Some(stack) = stack {
+            e.updated_stack = stack;
+        }
         if let Some(slot) = e.sub_hashes.get_mut(sub as usize) {
             // A partial update leaves the subresource's bytes unknown.
             *slot = new_hash;
         }
     }
-    out
+    (out, hashed)
 }

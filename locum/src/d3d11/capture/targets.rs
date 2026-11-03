@@ -278,9 +278,7 @@ impl Target {
         let key = locum_capture::hash::key(&out);
         let bytes = out.len() as u64;
         let blobs = &crate::settings::settings().blobs;
-        if !blobs.has(&key) {
-            locum_capture::writer::blob(blobs, key.clone(), out, true);
-        }
+        locum_capture::writer::blob(blobs, key.clone(), out, true);
         Some((key, bytes))
     }
 }

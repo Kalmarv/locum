@@ -35,6 +35,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use locum_capture::cost::Cost;
 use locum_capture::db;
 use serde_json::Value;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -349,6 +350,7 @@ pub fn after_present(finished: bool, immediate: &ID3D11DeviceContext4) {
                 s.request,
                 s.frame + 2
             );
+            log!("  {}", crate::cost::line());
         }
         Phase::Before => start(immediate),
         Phase::Recording => {}
@@ -377,6 +379,7 @@ fn start(immediate: &ID3D11DeviceContext4) {
     };
     let bytes: u64 = start.len() as u64;
     log!("capture: start copies of {count} resources written before the frame ({bytes} read); recording");
+    log!("  getting ready, {}", crate::cost::line());
     state().start = start;
 }
 
@@ -443,6 +446,7 @@ fn writes(c: &ID3D11DeviceContext4, event: &mut Event) -> bool {
 
 /// Records an event on a context, while armed (see [`writes`]).
 pub(super) fn record(c: &ID3D11DeviceContext4, mut event: Event) {
+    let started = std::time::Instant::now();
     if !writes(c, &mut event) {
         return;
     }
@@ -452,7 +456,12 @@ pub(super) fn record(c: &ID3D11DeviceContext4, mut event: Event) {
     } else {
         s.timeline.push(event);
     }
+    drop(s);
+    RECORDED.add(started, 0);
 }
+
+/// Events recorded, with the time spent noting what they write (first-write copies included).
+pub static RECORDED: Cost = Cost::new();
 
 /// Does what [`record`] does for an event's writes without recording it.
 pub(super) fn first_writes_only(c: &ID3D11DeviceContext4, mut event: Event) {

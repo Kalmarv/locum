@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use locum_capture::cost::Cost;
 use locum_capture::layout;
 use locum_capture::{hash, stacks, writer};
 use serde_json::{Value, json};
@@ -44,6 +45,8 @@ unsafe impl Send for Shadow {}
 /// Shadows by (context, resource, subresource) address.
 type Shadows = HashMap<(usize, usize, u32), Shadow>;
 static SHADOWS: Mutex<Option<Shadows>> = Mutex::new(None);
+/// Maps given a shadow (bytes) and unmaps of one recorded, on the game's threads.
+pub static SHADOWED: Cost = Cost::new();
 static OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
 /// The last bytes locum wrote through each (context, resource, subresource) during this capture: the contents a
 /// following no-overwrite map starts from.
@@ -141,16 +144,12 @@ pub unsafe fn map(
         }
         return hr;
     }
-    let Some(dims) = registry::entry(id).map(|e| e.dims) else {
-        return hr;
-    };
-    let Some(subs) = dims.subs() else { return hr };
-    let Some(s) = subs.get(sub as usize) else {
+    let Some((kind, Some(s))) = registry::sub_of(id, sub) else {
         return hr;
     };
     let m = unsafe { &mut *out };
-    let size = if dims.kind == "buffer" {
-        dims.width as usize
+    let size = if kind == "buffer" {
+        s.size as usize
     } else if s.depth > 1 {
         m.DepthPitch as usize * s.depth as usize
     } else {
@@ -159,6 +158,7 @@ pub unsafe fn map(
     if size == 0 || m.pData.is_null() {
         return hr;
     }
+    let started = std::time::Instant::now();
     let mut data = vec![0u8; size];
     let reference = if map_type == D3D11_MAP_WRITE_DISCARD {
         fill_pattern(&mut data);
@@ -192,6 +192,7 @@ pub unsafe fn map(
     let entry = map.entry(key).insert_entry(shadow);
     m.pData = entry.get().data.as_ptr() as *mut c_void;
     OUTSTANDING.fetch_add(1, Ordering::Relaxed);
+    SHADOWED.add(started, size as u64);
     hr
 }
 
@@ -217,14 +218,13 @@ pub unsafe fn unmap(c: &ID3D11DeviceContext4, resource: *mut c_void, sub: u32, r
     if !armed() {
         return;
     }
+    let started = std::time::Instant::now();
     let ranges = written(&shadow.data, shadow.reference.as_deref());
-    let dims = registry::entry(shadow.resource_id).map(|e| e.dims);
-    let (bytes, args) = match dims.as_ref().filter(|d| d.kind != "buffer") {
+    let texture = registry::sub_of(shadow.resource_id, sub).filter(|(kind, _)| *kind != "buffer");
+    let (bytes, args) = match texture {
         // A texture's map is recorded as its whole subresource, tightly packed.
-        Some(d) => {
-            let Some(s) = d.subs().and_then(|subs| subs.get(sub as usize).copied()) else {
-                return;
-            };
+        Some((_, s)) => {
+            let Some(s) = s else { return };
             let mut packed = Vec::with_capacity(s.size as usize);
             unsafe {
                 layout::pack(
@@ -259,14 +259,13 @@ pub unsafe fn unmap(c: &ID3D11DeviceContext4, resource: *mut c_void, sub: u32, r
         .insert((shadow.context, shadow.resource_id, sub), shadow.data);
     let key = hash::key(&bytes);
     let blobs = &settings().blobs;
-    if !blobs.has(&key) {
-        writer::blob(blobs, key.clone(), bytes, true);
-    }
+    writer::blob(blobs, key.clone(), bytes, true);
     let mut e = new_event("map", "Unmap", shadow.context, shadow.deferred, args);
     e.data = Some(key);
     e.stack = stacks::capture();
     e.writes.push(shadow.resource_id);
     record(c, e);
+    SHADOWED.add(started, 0);
 }
 
 /// Copies a resource the event writes first, without recording the event (a map's start: the event is recorded at
@@ -411,9 +410,7 @@ pub unsafe fn update(
     );
     if let Some((bytes, key)) = bytes {
         let blobs = &settings().blobs;
-        if !blobs.has(&key) {
-            writer::blob(blobs, key.clone(), bytes, true);
-        }
+        writer::blob(blobs, key.clone(), bytes, true);
         e.data = Some(key);
     }
     e.stack = stacks::capture();

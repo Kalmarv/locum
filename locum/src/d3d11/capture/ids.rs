@@ -432,9 +432,7 @@ pub unsafe fn input_layout_created(
         let bytes = unsafe { core::slice::from_raw_parts(code.cast::<u8>(), len) }.to_vec();
         let key = locum_capture::hash::key(&bytes);
         let blobs = &crate::settings::settings().blobs;
-        if !blobs.has(&key) {
-            locum_capture::writer::blob(blobs, key.clone(), bytes, true);
-        }
+        locum_capture::writer::blob(blobs, key.clone(), bytes, true);
         Some(key)
     };
     let text = json!({"elements": elements, "signature": signature}).to_string();

@@ -437,9 +437,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             let key = hash::key(&code);
             row.size = code.len() as u64;
             let blobs = &settings().blobs;
-            if !blobs.has(&key) {
-                writer::blob(blobs, key.clone(), code, true);
-            }
+            writer::blob(blobs, key.clone(), code, true);
             row.blob = Some(key);
         } else {
             *gaps
@@ -528,6 +526,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         started.elapsed().as_secs_f64()
     );
     log!("{summary}");
+    log!("  the frame, {}", crate::cost::line());
     writer::run(move || {
         let t = std::time::Instant::now();
         match db::write(&path, &capture) {

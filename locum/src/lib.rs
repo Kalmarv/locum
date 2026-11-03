@@ -8,6 +8,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod com;
+mod cost;
 mod d3d11;
 mod dump;
 mod dxgi;

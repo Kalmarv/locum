@@ -512,13 +512,7 @@ fn count_frame() -> u64 {
         if let Some(t) = *since {
             let secs = now.duration_since(t).as_secs_f64();
             log!("frame {frame}: {:.2} frames/s over the last 600", 600.0 / secs);
-            log!(
-                "  locum on the game's threads: resources made {}, updates {}; writer: blobs written {}, dropped {}",
-                crate::d3d11::registry::REGISTERED.take(),
-                crate::d3d11::registry::UPDATES.take(),
-                locum_capture::writer::WRITTEN.take(),
-                locum_capture::writer::DROPPED.take()
-            );
+            log!("  {}", crate::cost::line());
         } else {
             log!("first present");
         }

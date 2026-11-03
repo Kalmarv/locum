@@ -38,9 +38,7 @@ pub unsafe fn read(immediate: &ID3D11DeviceContext4, rb: &Readback) -> Result<(S
         .collect();
     let k = key(&bytes);
     let blobs = &settings().blobs;
-    if !blobs.has(&k) {
-        writer::blob(blobs, k.clone(), bytes, true);
-    }
+    writer::blob(blobs, k.clone(), bytes, true);
     Ok((k, hashes))
 }
 
