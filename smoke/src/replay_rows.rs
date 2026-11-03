@@ -343,6 +343,78 @@ pub(super) fn row16(
     deferred: &ID3D11DeviceContext,
     swapchain: &IDXGISwapChain1,
 ) -> Result<()> {
+    boxed_upload(checks, device, c, deferred, swapchain, ("row16", false, false))?;
+    let (mut device, mut c) = (None, None);
+    unsafe {
+        D3D11CreateDevice(
+            None,
+            windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            Some(&mut c),
+        )
+    }?;
+    let (device, c) = (device.unwrap(), c.unwrap());
+    let mut deferred = None;
+    unsafe { device.CreateDeferredContext(0, Some(&mut deferred)) }?;
+    let deferred = deferred.unwrap();
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            w!("locum boxed upload"),
+            WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            64,
+            64,
+            None,
+            None,
+            None,
+            None,
+        )
+    }?;
+    let dxgi: IDXGIDevice = device.cast()?;
+    let factory: IDXGIFactory2 = unsafe { dxgi.GetAdapter()?.GetParent() }?;
+    let desc = DXGI_SWAP_CHAIN_DESC1 {
+        Width: 64,
+        Height: 64,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+        BufferCount: 2,
+        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+        ..Default::default()
+    };
+    let swapchain = unsafe { factory.CreateSwapChainForHwnd(&device, hwnd, &desc, None, None) }?;
+    for case in [
+        ("row16-warp-raw", false, false),
+        ("row16-warp-adjusted", true, false),
+        ("row16-warp-modern", false, true),
+    ] {
+        boxed_upload(checks, &device, &c, &deferred, &swapchain, case)?;
+    }
+    unsafe {
+        c.ClearState();
+    }
+    drop((swapchain, deferred));
+    unsafe { DestroyWindow(hwnd) }?;
+    Ok(())
+}
+
+fn boxed_upload(
+    checks: &mut Checks,
+    device: &ID3D11Device,
+    c: &ID3D11DeviceContext,
+    deferred: &ID3D11DeviceContext,
+    swapchain: &IDXGISwapChain1,
+    case: (&str, bool, bool),
+) -> Result<()> {
+    let (label, adjusted, modern) = case;
     unsafe {
         c.ClearState();
         deferred.ClearState();
@@ -356,7 +428,7 @@ pub(super) fn row16(
         )
     }?;
     println!(
-        "row16: DriverCommandLists={}",
+        "{label}: DriverCommandLists={}",
         threading.DriverCommandLists.as_bool()
     );
     let sh = Shaders::new(device)?;
@@ -385,7 +457,7 @@ pub(super) fn row16(
         device.CreateShaderResourceView(source.as_ref().unwrap(), None, Some(&mut srv))?;
         device.CreatePixelShader(&compile("Texture2D<float4> data : register(t0); float4 main(float4 p : SV_Position) : SV_Target { return data.Load(int3((uint2)p.xy / 16, 0)); }", s!("ps_5_0"))?, None, Some(&mut ps))?;
     }
-    let dir = begin(swapchain, "row16")?;
+    let dir = begin(swapchain, label)?;
     let region = D3D11_BOX {
         left: 1,
         top: 1,
@@ -395,18 +467,25 @@ pub(super) fn row16(
         back: 1,
     };
     // Two packed source rows with padding and extra readable sentinels for the legacy deferred offset bug.
-    let mut pixels = [0x7bu8; 96];
-    pixels[..8].copy_from_slice(&[255, 0, 0, 255, 0, 255, 0, 255]);
-    pixels[24..32].copy_from_slice(&[0, 0, 255, 255, 255, 255, 255, 255]);
+    let mut pixels = [0x7bu8; 160];
+    pixels[64..72].copy_from_slice(&[255, 0, 0, 255, 0, 255, 0, 255]);
+    pixels[88..96].copy_from_slice(&[0, 0, 255, 255, 255, 255, 255, 255]);
     unsafe {
-        deferred.UpdateSubresource(
-            source.as_ref().unwrap(),
-            0,
-            Some(&region),
-            pixels.as_ptr().cast(),
-            24,
-            0,
-        );
+        let start = if adjusted { 64 - 28 } else { 64 };
+        let data = pixels.as_ptr().add(start).cast();
+        if modern {
+            deferred.cast::<ID3D11DeviceContext1>()?.UpdateSubresource1(
+                source.as_ref().unwrap(),
+                0,
+                Some(&region),
+                data,
+                24,
+                0,
+                0,
+            );
+        } else {
+            deferred.UpdateSubresource(source.as_ref().unwrap(), 0, Some(&region), data, 24, 0);
+        }
         let mut list = None;
         deferred.FinishCommandList(false, Some(&mut list))?;
         c.ExecuteCommandList(list.as_ref().unwrap(), false);
@@ -435,11 +514,20 @@ pub(super) fn row16(
         });
     }
     unsafe { c.Unmap(&staging, 0) };
-    let expected = [&pixels[..8], &pixels[24..32]].concat();
-    println!("row16: GPU rectangle={actual:?}");
-    checks.check(actual == expected, "row16: deferred box uses packed source rows");
-    finish(checks, swapchain, &dir, "row16")?;
-    let db = rusqlite::Connection::open(dir.join("captures/row16/capture.db")).unwrap();
+    let driver_offset = if !modern && !threading.DriverCommandLists.as_bool() {
+        28
+    } else {
+        0
+    };
+    let start = (if adjusted { 64 - 28 } else { 64 }) + driver_offset;
+    let expected = [&pixels[start..start + 8], &pixels[start + 24..start + 32]].concat();
+    println!("{label}: GPU rectangle={actual:?}");
+    checks.check(
+        actual == expected,
+        &format!("{label}: GPU source matches the context and driver semantics"),
+    );
+    finish(checks, swapchain, &dir, label)?;
+    let db = rusqlite::Connection::open(dir.join(format!("captures/{label}/capture.db"))).unwrap();
     let key: String = db
         .query_row(
             "SELECT data FROM events WHERE kind='update' AND deferred=1",
@@ -450,7 +538,7 @@ pub(super) fn row16(
     let recorded = locum_capture::blobs::Blobs::new(dir.join("blobs")).get(&key);
     checks.check(
         recorded.ok().as_deref() == Some(actual.as_slice()),
-        "row16: recorded box bytes equal the GPU rectangle",
+        &format!("{label}: recorded box bytes equal the GPU rectangle"),
     );
     drop(texture);
     Ok(())

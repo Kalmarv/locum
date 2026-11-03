@@ -358,6 +358,21 @@ pub fn id_of(resource: &ID3D11Resource) -> u64 {
     }
 }
 
+/// Extra source offset of legacy UpdateSubresource on an emulated deferred context.
+/// See https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11devicecontext-updatesubresource
+pub(super) fn source_offset(dims: &Dims, region: &D3D11_BOX, row: u32, depth: u32) -> Option<usize> {
+    if dims.kind == "buffer" {
+        return Some(region.left as usize);
+    }
+    let format = locum_capture::format::layout(dims.format)?;
+    let x = (region.left / format.block_width) as usize * format.block_bytes as usize;
+    let y = (region.top / format.block_height) as usize;
+    (region.front as usize)
+        .checked_mul(depth as usize)?
+        .checked_add(y.checked_mul(row as usize)?)?
+        .checked_add(x)
+}
+
 /// An `UpdateSubresource`: counted on the resource's entry, and hashed (and stored) when it covers a whole
 /// subresource. Returns the canonical bytes of the region and their key, for a capture.
 ///
@@ -493,4 +508,37 @@ unsafe fn update_entry(
         }
     }
     (out, hashed)
+}
+
+#[cfg(test)]
+mod source_offset_tests {
+    use super::*;
+
+    #[test]
+    fn offsets_use_bytes_blocks_and_volume_pitches() {
+        let region = D3D11_BOX {
+            left: 4,
+            top: 8,
+            front: 2,
+            right: 8,
+            bottom: 12,
+            back: 3,
+        };
+        let dims = |kind, format| Dims {
+            kind,
+            format,
+            ..Default::default()
+        };
+        assert_eq!(source_offset(&dims("buffer", 0), &region, 99, 999), Some(4));
+        assert_eq!(
+            source_offset(&dims("texture3d", 28), &region, 64, 1024),
+            Some(2576)
+        );
+        assert_eq!(source_offset(&dims("texture3d", 71), &region, 32, 256), Some(584));
+        assert_eq!(
+            source_offset(&dims("texture3d", 77), &region, 64, 512),
+            Some(1168)
+        );
+        assert_eq!(source_offset(&dims("texture2d", 103), &region, 64, 0), None);
+    }
 }

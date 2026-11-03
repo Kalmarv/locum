@@ -212,6 +212,19 @@ fn smoke(root: &Path, debug: bool) {
         ordered_ok &= ok && settled;
     }
     let mut rows_ok = verified(&cli, &log_dir, "row16", false, debug, "row16: bit-exact replay").0;
+    for label in ["row16-warp-raw", "row16-warp-adjusted", "row16-warp-modern"] {
+        for warp in [false, true] {
+            rows_ok &= verified(
+                &cli,
+                &log_dir,
+                label,
+                warp,
+                debug,
+                &format!("{label}: bit-exact replay"),
+            )
+            .0;
+        }
+    }
     if log_dir.join("captures/row17/capture.db").exists() {
         for warp in [false, true] {
             rows_ok &= verified(&cli, &log_dir, "row17", warp, debug, "row17: bit-exact replay").0;

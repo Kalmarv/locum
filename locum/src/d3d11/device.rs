@@ -145,6 +145,31 @@ impl Context {
         if dst.is_null() || data.is_null() {
             return;
         }
+        // Emulated command lists add the destination offset to UpdateSubresource's source pointer.
+        // Record those bytes, including when the application already compensated for that runtime behavior.
+        // UpdateSubresource1 and native command lists use the supplied pointer without this offset.
+        let mut data = data;
+        if self.deferred && call == "UpdateSubresource" && !region.is_null() {
+            let mut threading = D3D11_FEATURE_DATA_THREADING::default();
+            let emulated = unsafe { self.inner.GetDevice() }.is_ok_and(|device| {
+                unsafe {
+                    device.CheckFeatureSupport(
+                        D3D11_FEATURE_THREADING,
+                        (&mut threading as *mut D3D11_FEATURE_DATA_THREADING).cast(),
+                        size_of_val(&threading) as u32,
+                    )
+                }
+                .is_ok()
+                    && !threading.DriverCommandLists.as_bool()
+            });
+            if emulated
+                && let Some(resource) = unsafe { ID3D11Resource::from_raw_borrowed(&dst) }
+                && let Some(dims) = registry::dims_of(resource)
+                && let Some(offset) = registry::source_offset(&dims, unsafe { &*region }, row, depth)
+            {
+                data = data.wrapping_byte_add(offset);
+            }
+        }
         if capture::armed() {
             unsafe { ops::update(self.ctx(), call, dst, sub, region, data, row, depth, flags) };
         } else if let Some(r) = unsafe { ID3D11Resource::from_raw_borrowed(&dst) } {
