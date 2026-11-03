@@ -108,6 +108,11 @@ starts as the resource's memory and gets back only the words the game changed, s
 it was (a staging resource the GPU copied into keeps that copy). A swap chain resize during a capture gives the
 capture up (it holds references to the back buffers): request another.
 
+`WriteToSubresource` (Direct3D 11.3: the CPU writing straight into a default texture) is recorded as an `update`
+event with its box, subresource and bytes, and replay makes the same write. Such a texture is mapped first (`Map`
+with no pointer back); its contents are copied before that map. One mapped already when the capture began has no
+such copy, and a `default_map` gap marks the capture incomplete.
+
 A pass ends where the targets in effect change on the GPU's timeline: an `OMSetRenderTargets` that binds other
 targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame. Its
 targets are read there, and the capture records the event they were read after (the pass's last draw, or a clear, copy

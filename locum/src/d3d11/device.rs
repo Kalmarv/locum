@@ -567,6 +567,34 @@ unsafe impl DeviceMethods for Device {
         hr
     }
 
+    unsafe fn WriteToSubresource(
+        &self,
+        dst: *mut c_void,
+        sub: u32,
+        region: *const D3D11_BOX,
+        data: *const c_void,
+        row: u32,
+        depth: u32,
+    ) {
+        // The runtime requires this texture to be mapped with a null output pointer. Map already copied its
+        // initial contents while it was still legal to issue GPU work; record only the caller's bytes here.
+        let empty = !region.is_null()
+            && unsafe {
+                let b = &*region;
+                b.left >= b.right || b.top >= b.bottom || b.front >= b.back
+            };
+        if !empty {
+            if capture::armed() {
+                ops::default_write_start(dst);
+            }
+            unsafe {
+                self.immediate()
+                    .update("WriteToSubresource", dst, sub, region, data, row, depth, 0)
+            };
+        }
+        unsafe { real::WriteToSubresource(self.inner(), dst, sub, region, data, row, depth) };
+    }
+
     unsafe fn CreateInputLayout(
         &self,
         a0: *const D3D11_INPUT_ELEMENT_DESC,

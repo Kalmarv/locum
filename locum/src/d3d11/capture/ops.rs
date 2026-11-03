@@ -375,6 +375,27 @@ pub fn copy_region(
     );
 }
 
+/// A default texture is mapped during WriteToSubresource: never initiate a GPU copy here. If Map ran before
+/// this captured frame, no initial copy was possible; preserve the upload but reject the incomplete timeline.
+pub fn default_write_start(dst: *mut c_void) {
+    let Some(resource) = res(dst) else { return };
+    let id = resource_id(&resource);
+    let mut s = super::state();
+    if s.phase != super::Phase::Recording {
+        return;
+    }
+    if let Some(t) = s.resources.get_mut(&id)
+        && !t.touched
+    {
+        t.touched = true;
+        let why = format!(
+            "WriteToSubresource on #{id}: texture mapped before its initial contents could be captured"
+        );
+        s.contents.insert(id, Err(why.clone()));
+        *s.gaps.entry(("default_map".into(), why)).or_default() += 1;
+    }
+}
+
 /// `UpdateSubresource` while armed: the bytes it writes (canonical layout of the region) go to the blob store.
 ///
 /// # Safety

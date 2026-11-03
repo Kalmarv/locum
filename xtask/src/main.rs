@@ -402,6 +402,53 @@ fn smoke(root: &Path, debug: bool) {
             .0;
         }
     }
+    for label in [
+        "device-write-gpu-2d",
+        "device-write-gpu-map-first",
+        "device-write-warp-map-first",
+        "device-write-gpu-3d",
+        "device-write-warp-2d",
+        "device-write-warp-3d",
+    ] {
+        if log_dir.join(format!("captures/{label}/capture.db")).exists() {
+            for warp in [false, true] {
+                rows_ok &= verified(
+                    &cli,
+                    &log_dir,
+                    label,
+                    warp,
+                    debug,
+                    &format!("{label}: bit-exact replay"),
+                )
+                .0;
+            }
+        }
+    }
+    for label in ["device-write-gpu-prearmed", "device-write-warp-prearmed"] {
+        if !log_dir.join(format!("captures/{label}/capture.db")).exists() {
+            continue;
+        }
+        for warp in [false, true] {
+            let mut cmd = Command::new(&cli);
+            cmd.arg("verify").arg(log_dir.join(format!("captures/{label}")));
+            if warp {
+                cmd.arg("--warp");
+            }
+            let output = cmd.output().expect("verify prearmed default map");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let ok = !output.status.success() && text.contains("default_map");
+            println!("--- verify {label} WARP={warp}\n{text}");
+            println!(
+                "{} {label}: rejects missing pre-map contents",
+                if ok { "ok  " } else { "FAIL" }
+            );
+            rows_ok &= ok;
+        }
+    }
     if log_dir.join("captures/row17/capture.db").exists() {
         for warp in [false, true] {
             rows_ok &= verified(&cli, &log_dir, "row17", warp, debug, "row17: bit-exact replay").0;

@@ -400,6 +400,7 @@ pub(super) fn row16(
         ..Default::default()
     };
     let swapchain = unsafe { factory.CreateSwapChainForHwnd(&device, hwnd, &desc, None, None) }?;
+    super::device_writes::run(checks, &device, &c, &swapchain, "warp")?;
     for case in [
         ("row16-warp-raw", false, false),
         ("row16-warp-adjusted", true, false),
