@@ -1,7 +1,7 @@
 // The pipeline: the timeline of every event in GPU order, grouped by pass, and an inspector for the selected one.
 
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
-import { cached, get, type Binding, type Draw, type EventDetail, type Group, type Row } from "./api";
+import { cached, get, type Binding, type Draw, type EventDetail, type Group, type ResultOut, type Row } from "./api";
 import { Thumb, type Picture } from "./image";
 import { BytesView, ConstantsTable, EventLink, KV, ModeSelect, ResLink, Section, ShaderLink, Stack, useCtx } from "./parts";
 import {
@@ -283,8 +283,26 @@ function EventView({ e }: { e: EventDetail }) {
           {e.dataBlob.size != null ? <BytesView blob={e.dataBlob.key} total={e.dataBlob.size} /> : <div class="muted">not in the blob store</div>}
         </Section>
       ) : null}
+      <Results results={e.results} />
       <Section title="call stack" open={false}><Stack frames={e.stackFrames} /></Section>
     </div>
+  );
+}
+
+/** Output of a shader whose writes depend on the GPU's thread order (atomics), recorded right after the event. */
+function Results({ results }: { results: ResultOut[] }) {
+  if (!results.length) return null;
+  return (
+    <Section title={`order-dependent: output recorded for ${results.map(r => `#${r.resource.id}`).join(", ")}`}>
+      <div class="muted small">its shader's writes depend on the order the GPU runs threads in, so the capture keeps what
+        the game's GPU wrote; replay compares its own output with this and goes on from it</div>
+      {results.map(r => (
+        <div class="result-out">
+          <div><ResLink r={r.resource} /> <span class="muted">contents right after it, {short(r.content, 16)}{r.size == null ? ", not in the blob store" : `, ${r.size.toLocaleString()} bytes`}</span></div>
+          {r.size != null ? <BytesView blob={r.content} total={r.size} stride={r.stride || 16} /> : null}
+        </div>
+      ))}
+    </Section>
   );
 }
 
@@ -362,6 +380,8 @@ export function DrawView({ n }: { n: number }) {
               </div>
             </Section>
           ) : null}
+
+          <Results results={draw.results} />
 
           <Section title="call stack" open={false}><Stack frames={draw.eventRow?.stackFrames ?? []} /></Section>
         </div>

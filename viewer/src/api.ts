@@ -114,6 +114,15 @@ export function sourceText(s: SourceObj): string {
   return s.kind === "target" ? `target:${s.draw}:${s.name}` : `${s.kind}:${s.id}:${s.sub}:${s.z ?? 0}`;
 }
 
+/** What an order-dependent draw or dispatch wrote through a UAV, as the game's GPU wrote it. */
+export interface ResultOut {
+  resource: ResourceRef;
+  content: string;
+  /** Bytes in the blob store, or null when it is not there. */
+  size: number | null;
+  stride: number;
+}
+
 export interface Draw {
   n: number;
   event: number;
@@ -137,6 +146,7 @@ export interface Draw {
   bindings: Binding[];
   passRange: { n: number; first: number; last: number } | null;
   targets: Target[];
+  results: ResultOut[];
   prev: { n: number; event: number } | null;
   next: { n: number; event: number } | null;
 }
@@ -158,6 +168,7 @@ export interface EventDetail {
   writes: ResourceRef[];
   stackFrames: string[];
   dataBlob: { key: string; size: number | null } | null;
+  results: ResultOut[];
   view: { id: number; kind: string; resource: number; format: string; json: any } | null;
 }
 

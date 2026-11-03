@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writ
 import { dirname, join, resolve } from "node:path";
 import { Capture, listCaptures, summarize, type Source } from "./capture";
 import { Cli, cacheRoot, findCli } from "./cli";
-import { encodePng } from "./png";
+import { CHANNELS, decodePng, encodePng, selectChannels, type Channels } from "./png";
 import { formatNames } from "./format";
 
 const { values: args } = parseArgs({
@@ -198,18 +198,26 @@ function cacheDir(c: Capture): string {
 
 const RANGE = /^(auto|clamp|tonemap|-?[0-9.eE+-]+:-?[0-9.eE+-]+)$/;
 
-/** A PNG of a source, made by locum-cli. */
-async function image(c: Capture, src: Source, range: string): Promise<string> {
+/** A PNG of a source, made by locum-cli, then reduced to `channels` (see selectChannels). */
+async function image(c: Capture, src: Source, range: string, channels: string): Promise<string> {
   if (!RANGE.test(range)) throw new HttpError(400, `bad range ${range}`);
+  if (!(CHANNELS as readonly string[]).includes(channels)) throw new HttpError(400, `bad channels ${channels}`);
   const tag = range.replace(/[^a-z0-9.+-]/gi, "_");
   const common = ["--blobs", c.blobs, "--range", range];
+  let full: string;
   if (src.kind === "target") {
     const out = join(cacheDir(c), `target-${src.draw}-${src.name}-${tag}.png`);
-    return cli.cached(out, tmp => cli.run(["target", c.path, String(src.draw), src.name, "-o", tmp, ...common]).then(() => {}));
+    full = await cli.cached(out, tmp => cli.run(["target", c.path, String(src.draw), src.name, "-o", tmp, ...common]).then(() => {}));
+  } else {
+    const out = join(cacheDir(c), `${src.kind}-${src.id}-${src.sub}-${src.z ?? 0}-${tag}.png`);
+    full = await cli.cached(out, tmp => cli.run(["export", c.path, String(src.id), "-o", tmp, "--sub", String(src.sub),
+      "--z", String(src.z ?? 0), ...(src.kind === "upload" ? ["--upload"] : []), ...common]).then(() => {}));
   }
-  const out = join(cacheDir(c), `${src.kind}-${src.id}-${src.sub}-${src.z ?? 0}-${tag}.png`);
-  return cli.cached(out, tmp => cli.run(["export", c.path, String(src.id), "-o", tmp, "--sub", String(src.sub),
-    "--z", String(src.z ?? 0), ...(src.kind === "upload" ? ["--upload"] : []), ...common]).then(() => {}));
+  if (channels === "rgba") return full;
+  return cli.cached(full.replace(/\.png$/, `-${channels}.png`), async tmp => {
+    const p = decodePng(new Uint8Array(await Bun.file(full).arrayBuffer()));
+    await Bun.write(tmp, encodePng(p.width, p.height, selectChannels(p.rgba, channels as Channels)));
+  });
 }
 
 const HEX = /^[0-9a-f]{8,64}$/i;
@@ -292,7 +300,7 @@ async function api(req: Request, url: URL): Promise<Response> {
         "x-blob-size": String(statSync(c.blobPath(key)).size) } });
     }
     case "image": {
-      const file = await image(c, parseSource(q.get("src")), q.get("range") || "auto");
+      const file = await image(c, parseSource(q.get("src")), q.get("range") || "auto", q.get("channels") || "rgb");
       return new Response(Bun.file(file), { headers: { "content-type": "image/png", "cache-control": "max-age=3600" } });
     }
     case "texel": {

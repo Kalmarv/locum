@@ -95,12 +95,11 @@ export function hex(bits: number, width = 8): string {
   return `0x${(bits >>> 0).toString(16).padStart(width, "0")}`;
 }
 
-/** A float in at most 12 characters; denormals and NaNs (more likely integers or packed bits) as hex. */
+/** A float in at most 12 characters. */
 export function float(f: number): string {
   if (Number.isNaN(f)) return "NaN";
   if (!Number.isFinite(f)) return f > 0 ? "inf" : "-inf";
   if (f === 0) return Object.is(f, -0) ? "-0" : "0";
-  if (Math.abs(f) < 1.1754944e-38) return "denormal";
   const plain = String(Number(f.toPrecision(8)));
   if (plain.length <= 12) return plain;
   return f.toExponential(4);

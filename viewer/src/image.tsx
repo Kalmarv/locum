@@ -15,8 +15,11 @@ export interface Picture {
   before?: { src: SourceObj; label: string; writesBetween?: number } | null;
 }
 
-export function imageUrl(id: string, src: SourceObj, range = "auto"): string {
-  return `/api/c/${id}/image?${new URLSearchParams({ src: sourceText(src), range })}`;
+/** rgb drops alpha: a target's alpha is rarely coverage, and where it is 0 the colour would not show. */
+export type Channels = "rgb" | "rgba" | "r" | "g" | "b" | "a";
+
+export function imageUrl(id: string, src: SourceObj, range = "auto", channels: Channels = "rgb"): string {
+  return `/api/c/${id}/image?${new URLSearchParams({ src: sourceText(src), range, channels })}`;
 }
 
 interface Texel {
@@ -74,6 +77,7 @@ export function Viewer({ pic, onClose }: { pic: Picture; onClose?: () => void })
   const [range, setRange] = useState("auto");
   const [custom, setCustom] = useState("0:1");
   const [mode, setMode] = useState<Mode>("after");
+  const [channels, setChannels] = useState<Channels>("rgb");
   const [img, setImg] = useState<HTMLImageElement | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [diffInfo, setDiffInfo] = useState<string | null>(null);
@@ -110,13 +114,13 @@ export function Viewer({ pic, onClose }: { pic: Picture; onClose?: () => void })
         if (live) setImg(i);
       }, e => live && setError(String(e)));
     } else {
-      url = imageUrl(pic.id, src, effectiveRange);
+      url = imageUrl(pic.id, src, effectiveRange, channels);
       loadImage(url).then(i => live && setImg(i), e => live && setError(String(e.message ?? e)));
     }
     return () => {
       live = false;
     };
-  }, [pic.id, sourceText(src), effectiveRange, mode]);
+  }, [pic.id, sourceText(src), effectiveRange, mode, channels]);
 
   // Keep the picture's pixels for the hover readout.
   useEffect(() => {
@@ -281,10 +285,13 @@ export function Viewer({ pic, onClose }: { pic: Picture; onClose?: () => void })
           <option value="auto">auto</option><option value="clamp">clamp</option><option value="tonemap">tonemap</option><option value="custom">lo:hi</option>
         </select></label>
         {range === "custom" ? <input class="small" value={custom} onChange={e => setCustom((e.target as HTMLInputElement).value)} /> : null}
+        <label title="rgb ignores alpha; one channel shows as grey">channels <select value={channels} onChange={e => setChannels((e.target as HTMLSelectElement).value as Channels)} disabled={mode === "diff"}>
+          {(["rgb", "rgba", "r", "g", "b", "a"] as Channels[]).map(c => <option value={c}>{c}</option>)}
+        </select></label>
         <button onClick={fit} title="f">fit</button>
         <button onClick={actual} title="1">1:1</button>
         <span class="muted">{view.zoom ? `${(view.zoom * 100).toFixed(view.zoom < 0.1 ? 1 : 0)}%` : ""}</span>
-        <a href={imageUrl(pic.id, src, effectiveRange)} target="_blank">png</a>
+        <a href={imageUrl(pic.id, src, effectiveRange, channels)} target="_blank">png</a>
         {onClose ? <button class="close" onClick={onClose} title="Esc">close</button> : null}
       </div>
       {mode === "before" && pic.before ? <div class="note">before: {pic.before.label}{pic.before.writesBetween ? `; ${pic.before.writesBetween} event(s) wrote it in between (a clear or copy), which this picture does not show` : ""}</div> : null}

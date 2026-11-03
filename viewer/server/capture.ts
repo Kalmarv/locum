@@ -113,12 +113,15 @@ export class Capture {
   private timelineCache: { rows: TimelineRow[]; groups: Group[] } | null = null;
   private modulesCache: { path: string; base: bigint; size: bigint }[] | null = null;
   readonly targetEventColumn: boolean;
+  /** Captures before the `results` table (what order-dependent shaders wrote) lack it. */
+  readonly hasResults: boolean;
 
   constructor(readonly id: string, readonly path: string, readonly blobs: string, readonly label: string) {
     this.db = new Database(path, { readonly: true });
     this.db.exec("PRAGMA query_only = ON");
     const cols = this.all("PRAGMA table_info(targets)").map(r => r.name);
     this.targetEventColumn = cols.includes("event");
+    this.hasResults = this.count("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'results'") > 0;
   }
 
   all(sql: string, ...params: SQLQueryBindings[]): Row[] {
@@ -380,6 +383,23 @@ export class Capture {
     return { id, text: describeShape(s), kind: s.kind, format: s.format, width: s.width, height: s.height };
   }
 
+  /**
+   * What an event whose shader's writes depend on the GPU's thread order wrote through its UAVs, as the game's GPU
+   * wrote it: each resource's whole contents right after the event (canonical layout).
+   */
+  results(seq: number) {
+    if (!this.hasResults) return [];
+    const rows = this.all("SELECT resource, content FROM results WHERE event = ? ORDER BY resource", seq);
+    const shapes = this.shapes(rows.map(r => r.resource));
+    return rows.map(r => {
+      const s = shapes.get(r.resource);
+      return {
+        resource: this.resourceRef(s, r.resource), content: r.content as string,
+        size: this.hasBlob(r.content) ? statSync(this.blobPath(r.content)).size : null, stride: s?.stride ?? 0,
+      };
+    });
+  }
+
   /** One event: its row, what it read and wrote, its stack, and its draw when it is one. */
   event(seq: number) {
     const e = this.one("SELECT * FROM events WHERE seq = ?", seq);
@@ -407,6 +427,7 @@ export class Capture {
       stackFrames: this.stack(e.stack),
       dataBlob: data,
       view,
+      results: this.results(seq),
     };
   }
 
@@ -526,6 +547,7 @@ export class Capture {
       viewports: this.all("SELECT * FROM viewports WHERE draw = ? ORDER BY i", n),
       scissors: this.all("SELECT * FROM scissors WHERE draw = ? ORDER BY i", n),
       bindings: out,
+      results: this.results(d.event),
       passRange: pass ? { n: pass.n, first: pass.first_draw, last: pass.last_draw } : null,
       targets: pass ? this.targetsAfter(pass.last_draw) : this.targetsAfter(n),
       prev, next,

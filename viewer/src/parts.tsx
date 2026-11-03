@@ -100,12 +100,12 @@ function registerName(names: (string | null)[]): string {
   return names.map(n => n ?? "_").join(", ");
 }
 
-type BytesMode = "hex" | "f32" | "u32" | "i32" | "f16" | "u16" | "u8";
+type BytesMode = "auto" | "f32" | "u32" | "i32" | "f16" | "u16" | "u8" | "hex";
 
 /** A blob's bytes, a page at a time, as hex or as numbers. */
 export function BytesView({ blob, total, stride: initialStride }: { blob: string; total?: number | null; stride?: number }) {
   const { id } = useCtx();
-  const [mode, setMode] = useState<BytesMode>("f32");
+  const [mode, setMode] = useState<BytesMode>("auto");
   const [offset, setOffset] = useState(0);
   const [stride, setStride] = useState(initialStride && initialStride > 0 && initialStride <= 256 ? initialStride : 16);
   const page = 4096;
@@ -120,7 +120,7 @@ export function BytesView({ blob, total, stride: initialStride }: { blob: string
       const end = Math.min(at + stride, b.length);
       const w = mode === "hex" || mode === "u8" ? 1 : mode === "f16" || mode === "u16" ? 2 : 4;
       if (mode !== "hex") for (let k = at; k + w <= end; k += w) {
-        cells.push(mode === "f32" ? float(v.getFloat32(k, true)) : mode === "u32" ? String(v.getUint32(k, true))
+        cells.push(mode === "auto" ? word(v.getUint32(k, true), null, "auto") : mode === "f32" ? float(v.getFloat32(k, true)) : mode === "u32" ? String(v.getUint32(k, true))
           : mode === "i32" ? String(v.getInt32(k, true)) : mode === "f16" ? float(f16(v.getUint16(k, true)))
           : mode === "u16" ? String(v.getUint16(k, true)) : String(v.getUint8(k)));
       }
@@ -130,7 +130,7 @@ export function BytesView({ blob, total, stride: initialStride }: { blob: string
   return (
     <div class="bytes">
       <div class="bytes-bar">
-        <span class="seg">{(["f32", "u32", "i32", "f16", "u16", "u8", "hex"] as BytesMode[]).map(m => <button class={mode === m ? "on" : ""} onClick={() => setMode(m)}>{m}</button>)}</span>
+        <span class="seg">{(["auto", "f32", "u32", "i32", "f16", "u16", "u8", "hex"] as BytesMode[]).map(m => <button class={mode === m ? "on" : ""} title={m === "auto" ? "4-byte words as floats; ones that look like integers or packed bits (denormal, NaN) as hex" : undefined} onClick={() => setMode(m)}>{m}</button>)}</span>
         <label>row <input class="small" type="number" min={4} max={256} step={4} value={stride} onChange={e => setStride(Math.max(4, Math.min(256, Number((e.target as HTMLInputElement).value) || 16)))} /> bytes</label>
         <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - page))}>prev</button>
         <span class="muted">{offset.toLocaleString()}–{Math.min(offset + page, size).toLocaleString()} of {size.toLocaleString()} bytes</span>
