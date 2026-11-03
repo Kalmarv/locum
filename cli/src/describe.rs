@@ -250,3 +250,31 @@ pub fn short(key: &str) -> &str {
 pub fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1 << 20) as f64)
 }
+
+/// A draw's or dispatch's arguments by name (`count=714 start=885904 base=0`): the API puts the start index in a
+/// different place in each call. Indirect calls name their argument buffer. Arguments of another shape are shown as
+/// recorded.
+pub fn call_args(call: &str, args: &str) -> String {
+    let names: &[&str] = match call {
+        "Draw" => &["count", "start"],
+        "DrawIndexed" => &["count", "start", "base"],
+        "DrawInstanced" => &["count", "instances", "start", "first_instance"],
+        "DrawIndexedInstanced" => &["count", "instances", "start", "base", "first_instance"],
+        "Dispatch" => &["x", "y", "z"],
+        "DrawInstancedIndirect" | "DrawIndexedInstancedIndirect" | "DispatchIndirect" => &["args", "offset"],
+        _ => &[],
+    };
+    let values: Vec<i64> = serde_json::from_str(args).unwrap_or_default();
+    if names.is_empty() || values.len() != names.len() {
+        return args.to_string();
+    }
+    names
+        .iter()
+        .zip(&values)
+        .map(|(name, v)| match *name {
+            "args" => format!("args=#{v}"),
+            _ => format!("{name}={v}"),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}

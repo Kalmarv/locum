@@ -167,7 +167,7 @@ Replay runs a captured draw again offline, on the GPU or on WARP (`--warp`), wit
 ```
 locum-cli verify last                      # replay the frame; compare every target read back with the game's
 locum-cli replay last 812                  # the draw and the earlier events it depends on; writes its targets
-locum-cli replay last last --rule "constant vs b11 c0 8 8 0 0"   # before, after and a diff picture of the change
+locum-cli replay last last --rule "constant vs b11 c0 8 8 0 0"   # as recorded, with the rule, and a diff picture
 locum-cli replay last 812 --rules mine.txt --mode frame
 ```
 
@@ -200,8 +200,8 @@ events wrote in the game. Rules do not change what such an event writes.
 A draw is replayed with what it depends on: walking back from it, each earlier event that wrote a resource it (or an
 event already taken) reads or writes is taken too, and every resource starts with its contents as the frame began.
 Each draw runs from the full state captured at it, with its constant buffers made from the bytes the GPU read. With
-rules, the targets are written before (`rt0.before.png`) and after (`rt0.after.png`) them, and `rt0.diff.png` shows
-the texels that changed in magenta over the unchanged ones in grey.
+rules, the draw is replayed twice, and its targets are written as recorded (`rt0.recorded.png`) and with the rules
+(`rt0.rules.png`), and `rt0.diff.png` shows the texels that changed in magenta over the unchanged ones in grey.
 
 The memory dump ties what the GPU saw back to the game's memory:
 

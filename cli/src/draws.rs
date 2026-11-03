@@ -133,7 +133,7 @@ pub fn draws(c: &Capture, f: &Filter) -> Result<(), String> {
         out!(
             "{n:>5} {:>4} {:<26} {context:<8} {:<16} {:<16} {}",
             pass.map_or("-".into(), |p| p.to_string()),
-            format!("{call} {args}"),
+            format!("{call} {}", describe::call_args(call, args)),
             first.map_or("-", String::as_str),
             ps.as_deref().unwrap_or("-"),
             targets.join(" ")
@@ -246,7 +246,8 @@ pub fn draw(c: &Capture, n: i64, all: bool) -> Result<(), String> {
         "the immediate context".into()
     };
     out!(
-        "draw {n}: {call} {args}, event {event}, pass {}, on {place}",
+        "draw {n}: {call} {}, event {event}, pass {}, on {place}",
+        describe::call_args(&call, &args),
         pass.map_or("-".into(), |p| p.to_string())
     );
     if let Some(s) = stack {

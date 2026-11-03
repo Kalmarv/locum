@@ -702,7 +702,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         .collect();
     for output in &outs {
         let s = shape(c, output.resource).ok_or("resource vanished")?;
-        let suffix = if edited.is_some() { ".before" } else { "" };
+        let suffix = if edited.is_some() { ".recorded" } else { "" };
         let path = write_output(
             &o.out,
             &format!("{}{suffix}", output.name),
@@ -730,7 +730,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
             };
             let p = write_output(
                 &o.out,
-                &format!("{}.after", output.name),
+                &format!("{}.rules", output.name),
                 &s,
                 &after[&output.resource],
                 output,

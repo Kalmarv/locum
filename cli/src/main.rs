@@ -205,7 +205,8 @@ enum Command {
         out: PathBuf,
     },
     /// Replays a draw offline (with what it depends on), optionally with rules changing it, and writes what it drew.
-    /// With rules, writes the draw's targets before and after them and where they differ.
+    /// With rules, writes the draw's targets as recorded (`.recorded`) and with the rules (`.rules`), and where they
+    /// differ (`.diff.png`).
     Replay {
         capture: String,
         /// The draw's number, or `last`.

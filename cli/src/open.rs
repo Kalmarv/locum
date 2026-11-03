@@ -61,6 +61,12 @@ pub fn open(arg: &str, blobs: Option<&Path>) -> Result<Capture, String> {
             .ok_or_else(|| format!("no captures in {}", locum_dir().join("captures").display()))?
     } else {
         let named = locum_dir().join("captures").join(arg).join("capture.db");
+        if given.join("draws.jsonl").is_file() {
+            return Err(format!(
+                "{arg} holds a capture in locum's first format (draws.jsonl, from before capture.db), which this \
+                 CLI does not read; capture the frame again"
+            ));
+        }
         if !named.is_file() {
             return Err(format!(
                 "{arg} is not a capture.db, a folder with one, or a capture in {}",
