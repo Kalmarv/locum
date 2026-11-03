@@ -342,13 +342,16 @@ fn execute(
         b.create(c, id, contents.as_deref())
             .map_err(|e| format!("resource #{id}: {e}"))?;
     }
-    let written = order_dependent(c);
+    // Only order-dependent outputs are put back: the game's bytes for any other would undo what a rule changed.
+    let written = recorded(c);
     let mut settled = 0;
     for &seq in &plan.events {
         b.run(c, seq, rules).map_err(|e| format!("event {seq}: {e}"))?;
-        settled += settle(c, b.as_mut(), &written, seq)
+        settled += settle(c, b.as_mut(), &written, seq, false)
             .map_err(|e| format!("event {seq}: {e}"))?
-            .len();
+            .iter()
+            .filter(|s| s.ordered)
+            .count();
     }
     let mut results = Vec::new();
     for o in outs {
@@ -368,28 +371,47 @@ fn execute(
     Ok((results, warnings))
 }
 
-/// What the game's GPU wrote through UAVs in the draws and dispatches whose shaders' writes depend on the order the
-/// GPU runs their threads, by event: (resource, content key). Empty for captures from before this was recorded.
-fn order_dependent(c: &Capture) -> HashMap<i64, Vec<(i64, String)>> {
-    let mut out: HashMap<i64, Vec<(i64, String)>> = HashMap::new();
-    let recorded = c
-        .row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'results'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .is_some_and(|n| n > 0);
-    if recorded {
-        for (event, resource, key) in c.rows("SELECT event, resource, content FROM results", [], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
-        }) {
-            out.entry(event).or_default().push((resource, key));
-        }
+/// What the game's GPU wrote through a UAV in a draw or dispatch, recorded right after it.
+struct Written {
+    resource: i64,
+    key: String,
+    /// One of its shaders writes what depends on the order the GPU runs its threads.
+    ordered: bool,
+}
+
+/// What the game's GPU wrote through UAVs in each draw and dispatch, by event. Captures from before every output was
+/// recorded hold only order-dependent ones, without the column saying so; older ones have none.
+fn recorded(c: &Capture) -> HashMap<i64, Vec<Written>> {
+    let mut out: HashMap<i64, Vec<Written>> = HashMap::new();
+    let columns: Vec<String> = c.rows("SELECT name FROM pragma_table_info('results')", [], |r| r.get(0));
+    if columns.is_empty() {
+        return out;
+    }
+    let ordered = if columns.iter().any(|n| n == "order_dependent") {
+        "order_dependent"
+    } else {
+        "1"
+    };
+    for (event, w) in c.rows(
+        &format!("SELECT event, resource, content, {ordered} FROM results"),
+        [],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                Written {
+                    resource: r.get(1)?,
+                    key: r.get(2)?,
+                    ordered: r.get(3)?,
+                },
+            ))
+        },
+    ) {
+        out.entry(event).or_default().push(w);
     }
     out
 }
 
-/// How an order-dependent event's output in replay compares with the game's.
+/// How an event's output in replay compares with the game's.
 enum Settled {
     Identical,
     /// The same records, `stride` bytes each, in another order.
@@ -399,24 +421,34 @@ enum Settled {
     Differs(String),
 }
 
-/// After order-dependent event `seq` ran, compares what it wrote with what the game's GPU wrote, and puts the game's
-/// bytes in place, so everything after follows the order the game's GPU took. Its own output can hold the same records
-/// in another order, or differ in more than order: a shader that writes what its atomics returned (an offset into a
-/// list it allocates from, say) writes other values when its threads run in another order.
+/// One output of an event, compared.
+struct Compared {
+    resource: i64,
+    ordered: bool,
+    settled: Settled,
+}
+
+/// After event `seq` ran, compares what it wrote through UAVs with what the game's GPU wrote. Where they differ, the
+/// game's bytes are put in place for order-dependent outputs always, and for every output when `all`: everything
+/// after then follows the order the game's GPU took, and starts from the game's state, so a difference later is that
+/// later event's own. An order-dependent output can hold the same records in another order, or differ in more than
+/// order: a shader that writes what its atomics returned (an offset into a list it allocates from, say) writes other
+/// values when its threads run in another order. Any other output is identical or differs.
 fn settle(
     c: &Capture,
     b: &mut dyn Backend,
-    results: &HashMap<i64, Vec<(i64, String)>>,
+    written: &HashMap<i64, Vec<Written>>,
     seq: i64,
-) -> Result<Vec<(i64, Settled)>, String> {
-    let Some(written) = results.get(&seq) else {
+    all: bool,
+) -> Result<Vec<Compared>, String> {
+    let Some(written) = written.get(&seq) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    for (resource, key) in written {
-        let s = shape(c, *resource).ok_or("resource vanished")?;
-        let game = c.blob(key)?;
-        let mine = b.read(*resource)?;
+    for w in written {
+        let s = shape(c, w.resource).ok_or("resource vanished")?;
+        let game = c.blob(&w.key)?;
+        let mine = b.read(w.resource)?;
         // A structured buffer's records are its structures; anything else is taken in 4-byte words, the unit UAV
         // atomics work in.
         let stride = if s.kind == "buffer" && s.stride > 0 {
@@ -428,7 +460,11 @@ fn settle(
             Settled::Identical
         } else if mine.len() != game.len() {
             Settled::Differs(format!("{} bytes, the game's {}", mine.len(), game.len()))
-        } else if s.kind == "buffer" && game.len() % stride == 0 && same_records(&mine, &game, stride) {
+        } else if w.ordered
+            && s.kind == "buffer"
+            && game.len() % stride == 0
+            && same_records(&mine, &game, stride)
+        {
             Settled::Reordered { stride }
         } else {
             let differ = mine
@@ -441,10 +477,14 @@ fn settle(
                 game.len().div_ceil(stride)
             ))
         };
-        if !matches!(settled, Settled::Identical) {
-            b.write(c, *resource, &game)?;
+        if !matches!(settled, Settled::Identical) && (w.ordered || all) {
+            b.write(c, w.resource, &game)?;
         }
-        out.push((*resource, settled));
+        out.push(Compared {
+            resource: w.resource,
+            ordered: w.ordered,
+            settled,
+        });
     }
     Ok(out)
 }
@@ -637,7 +677,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
 
 /// Gaps that are checks the capture could not make or keep (targets not read back, a command list's earlier
 /// executions, the CPU's memory), not inputs the replay lacks: shown, but they leave the proof complete.
-const CHECKS: &str = "'evidence', 'targets', 'memory'";
+const CHECKS: &str = "'evidence', 'targets', 'outputs', 'memory'";
 
 /// Replays the whole frame and compares every target the capture read back with the replay's at the same point. Fails
 /// unless every target compared is identical and nothing kept the capture or the replay from being complete.
@@ -694,30 +734,48 @@ pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Resul
         planned.as_secs_f64(),
         started.elapsed().as_secs_f64()
     );
-    let written = order_dependent(c);
+    let written = recorded(c);
+    // Draws and dispatches are named by their number, as targets are.
+    let numbered: HashMap<i64, (i64, String)> = c
+        .rows("SELECT event, n, call FROM draws", [], |r| {
+            Ok((r.get::<_, i64>(0)?, (r.get::<_, i64>(1)?, r.get::<_, String>(2)?)))
+        })
+        .into_iter()
+        .collect();
     let mut next = 0;
     let (mut same, mut compared) = (0, 0);
     let (mut settled_same, mut reordered, mut differing) = (0, 0, 0);
+    let (mut outputs_same, mut outputs_differing) = (0, 0);
     let t = std::time::Instant::now();
     for &seq in &plan.events {
         b.run(c, seq, &[]).map_err(|e| format!("event {seq}: {e}"))?;
-        for (resource, settled) in
-            settle(c, b.as_mut(), &written, seq).map_err(|e| format!("event {seq}: {e}"))?
-        {
-            match settled {
-                Settled::Identical => settled_same += 1,
-                Settled::Reordered { stride } => {
+        let who = numbered.get(&seq).map_or_else(
+            || format!("event {seq}"),
+            |(n, call)| format!("{call} {n} (event {seq})"),
+        );
+        for out in settle(c, b.as_mut(), &written, seq, true).map_err(|e| format!("event {seq}: {e}"))? {
+            let resource = out.resource;
+            match (out.ordered, out.settled) {
+                (true, Settled::Identical) => settled_same += 1,
+                (false, Settled::Identical) => outputs_same += 1,
+                (_, Settled::Reordered { stride }) => {
                     reordered += 1;
                     out!(
-                        "event {seq:>5} #{resource}: the game's {stride}-byte records in another order; going on \
-                         from the game's order"
+                        "{who} #{resource}: the game's {stride}-byte records in another order; going on from the \
+                         game's order"
                     );
                 }
-                Settled::Differs(how) => {
+                (true, Settled::Differs(how)) => {
                     differing += 1;
                     out!(
-                        "event {seq:>5} #{resource}: differs from the game's output in more than order ({how}); going \
-                         on from the game's"
+                        "{who} #{resource}: order-dependent, differs from the game's output in more than order \
+                         ({how}); going on from the game's"
+                    );
+                }
+                (false, Settled::Differs(how)) => {
+                    outputs_differing += 1;
+                    out!(
+                        "{who} #{resource}: wrote other bytes than the game's ({how}); going on from the game's"
                     );
                 }
             }
@@ -746,7 +804,13 @@ pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Resul
         "{same} of {compared} targets identical; replayed in {:.1} s",
         t.elapsed().as_secs_f64()
     );
-    if !written.is_empty() {
+    if outputs_same + outputs_differing > 0 {
+        out!(
+            "what draws and dispatches wrote through UAVs: {outputs_same} identical to the game's, {outputs_differing} \
+             different"
+        );
+    }
+    if settled_same + reordered + differing > 0 {
         out!(
             "order-dependent shaders' outputs: {settled_same} identical to the game's, {reordered} the same records in \
              another order, {differing} different"
@@ -804,8 +868,18 @@ pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Resul
     if limit.is_some_and(|l| compared >= l) {
         out!("(stopped after {compared} comparisons: --limit)");
     }
+    let mut failed = Vec::new();
     if same < compared {
-        return Err(format!("{} of {compared} targets differ", compared - same));
+        failed.push(format!("{} of {compared} targets differ", compared - same));
+    }
+    if outputs_differing > 0 {
+        failed.push(format!(
+            "{outputs_differing} of {} outputs of draws and dispatches differ",
+            outputs_same + outputs_differing
+        ));
+    }
+    if !failed.is_empty() {
+        return Err(failed.join("; "));
     }
     if compared == 0 {
         return Err("no target was compared".into());

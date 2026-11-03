@@ -183,6 +183,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         }
     }
     let (mut cbs_repeated, mut targets_repeated, mut results_repeated) = (0u64, 0u64, 0u64);
+    let mut outputs_repeated = 0u64;
     let mut n = 0u64;
     let mut pass: Option<(u64, Vec<(u32, u64)>)> = None;
     let mut timeline = timeline;
@@ -266,24 +267,37 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                 shader_hashes.insert((h.clone(), db::stage_names()[i]));
             }
         }
+        // Without an order-dependent event's output replay cannot go on in the game's order (a gap that leaves the
+        // capture incomplete); without another's, that output is only not compared.
+        let ordered = d.order_dependent;
         for (resource, r) in std::mem::take(&mut d.results) {
             let read = match r {
                 Ok(rb) if last_result.get(&rb.copy_id()) != Some(&index) => {
-                    results_repeated += 1;
+                    if ordered {
+                        results_repeated += 1;
+                    } else {
+                        outputs_repeated += 1;
+                    }
                     continue;
                 }
                 Ok(rb) => unsafe { contents::read(immediate, &rb) },
                 Err(e) => Err(e),
             };
             match read {
-                Ok((key, _)) => capture.results.push((seq, resource, key)),
+                Ok((key, _)) => capture.results.push((seq, resource, key, ordered)),
                 Err(e) => {
-                    *gaps
-                        .entry((
+                    let gap = if ordered {
+                        (
                             "results".into(),
                             format!("an order-dependent shader's output not read: {e}"),
-                        ))
-                        .or_insert(0) += 1;
+                        )
+                    } else {
+                        (
+                            "outputs".into(),
+                            format!("what a draw or dispatch wrote through UAVs, not read: {e}"),
+                        )
+                    };
+                    *gaps.entry(gap).or_insert(0) += 1;
                 }
             }
         }
@@ -530,6 +544,17 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                     .into(),
             ),
             results_repeated,
+        );
+    }
+    if outputs_repeated > 0 {
+        gaps.insert(
+            (
+                "outputs".into(),
+                "what a draw or dispatch in a command list executed more than once wrote through UAVs: only its last \
+                 execution's output was kept"
+                    .into(),
+            ),
+            outputs_repeated,
         );
     }
     if targets_repeated > 0 {

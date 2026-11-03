@@ -28,7 +28,8 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
   - `label NAME`: the capture's folder name (default `frame-<n>`);
   - `skip targets`: no render and depth targets read back at the end of each pass;
   - `skip contents`: no resource contents (draws, state and constants only);
-  - `max_mb N`: the most memory the target copies may use (default 4096); targets past it are skipped and counted.
+  - `max_mb N`: the most memory the copies of targets and of what draws and dispatches wrote through UAVs may use
+    (default 4096); copies past it are skipped and counted.
 - `blobs/<2 hex>/<32 hex>`: the blob store, shared by every capture: resource contents, targets, the bytes each update
   and map wrote, and shader bytecode, each under the xxh3-128 hash of its bytes. Contents are in a canonical layout:
   subresources in order (mip within array slice), rows packed tightly, blocks for compressed formats.
@@ -84,16 +85,16 @@ contents. locum's own copies run whatever predicate the game has set.
   GPU read (`cb_data`);
 - `passes` and `targets`: runs of draws with the same targets, and the targets read back after each one's last draw
   (in the format the pass drew in; depth as the colour format of the same bits, D24S8 as R24_UNORM_X8);
-- `results`: what each draw or dispatch whose shader is order-dependent (below) wrote through its UAVs, as the GPU
-  wrote it;
+- `results`: what each draw or dispatch wrote through its UAVs, as the GPU wrote it, and whether its shader is
+  order-dependent (below);
 - `shaders`, `modules`, `stacks`: bytecode keys, and what the call stacks need to be read.
 
 Some shaders write different bytes depending on the order the GPU happens to run their threads: a thread that takes
 the next free slot of a buffer with an atomic add (particles, light lists) puts its record wherever it lands, and the
 GPU never runs the threads in the same order twice. locum reads every shader's bytecode as it is made and flags those
 that use an atomic that returns a value (`imm_atomic_*`, `atomic_cmp_store`; `locum_capture::dxbc`), and the log
-names them. During a capture, each draw or dispatch with such a shader has everything bound to it as a UAV copied
-right after it runs, into `results`.
+names them. During a capture, every draw or dispatch has everything bound to it as a UAV copied right after it runs,
+into `results`, flagged when its shader is order-dependent.
 
 While a capture is recording, the game's writes through `Map` go to memory locum owns and are copied to the driver's
 at `Unmap`, so a map records only the bytes the game wrote. A discarding map starts as a fixed pattern
@@ -145,15 +146,21 @@ locum-cli replay last last --rule "constant vs b11 c0 8 8 0 0"   # before, after
 locum-cli replay last 812 --rules mine.txt --mode frame
 ```
 
-`verify` exits with success only when every target compared is identical and nothing the replay needs is missing
-(contents, command lists, constants); checks the capture could not make (targets skipped, a repeated list's earlier
-executions, the memory dump) are listed as not compared.
+`verify` exits with success only when every target and every output of a draw or dispatch compared is identical and
+nothing the replay needs is missing (contents, command lists, constants); checks the capture could not make (targets
+or outputs skipped, a repeated list's earlier executions, the memory dump) are listed as not compared.
 
-After an order-dependent draw or dispatch, replay compares what it wrote with what the game's GPU wrote (`results`)
-and says how they compare: identical; the same records in another order (a structured buffer's structures, otherwise
-4-byte words); or different in more than order, as when the shader writes what its atomics returned (Sekiro's light
-tiles each hold the offset into the light list their group was given). Then it puts the game's bytes in place and
-goes on from them, so everything after follows the game's order and can be compared exactly. Outputs that differ in
+After each draw or dispatch, replay compares what it wrote through UAVs with what the game's GPU wrote (`results`).
+Where it differs, `verify` names the event (`Dispatch 218 (event 567) #4770: wrote other bytes than the game's`),
+fails, and goes on from the game's bytes, so a difference further on is that later event's own: the first such line
+is where the replay and the game part. `replay` with rules puts back only order-dependent outputs, so a rule's
+effect on a dispatch stays.
+
+An order-dependent draw or dispatch's output is compared the same way, and described: identical; the same records in
+another order (a structured buffer's structures, otherwise 4-byte words); or different in more than order, as when
+the shader writes what its atomics returned (Sekiro's light tiles each hold the offset into the light list their
+group was given). Then it puts the game's bytes in place and goes on from them, so everything after follows the
+game's order and can be compared exactly. Neither is a failure. Outputs that differ in
 more than order are listed as not compared: what verify proves is that every target is the game's given what those
 events wrote in the game. Rules do not change what such an event writes.
 

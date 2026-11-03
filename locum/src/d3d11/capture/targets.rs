@@ -190,7 +190,7 @@ unsafe fn copy_one(
         if s.target_bytes + bytes > s.request.max_target_bytes {
             s.targets_skipped_bytes += bytes;
             drop(s);
-            skip("over the capture's memory limit (max_mb)");
+            skip(super::OVER_LIMIT);
             return None;
         }
         s.target_bytes += bytes;

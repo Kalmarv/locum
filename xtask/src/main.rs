@@ -209,7 +209,38 @@ fn smoke(root: &Path, debug: bool) {
             "{} ordered: on {device}, each of the dispatch's three outputs was compared with the game's",
             if settled { "ok  " } else { "FAIL" }
         );
-        ordered_ok &= ok && settled;
+        let plain = text.lines().any(|l| {
+            l == "what draws and dispatches wrote through UAVs: 1 identical to the game's, 0 different"
+        });
+        println!(
+            "{} outputs: on {device}, the order-independent dispatch's output is compared and identical",
+            if plain { "ok  " } else { "FAIL" }
+        );
+        // The same capture with that output's record off by one word: verify fails, naming the dispatch.
+        let mut command = Command::new(&cli);
+        command
+            .arg("verify")
+            .arg(log_dir.join("captures/ordered-tampered"));
+        if warp {
+            command.arg("--warp");
+        }
+        let output = command
+            .env("LOCUM_DIR", &log_dir)
+            .output()
+            .expect("verify the tampered capture");
+        let tampered =
+            String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        let named = !output.status.success()
+            && tampered
+                .lines()
+                .any(|l| l.starts_with("Dispatch 1 ") && l.contains("wrote other bytes than the game's"))
+            && tampered.contains("1 of 1 outputs of draws and dispatches differ");
+        println!("--- verify ordered-tampered (WARP={warp})\n{tampered}");
+        println!(
+            "{} outputs: on {device}, verify fails on a dispatch whose output is not the game's, and names it",
+            if named { "ok  " } else { "FAIL" }
+        );
+        ordered_ok &= ok && settled && plain && named;
     }
     let mut rows_ok = verified(&cli, &log_dir, "row16", false, debug, "row16: bit-exact replay").0;
     for label in ["row16-warp-raw", "row16-warp-adjusted", "row16-warp-modern"] {

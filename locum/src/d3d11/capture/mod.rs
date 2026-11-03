@@ -5,7 +5,8 @@
 //! default; its lines can change that:
 //! - `label NAME`: the capture's folder name (default `frame-<n>`);
 //! - `skip targets`: no target readback at pass ends; `skip contents`: no resource contents;
-//! - `max_mb N`: the most memory target readback may use (default 4096);
+//! - `max_mb N`: the most memory the copies of targets and of what draws and dispatches wrote through UAVs may use
+//!   (default 4096);
 //! - `skip memory`: no memory dump of the process (see [`super::dump`]).
 //!
 //! A capture runs over two frames:
@@ -158,9 +159,9 @@ pub(super) struct Draw {
     bound: Vec<targets::Bound>,
     /// Whether the pass this draw ends has been dealt with.
     closed: bool,
-    /// Whether one of its shaders writes what depends on the order the GPU runs its threads; if so, copies of what
-    /// it wrote through UAVs, made right after it ran.
+    /// Whether one of its shaders writes what depends on the order the GPU runs its threads.
     order_dependent: bool,
+    /// Copies of what it wrote through UAVs, made right after it ran (or why there is none).
     results: Vec<(u64, Result<contents::Readback, String>)>,
     results_taken: bool,
 }
@@ -217,6 +218,7 @@ struct State {
     staging: Vec<ID3D11Buffer>,
     used: u32,
     copy_failures: u32,
+    /// Bytes of target and output copies made so far, against the request's `max_mb`.
     target_bytes: u64,
     targets_skipped: u32,
     targets_skipped_bytes: u64,
@@ -562,10 +564,11 @@ fn draw_event(
     record(context, event);
 }
 
-/// After a draw or dispatch ran on a context, while armed: if one of its shaders writes what depends on the order the
-/// GPU runs its threads, what it wrote through UAVs is copied now, on its context. Replay checks its own result
-/// against the game's (the same records in another order is that order) and goes on from the game's, so what follows
-/// does not depend on the order either GPU happened to run in.
+/// After a draw or dispatch ran on a context, while armed: what it wrote through UAVs is copied now, on its context,
+/// within the capture's memory limit. Replay checks its own output against the game's and goes on from the game's, so
+/// the first event whose output differs is the one named, and what follows is compared from the game's state. For a
+/// shader whose writes depend on the order the GPU runs its threads, the same records in another order are that
+/// order, not a difference.
 pub fn after_draw(
     Ctx {
         c: context,
@@ -586,7 +589,7 @@ pub fn after_draw(
         let Some(d) = last.and_then(|e| e.draw.as_deref_mut()) else {
             return;
         };
-        if !d.order_dependent || d.results_taken {
+        if d.results_taken {
             return;
         }
         d.results_taken = true;
@@ -604,7 +607,7 @@ pub fn after_draw(
     };
     let results: Vec<(u64, Result<contents::Readback, String>)> = uavs
         .into_iter()
-        .map(|(i, r)| (i, unsafe { contents::issue(context, &r) }))
+        .map(|(i, r)| (i, unsafe { output_copy(context, &r) }))
         .collect();
     let mut s = state();
     let last = if deferred {
@@ -616,6 +619,28 @@ pub fn after_draw(
         d.results = results;
     }
 }
+
+/// A copy of what a draw or dispatch wrote to `resource`, unless it would take the capture past its memory limit.
+///
+/// # Safety
+/// `resource` must be a live resource of `context`'s device.
+unsafe fn output_copy(
+    context: &ID3D11DeviceContext4,
+    resource: &ID3D11Resource,
+) -> Result<contents::Readback, String> {
+    let bytes = locum_d3d11::readback::bytes(resource)?;
+    {
+        let mut s = state();
+        if s.target_bytes + bytes > s.request.max_target_bytes {
+            return Err(OVER_LIMIT.into());
+        }
+        s.target_bytes += bytes;
+    }
+    unsafe { contents::issue(context, resource) }
+}
+
+/// Why an output was not copied: the capture's target and output copies reached `max_mb`.
+pub(super) const OVER_LIMIT: &str = "over the capture's memory limit (max_mb)";
 
 /// `OMSetRenderTargets` (or `ClearState`, with no targets) on a context, while armed: if it binds other targets than
 /// the context's last draw used, that draw ended a pass and its targets are copied now, on this context.

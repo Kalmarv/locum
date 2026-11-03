@@ -1462,6 +1462,12 @@ float4 main(float4 p : SV_Position) : SV_Target {
 /// Threads of `SLOTS_CS`, one record each.
 const SLOTS: u32 = 64 * 64;
 
+/// A dispatch whose output does not depend on thread order: each thread writes its own word.
+const SQUARES_CS: &str = "RWStructuredBuffer<uint> squares : register(u0);
+[numthreads(64, 1, 1)] void main(uint id : SV_DispatchThreadID) {
+    squares[id] = id * id + 7;
+}";
+
 /// A frame whose dispatch's output depends on thread order and whose draw shows that order: the capture records what
 /// the dispatch wrote, as the GPU wrote it.
 fn ordered_capture(
@@ -1474,11 +1480,13 @@ fn ordered_capture(
     let sh = Shaders::new(device)?;
     let cs_code = compile(SLOTS_CS, s!("cs_5_0"))?;
     let ps_code = compile(SLOTS_PS, s!("ps_5_0"))?;
+    let squares_code = compile(SQUARES_CS, s!("cs_5_0"))?;
     let cs_hash = format!("{:016x}", fnv(&cs_code));
-    let (mut cs, mut ps) = (None, None);
+    let (mut cs, mut ps, mut squares_cs) = (None, None, None);
     unsafe {
         device.CreateComputeShader(&cs_code, None, Some(&mut cs))?;
         device.CreatePixelShader(&ps_code, None, Some(&mut ps))?;
+        device.CreateComputeShader(&squares_code, None, Some(&mut squares_cs))?;
     }
     let log = std::fs::read_to_string(dir.join("locum.log")).unwrap_or_default();
     checks.check(
@@ -1516,11 +1524,26 @@ fn ordered_capture(
         device.CreateBuffer(&structured, Some(&initial), Some(&mut records))?;
         device.CreateBuffer(&structured, Some(&initial), Some(&mut slots))?;
     }
-    let (counter, records, slots) = (
+    let mut squares = None;
+    unsafe {
+        device.CreateBuffer(
+            &D3D11_BUFFER_DESC {
+                ByteWidth: SLOTS * 4,
+                StructureByteStride: 4,
+                ..structured
+            },
+            Some(&initial),
+            Some(&mut squares),
+        )?;
+    }
+    let (counter, records, slots, squares) = (
         counter.expect("counter"),
         records.expect("records"),
         slots.expect("slots"),
+        squares.expect("squares"),
     );
+    let mut squares_view = None;
+    unsafe { device.CreateUnorderedAccessView(&squares, None, Some(&mut squares_view))? };
     let (mut counter_view, mut records_view, mut records_srv) = (None, None, None);
     let (mut slots_view, mut slots_srv) = (None, None);
     unsafe {
@@ -1571,6 +1594,10 @@ fn ordered_capture(
         );
         c.Dispatch(SLOTS / 64, 1, 1);
         c.CSSetUnorderedAccessViews(0, 3, Some([None, None, None].as_ptr()), None);
+        c.CSSetShader(squares_cs.as_ref(), None);
+        c.CSSetUnorderedAccessViews(0, 1, Some([squares_view.clone()].as_ptr()), None);
+        c.Dispatch(SLOTS / 64, 1, 1);
+        c.CSSetUnorderedAccessViews(0, 1, Some([None].as_ptr()), None);
         c.CSSetShader(None, None);
         sh.bind(c, &view, &cb);
         c.PSSetShader(ps.as_ref(), None);
@@ -1581,6 +1608,7 @@ fn ordered_capture(
     }
     unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
     let written = gpu_bytes(device, c, &records)?;
+    let squared = gpu_bytes(device, c, &squares)?;
     drop(texture);
 
     let path = dir.join("captures/ordered/capture.db");
@@ -1597,7 +1625,7 @@ fn ordered_capture(
     let kept: Vec<(i64, String)> = db
         .prepare(
             "SELECT r.resource, r.content FROM results r JOIN events e ON e.seq = r.event \
-             WHERE e.kind = 'dispatch' ORDER BY r.resource",
+             WHERE e.kind = 'dispatch' AND r.order_dependent ORDER BY r.resource",
         )
         .and_then(|mut q| q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
         .unwrap_or_default();
@@ -1615,6 +1643,34 @@ fn ordered_capture(
             .any(|(_, k)| blobs.get(k).ok().as_deref() == Some(written.as_slice())),
         "ordered: the recorded records are the GPU's, in the GPU's order",
     );
+
+    // The second dispatch's output is recorded too, as not order-dependent.
+    let plain: Vec<(i64, String)> = db
+        .prepare("SELECT event, content FROM results WHERE NOT order_dependent")
+        .and_then(|mut q| q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+        .unwrap_or_default();
+    checks.check(
+        plain.len() == 1 && blobs.get(&plain[0].1).ok().as_deref() == Some(squared.as_slice()),
+        "outputs: what a dispatch that does not depend on thread order wrote is recorded, as the GPU wrote it",
+    );
+    drop(db);
+    // A copy of the capture whose record of that output is off by one word: verify must name that dispatch.
+    if let [(event, _)] = plain.as_slice() {
+        let tampered = dir.join("captures/ordered-tampered");
+        std::fs::create_dir_all(&tampered).expect("tampered capture folder");
+        std::fs::copy(&path, tampered.join("capture.db")).expect("copy the capture");
+        let mut wrong = squared.clone();
+        wrong[0] ^= 1;
+        let key = locum_capture::hash::key(&wrong);
+        blobs.put(&key, &wrong).expect("store the wrong bytes");
+        let db = rusqlite::Connection::open(tampered.join("capture.db")).expect("tampered database");
+        db.execute(
+            "UPDATE results SET content = ?1 WHERE event = ?2",
+            rusqlite::params![key, event],
+        )
+        .expect("tamper with the output");
+        println!("outputs: tampered capture written, dispatch at event {event}");
+    }
     Ok(())
 }
 

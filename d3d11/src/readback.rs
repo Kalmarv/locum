@@ -66,6 +66,11 @@ pub fn subs(resource: &ID3D11Resource) -> Result<Vec<Sub>, String> {
     Err("not a buffer or texture".into())
 }
 
+/// The bytes a readback of `resource` holds: its subresources in the canonical layout.
+pub fn bytes(resource: &ID3D11Resource) -> Result<u64, String> {
+    Ok(subs(resource)?.iter().map(|s| s.size).sum())
+}
+
 /// Records a copy of `resource` into a new staging resource on `c`, whatever predicate `c` has set.
 ///
 /// # Safety
