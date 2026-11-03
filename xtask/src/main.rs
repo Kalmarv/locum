@@ -762,8 +762,9 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
                     && t.contains("1032")
                     && t.contains("(upload)")
                     && t.contains("(first-use)")
+                    && t.contains("topology: triangle list (4)")
             },
-            "locum-cli draw 0: ps b3 named Frame.value holding 1032; upload and first-use contents",
+            "locum-cli draw 0: ps b3 named Frame.value holding 1032; upload and first-use contents; topology named",
         ),
         (
             run(&["find", "32"]).contains("Frame.value.x"),

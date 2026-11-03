@@ -12,6 +12,7 @@ mod open;
 mod replay;
 mod resources;
 mod shaders;
+mod states;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

@@ -9,6 +9,7 @@ use rusqlite::types::Value;
 use crate::describe::{self, Reflection, STAGE_ORDER, register_name, shape, short, value};
 use crate::open::Capture;
 use crate::out;
+use crate::states;
 
 #[derive(Default)]
 pub struct Filter {
@@ -194,12 +195,12 @@ pub fn shader_of(c: &Capture, draw: i64, stage: &str) -> Option<String> {
     .flatten()
 }
 
-fn state_json(c: &Capture, id: i64) -> String {
+/// A state object, its enums named.
+fn state_text(c: &Capture, id: i64) -> String {
     c.row("SELECT kind, json FROM states WHERE id = ?1", [id], |r| {
-        Ok(format!(
-            "{} {}",
-            r.get::<_, String>(0)?,
-            r.get::<_, Option<String>>(1)?.unwrap_or_default()
+        Ok(states::describe(
+            &r.get::<_, String>(0)?,
+            r.get::<_, Option<String>>(1)?.as_deref(),
         ))
     })
     .unwrap_or_else(|| "?".into())
@@ -306,7 +307,7 @@ pub fn draw(c: &Capture, n: i64, all: bool) -> Result<(), String> {
     let (topology, layout, raster, blend, depth, factor, mask, stencil_ref, predicate, predicate_value) =
         fixed;
     if let Some(t) = topology {
-        out!("topology: {t}");
+        out!("topology: {}", states::topology(t));
     }
     for (name, id) in [
         ("input layout", layout),
@@ -315,7 +316,9 @@ pub fn draw(c: &Capture, n: i64, all: bool) -> Result<(), String> {
         ("depth-stencil", depth),
     ] {
         if let Some(id) = id {
-            out!("{name} #{id}: {}", state_json(c, id));
+            let text = state_text(c, id);
+            let gap = if text.starts_with('\n') { "" } else { " " };
+            out!("{name} #{id}:{gap}{text}");
         }
     }
     if blend.is_some() || factor.is_some() {
@@ -393,7 +396,7 @@ pub fn draw(c: &Capture, n: i64, all: bool) -> Result<(), String> {
             }
         }
         if let Some(s) = b.state {
-            line += &format!(" {}", state_json(c, s));
+            line += &format!(" #{s}: {}", state_text(c, s));
         }
         if let Some(r) = b.resource {
             match shape(c, r) {

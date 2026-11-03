@@ -12,6 +12,7 @@ use crate::describe::{Reflection, float, shape};
 use crate::draws::shader_of;
 use crate::open::Capture;
 use crate::out;
+use crate::states;
 
 /// A draw's identity, readable.
 fn identity(c: &Capture, n: i64) -> String {
@@ -170,26 +171,24 @@ fn differences(ca: &Capture, a: i64, cb: &Capture, b: i64, ra: &mut Reflection) 
             ));
         }
     }
-    // Fixed-function state, by its description.
-    let state = |c: &Capture, n: i64| -> Vec<(String, Option<String>)> {
+    // Fixed-function state, kind by kind: different when the descriptions differ (shown with their enums named); a
+    // kind one draw has no state object for is the API's default.
+    let state = |c: &Capture, n: i64| -> BTreeMap<String, String> {
         c.rows(
-            "SELECT s.kind, s.json FROM draws d JOIN states s ON s.id IN (d.rasterizer, d.blend, d.depth_stencil) \
-             WHERE d.n = ?1 ORDER BY s.kind",
+            "SELECT s.kind, s.json FROM draws d JOIN states s ON s.id IN (d.rasterizer, d.blend, d.depth_stencil)              WHERE d.n = ?1",
             [n],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
         )
+        .into_iter()
+        .collect()
     };
     let (sa, sb) = (state(ca, a), state(cb, b));
-    for (x, y) in sa.iter().zip(&sb) {
-        if x.0 == y.0 && x.1 != y.1 {
-            out.push((
-                x.0.clone(),
-                format!(
-                    "{} -> {}",
-                    x.1.as_deref().unwrap_or("-"),
-                    y.1.as_deref().unwrap_or("-")
-                ),
-            ));
+    let kinds: std::collections::BTreeSet<&String> = sa.keys().chain(sb.keys()).collect();
+    for kind in kinds {
+        let (x, y) = (sa.get(kind), sb.get(kind));
+        if x != y {
+            let text = |j: Option<&String>| j.map_or("default".into(), |j| states::describe(kind, Some(j)));
+            out.push((kind.clone(), format!("{} -> {}", text(x), text(y))));
         }
     }
     let viewport = |c: &Capture, n: i64| -> Vec<String> {
