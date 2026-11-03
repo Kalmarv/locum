@@ -200,8 +200,8 @@ pub fn constant_buffers(dxbc: &[u8]) -> Option<Vec<ConstantBuffer>> {
 const COMPONENTS: [&str; 4] = ["x", "y", "z", "w"];
 
 /// The name of the 4-byte value at `offset` in a variable of type `ty` called `name`, like `uvScale.y`,
-/// `bones[3][1].z` or `light.color.x`. HLSL packs arrays and structs in 16-byte registers.
-fn name_in(name: &str, ty: &Type, offset: u32) -> String {
+/// `bones[3][1].z` or `light.color.x`, and its base type. HLSL packs arrays and structs in 16-byte registers.
+fn name_in(name: &str, ty: &Type, offset: u32) -> (String, u16) {
     if ty.elements > 0 {
         let element = Type {
             elements: 0,
@@ -216,7 +216,7 @@ fn name_in(name: &str, ty: &Type, offset: u32) -> String {
             let member = ty.members.iter().rev().find(|m| m.offset <= offset);
             match member {
                 Some(m) => name_in(&format!("{name}.{}", m.name), &m.ty, offset - m.offset),
-                None => name.to_string(),
+                None => (name.to_string(), ty.base),
             }
         }
         2 | 3 => {
@@ -227,10 +227,13 @@ fn name_in(name: &str, ty: &Type, offset: u32) -> String {
             } else {
                 (minor, major)
             };
-            format!("{name}[{r}][{c}]")
+            (format!("{name}[{r}][{c}]"), ty.base)
         }
-        1 => format!("{name}.{}", COMPONENTS[((offset / 4) % 4) as usize]),
-        _ => name.to_string(),
+        1 => (
+            format!("{name}.{}", COMPONENTS[((offset / 4) % 4) as usize]),
+            ty.base,
+        ),
+        _ => (name.to_string(), ty.base),
     }
 }
 
@@ -253,6 +256,12 @@ fn element_stride(ty: &Type) -> u32 {
 impl ConstantBuffer {
     /// The name of the 4-byte value at `offset` bytes into the buffer, if a variable covers it.
     pub fn name_at(&self, offset: u32) -> Option<String> {
+        self.at(offset).map(|(name, _)| name)
+    }
+
+    /// The name of the 4-byte value at `offset` bytes into the buffer and its base type (`D3D_SHADER_VARIABLE_TYPE`:
+    /// 1 bool, 2 int, 3 float, 19 uint), if a variable covers it.
+    pub fn at(&self, offset: u32) -> Option<(String, u16)> {
         let v = self
             .variables
             .iter()
@@ -306,7 +315,7 @@ mod tests {
             elements: 0,
             members: Vec::new(),
         };
-        assert_eq!(name_in("world", &m, 36), "world[2][1]");
+        assert_eq!(name_in("world", &m, 36).0, "world[2][1]");
         assert_eq!(type_name_check(), "float4[4]");
     }
 

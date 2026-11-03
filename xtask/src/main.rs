@@ -117,6 +117,8 @@ fn smoke(root: &Path) {
             "locum-shim-dxgi",
             "-p",
             "locum-smoke",
+            "-p",
+            "locum-cli",
         ])
         .status()
         .expect("run cargo build");
@@ -142,7 +144,63 @@ fn smoke(root: &Path) {
 "
         ))
     );
-    std::process::exit(status.code().unwrap_or(1));
+    if !status.success() {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+    if !cli_checks(&release.join("locum-cli.exe"), &log_dir) {
+        std::process::exit(1);
+    }
+}
+
+/// Runs locum-cli on the smoke test's capture and checks what it says about it.
+fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
+    let capture = log_dir.join("captures").join("frame-32");
+    let run = |args: &[&str]| -> String {
+        let out = Command::new(cli)
+            .arg(args[0])
+            .arg(&capture)
+            .args(&args[1..])
+            .env("LOCUM_DIR", log_dir)
+            .output()
+            .expect("run locum-cli");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        println!(
+            "--- locum-cli {}
+{text}",
+            args.join(" ")
+        );
+        text
+    };
+    let checks = [
+        (
+            run(&["info"]).contains("3 draws and dispatches in 3 passes"),
+            "locum-cli info: three draws in three passes",
+        ),
+        (
+            {
+                let t = run(&["draw", "0"]);
+                t.contains("Frame.value")
+                    && t.contains("1032")
+                    && t.contains("(upload)")
+                    && t.contains("(end)")
+            },
+            "locum-cli draw 0: ps b3 named Frame.value holding 1032; contents from the upload and read at the end",
+        ),
+        (
+            run(&["find", "32"]).contains("Frame.value.x"),
+            "locum-cli find 32: the command list's constant, by name",
+        ),
+        (
+            run(&["events", "--kind", "map"]).contains("Unmap"),
+            "locum-cli events --kind map: the map in the command list",
+        ),
+    ];
+    let mut ok = true;
+    for (passed, what) in checks {
+        println!("{}  {what}", if passed { "ok  " } else { "FAIL" });
+        ok &= passed;
+    }
+    ok
 }
 
 fn generate_all(root: &Path) {

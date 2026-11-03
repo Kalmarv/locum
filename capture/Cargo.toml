@@ -17,3 +17,4 @@ windows = { workspace = true, features = [
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
 ] }
+texture2ddecoder = "0.1.2"

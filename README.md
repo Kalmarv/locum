@@ -96,15 +96,42 @@ Draws recorded on deferred contexts are placed where their command list is execu
 are copied by the GPU on the draw's own context, so each draw's constants and each pass's targets are the ones the
 GPU saw at that point of the frame.
 
+## Reading a capture
+
+`locum-cli` reads captures. A capture is named by its `capture.db`, its folder, its name under locum's folder, or
+`last`:
+
+```
+locum-cli captures                         # the captures in locum's folder, newest first
+locum-cli info last                        # what it holds, and what it is missing
+locum-cli draws last --ps 9f2c --pass 3    # draws, filtered by shader, pass, --uses/--target RESOURCE, --content KEY
+locum-cli draw last 120                    # one draw: state, everything bound, constants by name, targets after it
+locum-cli cb last 120 ps 3                 # a constant buffer, every register, named from the shader's reflection
+locum-cli find last 0.35                   # which constant holds 0.35, its name, and the draws that saw it
+locum-cli passes last
+locum-cli resources last --used --format BC7_UNORM
+locum-cli resource last 812                # where it was made (call stack), hashes, views, draws, events
+locum-cli events last --kind copy          # the timeline; --resource N for what touched one resource
+locum-cli shader last 9f2c -d              # constant buffers and disassembly
+locum-cli export last 812 -o tex.dds       # contents as the frame began: .dds (all of it), .png (one mip), or raw
+locum-cli target last 120 rt0 -o gbuf0.png # a target read back after a pass
+locum-cli sql last "SELECT ..."            # anything else
+```
+
+Constants are named from each shader's reflection, as `cbuffer.variable[index].component`. PNGs of depth and other
+one-channel images are stretched from their smallest to largest value, float colour is tone-mapped, and `--range
+LO:HI` sets the mapping.
+
 ## Building
 
 ```
 cargo build --release
 ```
 
-The DLLs are `target/release/locum.dll`, `d3d11.dll` and `dxgi.dll`. Regenerate the vtables after changing the
+The DLLs are `target/release/locum.dll`, `d3d11.dll` and `dxgi.dll`, and the reader `target/release/locum-cli.exe`. Regenerate the vtables after changing the
 `windows` version with `cargo xtask gen`. `cargo xtask smoke` builds everything and runs a small Direct3D program
-through locum's DLLs, checking identity, deferred contexts, a capture and overrides.
+through locum's DLLs, checking identity, deferred contexts, a capture and overrides, then reads the capture with
+`locum-cli`.
 
 ## References
 

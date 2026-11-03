@@ -25,6 +25,14 @@ struct Content {
     note: Option<String>,
 }
 
+/// The ids without repeats, in order.
+fn sorted(ids: &[u64]) -> Vec<u64> {
+    let mut v = ids.to_vec();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
 /// Reads everything back and hands the capture to the writer. Runs on the presenting thread after the real Present.
 pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     let started = std::time::Instant::now();
@@ -194,6 +202,8 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             args: e.args.to_string(),
             data: e.data.clone(),
             stack,
+            reads: sorted(&e.reads),
+            writes: sorted(&e.writes),
         });
         let Some(d) = e.draw.as_deref_mut() else { continue };
         for cb in &d.cb_copies {

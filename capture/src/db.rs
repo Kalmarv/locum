@@ -54,6 +54,8 @@ CREATE TABLE shaders(hash TEXT PRIMARY KEY, stage TEXT NOT NULL, blob TEXT, size
 -- resource (clears, copies, updates, maps, resolves, mips). data: key of the bytes an update or map wrote.
 CREATE TABLE events(seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, call TEXT NOT NULL, context INTEGER,
   deferred INTEGER, list INTEGER, draw INTEGER, args TEXT, data TEXT, stack INTEGER);
+-- The resources each event read and wrote (a draw: what it had bound to read, and its targets and UAVs).
+CREATE TABLE event_resources(event INTEGER NOT NULL, resource INTEGER NOT NULL, access TEXT NOT NULL);
 CREATE TABLE draws(n INTEGER PRIMARY KEY, event INTEGER NOT NULL, call TEXT NOT NULL, args TEXT, pass INTEGER,
   vs TEXT, hs TEXT, ds TEXT, gs TEXT, ps TEXT, cs TEXT,
   topology INTEGER, layout INTEGER, rasterizer INTEGER, blend INTEGER, depth_stencil INTEGER,
@@ -81,6 +83,7 @@ CREATE INDEX bindings_content ON bindings(content);
 CREATE INDEX draws_vs ON draws(vs);
 CREATE INDEX draws_ps ON draws(ps);
 CREATE INDEX events_kind ON events(kind);
+CREATE INDEX event_resources_resource ON event_resources(resource);
 CREATE INDEX resources_upload ON resources(upload);
 CREATE INDEX resources_content ON resources(content);
 CREATE INDEX subresources_hash ON subresources(hash);
@@ -173,6 +176,8 @@ pub struct Event {
     pub args: String,
     pub data: Option<String>,
     pub stack: Option<u64>,
+    pub reads: Vec<u64>,
+    pub writes: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -415,6 +420,14 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
                 e.data,
                 opt_i64(e.stack)
             ])?;
+        }
+        let mut s = tx.prepare("INSERT INTO event_resources VALUES(?1,?2,?3)")?;
+        for e in &capture.events {
+            for (ids, access) in [(&e.reads, "read"), (&e.writes, "write")] {
+                for &id in ids {
+                    s.execute(params![e.seq as i64, id as i64, access])?;
+                }
+            }
         }
         let mut s = tx.prepare(
             "INSERT INTO draws VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",

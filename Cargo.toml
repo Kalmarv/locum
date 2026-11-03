@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["capture", "locum", "shims/d3d11", "shims/dxgi", "smoke", "xtask"]
+members = ["capture", "cli", "locum", "shims/d3d11", "shims/dxgi", "smoke", "xtask"]
 
 [workspace.package]
 version = "0.1.0"

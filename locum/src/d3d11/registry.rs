@@ -246,7 +246,7 @@ unsafe fn register(
     let id = next_id();
     set_id(&child, id, 0);
     let mut entry = Entry {
-        created_frame: created.then(crate::dxgi::frames),
+        created_frame: created.then(crate::dxgi::frame),
         created_stack: if created { stacks::capture() } else { Vec::new() },
         ..Default::default()
     };
@@ -424,7 +424,7 @@ pub unsafe fn updated(
     let stack = stacks::capture();
     if let Some(e) = entries().as_mut().and_then(|e| e.get_mut(&id)) {
         e.update_count += 1;
-        e.updated_frame = Some(crate::dxgi::frames());
+        e.updated_frame = Some(crate::dxgi::frame());
         e.updated_stack = stack;
         if let Some(slot) = e.sub_hashes.get_mut(sub as usize) {
             // A partial update leaves the subresource's bytes unknown.

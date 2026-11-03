@@ -496,9 +496,10 @@ impl SwapChain {
 
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-/// Frames presented so far.
-pub fn frames() -> u64 {
-    FRAMES.load(Ordering::Relaxed)
+/// The frame being made: 1 until the first present, then the number of the present that will end it (captures name
+/// frames the same way).
+pub fn frame() -> u64 {
+    FRAMES.load(Ordering::Relaxed) + 1
 }
 
 /// Counts a frame and logs the frame rate every 600.
