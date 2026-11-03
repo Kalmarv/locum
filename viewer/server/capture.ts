@@ -107,21 +107,61 @@ export interface Group {
   count: number;
 }
 
+/**
+ * How long a capture.db stays open after its last query. On Windows an open handle stops whatever wrote the capture
+ * from replacing it (a smoke run, a new capture of the same name), so the viewer holds it only while it reads.
+ */
+const IDLE_MS = 1500;
+
 export class Capture {
-  readonly db: Database;
+  private handle: Database | null = null;
+  private idle: ReturnType<typeof setTimeout> | null = null;
+  /** The file's mtime and size when it was last opened: when they change, what was read from it is dropped. */
+  private stamp = "";
   private reflection = new Map<string, ConstantBuffer[] | null>();
   private timelineCache: { rows: TimelineRow[]; groups: Group[] } | null = null;
   private modulesCache: { path: string; base: bigint; size: bigint }[] | null = null;
-  readonly targetEventColumn: boolean;
-  /** Captures before the `results` table (what order-dependent shaders wrote) lack it. */
-  readonly hasResults: boolean;
+  private features: { targetEvent: boolean; results: boolean } | null = null;
 
-  constructor(readonly id: string, readonly path: string, readonly blobs: string, readonly label: string) {
-    this.db = new Database(path, { readonly: true });
-    this.db.exec("PRAGMA query_only = ON");
-    const cols = this.all("PRAGMA table_info(targets)").map(r => r.name);
-    this.targetEventColumn = cols.includes("event");
-    this.hasResults = this.count("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'results'") > 0;
+  constructor(readonly id: string, readonly path: string, readonly blobs: string, readonly label: string) {}
+
+  /** The database, opened on first use and closed again once idle. */
+  private get db(): Database {
+    if (!this.handle) {
+      const st = statSync(this.path);
+      const stamp = `${st.mtimeMs}-${st.size}`;
+      if (stamp !== this.stamp) {
+        this.stamp = stamp;
+        this.reflection.clear();
+        this.timelineCache = null;
+        this.modulesCache = null;
+        this.features = null;
+      }
+      this.handle = new Database(this.path, { readonly: true });
+      this.handle.exec("PRAGMA query_only = ON");
+    }
+    if (this.idle) clearTimeout(this.idle);
+    this.idle = setTimeout(() => this.close(), IDLE_MS);
+    return this.handle;
+  }
+
+  private schema() {
+    const db = this.db; // opened first, so a replaced file's schema is read afresh
+    this.features ??= {
+      targetEvent: db.query("PRAGMA table_info(targets)").all().some((r: any) => r.name === "event"),
+      results: !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'results'").get(),
+    };
+    return this.features;
+  }
+
+  /** Older captures' targets table has no `event` column (the event their readback followed). */
+  get targetEventColumn(): boolean {
+    return this.schema().targetEvent;
+  }
+
+  /** Captures before the `results` table (what order-dependent shaders wrote) lack it. */
+  get hasResults(): boolean {
+    return this.schema().results;
   }
 
   all(sql: string, ...params: SQLQueryBindings[]): Row[] {
@@ -723,19 +763,26 @@ export class Capture {
   sql(text: string, limit = 2000) {
     const started = performance.now();
     const stmt = this.db.prepare(text);
-    const columns = stmt.columnNames;
-    const rows: any[][] = [];
-    let truncated = false;
-    for (const row of stmt.iterate() as Iterable<Row>) {
-      if (rows.length >= limit) { truncated = true; break; }
-      rows.push(columns.map(c => cell(row[c])));
+    try {
+      const columns = stmt.columnNames;
+      const rows: any[][] = [];
+      let truncated = false;
+      for (const row of stmt.iterate() as Iterable<Row>) {
+        if (rows.length >= limit) { truncated = true; break; }
+        rows.push(columns.map(c => cell(row[c])));
+      }
+      return { columns, rows, truncated, ms: Math.round(performance.now() - started) };
+    } finally {
+      stmt.finalize();
     }
-    stmt.finalize();
-    return { columns, rows, truncated, ms: Math.round(performance.now() - started) };
   }
 
+  /** Closes the database; the next query opens it again. */
   close() {
-    this.db.close();
+    if (this.idle) clearTimeout(this.idle);
+    this.idle = null;
+    this.handle?.close();
+    this.handle = null;
   }
 }
 

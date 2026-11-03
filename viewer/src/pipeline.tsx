@@ -295,7 +295,8 @@ function Results({ results }: { results: ResultOut[] }) {
   return (
     <Section title={`order-dependent: output recorded for ${results.map(r => `#${r.resource.id}`).join(", ")}`}>
       <div class="muted small">its shader's writes depend on the order the GPU runs threads in, so the capture keeps what
-        the game's GPU wrote; replay compares its own output with this and goes on from it</div>
+        the game's GPU wrote; replay says how its own output compared (identical, the same records in another order, or
+        different in more than order) and then puts these bytes in place and goes on from them</div>
       {results.map(r => (
         <div class="result-out">
           <div><ResLink r={r.resource} /> <span class="muted">contents right after it, {short(r.content, 16)}{r.size == null ? ", not in the blob store" : `, ${r.size.toLocaleString()} bytes`}</span></div>

@@ -191,9 +191,12 @@ function parseSource(text: string | null): Source {
   throw new HttpError(400, `bad source ${text}`);
 }
 
+/** Where outputs of locum-cli for a capture are kept: a new capture file or a rebuilt locum-cli starts afresh. */
 function cacheDir(c: Capture): string {
   const st = statSync(c.path);
-  return join(cacheRoot, "img", `${c.id}-${Math.round(st.mtimeMs)}-${st.size}`);
+  const exe = cli.exe && existsSync(cli.exe) ? statSync(cli.exe) : null;
+  const tool = exe ? `${Math.round(exe.mtimeMs).toString(36)}${exe.size.toString(36)}` : "none";
+  return join(cacheRoot, "img", `${c.id}-${Math.round(st.mtimeMs)}-${st.size}-${tool}`);
 }
 
 const RANGE = /^(auto|clamp|tonemap|-?[0-9.eE+-]+:-?[0-9.eE+-]+)$/;
@@ -326,6 +329,7 @@ async function api(req: Request, url: URL): Promise<Response> {
       if (req.method !== "POST") {
         return json({ text: existsSync(out) ? readFileSync(out, "utf8") : null });
       }
+      if (q.get("again")) rmSync(out, { force: true });
       // Verify's report matters most when targets differ, which it reports with a failing exit code.
       await cli.cached(out, async tmp => {
         const r = await cli.runAll(["verify", c.path, "--blobs", c.blobs], 30 * 60_000);

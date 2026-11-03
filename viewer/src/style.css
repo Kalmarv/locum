@@ -88,7 +88,7 @@ pre.schema { font-size: 11px; max-height: 300px; white-space: pre-wrap; }
 .kinds { display: flex; flex-wrap: wrap; gap: 2px 8px; align-items: center; }
 .kinds label { display: inline-flex; gap: 3px; align-items: center; }
 .filter-fields { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-.filter-fields input { width: 104px; }
+.filter-fields input:not([type=checkbox]) { width: 104px; }
 .rows { flex: 1; overflow-y: auto; overflow-x: hidden; position: relative; font-family: var(--mono); font-size: 12px; }
 .rows.plain { font-family: inherit; }
 .row { position: absolute; left: 0; right: 0; height: 20px; line-height: 20px; display: flex; gap: 8px; padding: 0 8px; white-space: nowrap; overflow: hidden; color: var(--text); cursor: pointer; }

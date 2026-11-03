@@ -49,11 +49,11 @@ function Verify() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const prior = useAsync(() => get<{ text: string | null }>(`c/${id}/verify`), [id, run]);
-  async function start() {
+  async function start(again = false) {
     setBusy(true);
     setError(null);
     try {
-      await post(`c/${id}/verify`, {});
+      await post(`c/${id}/verify${again ? "?again=1" : ""}`, {});
     } catch (e) {
       setError(String((e as Error).message ?? e));
     } finally {
@@ -63,12 +63,13 @@ function Verify() {
   }
   return (
     <Section title="verify (replay the frame and compare every target)" open={!!prior.data?.text}>
-      {prior.data?.text ? <pre class="verify">{prior.data.text}</pre> : (
-        <div>
-          <button onClick={start} disabled={busy}>{busy ? "replaying… (this runs the whole frame on the GPU)" : "run locum-cli verify"}</button>
-          {error ? <pre class="error">{error}</pre> : null}
-        </div>
-      )}
+      {prior.data?.text ? <pre class="verify">{prior.data.text}</pre> : null}
+      <div>
+        <button onClick={() => start(!!prior.data?.text)} disabled={busy}>
+          {busy ? "replaying… (this runs the whole frame on the GPU)" : prior.data?.text ? "run it again" : "run locum-cli verify"}
+        </button>
+        {error ? <pre class="error">{error}</pre> : null}
+      </div>
     </Section>
   );
 }
