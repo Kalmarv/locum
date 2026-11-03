@@ -134,8 +134,18 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             }
             let Some(rb) = t.first_write.take() else { continue };
             let note = match (first_writer.get(&id), copies.get(&id).copied().unwrap_or(0)) {
-                (_, 0) => {
-                    Some("copied before a write in a command list the frame never executed".to_string())
+                // The copy is in a command list the frame never executed, so it never ran on the timeline. If no
+                // event the frame ran wrote the resource, the frame left it as it began, and it is read at the end
+                // (below); if one did, nothing copied it before that write.
+                (None, 0) => continue,
+                (Some(&i), 0) => {
+                    content.insert(
+                        id,
+                        Err(format!(
+                            "event {i} wrote it, and its only copy before a write is in a command list the frame                              never executed"
+                        )),
+                    );
+                    continue;
                 }
                 (Some(&i), _) if !timeline[i].first_writes.contains(&id) => Some(format!(
                     "event {i} wrote it before the command list holding its copy ran: contents may include that write"

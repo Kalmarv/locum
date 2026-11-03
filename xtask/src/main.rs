@@ -254,6 +254,33 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
             },
             "locum-cli diff: a capture against itself matches every draw and finds nothing different",
         ),
+        (
+            {
+                let index = |folder: &str| {
+                    let out = log_dir.join("files").join(format!("{folder}.db"));
+                    let _ = std::fs::remove_file(&out);
+                    let made = Command::new(cli)
+                        .args(["index", "-o"])
+                        .arg(&out)
+                        .arg(log_dir.join("files").join(folder))
+                        .output()
+                        .expect("run locum-cli index");
+                    println!(
+                        "--- locum-cli index {folder}
+{}",
+                        String::from_utf8_lossy(&made.stdout)
+                    );
+                    out.display().to_string()
+                };
+                let (whole, part) = (index("whole"), index("from-mip-1"));
+                let t = run(&["join", "--index", &whole]);
+                let u = run(&["join", "--index", &part]);
+                t.contains("texture.dds (upload)")
+                    && t.contains("textures the frame used: 1 of 1 named")
+                    && u.contains("texture.dds (2 of 3 subresources: mips 1..=2 are the file's mips 0..=1)")
+            },
+            "locum-cli join: the texture named by its file whole, and by a file holding its mips from the second on",
+        ),
     ];
     let mut ok = true;
     for (passed, what) in checks {

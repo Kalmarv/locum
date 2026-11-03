@@ -1,9 +1,10 @@
 //! Every resource the game creates, from its creation to its destruction: a number, its description, the stack that
 //! created it, and the hash of the data it was created with (written to the blob store with `uploads store`). Updates
-//! that cover a whole subresource are hashed the same way, except those of constant buffers outside a capture: those
-//! are rewritten many times a frame, their bytes match no file, and a capture records its own. A capture lists every
-//! live resource from here, and takes the contents of the immutable ones it uses from their upload instead of reading
-//! them back.
+//! that cover a whole subresource are hashed the same way, except, outside a capture, those of per-frame data: a
+//! constant buffer, or a resource already updated in this frame or the last. Those are rewritten many times a second
+//! (Sekiro: thousands of updates a frame), their bytes match no file, and a capture records its own. A capture lists
+//! every live resource from here, and takes the contents of the immutable ones it uses from their upload instead of
+//! reading them back.
 //!
 //! Nothing here holds a reference to a resource: entries are keyed by number and removed by the runtime's
 //! destruction callback, so the registry never keeps a resource alive or touches a dead one.
@@ -389,15 +390,17 @@ unsafe fn update_entry(
 ) -> (Option<(Vec<u8>, String)>, u64) {
     let id = id_of(resource);
     // Counted, and what the rest needs taken, under one lock.
-    let (kind, format, whole, constant) = {
+    let (kind, format, whole, per_frame) = {
         let mut entries = entries();
         let Some(e) = entries.as_mut().and_then(|e| e.get_mut(&id)) else {
             return (None, 0);
         };
+        let frame = crate::dxgi::frame();
+        let per_frame = e.dims.bind & D3D11_BIND_CONSTANT_BUFFER.0 as u32 != 0
+            || e.updated_frame.is_some_and(|f| f + 1 >= frame);
         e.update_count += 1;
-        e.updated_frame = Some(crate::dxgi::frame());
-        let constant = e.dims.bind & D3D11_BIND_CONSTANT_BUFFER.0 as u32 != 0;
-        if constant && !keep {
+        e.updated_frame = Some(frame);
+        if per_frame && !keep {
             // Its bytes are unknown from here; a capture reads them back.
             if let Some(slot) = e.sub_hashes.get_mut(sub as usize) {
                 *slot = None;
@@ -407,7 +410,7 @@ unsafe fn update_entry(
         let Some(&whole) = e.subs.get(sub as usize) else {
             return (None, 0);
         };
-        (e.dims.kind, e.dims.format, whole, constant)
+        (e.dims.kind, e.dims.format, whole, per_frame)
     };
     let f = locum_capture::format::layout(format).unwrap_or(locum_capture::format::Layout {
         block_width: 1,
@@ -455,8 +458,8 @@ unsafe fn update_entry(
     } else {
         (row_pitch as usize, depth_pitch as usize)
     };
-    // Stored for the join with files: whole uploads of anything but constant buffers.
-    let store = covers && !constant && settings().uploads == Uploads::Store;
+    // Stored for the join with files: whole uploads of what is not per-frame data.
+    let store = covers && !per_frame && settings().uploads == Uploads::Store;
     let hashing = covers && settings().uploads != Uploads::Off;
     let mut out = None;
     let mut new_hash = None;
@@ -478,8 +481,8 @@ unsafe fn update_entry(
             writer::blob(&settings().blobs, k, bytes, false);
         }
     }
-    // A constant buffer's updates are a capture's events, each with its own stack.
-    let stack = (!constant).then(stacks::capture);
+    // Per-frame data's updates are a capture's events, each with its own stack.
+    let stack = (!per_frame).then(stacks::capture);
     if let Some(e) = entries().as_mut().and_then(|e| e.get_mut(&id)) {
         if let Some(stack) = stack {
             e.updated_stack = stack;

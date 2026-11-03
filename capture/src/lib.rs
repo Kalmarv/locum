@@ -9,6 +9,7 @@ pub mod db;
 pub mod dds;
 pub mod format;
 pub mod hash;
+pub mod index;
 pub mod layout;
 pub mod rdef;
 pub mod rules;

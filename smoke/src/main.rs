@@ -273,6 +273,14 @@ fn deferred_value(frame: u32) -> f32 {
     frame as f32
 }
 
+/// What a command list recorded in `frame` maps into the dynamic vertex buffer the frame's draws read.
+fn dynamic_vertex_value(frame: u32) -> f32 {
+    frame as f32 * 3.0 + 7.0
+}
+
+/// The frame whose command list fills the dynamic vertex buffer last before the capture.
+const DYNAMIC_FILLED: u32 = CAPTURED - 5;
+
 /// A 64x64 render target of the swap chain's format, and its view.
 fn target(device: &ID3D11Device) -> Result<(ID3D11Texture2D, ID3D11RenderTargetView)> {
     let desc = D3D11_TEXTURE2D_DESC {
@@ -446,7 +454,21 @@ fn constant_buffer(device: &ID3D11Device, dynamic: bool) -> Result<ID3D11Buffer>
     Ok(buffer.expect("buffer"))
 }
 
-/// Writes `value` four times to a dynamic constant buffer with Map(WRITE_DISCARD) on `c`.
+/// A 16-byte dynamic vertex buffer.
+fn dynamic_vertex_buffer(device: &ID3D11Device) -> Result<ID3D11Buffer> {
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: 16,
+        Usage: D3D11_USAGE_DYNAMIC,
+        BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
+        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        ..Default::default()
+    };
+    let mut buffer = None;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }?;
+    Ok(buffer.expect("buffer"))
+}
+
+/// Writes `value` four times to a dynamic buffer with Map(WRITE_DISCARD) on `c`.
 fn write_dynamic(c: &ID3D11DeviceContext, cb: &ID3D11Buffer, value: f32) -> Result<()> {
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
     unsafe {
@@ -578,6 +600,27 @@ fn capture(
     let (_b, target_b) = target(device)?;
     let (_texture, texture_view, texture_bytes) = uploaded_texture(device)?;
     let (vertices, vertex_bytes) = immutable_buffer(device)?;
+    let dynamic_vertices = dynamic_vertex_buffer(device)?;
+    // The texture as files for locum-cli's index: whole, and from its second mip on (as a game that skips its top
+    // mip would have it).
+    let texture_file = |mips: u32, first: usize| {
+        let t = locum_capture::dds::Texture {
+            format: DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32,
+            dimensions: 2,
+            width: 5 >> first,
+            height: (3 >> first).max(1),
+            depth: 1,
+            mips,
+            array: 1,
+            cube: false,
+        };
+        locum_capture::dds::file(&t, &texture_bytes[[0, 60][first]..])
+    };
+    for (folder, bytes) in [("whole", texture_file(3, 0)), ("from-mip-1", texture_file(2, 1))] {
+        let d = dir.join("files").join(folder);
+        std::fs::create_dir_all(&d).expect("make the files folder");
+        std::fs::write(d.join("texture.dds"), bytes).expect("write the texture's file");
+    }
 
     let _ = std::fs::remove_dir_all(dir.join("captures").join(format!("frame-{CAPTURED}")));
     std::fs::write(dir.join("capture"), b"").expect("write the capture request");
@@ -596,9 +639,21 @@ fn capture(
                 immediate.ExecuteCommandList(&list, false);
             }
 
+            // A command list that fills the dynamic vertex buffer: executed a few frames before the capture; in
+            // the captured frame recorded and never executed, so its map is not what the frame's draws read.
+            if frame == DYNAMIC_FILLED || frame == CAPTURED {
+                write_dynamic(deferred, &dynamic_vertices, dynamic_vertex_value(frame))?;
+                let mut fill = None;
+                deferred.FinishCommandList(false, Some(&mut fill))?;
+                if frame == DYNAMIC_FILLED {
+                    immediate.ExecuteCommandList(fill.as_ref(), false);
+                }
+            }
+
             // The next frame's command list.
             write_dynamic(deferred, &deferred_cb, deferred_value(frame + 1))?;
             sh.bind(deferred, back, &deferred_cb);
+            deferred.IASetVertexBuffers(0, 1, Some(&Some(dynamic_vertices.clone())), Some(&16), Some(&0));
             deferred.Draw(3, 0);
             deferred.OMSetRenderTargets(Some(&[Some(target_b.clone())]), None);
             deferred.Draw(3, 0);
@@ -813,6 +868,16 @@ fn capture(
         )
         .unwrap_or(i64::MAX);
     checks.check(unread == 0, "contents: every resource the frame used has them");
+    let dynamic = resource(
+        "SELECT r.id, r.content, r.content_source, r.upload FROM resources r JOIN bindings b ON b.resource = r.id          WHERE b.draw = 1 AND b.kind = 'vb' AND b.slot = 0",
+    );
+    println!("dynamic vertex buffer: {dynamic:?}");
+    checks.check(
+        dynamic.is_some_and(|v| {
+            v.2.as_deref() == Some("end") && blob(v.1) == Some(cb_bytes(dynamic_vertex_value(DYNAMIC_FILLED)))
+        }),
+        "contents: a dynamic vertex buffer the frame only read holds what it was last filled with, not what a          command list recorded in the frame and never executed maps into it",
+    );
     let shader_blobs: Vec<Option<String>> = db
         .prepare("SELECT blob FROM shaders")
         .and_then(|mut q| q.query_map([], |r| r.get(0))?.collect())

@@ -6,6 +6,7 @@ mod diff;
 mod draws;
 mod export;
 mod info;
+mod join;
 mod memory;
 mod open;
 mod replay;
@@ -24,6 +25,10 @@ struct Cli {
     /// The blob store (default: LOCUM_BLOBS, or the one the capture names).
     #[arg(long, global = true)]
     blobs: Option<PathBuf>,
+    /// An index of files (`locum-cli index`) naming what resources were made from; repeat for several (default:
+    /// LOCUM_INDEX, paths separated by ';').
+    #[arg(long, global = true)]
+    index: Vec<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -281,6 +286,26 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
+    /// Adds DDS files (each file given, and every one under each folder given) to an index of files by the keys of
+    /// their bytes, made if there is none.
+    Index {
+        /// The index to make or add to.
+        #[arg(short, long)]
+        out: PathBuf,
+        inputs: Vec<PathBuf>,
+    },
+    /// What each resource the frame used was made from, by the indexes given (--index).
+    Join {
+        capture: String,
+        /// Every resource alive at the capture, not only those the frame used.
+        #[arg(long)]
+        all: bool,
+        /// List those not found instead.
+        #[arg(long)]
+        unnamed: bool,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
     /// Any SQL on the capture; rows tab-separated.
     Sql { capture: String, query: String },
 }
@@ -319,7 +344,8 @@ fn sql(c: &open::Capture, query: &str) -> Result<(), String> {
 
 fn run(cli: Cli) -> Result<(), String> {
     let blobs = cli.blobs.as_deref();
-    let open = |name: &str| open::open(name, blobs);
+    let indexes = join::paths(&cli.index);
+    let open = |name: &str| open::open(name, blobs)?.named(&indexes);
     match cli.command {
         Command::Captures { dir } => info::captures(&dir.unwrap_or_else(open::locum_dir), blobs),
         Command::Info { capture } => info::info(&open(&capture)?),
@@ -515,6 +541,13 @@ fn run(cli: Cli) -> Result<(), String> {
             memory::memdiff(&a, &b, from, to, tolerance, limit)
         }
         Command::Diff { a, b, draws, limit } => diff::diff(&open(&a)?, &open(&b)?, draws, limit),
+        Command::Index { out, inputs } => join::index(&out, &inputs),
+        Command::Join {
+            capture,
+            all,
+            unnamed,
+            limit,
+        } => join::join(&open(&capture)?, all, unnamed, limit),
         Command::Sql { capture, query } => sql(&open(&capture)?, &query),
     }
 }

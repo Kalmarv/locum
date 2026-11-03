@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::join::Names;
 use locum_capture::blobs::Blobs;
 use rusqlite::{Connection, OpenFlags, Params, Row};
 
@@ -19,6 +20,8 @@ pub struct Capture {
     pub db: Connection,
     pub path: PathBuf,
     pub blobs: Blobs,
+    /// What its resources were made from, by the indexes given.
+    pub names: Names,
 }
 
 /// The captures under `dir/captures`, newest first.
@@ -90,10 +93,17 @@ pub fn open(arg: &str, blobs: Option<&Path>) -> Result<Capture, String> {
         db,
         path,
         blobs: Blobs::new(root),
+        names: Names::default(),
     })
 }
 
 impl Capture {
+    /// The capture, naming its resources from the indexes at `paths`.
+    pub fn named(mut self, paths: &[PathBuf]) -> Result<Capture, String> {
+        self.names = Names::open(paths)?;
+        Ok(self)
+    }
+
     pub fn meta(&self, key: &str) -> Option<String> {
         self.db
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))

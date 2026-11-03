@@ -400,6 +400,9 @@ pub fn draw(c: &Capture, n: i64, all: bool) -> Result<(), String> {
                 Some(s) => line += &format!(" -> {s}"),
                 None => line += &format!(" -> #{r}"),
             }
+            if let Some(m) = c.names.of(c, r) {
+                line += &format!(" = {}", m.file.name);
+            }
         }
         if let Some(o) = b.offset.filter(|&o| o != 0) {
             line += &format!(" offset {o}");

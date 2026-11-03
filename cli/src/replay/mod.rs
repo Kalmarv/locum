@@ -119,15 +119,21 @@ pub fn plan(c: &Capture, target: i64, mode: Mode) -> Plan {
             events.reverse();
         }
     }
-    // Everything a draw has bound, and the resource of every view an event names.
-    for &seq in &events {
-        let bound: Vec<i64> = c.rows(
-            "SELECT DISTINCT b.resource FROM bindings b JOIN draws d ON d.n = b.draw WHERE d.event = ?1 \
-             AND b.resource IS NOT NULL AND b.kind <> 'cb'",
-            [seq],
-            |r| r.get(0),
-        );
-        resources.extend(bound);
+    // Everything a draw has bound, and the resource of every view an event names, in one query (one per event
+    // scans the bindings once per event: minutes on a game's frame).
+    let mut bound: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    for (event, resource) in c.rows(
+        "SELECT DISTINCT d.event, b.resource FROM bindings b JOIN draws d ON d.n = b.draw \
+         WHERE b.resource IS NOT NULL AND b.kind <> 'cb'",
+        [],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    ) {
+        bound.entry(event).or_default().push(resource);
+    }
+    for seq in &events {
+        if let Some(b) = bound.get(seq) {
+            resources.extend(b);
+        }
     }
     Plan { events, resources }
 }
@@ -508,7 +514,9 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
         .row("SELECT max(seq) FROM events", [], |r| r.get::<_, Option<i64>>(0))
         .flatten()
         .ok_or("the capture has no events")?;
+    let started = std::time::Instant::now();
     let plan = plan(c, last, Mode::Frame);
+    let planned = started.elapsed();
     let checks: Vec<(i64, i64, String, i64, String, i64)> = c.rows(
         "SELECT t.draw, d.event, t.target, t.resource, t.blob, coalesce(t.sub, 0) FROM targets t \
          JOIN draws d ON d.n = t.draw WHERE t.blob IS NOT NULL AND t.resource IS NOT NULL ORDER BY d.event",
@@ -521,6 +529,7 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
         plan.resources.len(),
         checks.len()
     );
+    let started = std::time::Instant::now();
     let mut b = backend(c, warp)?;
     for &id in &plan.resources {
         let key: Option<String> = c
@@ -533,6 +542,11 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
         b.create(c, id, contents.as_deref())
             .map_err(|e| format!("resource #{id}: {e}"))?;
     }
+    out!(
+        "planned in {:.1} s; device and resources made in {:.1} s",
+        planned.as_secs_f64(),
+        started.elapsed().as_secs_f64()
+    );
     let mut next = 0;
     let (mut same, mut compared) = (0, 0);
     let t = std::time::Instant::now();

@@ -204,6 +204,9 @@ pub fn resource(c: &Capture, id: i64) -> Result<(), String> {
         (Some(u), false) => out!("upload {u} (hash only)"),
         _ => out!("no upload hash (created without data, or updated in parts)"),
     }
+    if let Some(m) = c.names.of(c, id) {
+        out!("made from {m}");
+    }
     if updates > 0 {
         out!(
             "updated {updates} times, last at frame {}",
