@@ -419,7 +419,7 @@ fn execute(
     let mut settled = 0;
     for &seq in &plan.events {
         b.run(c, seq, rules).map_err(|e| format!("event {seq}: {e}"))?;
-        settled += settle(c, b.as_mut(), &written, seq, false)
+        settled += settle(c, b.as_mut(), &written, seq, false, None)
             .map_err(|e| format!("event {seq}: {e}"))?
             .iter()
             .filter(|s| s.ordered)
@@ -502,18 +502,25 @@ struct Compared {
     settled: Settled,
 }
 
-/// After event `seq` ran, compares what it wrote through UAVs with what the game's GPU wrote. Where they differ, the
-/// game's bytes are put in place for order-dependent outputs always, and for every output when `all`: everything
-/// after then follows the order the game's GPU took, and starts from the game's state, so a difference later is that
-/// later event's own. An order-dependent output can hold the same records in another order, or differ in more than
-/// order: a shader that writes what its atomics returned (an offset into a list it allocates from, say) writes other
-/// values when its threads run in another order. Any other output is identical or differs.
+/// Writes bytes `verify --out` keeps.
+fn kept(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// After event `seq` ran, compares what it wrote through UAVs with what the game's GPU wrote. Where they differ, both
+/// are written to `keep` when given, and the game's bytes are put in place for order-dependent outputs always, and for
+/// every output when `all`: everything after then follows the order the game's GPU took, and starts from the game's
+/// state, so a difference later is that later event's own. An order-dependent output can hold the same records in
+/// another order, or differ in more than order: a shader that writes what its atomics returned (an offset into a list
+/// it allocates from, say) writes other values when its threads run in another order. Any other output is identical
+/// or differs.
 fn settle(
     c: &Capture,
     b: &mut dyn Backend,
     written: &HashMap<i64, Vec<Written>>,
     seq: i64,
     all: bool,
+    keep: Option<&Path>,
 ) -> Result<Vec<Compared>, String> {
     let Some(written) = written.get(&seq) else {
         return Ok(Vec::new());
@@ -551,8 +558,15 @@ fn settle(
                 game.len().div_ceil(stride)
             ))
         };
-        if !matches!(settled, Settled::Identical) && (w.ordered || all) {
-            b.write(c, w.resource, &game)?;
+        if !matches!(settled, Settled::Identical) {
+            if let Some(dir) = keep {
+                let file = |side: &str| dir.join(format!("event-{seq}-{}.{side}.bin", w.resource));
+                kept(&file("replay"), &mine)?;
+                kept(&file("game"), &game)?;
+            }
+            if w.ordered || all {
+                b.write(c, w.resource, &game)?;
+            }
         }
         out.push(Compared {
             resource: w.resource,
@@ -755,7 +769,19 @@ const CHECKS: &str = "'evidence', 'targets', 'outputs', 'memory'";
 
 /// Replays the whole frame and compares every target the capture read back with the replay's at the same point. Fails
 /// unless every target compared is identical and nothing kept the capture or the replay from being complete.
-pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Result<(), String> {
+/// With `keep`, each output and target that differs is written there: the replay's and the game's bytes
+/// (`event-<seq>-<resource>.{replay,game}.bin`, `draw-<n>-<target>.{replay,game}.bin`), and for a target its two
+/// pictures and where they differ (`.replay.png`, `.game.png`, `.diff.png`).
+pub fn verify(
+    c: &Capture,
+    warp: bool,
+    debug: bool,
+    limit: Option<i64>,
+    keep: Option<&Path>,
+) -> Result<(), String> {
+    if let Some(dir) = keep {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
     let last: i64 = c
         .row("SELECT max(seq) FROM events", [], |r| r.get::<_, Option<i64>>(0))
         .flatten()
@@ -855,7 +881,9 @@ pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Resul
             },
             |(n, call)| format!("{call} {n} (event {seq})"),
         );
-        for out in settle(c, b.as_mut(), &written, seq, true).map_err(|e| format!("event {seq}: {e}"))? {
+        for out in
+            settle(c, b.as_mut(), &written, seq, true, keep).map_err(|e| format!("event {seq}: {e}"))?
+        {
             let resource = out.resource;
             match (out.ordered, out.settled) {
                 (true, Settled::Identical) => settled_same += 1,
@@ -915,10 +943,23 @@ pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Resul
                     mine.len()
                 ));
             }
-            let d = compare(format::readable(s.format), &x, &game, mine);
+            let fmt = format::readable(s.format);
+            let d = compare(fmt, &x, &game, mine);
             compared += 1;
             if d.differ == 0 {
                 same += 1;
+            } else if let Some(dir) = keep {
+                let file = |ext: &str| dir.join(format!("draw-{draw}-{name}.{ext}"));
+                kept(&file("replay.bin"), mine)?;
+                kept(&file("game.bin"), &game)?;
+                // Pictures only of the formats texels can decode; the bytes are written whatever the format.
+                let decode = |bytes| texels::decode(fmt, x.width, x.height, bytes);
+                if let (Ok(replay), Ok(theirs)) = (decode(mine), decode(&game)) {
+                    let range = Range::parse("auto").expect("auto is a range");
+                    png(&file("replay.png"), x.width, x.height, &replay.rgba8(range))?;
+                    png(&file("game.png"), x.width, x.height, &theirs.rgba8(range))?;
+                    diff_png(&file("diff.png"), fmt, &x, &game, mine, range)?;
+                }
             }
             out!("draw {draw:>5} {name:<6} {s} (event {seq}): {d}");
         }

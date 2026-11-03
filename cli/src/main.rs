@@ -254,6 +254,10 @@ enum Command {
         /// Compare at most this many targets.
         #[arg(long)]
         limit: Option<i64>,
+        /// Write what differs here: the replay's and the game's bytes of each output and target, and pictures of
+        /// the targets and where they differ.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
     },
     /// Writes a full-memory minidump of a process from a snapshot of it (locum runs this at a capture: settings.txt
     /// `dumper`).
@@ -537,7 +541,8 @@ fn run(cli: Cli) -> Result<(), String> {
             warp,
             debug,
             limit,
-        } => replay::verify(&open(&capture)?, warp, debug, limit),
+            out,
+        } => replay::verify(&open(&capture)?, warp, debug, limit, out.as_deref()),
         Command::Dump { pid, out, signal } => memory::dump(pid, &out, signal.as_deref()),
         Command::Memfind {
             target,

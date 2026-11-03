@@ -100,6 +100,12 @@ that use an atomic that returns a value (`imm_atomic_*`, `atomic_cmp_store`; `lo
 names them. During a capture, every draw or dispatch has everything bound to it as a UAV copied right after it runs,
 into `results`, flagged when its shader is order-dependent.
 
+A shader can also depend on the order without an atomic, when its thread groups write the same records: whichever
+group runs last wins, and D3D doesn't order groups. In a Motor Town frame, groups 0 and 1 of one dispatch (compute shader
+`d01ca9db50d0ef89`) both write records 12212 to 12272; the game's own output holds group 0's values in the first 36 and group 1's in the rest,
+and verify's replay holds group 1's in all of them. The bytecode can't show this (which records a group writes comes
+from its input buffers), so such a dispatch isn't flagged, and verify reports it as differing.
+
 While a capture is recording, the game's writes through `Map` go to memory locum owns and are copied to the driver's
 at `Unmap`, so a map records only the bytes the game wrote. A discarding map starts as a fixed pattern
 (`locum_capture::maps`), which is what the GPU reads wherever the game wrote nothing; replay writes the same pattern
@@ -175,7 +181,10 @@ locum-cli replay last 812 --rules mine.txt --mode frame
 
 `verify` exits with success only when every target and every draw, dispatch or clear output compared is identical and
 nothing the replay needs is missing (contents, command lists, constants); checks the capture could not make (targets
-or outputs skipped, a repeated list's earlier executions, the memory dump) are listed as not compared.
+or outputs skipped, a repeated list's earlier executions, the memory dump) are listed as not compared. With
+`--out <dir>` it writes the replay's and the game's bytes of everything that differs there
+(`event-<seq>-<resource>.{replay,game}.bin`, `draw-<n>-<target>.{replay,game}.bin`), and for a target in a format it
+can decode, both pictures and one of where they differ (`.replay.png`, `.game.png`, `.diff.png`).
 
 A capture taken while a rule in `overrides.txt` changed or skipped one of its draws records the draw as the game
 asked for it, not as the GPU ran it: an `overrides` gap names the draw, the event and the rule, and verify fails even
