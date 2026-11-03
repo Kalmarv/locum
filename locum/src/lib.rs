@@ -1,4 +1,4 @@
-//! locum: records a frame of a Direct3D 11 game so it can be replayed exactly, looked at and changed. The game loads
+//! locum: captures everything a Direct3D 11 game draws in a frame, to look at, query, change and replay. The game loads
 //! locum's d3d11.dll and dxgi.dll from its own folder; they forward to this DLL, which hands every call on to the
 //! real runtime and watches it go by.
 //!
