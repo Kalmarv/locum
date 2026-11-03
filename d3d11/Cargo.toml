@@ -1,0 +1,17 @@
+[package]
+name = "locum-d3d11"
+description = "Direct3D 11 pieces shared by locum in the game and by replay: reading resources back into locum's canonical layout."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+locum-capture = { path = "../capture" }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+] }

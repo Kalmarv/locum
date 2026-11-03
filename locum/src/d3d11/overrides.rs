@@ -1,14 +1,6 @@
-//! Changing what the game draws, by rules in `overrides.txt` in locum's folder. The file is read again when it
-//! changes (checked every 30 frames); removing it removes the rules. One rule per line, `#` starts a comment:
-//!
-//! - `skip vs=<hash>`: draws with that shader bound are not drawn (`skip cs=<hash>`: dispatches are not run);
-//! - `solid vs=<hash> R G B A`: draws with that shader bound get a pixel shader writing that colour to every target;
-//! - `shader ps=<hash> FILE`: that shader is replaced by the bytecode in FILE (relative to locum's folder);
-//! - `constant ps b3 c0 X Y Z W`: the draw sees constant 0 of its ps b3 buffer (counted from the first constant
-//!   bound) as X Y Z W; a value is a float or `0x` and 8 hex digits (raw bits).
-//!
-//! Any rule can end with conditions, `if vs=<hash> ps=<hash>`, all of which must hold; `vs=<hash>` after `skip`,
-//! `solid` and `shader` is such a condition too. Any stage can be named: vs hs ds gs ps cs.
+//! Changing what the game draws, by rules in `overrides.txt` in locum's folder (the language is in
+//! [`locum_capture::rules`], shared with replay). The file is read again when it changes (checked every 30 frames);
+//! removing it removes the rules.
 //!
 //! Rules apply at the draw, on the draw's own context, and are undone after it: a replaced shader or constant buffer
 //! is bound for that draw only. A constant is changed in a copy of the bound buffer made by the GPU at the draw, so
@@ -24,6 +16,8 @@ use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::core::{HRESULT, Interface, PCSTR};
 
+use locum_capture::rules::{self, Action};
+
 use crate::d3d11::shaders::{self, Stage};
 use crate::d3d11::stages::{self, CbBinding};
 use crate::log::{folder, log};
@@ -36,25 +30,20 @@ pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
 }
 
-enum Action {
-    Skip,
-    /// A pixel shader writing one colour.
-    Solid([f32; 4]),
-    /// A shader of `Rule::stage` from bytecode.
-    Shader(Vec<u8>),
-    Constant {
-        slot: u32,
-        index: u32,
-        bits: [u32; 4],
-    },
-}
+/// The shader stages by the rules' numbering.
+const STAGES: [Stage; 6] = [
+    Stage::Vertex,
+    Stage::Hull,
+    Stage::Domain,
+    Stage::Geometry,
+    Stage::Pixel,
+    Stage::Compute,
+];
 
+/// A rule, and what applying it in the game needs.
 struct Rule {
-    text: String,
-    /// The stage the rule changes (pixel for `solid`).
+    rule: rules::Rule,
     stage: Stage,
-    when: Vec<(Stage, u64)>,
-    action: Action,
     applied: AtomicU64,
     /// The replacement shader, made on first use (None if that failed).
     made: Mutex<Option<Option<ID3D11DeviceChild>>>,
@@ -74,110 +63,6 @@ fn current() -> Option<Arc<Rules>> {
     RULES.read().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
-fn stage_named(name: &str) -> Option<Stage> {
-    Some(match name {
-        "vs" => Stage::Vertex,
-        "hs" => Stage::Hull,
-        "ds" => Stage::Domain,
-        "gs" => Stage::Geometry,
-        "ps" => Stage::Pixel,
-        "cs" => Stage::Compute,
-        _ => return None,
-    })
-}
-
-/// `vs=0123456789abcdef`.
-fn condition(word: &str) -> Result<(Stage, u64), String> {
-    let (stage, hash) = word
-        .split_once('=')
-        .ok_or_else(|| format!("{word:?} is not stage=hash"))?;
-    let stage = stage_named(stage).ok_or_else(|| format!("unknown stage {stage:?}"))?;
-    let hash = u64::from_str_radix(hash, 16).map_err(|_| format!("{hash:?} is not a hex hash"))?;
-    Ok((stage, hash))
-}
-
-fn value_bits(word: &str) -> Result<u32, String> {
-    if let Some(hex) = word.strip_prefix("0x") {
-        return u32::from_str_radix(hex, 16).map_err(|_| format!("{word:?} is not 0x and hex digits"));
-    }
-    word.parse::<f32>()
-        .map(f32::to_bits)
-        .map_err(|_| format!("{word:?} is not a number"))
-}
-
-fn numbered(word: Option<&str>, prefix: char, what: &str) -> Result<u32, String> {
-    word.and_then(|w| w.strip_prefix(prefix))
-        .and_then(|n| n.parse().ok())
-        .ok_or_else(|| format!("expected {what} ({prefix}N)"))
-}
-
-fn parse_rule(line: &str, dir: &std::path::Path) -> Result<Rule, String> {
-    let (body, conditions) = match line.split_once(" if ") {
-        Some((b, c)) => (
-            b,
-            c.split_whitespace()
-                .map(condition)
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        None => (line, Vec::new()),
-    };
-    let mut words = body.split_whitespace();
-    let verb = words.next().ok_or("empty rule")?;
-    let mut when = conditions;
-    let (stage, action) = match verb {
-        "skip" | "solid" | "shader" => {
-            let first = condition(words.next().ok_or("expected stage=hash")?)?;
-            when.insert(0, first);
-            match verb {
-                "skip" => (first.0, Action::Skip),
-                "solid" => {
-                    let mut c = [0f32; 4];
-                    for v in &mut c {
-                        let w = words.next().ok_or("solid needs R G B A")?;
-                        *v = w.parse().map_err(|_| format!("{w:?} is not a number"))?;
-                    }
-                    (Stage::Pixel, Action::Solid(c))
-                }
-                _ => {
-                    let file = words.next().ok_or("shader needs a file")?;
-                    let code = std::fs::read(dir.join(file)).map_err(|e| format!("{file}: {e}"))?;
-                    (first.0, Action::Shader(code))
-                }
-            }
-        }
-        "constant" => {
-            let stage = words
-                .next()
-                .and_then(stage_named)
-                .ok_or("constant needs a stage")?;
-            let slot = numbered(words.next(), 'b', "a constant buffer slot")?;
-            let index = numbered(words.next(), 'c', "a constant")?;
-            let mut bits = [0u32; 4];
-            for b in &mut bits {
-                *b = value_bits(words.next().ok_or("constant needs X Y Z W")?)?;
-            }
-            if slot >= stages::CB_SLOTS || index >= D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT {
-                return Err("slot or constant out of range".into());
-            }
-            (stage, Action::Constant { slot, index, bits })
-        }
-        other => return Err(format!("unknown rule {other:?}")),
-    };
-    if let Some(extra) = words.next() {
-        return Err(format!("unexpected {extra:?}"));
-    }
-    Ok(Rule {
-        text: line.to_string(),
-        stage,
-        when,
-        action,
-        applied: AtomicU64::new(0),
-        made: Mutex::new(None),
-        values: Mutex::new(None),
-        scratch: Mutex::new(HashMap::new()),
-    })
-}
-
 /// At each present: reads `overrides.txt` again if it changed (every 30 frames), and reports how often each rule
 /// applied (every 600).
 pub fn poll(frame: u64) {
@@ -187,7 +72,7 @@ pub fn poll(frame: u64) {
         for r in &rules.rules {
             log!(
                 "override {:?}: applied {} times",
-                r.text,
+                r.rule.text,
                 r.applied.load(Ordering::Relaxed)
             );
         }
@@ -215,18 +100,21 @@ pub fn poll(frame: u64) {
 }
 
 fn load(text: &str, dir: &std::path::Path) -> Vec<Rule> {
-    let mut rules = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        let line = line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        match parse_rule(line, dir) {
-            Ok(r) => rules.push(r),
-            Err(e) => log!("overrides.txt line {}: {e}: ignored", n + 1),
-        }
+    let (parsed, errors) = rules::parse_all(text, dir);
+    for (line, e) in errors {
+        log!("overrides.txt line {line}: {e}: ignored");
     }
-    rules
+    parsed
+        .into_iter()
+        .map(|rule| Rule {
+            stage: STAGES[rule.stage],
+            rule,
+            applied: AtomicU64::new(0),
+            made: Mutex::new(None),
+            values: Mutex::new(None),
+            scratch: Mutex::new(HashMap::new()),
+        })
+        .collect()
 }
 
 /// The shaders bound at a draw, hashed once each when a rule asks.
@@ -244,9 +132,7 @@ impl Bound<'_> {
     }
 
     fn holds(&mut self, rule: &Rule) -> bool {
-        rule.when
-            .iter()
-            .all(|&(stage, hash)| self.hash(stage) == Some(hash))
+        rule.rule.holds(|stage| self.hash(STAGES[stage]))
     }
 }
 
@@ -259,9 +145,9 @@ enum Undo {
 pub unsafe fn around(c: &ID3D11DeviceContext4, compute: bool, draw: impl FnOnce()) {
     let Some(rules) = current() else { return draw() };
     let mut bound = Bound { c, hashes: [None; 6] };
-    let applies = |r: &Rule| compute == (r.stage == Stage::Compute);
+    let applies = |r: &Rule| r.rule.applies(compute);
     if rules.rules.iter().any(|r| {
-        matches!(r.action, Action::Skip) && applies(r) && bound.holds(r) && {
+        matches!(r.rule.action, Action::Skip) && applies(r) && bound.holds(r) && {
             r.applied.fetch_add(1, Ordering::Relaxed);
             true
         }
@@ -271,10 +157,10 @@ pub unsafe fn around(c: &ID3D11DeviceContext4, compute: bool, draw: impl FnOnce(
     let mut undo = Vec::new();
     let mut replaced = [false; 6];
     for r in &rules.rules {
-        if matches!(r.action, Action::Skip) || !applies(r) || !bound.holds(r) {
+        if matches!(r.rule.action, Action::Skip) || !applies(r) || !bound.holds(r) {
             continue;
         }
-        match &r.action {
+        match &r.rule.action {
             Action::Solid(_) | Action::Shader(_) if !replaced[r.stage as usize] => {
                 let Some(shader) = (unsafe { replacement(c, r) }) else {
                     continue;
@@ -309,7 +195,7 @@ unsafe fn replacement(c: &ID3D11DeviceContext4, r: &Rule) -> Option<ID3D11Device
     let mut made = r.made.lock().unwrap_or_else(|e| e.into_inner());
     made.get_or_insert_with(|| {
         let device = unsafe { c.GetDevice() }.ok()?;
-        let code = match &r.action {
+        let code = match &r.rule.action {
             Action::Solid(colour) => solid_ps(colour)?,
             Action::Shader(code) => code.clone(),
             _ => return None,
@@ -317,7 +203,7 @@ unsafe fn replacement(c: &ID3D11DeviceContext4, r: &Rule) -> Option<ID3D11Device
         match unsafe { stages::create_shader(&device, r.stage, &code) } {
             Ok(s) => Some(s),
             Err(e) => {
-                log!("override {:?}: the shader could not be made: {e}", r.text);
+                log!("override {:?}: the shader could not be made: {e}", r.rule.text);
                 None
             }
         }
@@ -423,12 +309,7 @@ type CompileFn = unsafe extern "system" fn(
 
 /// A ps_5_0 shader writing `colour` to all eight targets, compiled with the system's d3dcompiler_47.dll.
 fn solid_ps(colour: &[f32; 4]) -> Option<Vec<u8>> {
-    let [r, g, b, a] = colour;
-    let targets: String = (0..8).map(|i| format!("float4 c{i} : SV_Target{i}; ")).collect();
-    let fill: String = (0..8).map(|i| format!("o.c{i} = k; ")).collect();
-    let source = format!(
-        "struct O {{ {targets}}}; O main() {{ float4 k = float4({r:?}, {g:?}, {b:?}, {a:?}); O o; {fill}return o; }}"
-    );
+    let source = rules::solid_source(colour);
     let module = load_system_dll("d3dcompiler_47.dll")?;
     let compile = unsafe { export::<CompileFn>(module, c"D3DCompile") }?;
     let (mut code, mut errors) = (core::ptr::null_mut(), core::ptr::null_mut());
@@ -460,44 +341,4 @@ fn solid_ps(colour: &[f32; 4]) -> Option<Vec<u8>> {
         return None;
     }
     code.map(|c| bytes(&c))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn rule(line: &str) -> Result<Rule, String> {
-        parse_rule(line, &PathBuf::from("."))
-    }
-
-    #[test]
-    fn rules_parse() {
-        let r = rule("skip vs=00000000000000ff if ps=10").unwrap();
-        assert!(matches!(r.action, Action::Skip));
-        assert_eq!(r.when.len(), 2);
-        let r = rule("constant vs b11 c0 4 4 0x3f800000 -1.5").unwrap();
-        match r.action {
-            Action::Constant { slot, index, bits } => {
-                assert_eq!((slot, index), (11, 0));
-                assert_eq!(
-                    bits,
-                    [
-                        4f32.to_bits(),
-                        4f32.to_bits(),
-                        1f32.to_bits(),
-                        (-1.5f32).to_bits()
-                    ]
-                );
-            }
-            _ => panic!("not a constant rule"),
-        }
-        assert!(matches!(
-            rule("solid vs=1 1 0 1 1").unwrap().action,
-            Action::Solid([1.0, 0.0, 1.0, 1.0])
-        ));
-        assert!(rule("constant vs b14 c0 0 0 0 0").is_err());
-        assert!(rule("skip vs").is_err());
-        assert!(rule("frobnicate").is_err());
-    }
 }

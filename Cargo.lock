@@ -231,6 +231,7 @@ name = "locum"
 version = "0.1.0"
 dependencies = [
  "locum-capture",
+ "locum-d3d11",
  "serde",
  "serde_json",
  "windows",
@@ -255,6 +256,14 @@ dependencies = [
  "png",
  "rusqlite",
  "serde_json",
+ "windows",
+]
+
+[[package]]
+name = "locum-d3d11"
+version = "0.1.0"
+dependencies = [
+ "locum-capture",
  "windows",
 ]
 

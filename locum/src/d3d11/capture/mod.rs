@@ -402,7 +402,7 @@ fn writes(c: &ID3D11DeviceContext4, event: &mut Event) -> bool {
     if !records || !started || !contents {
         return records;
     }
-    let todo: Vec<(u64, ID3D11Resource, Dims)> = {
+    let todo: Vec<(u64, ID3D11Resource)> = {
         let s = state();
         event
             .writes
@@ -410,14 +410,12 @@ fn writes(c: &ID3D11DeviceContext4, event: &mut Event) -> bool {
             .filter(|id| !s.start.contains_key(id))
             .filter_map(|id| {
                 let t = s.resources.get(id)?;
-                t.first_write
-                    .is_none()
-                    .then(|| (*id, t.resource.clone(), t.dims.clone()))
+                t.first_write.is_none().then(|| (*id, t.resource.clone()))
             })
             .collect()
     };
-    for (id, resource, dims) in todo {
-        match unsafe { contents::issue(c, &resource, &dims) } {
+    for (id, resource) in todo {
+        match unsafe { contents::issue(c, &resource) } {
             Ok(rb) => {
                 if let Some(t) = state().resources.get_mut(&id) {
                     t.first_write = Some(rb);
