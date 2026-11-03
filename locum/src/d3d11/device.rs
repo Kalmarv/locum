@@ -105,6 +105,9 @@ impl Context {
         } else {
             real()
         }
+        if capture::armed() {
+            capture::after_draw(self.ctx());
+        }
     }
 
     /// Records a draw or dispatch if a capture is running.

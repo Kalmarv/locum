@@ -1247,6 +1247,32 @@ impl Backend for D3d11 {
         unsafe { rb.read(&ctx) }
     }
 
+    fn write(&mut self, c: &Capture, id: i64, contents: &[u8]) -> Result<(), String> {
+        let s = shape(c, id).ok_or("not described in the capture")?;
+        let subs = s.subs();
+        if contents.len() as u64 != layout::total(&subs) {
+            return Err(format!(
+                "#{id}: {} bytes do not fit its {} bytes of subresources",
+                contents.len(),
+                layout::total(&subs)
+            ));
+        }
+        let r = self.resource(id)?.clone();
+        for x in &subs {
+            unsafe {
+                self.ctx.UpdateSubresource(
+                    &r,
+                    x.index,
+                    None,
+                    contents[x.offset as usize..].as_ptr().cast(),
+                    x.row_bytes,
+                    x.row_bytes * x.rows,
+                )
+            };
+        }
+        Ok(())
+    }
+
     fn warnings(&self) -> Vec<String> {
         self.warnings.iter().cloned().collect()
     }

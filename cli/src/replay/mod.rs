@@ -28,6 +28,8 @@ pub trait Backend {
     fn run(&mut self, c: &Capture, seq: i64, rules: &[Rule]) -> Result<(), String>;
     /// Resource `id`'s contents now, in the canonical layout.
     fn read(&mut self, id: i64) -> Result<Vec<u8>, String>;
+    /// Replaces resource `id`'s contents with `contents` (the canonical layout).
+    fn write(&mut self, c: &Capture, id: i64, contents: &[u8]) -> Result<(), String>;
     /// What it could not do as recorded, once each.
     fn warnings(&self) -> Vec<String>;
 }
@@ -339,8 +341,13 @@ fn execute(
         b.create(c, id, contents.as_deref())
             .map_err(|e| format!("resource #{id}: {e}"))?;
     }
+    let written = order_dependent(c);
+    let mut differing = 0;
     for &seq in &plan.events {
         b.run(c, seq, rules).map_err(|e| format!("event {seq}: {e}"))?;
+        for (_, settled) in settle(c, b.as_mut(), &written, seq).map_err(|e| format!("event {seq}: {e}"))? {
+            differing += usize::from(matches!(settled, Settled::Differs(_)));
+        }
     }
     let mut results = Vec::new();
     for o in outs {
@@ -352,7 +359,101 @@ fn execute(
             "{missing} resources had no contents in the capture and started empty"
         ));
     }
+    if differing > 0 && rules.is_empty() {
+        warnings.push(format!(
+            "{differing} outputs of order-dependent shaders differ from the game's in more than order"
+        ));
+    }
     Ok((results, warnings))
+}
+
+/// What the game's GPU wrote through UAVs in the draws and dispatches whose shaders' writes depend on the order the
+/// GPU runs their threads, by event: (resource, content key). Empty for captures from before this was recorded.
+fn order_dependent(c: &Capture) -> HashMap<i64, Vec<(i64, String)>> {
+    let mut out: HashMap<i64, Vec<(i64, String)>> = HashMap::new();
+    let recorded = c
+        .row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'results'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_some_and(|n| n > 0);
+    if recorded {
+        for (event, resource, key) in c.rows("SELECT event, resource, content FROM results", [], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        }) {
+            out.entry(event).or_default().push((resource, key));
+        }
+    }
+    out
+}
+
+/// How an order-dependent event's output in replay compares with the game's.
+enum Settled {
+    Identical,
+    /// The same records, `stride` bytes each, in another order.
+    Reordered {
+        stride: usize,
+    },
+    Differs(String),
+}
+
+/// After order-dependent event `seq` ran, compares what it wrote with what the game's GPU wrote, and where the two
+/// hold the same records in another order puts the game's bytes in place, so everything after follows the order the
+/// game's GPU took. Output that differs in more than order is left as replay made it.
+fn settle(
+    c: &Capture,
+    b: &mut dyn Backend,
+    results: &HashMap<i64, Vec<(i64, String)>>,
+    seq: i64,
+) -> Result<Vec<(i64, Settled)>, String> {
+    let Some(written) = results.get(&seq) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (resource, key) in written {
+        let s = shape(c, *resource).ok_or("resource vanished")?;
+        let game = c.blob(key)?;
+        let mine = b.read(*resource)?;
+        // A structured buffer's records are its structures; anything else is taken in 4-byte words, the unit UAV
+        // atomics work in.
+        let stride = if s.kind == "buffer" && s.stride > 0 {
+            s.stride as usize
+        } else {
+            4
+        };
+        let settled = if mine == game {
+            Settled::Identical
+        } else if mine.len() != game.len() {
+            Settled::Differs(format!("{} bytes, the game's {}", mine.len(), game.len()))
+        } else if s.kind == "buffer" && game.len() % stride == 0 && same_records(&mine, &game, stride) {
+            Settled::Reordered { stride }
+        } else {
+            let differ = mine
+                .chunks(stride)
+                .zip(game.chunks(stride))
+                .filter(|(a, g)| a != g)
+                .count();
+            Settled::Differs(format!(
+                "{differ} of {} {stride}-byte records differ",
+                game.len().div_ceil(stride)
+            ))
+        };
+        if matches!(settled, Settled::Reordered { .. }) {
+            b.write(c, *resource, &game)?;
+        }
+        out.push((*resource, settled));
+    }
+    Ok(out)
+}
+
+/// Whether `a` and `b` hold the same `stride`-byte records, as many times each, in any order.
+fn same_records(a: &[u8], b: &[u8], stride: usize) -> bool {
+    let mut x: Vec<&[u8]> = a.chunks_exact(stride).collect();
+    let mut y: Vec<&[u8]> = b.chunks_exact(stride).collect();
+    x.sort_unstable();
+    y.sort_unstable();
+    x == y
 }
 
 fn backend(c: &Capture, warp: bool) -> Result<Box<dyn Backend>, String> {
@@ -567,11 +668,31 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
         planned.as_secs_f64(),
         started.elapsed().as_secs_f64()
     );
+    let written = order_dependent(c);
     let mut next = 0;
     let (mut same, mut compared) = (0, 0);
+    let (mut settled_same, mut reordered, mut differing) = (0, 0, 0);
     let t = std::time::Instant::now();
     for &seq in &plan.events {
         b.run(c, seq, &[]).map_err(|e| format!("event {seq}: {e}"))?;
+        for (resource, settled) in
+            settle(c, b.as_mut(), &written, seq).map_err(|e| format!("event {seq}: {e}"))?
+        {
+            match settled {
+                Settled::Identical => settled_same += 1,
+                Settled::Reordered { stride } => {
+                    reordered += 1;
+                    out!(
+                        "event {seq:>5} #{resource}: the game's {stride}-byte records in another order; going on \
+                         from the game's order"
+                    );
+                }
+                Settled::Differs(how) => {
+                    differing += 1;
+                    out!("event {seq:>5} #{resource}: differs from the game's output: {how}");
+                }
+            }
+        }
         while next < checks.len() && checks[next].1 == seq {
             let (draw, _, name, resource, key, sub) = &checks[next];
             next += 1;
@@ -596,6 +717,12 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
         "{same} of {compared} targets identical; replayed in {:.1} s",
         t.elapsed().as_secs_f64()
     );
+    if !written.is_empty() {
+        out!(
+            "order-dependent shaders' outputs: {settled_same} identical to the game's, {reordered} the same records in \
+             another order, {differing} different"
+        );
+    }
     // What keeps an identical replay from proving the frame: what the capture could not record, used resources
     // without contents, and events replay could not run as recorded.
     for note in c.rows(
@@ -644,6 +771,11 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
     if same < compared {
         return Err(format!("{} of {compared} targets differ", compared - same));
     }
+    if differing > 0 {
+        return Err(format!(
+            "{differing} outputs of order-dependent shaders differ from the game's in more than order"
+        ));
+    }
     if compared == 0 {
         return Err("no target was compared".into());
     }
@@ -654,4 +786,21 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_records;
+
+    #[test]
+    fn records_in_another_order_are_the_same_records() {
+        let a = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let b = [5u8, 6, 7, 8, 1, 2, 3, 4];
+        assert!(same_records(&a, &b, 4));
+        // The same bytes, but not the same 4-byte records.
+        let c = [1u8, 2, 7, 8, 5, 6, 3, 4];
+        assert!(!same_records(&a, &c, 4));
+        // As often each: a record twice is not the same as two records.
+        assert!(!same_records(&[1, 1, 2, 2], &[1, 1, 1, 1], 2));
+    }
 }

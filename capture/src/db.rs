@@ -78,6 +78,11 @@ CREATE TABLE targets(draw INTEGER NOT NULL, target TEXT NOT NULL, view INTEGER, 
   height INTEGER, format INTEGER, sub INTEGER, blob TEXT, event INTEGER, PRIMARY KEY(draw, target));
 -- What the capture could not record, for `locum-cli info`.
 CREATE TABLE gaps(what TEXT NOT NULL, detail TEXT, count INTEGER NOT NULL);
+-- What a draw or dispatch whose shader's writes depend on the order the GPU runs its threads wrote through UAVs, as
+-- the game's GPU wrote it (key of the resource's whole contents right after the event): replay checks its own result
+-- against it and goes on from it.
+CREATE TABLE results(event INTEGER NOT NULL, resource INTEGER NOT NULL, content TEXT NOT NULL,
+  PRIMARY KEY(event, resource));
 CREATE INDEX bindings_draw ON bindings(draw);
 CREATE INDEX bindings_resource ON bindings(resource);
 CREATE INDEX bindings_content ON bindings(content);
@@ -289,6 +294,8 @@ pub struct Capture {
     pub scissors: Vec<Scissor>,
     pub passes: Vec<Pass>,
     pub targets: Vec<Target>,
+    /// (event, resource, content key): see the `results` table.
+    pub results: Vec<(u64, u64, String)>,
     pub gaps: Vec<Gap>,
 }
 
@@ -519,6 +526,10 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
                 t.blob,
                 t.event as i64
             ])?;
+        }
+        let mut s = tx.prepare("INSERT INTO results VALUES(?1,?2,?3)")?;
+        for (event, resource, content) in &capture.results {
+            s.execute(params![*event as i64, *resource as i64, content])?;
         }
         let mut s = tx.prepare("INSERT INTO gaps VALUES(?1,?2,?3)")?;
         for g in &capture.gaps {

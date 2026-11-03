@@ -81,6 +81,23 @@ pub unsafe fn created(stage: Stage, code: *const c_void, len: usize, hr: HRESULT
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashSet::new)
         .insert(h);
+    if new && let Ok(Some(o)) = locum_capture::dxbc::order_dependent(bytes) {
+        let ops: Vec<String> = o
+            .ops
+            .iter()
+            .map(|op| format!("{} x{}", op.name, op.count))
+            .collect();
+        log!(
+            "shader {h:016x} ({}): what it writes depends on the order the GPU runs its threads ({})",
+            stage.short(),
+            ops.join(", ")
+        );
+        ORDER_DEPENDENT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashSet::new)
+            .insert(h);
+    }
     if new && let Some(dir) = folder().map(|d| d.join("shaders")) {
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::fs::write(dir.join(format!("{h:016x}.{}.dxbc", stage.short())), bytes);
@@ -93,6 +110,18 @@ pub unsafe fn created(stage: Stage, code: *const c_void, len: usize, hr: HRESULT
             .map_or(0, HashSet::len);
         log!("shaders created: {created}, distinct bytecode: {distinct}");
     }
+}
+
+/// Shaders whose writes depend on the order the GPU runs their threads (`locum_capture::dxbc`), by hash.
+static ORDER_DEPENDENT: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+
+/// Whether the shader with hash `h` writes what depends on the order the GPU runs its threads.
+pub fn order_dependent(h: u64) -> bool {
+    ORDER_DEPENDENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(&h))
 }
 
 /// The hash locum stored on a shader, if it is one locum saw created.

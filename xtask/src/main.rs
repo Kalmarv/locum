@@ -157,26 +157,67 @@ dumps {}
     println!("--- {}", log_dir.join("locum.log").display());
     print!(
         "{}",
-        std::fs::read_to_string(log_dir.join("locum.log")).unwrap_or_else(|e| format!(
-            "(no log: {e})
-"
-        ))
+        std::fs::read_to_string(log_dir.join("locum.log")).unwrap_or_else(|e| format!("(no log: {e})\n"))
     );
     // Run CLI evidence checks even when a GPU/database assertion failed, so every adversarial case reports.
-    let cli_ok = cli_checks(&stage.join("locum-cli.exe"), &log_dir);
-    let adversarial = Command::new(stage.join("locum-cli.exe"))
-        .arg("verify")
-        .arg(log_dir.join("captures/adversarial"))
-        .env("LOCUM_DIR", &log_dir)
-        .output()
-        .expect("verify adversarial capture");
-    let text = String::from_utf8_lossy(&adversarial.stdout).into_owned()
-        + &String::from_utf8_lossy(&adversarial.stderr);
-    println!(
-        "--- adversarial rows6/7 verify (exit {:?})\n{text}",
-        adversarial.status.code()
+    let cli = stage.join("locum-cli.exe");
+    let cli_ok = cli_checks(&cli, &log_dir);
+    let (adversarial_ok, _) = verified(
+        &cli,
+        &log_dir,
+        "adversarial",
+        false,
+        "adversarial rows6/7: all recorded checkpoints match replay",
     );
-    // Every target compared identical, at least one compared, and verify's exit status says so.
+    // The ordered capture's dispatch writes its records in whatever order the GPU runs its threads; WARP runs them
+    // in another order than the GPU did. Both replays must still be bit for bit the game's.
+    let mut ordered_ok = true;
+    for warp in [false, true] {
+        let device = if warp { "WARP" } else { "the GPU" };
+        let (ok, text) = verified(
+            &cli,
+            &log_dir,
+            "ordered",
+            warp,
+            &format!(
+                "ordered: replayed on {device}, the draw after an order-dependent dispatch is the game's"
+            ),
+        );
+        let settled = text.lines().any(|l| {
+            l.starts_with("order-dependent shaders' outputs:")
+                && l.ends_with(" 0 different")
+                && !l.contains(": 0 identical to the game's, 0 the same")
+        });
+        println!(
+            "{} ordered: on {device}, the dispatch's output was checked against the game's and none differed",
+            if settled { "ok  " } else { "FAIL" }
+        );
+        ordered_ok &= ok && settled;
+    }
+    if !status.success() || !cli_ok || !adversarial_ok || !ordered_ok {
+        std::process::exit(1);
+    }
+}
+
+/// Runs `locum-cli verify` on the smoke test's capture `label` (on WARP if `warp`): whether it passed, with every
+/// target compared identical and at least one compared, and what it said.
+fn verified(cli: &Path, log_dir: &Path, label: &str, warp: bool, what: &str) -> (bool, String) {
+    let mut command = Command::new(cli);
+    command.arg("verify").arg(log_dir.join("captures").join(label));
+    if warp {
+        command.arg("--warp");
+    }
+    let output = command
+        .env("LOCUM_DIR", log_dir)
+        .output()
+        .unwrap_or_else(|e| panic!("verify the {label} capture: {e}"));
+    let text =
+        String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+    println!(
+        "--- verify {label}{} (exit {:?})\n{text}",
+        if warp { " --warp" } else { "" },
+        output.status.code()
+    );
     let all_same = text.lines().any(|l| {
         let w: Vec<&str> = l.split_whitespace().collect();
         w.len() > 4
@@ -186,14 +227,9 @@ dumps {}
             && w[0] == w[2]
             && w[0] != "0"
     });
-    let adversarial_ok = adversarial.status.success() && all_same;
-    println!(
-        "{} adversarial rows6/7: all recorded checkpoints match replay",
-        if adversarial_ok { "ok  " } else { "FAIL" }
-    );
-    if !status.success() || !cli_ok || !adversarial_ok {
-        std::process::exit(1);
-    }
+    let ok = output.status.success() && all_same;
+    println!("{} {what}", if ok { "ok  " } else { "FAIL" });
+    (ok, text)
 }
 
 /// Runs locum-cli on the smoke test's capture and checks what it says about it.

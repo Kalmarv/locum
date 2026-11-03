@@ -210,6 +210,8 @@ fn run(checks: &mut Checks) -> Result<()> {
     unsafe { immediate.ClearState() };
     drop((back, rtv, staging));
     adversarial_capture(checks, &device, &immediate, &deferred, &swapchain)?;
+    unsafe { immediate.ClearState() };
+    ordered_capture(checks, &device, &immediate, &swapchain)?;
     drop((swapchain, deferred));
     unsafe { DestroyWindow(hwnd) }?;
     Ok(())
@@ -1423,6 +1425,178 @@ fn adversarial_capture(
         log.contains("capture abandoned: the game resized its swap chain")
             && !dir.join("captures/resized/capture.db").exists(),
         "adversarial row3: the capture during the resize is abandoned, and says why",
+    );
+    Ok(())
+}
+
+/// Each thread takes the next free slot with an atomic add and writes its id there: which record lands where depends
+/// on the order the GPU runs the threads.
+const SLOTS_CS: &str = "RWByteAddressBuffer counter : register(u0);
+RWStructuredBuffer<uint2> records : register(u1);
+[numthreads(64, 1, 1)] void main(uint id : SV_DispatchThreadID) {
+    uint slot;
+    counter.InterlockedAdd(0, 1, slot);
+    records[slot] = uint2(id, id * 2654435761u);
+}";
+
+/// Draws record `y * 64 + x` at pixel (x, y), so the picture shows the order the records were written in. Its
+/// colours are whole steps of the 8-bit target, which every rasterizer (WARP too) writes the same.
+const SLOTS_PS: &str = "StructuredBuffer<uint2> records : register(t0);
+float4 main(float4 p : SV_Position) : SV_Target {
+    uint v = records[uint(p.y) * 64 + uint(p.x)].x;
+    return float4((v & 255) / 255.0, (v >> 8) / 255.0, 0, 1);
+}";
+
+/// Threads of `SLOTS_CS`, one record each.
+const SLOTS: u32 = 64 * 64;
+
+/// A frame whose dispatch's output depends on thread order and whose draw shows that order: the capture records what
+/// the dispatch wrote, as the GPU wrote it.
+fn ordered_capture(
+    checks: &mut Checks,
+    device: &ID3D11Device,
+    c: &ID3D11DeviceContext,
+    swapchain: &IDXGISwapChain1,
+) -> Result<()> {
+    let dir = std::path::PathBuf::from(std::env::var_os("LOCUM_DIR").expect("LOCUM_DIR"));
+    let sh = Shaders::new(device)?;
+    let cs_code = compile(SLOTS_CS, s!("cs_5_0"))?;
+    let ps_code = compile(SLOTS_PS, s!("ps_5_0"))?;
+    let cs_hash = format!("{:016x}", fnv(&cs_code));
+    let (mut cs, mut ps) = (None, None);
+    unsafe {
+        device.CreateComputeShader(&cs_code, None, Some(&mut cs))?;
+        device.CreatePixelShader(&ps_code, None, Some(&mut ps))?;
+    }
+    let log = std::fs::read_to_string(dir.join("locum.log")).unwrap_or_default();
+    checks.check(
+        log.contains(&format!(
+            "shader {cs_hash} (cs): what it writes depends on the order"
+        )),
+        "ordered: a shader that takes slots with an atomic add is found order-dependent when it is made",
+    );
+    let zeros = vec![0u8; SLOTS as usize * 8];
+    let initial = D3D11_SUBRESOURCE_DATA {
+        pSysMem: zeros.as_ptr().cast(),
+        ..Default::default()
+    };
+    let (mut counter, mut records) = (None, None);
+    unsafe {
+        device.CreateBuffer(
+            &D3D11_BUFFER_DESC {
+                ByteWidth: 16,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_UNORDERED_ACCESS.0 as u32,
+                MiscFlags: D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS.0 as u32,
+                ..Default::default()
+            },
+            Some(&initial),
+            Some(&mut counter),
+        )?;
+        device.CreateBuffer(
+            &D3D11_BUFFER_DESC {
+                ByteWidth: SLOTS * 8,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: (D3D11_BIND_UNORDERED_ACCESS.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+                MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
+                StructureByteStride: 8,
+                ..Default::default()
+            },
+            Some(&initial),
+            Some(&mut records),
+        )?;
+    }
+    let (counter, records) = (counter.expect("counter"), records.expect("records"));
+    let (mut counter_view, mut records_view, mut records_srv) = (None, None, None);
+    unsafe {
+        device.CreateUnorderedAccessView(
+            &counter,
+            Some(&D3D11_UNORDERED_ACCESS_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D11_UAV_DIMENSION_BUFFER,
+                Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+                    Buffer: D3D11_BUFFER_UAV {
+                        FirstElement: 0,
+                        NumElements: 4,
+                        Flags: D3D11_BUFFER_UAV_FLAG_RAW.0 as u32,
+                    },
+                },
+            }),
+            Some(&mut counter_view),
+        )?;
+        device.CreateUnorderedAccessView(&records, None, Some(&mut records_view))?;
+        device.CreateShaderResourceView(&records, None, Some(&mut records_srv))?;
+    }
+    let (texture, view) = target(device)?;
+    let cb = constant_buffer(device, false)?;
+
+    let request = dir.join("capture");
+    std::fs::write(&request, "label ordered\nskip memory\n").expect("request a capture");
+    for _ in 0..31 {
+        unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
+        if !request.exists() {
+            break;
+        }
+    }
+    checks.check(!request.exists(), "ordered capture request consumed");
+    if request.exists() {
+        return Ok(());
+    }
+    unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
+    // Now recording, until the next Present.
+    unsafe {
+        c.CSSetShader(cs.as_ref(), None);
+        c.CSSetUnorderedAccessViews(
+            0,
+            2,
+            Some([counter_view.clone(), records_view.clone()].as_ptr()),
+            None,
+        );
+        c.Dispatch(SLOTS / 64, 1, 1);
+        c.CSSetUnorderedAccessViews(0, 2, Some([None, None].as_ptr()), None);
+        c.CSSetShader(None, None);
+        sh.bind(c, &view, &cb);
+        c.PSSetShader(ps.as_ref(), None);
+        c.PSSetShaderResources(0, Some(&[records_srv.clone()]));
+        c.Draw(3, 0);
+        c.PSSetShaderResources(0, Some(&[None]));
+        c.OMSetRenderTargets(None, None);
+    }
+    unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
+    let written = gpu_bytes(device, c, &records)?;
+    drop(texture);
+
+    let path = dir.join("captures/ordered/capture.db");
+    checks.check(wait_for(&path), "ordered capture written");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let db = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("ordered database");
+    let blob_dir: String = db
+        .query_row("SELECT value FROM meta WHERE key='blobs'", [], |r| r.get(0))
+        .expect("blobs path");
+    let blobs = locum_capture::blobs::Blobs::new(blob_dir);
+    let kept: Vec<(i64, String)> = db
+        .prepare(
+            "SELECT r.resource, r.content FROM results r JOIN events e ON e.seq = r.event \
+             WHERE e.kind = 'dispatch' ORDER BY r.resource",
+        )
+        .and_then(|mut q| q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect())
+        .unwrap_or_default();
+    let sizes: Vec<Option<usize>> = kept
+        .iter()
+        .map(|(_, k)| blobs.get(k).ok().map(|b| b.len()))
+        .collect();
+    println!("ordered: the dispatch's recorded outputs {kept:?}, sizes {sizes:?}");
+    checks.check(
+        kept.len() == 2,
+        "ordered: what the dispatch wrote is recorded for both its UAVs",
+    );
+    checks.check(
+        kept.iter()
+            .any(|(_, k)| blobs.get(k).ok().as_deref() == Some(written.as_slice())),
+        "ordered: the recorded records are the GPU's, in the GPU's order",
     );
     Ok(())
 }

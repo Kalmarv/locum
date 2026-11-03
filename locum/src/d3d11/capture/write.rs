@@ -152,6 +152,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     // from the replayed buffers instead).
     let mut last_cb: HashMap<(u32, u32), usize> = HashMap::new();
     let mut last_target: HashMap<usize, usize> = HashMap::new();
+    let mut last_result: HashMap<usize, usize> = HashMap::new();
     for (seq, e) in timeline.iter().enumerate() {
         let Some(d) = e.draw.as_deref() else { continue };
         for cb in &d.cb_copies {
@@ -164,8 +165,13 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                 last_target.insert(id, seq);
             }
         }
+        for (_, r) in &d.results {
+            if let Ok(rb) = r {
+                last_result.insert(rb.copy_id(), seq);
+            }
+        }
     }
-    let (mut cbs_repeated, mut targets_repeated) = (0u64, 0u64);
+    let (mut cbs_repeated, mut targets_repeated, mut results_repeated) = (0u64, 0u64, 0u64);
     let mut n = 0u64;
     let mut pass: Option<(u64, Vec<(u32, u64)>)> = None;
     let mut timeline = timeline;
@@ -243,6 +249,27 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         for (i, sh) in d.shaders.iter().enumerate() {
             if let Some(h) = sh.as_ref().filter(|h| h.as_str() != "unknown") {
                 shader_hashes.insert((h.clone(), db::stage_names()[i]));
+            }
+        }
+        for (resource, r) in std::mem::take(&mut d.results) {
+            let read = match r {
+                Ok(rb) if last_result.get(&rb.copy_id()) != Some(&index) => {
+                    results_repeated += 1;
+                    continue;
+                }
+                Ok(rb) => unsafe { contents::read(immediate, &rb) },
+                Err(e) => Err(e),
+            };
+            match read {
+                Ok((key, _)) => capture.results.push((seq, resource, key)),
+                Err(e) => {
+                    *gaps
+                        .entry((
+                            "results".into(),
+                            format!("an order-dependent shader's output not read: {e}"),
+                        ))
+                        .or_insert(0) += 1;
+                }
             }
         }
         let after = seq + u64::from(d.after_events);
@@ -477,6 +504,17 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                     .into(),
             ),
             cbs_repeated,
+        );
+    }
+    if results_repeated > 0 {
+        gaps.insert(
+            (
+                "results".into(),
+                "an order-dependent shader in a command list executed more than once: only its last execution's \
+                 output was kept"
+                    .into(),
+            ),
+            results_repeated,
         );
     }
     if targets_repeated > 0 {

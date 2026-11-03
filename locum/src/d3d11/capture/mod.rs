@@ -155,6 +155,11 @@ pub(super) struct Draw {
     bound: Vec<targets::Bound>,
     /// Whether the pass this draw ends has been dealt with.
     closed: bool,
+    /// Whether one of its shaders writes what depends on the order the GPU runs its threads; if so, copies of what
+    /// it wrote through UAVs, made right after it ran.
+    order_dependent: bool,
+    results: Vec<(u64, Result<contents::Readback, String>)>,
+    results_taken: bool,
 }
 
 /// One thing a context did, as recorded on it.
@@ -528,6 +533,61 @@ fn draw_event(
     event.writes = touches.writes;
     event.draw = Some(draw);
     record(context, event);
+}
+
+/// After a draw or dispatch ran on a context, while armed: if one of its shaders writes what depends on the order the
+/// GPU runs its threads, what it wrote through UAVs is copied now, on its context. Replay checks its own result
+/// against the game's (the same records in another order is that order) and goes on from the game's, so what follows
+/// does not depend on the order either GPU happened to run in.
+pub fn after_draw(
+    Ctx {
+        c: context,
+        id,
+        deferred,
+    }: Ctx,
+) {
+    let uavs: Vec<(u64, ID3D11Resource)> = {
+        let mut s = state();
+        if !s.records(deferred) || !s.request.contents {
+            return;
+        }
+        let last = if deferred {
+            s.pending.get_mut(&id).and_then(|p| p.last_mut())
+        } else {
+            s.timeline.last_mut()
+        };
+        let Some(d) = last.and_then(|e| e.draw.as_deref_mut()) else {
+            return;
+        };
+        if !d.order_dependent || d.results_taken {
+            return;
+        }
+        d.results_taken = true;
+        let mut ids: Vec<u64> = d
+            .bindings
+            .iter()
+            .filter(|b| b.kind == "uav")
+            .filter_map(|b| b.resource)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .filter_map(|i| s.resources.get(&i).map(|t| (i, t.resource.clone())))
+            .collect()
+    };
+    let results: Vec<(u64, Result<contents::Readback, String>)> = uavs
+        .into_iter()
+        .map(|(i, r)| (i, unsafe { contents::issue(context, &r) }))
+        .collect();
+    let mut s = state();
+    let last = if deferred {
+        s.pending.get_mut(&id).and_then(|p| p.last_mut())
+    } else {
+        s.timeline.last_mut()
+    };
+    if let Some(d) = last.and_then(|e| e.draw.as_deref_mut()) {
+        d.results = results;
+    }
 }
 
 /// `OMSetRenderTargets` (or `ClearState`, with no targets) on a context, while armed: if it binds other targets than

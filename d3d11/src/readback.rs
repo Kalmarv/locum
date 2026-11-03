@@ -9,10 +9,19 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Interface;
 
 /// A copy of a resource waiting to be read.
+#[derive(Clone)]
 pub struct Readback {
     staging: ID3D11Resource,
     pub subs: Vec<Sub>,
     buffer: bool,
+}
+
+impl Readback {
+    /// Which copy this is: the same for every clone of it (a copy recorded in a command list is one copy however
+    /// often the list runs).
+    pub fn copy_id(&self) -> usize {
+        self.staging.as_raw() as usize
+    }
 }
 
 /// The typeless format a depth format's texture can be copied through.

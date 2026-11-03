@@ -63,6 +63,7 @@ pub(super) unsafe fn snapshot(c: &ID3D11DeviceContext4, compute: bool, draw: &mu
         };
         let name = stage.short();
         let hash = unsafe { shaders::hash_of(shader.as_raw()) };
+        draw.order_dependent |= hash.is_some_and(shaders::order_dependent);
         draw.shaders[stage_index(stage)] =
             Some(hash.map_or_else(|| "unknown".into(), |h| format!("{h:016x}")));
         for (slot, b) in unsafe { stages::constant_buffers(c, stage) }

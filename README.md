@@ -95,7 +95,16 @@ contents. locum's own copies run whatever predicate the game has set.
   GPU read (`cb_data`);
 - `passes` and `targets`: runs of draws with the same targets, and the targets read back after each one's last draw
   (in the format the pass drew in; depth as the colour format of the same bits, D24S8 as R24_UNORM_X8);
+- `results`: what each draw or dispatch whose shader is order-dependent (below) wrote through its UAVs, as the GPU
+  wrote it;
 - `shaders`, `modules`, `stacks`: bytecode keys, and what the call stacks need to be read.
+
+Some shaders write different bytes depending on the order the GPU happens to run their threads: a thread that takes
+the next free slot of a buffer with an atomic add (particles, light lists) puts its record wherever it lands, and the
+GPU never runs the threads in the same order twice. locum reads every shader's bytecode as it is made and flags those
+that use an atomic that returns a value (`imm_atomic_*`, `atomic_cmp_store`; `locum_capture::dxbc`), and the log
+names them. During a capture, each draw or dispatch with such a shader has everything bound to it as a UAV copied
+right after it runs, into `results`.
 
 While a capture is recording, the game's writes through `Map` go to memory locum owns and are copied to the driver's
 at `Unmap`, so a map records only the bytes the game wrote. A discarding map starts as a fixed pattern
@@ -150,6 +159,11 @@ locum-cli replay last 812 --rules mine.txt --mode frame
 `verify` exits with success only when every target compared is identical and nothing the replay needs is missing
 (contents, command lists, constants); checks the capture could not make (targets skipped, a repeated list's earlier
 executions, the memory dump) are listed as not compared.
+
+After an order-dependent draw or dispatch, replay compares what it wrote with what the game's GPU wrote (`results`):
+identical; the same records in another order (a structured buffer's structures, otherwise 4-byte words), in which
+case replay puts the game's bytes in place and goes on from them, so everything after follows the game's order; or
+different in more than order, which replay leaves as it made it and which fails verify.
 
 A draw is replayed with what it depends on: walking back from it, each earlier event that wrote a resource it (or an
 event already taken) reads or writes is taken too, and every resource starts with its contents as the frame began.
