@@ -4,9 +4,10 @@ A stand-in `d3d11.dll` and `dxgi.dll` for looking inside a Direct3D 11 game. The
 locum's; every call it makes arrives at locum first, which passes it on to the real runtime. Nothing in the system's
 DLLs is patched, and the game keeps rendering on its own driver.
 
-Status: early. The wrappers forward everything, shaders are hashed and dumped, and one frame can be captured with
-each draw's state, its constant-buffer contents and the render targets at the end of each pass. Rules in a file
-change what is drawn: skip draws, swap shaders, change constants.
+Status: early. The wrappers forward everything, shaders are hashed and dumped, and one frame can be captured whole:
+every draw and every call that changed a resource in GPU order, each draw's full state, the contents of every
+resource the frame used as the frame began, and the render targets at the end of each pass, in one SQLite file and a
+store of blobs. Rules in a file change what is drawn: skip draws, swap shaders, change constants.
 
 ## What it is for
 
@@ -35,11 +36,21 @@ Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` beside the game's executable. locum
   passes to the real object unwrapped.
 - `shaders/<hash>.<stage>.dxbc`: the bytecode of every shader the game creates, once per distinct shader. The hash
   is FNV-1a 64 of the bytecode.
-- `captures/frame-<n>/draws.jsonl`: a captured frame. Create a file named `capture` in the folder to request one;
-  locum removes it, records the next frames and writes the capture. Each line of the file is an option:
-  - `targets`: also read back the render and depth targets at the end of each pass, to
-    `captures/frame-<n>/targets/<draw>-<target>.dds` (the pass's last draw; `rt0` to `rt7` or `depth`);
+- `captures/<name>/capture.db`: a captured frame (below). Create a file named `capture` in the folder to request one;
+  locum removes it, records the next frames and writes the capture. Each line of the file is an option, and an empty
+  file captures everything:
+  - `label NAME`: the capture's folder name (default `frame-<n>`);
+  - `skip targets`: no render and depth targets read back at the end of each pass;
+  - `skip contents`: no resource contents (draws, state and constants only);
   - `max_mb N`: the most memory the target copies may use (default 4096); targets past it are skipped and counted.
+- `blobs/<2 hex>/<32 hex>`: the blob store, shared by every capture: resource contents, targets, the bytes each update
+  and map wrote, and shader bytecode, each under the xxh3-128 hash of its bytes. Contents are in a canonical layout:
+  subresources in order (mip within array slice), rows packed tightly, blocks for compressed formats.
+- `settings.txt` (written by you), one per line:
+  - `uploads store` (default), `hash` or `off`: whether the data each resource is created with, and each update
+    covering a whole subresource, is hashed and stored as it happens. Stored uploads are the game's own textures and
+    meshes without a readback, and their hashes match the files they were loaded from when those hold the same bytes;
+  - `blobs DIR`: where the blob store is (the variable `LOCUM_BLOBS` overrides it).
 - `overrides.txt` (written by you): rules that change what is drawn, read again when the file changes and dropped when
   it is removed. One per line:
   - `skip vs=<hash>`: draws with that shader bound are not drawn (`skip cs=<hash>`: dispatches are not run);
@@ -53,20 +64,33 @@ Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` beside the game's executable. locum
   of the bound buffer, so draws on deferred contexts get theirs when their command list runs. `locum.log` reports how
   often each rule applied every 600 frames.
 
-A capture is one JSON object per line: a `frame` line (draw count, command lists spliced in, copy failures), a
-`resource`, `view` or `state` line for each object the frame used (with a number the draws refer to), a `cb` line for
-each distinct constant-buffer content (hex), and a `draw` line for each draw and dispatch in the order the GPU runs
-them: the call and its arguments, each stage's shader hash, constant buffers (slot, buffer, range, content), shader
-resource views, render targets, depth target, input assembly and the blend, raster and depth-stencil states, and with
-`targets` the files read back after it.
+locum numbers every resource as it is created and keeps its description, creation stack and upload hash, so a
+capture lists all the resources alive, not only those the frame touched. The capture runs over three frames: the one
+before records command lists ahead of time and notes which resources are written; at the frame's start those are
+copied; during it every call is recorded, and any other resource is copied on its own context just before its first
+write. At the end, resources the frame only read are taken from their upload (immutable ones) or read back.
+
+`capture.db` has these tables (`capture/src/db.rs` has the schema with comments):
+
+- `meta`: the API, frame, process, request and counts; `gaps`: what could not be recorded, and why;
+- `resources` and `subresources`: every live resource with its description, upload hash, whether the frame used or
+  wrote it, and the key of its contents as the frame began with where they came from (`upload`, `start`,
+  `first-write`, `end`) and any doubt about them;
+- `views` and `states` (rasterizer, blend, depth-stencil, sampler, input layout), with their descriptions;
+- `events`: everything on the GPU's timeline in order: draws, dispatches, clears, copies, updates and maps (with the
+  key of the bytes written), resolves and mip generation, each with its context, command list and call stack;
+- `draws`, `bindings`, `viewports`, `scissors`: each draw's shaders and state, and everything bound to it by stage,
+  kind (`cb`, `srv`, `uav`, `sampler`, `rtv`, `dsv`, `vb`, `ib`, `so`) and slot, constant buffers with the bytes the
+  GPU read (`cb_data`);
+- `passes` and `targets`: runs of draws with the same targets, and the targets read back after each one's last draw
+  (in the format the pass drew in; depth as the colour format of the same bits, D24S8 as R24_UNORM_X8);
+- `shaders`, `modules`, `stacks`: bytecode keys, and what the call stacks need to be read.
+
+While a capture is recording, the game's writes through `Map` go to memory locum owns and are copied to the driver's
+at `Unmap`, so a map records only the bytes the game wrote.
 
 A pass ends where the targets in effect change on the GPU's timeline: an `OMSetRenderTargets` that binds other
-targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame. Its
-targets are copied then and kept with its last draw.
-
-Target files are DDS in the format the pass drew in; depth is written as the colour format of the same bits (D24S8 as
-R24_UNORM_X8, D32 as R32_FLOAT) and typeless formats as their plain typed format. Multisampled colour targets are
-resolved first.
+targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame.
 
 Draws recorded on deferred contexts are placed where their command list is executed. Constant buffers and targets
 are copied by the GPU on the draw's own context, so each draw's constants and each pass's targets are the ones the
@@ -80,7 +104,7 @@ cargo build --release
 
 The DLLs are `target/release/locum.dll`, `d3d11.dll` and `dxgi.dll`. Regenerate the vtables after changing the
 `windows` version with `cargo xtask gen`. `cargo xtask smoke` builds everything and runs a small Direct3D program
-through locum's DLLs, checking identity, deferred contexts and a capture.
+through locum's DLLs, checking identity, deferred contexts, a capture and overrides.
 
 ## References
 

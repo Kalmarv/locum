@@ -1,9 +1,7 @@
-//! Render and depth targets read back at the end of each pass, written as DDS files in the format the pass drew in.
+//! Render and depth targets read back at the end of each pass, in the format the pass drew in (depth as the colour
+//! format of the same bits), into the blob store.
 
 use core::ffi::c_void;
-use std::path::Path;
-
-use serde::Serialize;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::Interface;
@@ -12,20 +10,18 @@ use super::ids::view_ids;
 use super::state;
 use crate::log::log;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 pub struct Target {
     /// `rt0` to `rt7`, or `depth`.
-    target: String,
-    view: u64,
-    resource: u64,
-    width: u32,
-    height: u32,
-    /// The DXGI format of the file: the view's, with depth and typeless formats as the readable format of the same
-    /// bits.
-    format: i32,
-    /// The DDS file, relative to the capture's folder (filled in when the frame is written).
-    file: Option<String>,
-    #[serde(skip)]
+    pub target: String,
+    pub view: u64,
+    pub resource: u64,
+    pub width: u32,
+    pub height: u32,
+    /// The format it is read as: the view's, with depth and typeless formats as the readable format of the same bits.
+    pub format: i32,
+    /// The subresource of the resource the view writes.
+    pub sub: u32,
     staging: Option<ID3D11Texture2D>,
 }
 
@@ -199,7 +195,7 @@ unsafe fn copy_one(
         s.target_bytes += bytes;
     }
 
-    let mut source: ID3D11Resource = resource;
+    let mut source: ID3D11Resource = resource.clone();
     let mut source_sub = mip + slice * d.MipLevels;
     if d.SampleDesc.Count > 1 {
         if depth {
@@ -245,8 +241,8 @@ unsafe fn copy_one(
     }
     let staging = staging?;
     unsafe { c.CopySubresourceRegion(&staging, 0, 0, 0, 0, &source, source_sub, None) };
-    let kind = if depth { "dsv" } else { "rtv" };
-    let (view, resource) = unsafe { view_ids(view, kind, view_format, dimension) };
+    let _ = dimension;
+    let (view, resource) = view_ids(view);
     Some(Target {
         target,
         view,
@@ -254,28 +250,21 @@ unsafe fn copy_one(
         width,
         height,
         format: format.0,
-        file: None,
+        sub: mip + slice * d.MipLevels,
         staging: Some(staging),
     })
 }
 
 impl Target {
-    pub(super) fn target_name(&self) -> &str {
-        &self.target
-    }
-
-    /// Maps the copy (waiting for the GPU) and writes it to `dir/name`. Returns the bytes written.
-    pub(super) unsafe fn write(&mut self, immediate: &ID3D11DeviceContext4, dir: &Path, name: String) -> u64 {
-        let Some(staging) = self.staging.take() else {
-            return 0;
-        };
+    /// Maps the copy (waiting for the GPU) and hands its rows, tightly packed, to the blob store. Returns the key and
+    /// the bytes read.
+    pub(super) unsafe fn read(&mut self, immediate: &ID3D11DeviceContext4) -> Option<(String, u64)> {
+        let staging = self.staging.take()?;
         let bits = bits_per_pixel(DXGI_FORMAT(self.format)).expect("checked when copied");
         let row = (self.width * bits / 8) as usize;
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        if unsafe { immediate.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.is_err() {
-            return 0;
-        }
-        let mut out = dds_header(self.format, self.width, self.height, row as u32);
+        unsafe { immediate.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.ok()?;
+        let mut out = Vec::with_capacity(row * self.height as usize);
         for y in 0..self.height as usize {
             let line = unsafe {
                 core::slice::from_raw_parts(
@@ -286,11 +275,13 @@ impl Target {
             out.extend_from_slice(line);
         }
         unsafe { immediate.Unmap(&staging, 0) };
-        if std::fs::write(dir.join(&name), &out).is_err() {
-            return 0;
+        let key = locum_capture::hash::key(&out);
+        let bytes = out.len() as u64;
+        let blobs = &crate::settings::settings().blobs;
+        if !blobs.has(&key) {
+            locum_capture::writer::blob(blobs, key.clone(), out, true);
         }
-        self.file = Some(name);
-        out.len() as u64
+        Some((key, bytes))
     }
 }
 
@@ -343,52 +334,9 @@ fn bits_per_pixel(f: DXGI_FORMAT) -> Option<u32> {
     })
 }
 
-/// A DDS header with the DX10 extension: one 2D image of `format`, rows of `pitch` bytes.
-fn dds_header(format: i32, width: u32, height: u32, pitch: u32) -> Vec<u8> {
-    const CAPS: u32 = 0x1;
-    const HEIGHT: u32 = 0x2;
-    const WIDTH: u32 = 0x4;
-    const PITCH: u32 = 0x8;
-    const PIXELFORMAT: u32 = 0x1000;
-    const MIPMAPCOUNT: u32 = 0x2_0000;
-    const FOURCC: u32 = 0x4;
-    const TEXTURE: u32 = 0x1000;
-    let dx10 = u32::from_le_bytes(*b"DX10");
-    let mut words = vec![
-        124,
-        CAPS | HEIGHT | WIDTH | PITCH | PIXELFORMAT | MIPMAPCOUNT,
-        height,
-        width,
-        pitch,
-        0,
-        1,
-    ];
-    words.extend([0; 11]);
-    words.extend([32, FOURCC, dx10, 0, 0, 0, 0, 0]);
-    words.extend([TEXTURE, 0, 0, 0, 0]);
-    // DX10 header: format, 2D, no flags, one image, alpha mode unknown.
-    words.extend([format as u32, 3, 0, 1, 0]);
-    let mut out = Vec::with_capacity(4 + words.len() * 4);
-    out.extend_from_slice(b"DDS ");
-    for w in words {
-        out.extend_from_slice(&w.to_le_bytes());
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dds_header_is_148_bytes() {
-        let h = dds_header(DXGI_FORMAT_B8G8R8A8_UNORM.0, 64, 32, 256);
-        assert_eq!(h.len(), 148);
-        assert_eq!(&h[..4], b"DDS ");
-        assert_eq!(u32::from_le_bytes(h[12..16].try_into().unwrap()), 32); // height
-        assert_eq!(u32::from_le_bytes(h[16..20].try_into().unwrap()), 64); // width
-        assert_eq!(u32::from_le_bytes(h[128..132].try_into().unwrap()), 87); // DXGI format
-    }
 
     #[test]
     fn depth_is_written_as_colour() {

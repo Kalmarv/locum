@@ -8,6 +8,8 @@ license.workspace = true
 publish = false
 
 [dependencies]
+locum-capture = { path = "../capture" }
+rusqlite = { version = "0.41", features = ["bundled"] }
 serde_json = "1"
 windows = { workspace = true, features = [
     "Win32_Foundation",

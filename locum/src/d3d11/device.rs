@@ -13,19 +13,21 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use std::sync::OnceLock;
 
-use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, S_OK};
+use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, RECT, S_OK};
 use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 use windows::Win32::Graphics::Dxgi::{
     IDXGIDevice, IDXGIDevice1, IDXGIDevice2, IDXGIDevice3, IDXGIDevice4, IDXGIDevice4_Vtbl, IDXGIObject,
 };
 use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface};
 
-use crate::d3d11::capture;
 use crate::com::answer_query;
+use crate::d3d11::capture::{self, ops};
+use crate::d3d11::overrides;
+use crate::d3d11::registry;
+use crate::d3d11::shaders::{self, Stage};
 use crate::dxgi::Adapter;
 use crate::log::log;
-use crate::d3d11::overrides;
-use crate::d3d11::shaders::{self, Stage};
 use crate::vtables::adapter::AdapterMethods;
 use crate::vtables::context::{ContextMethods, real as real_context};
 use crate::vtables::device::{DeviceMethods, real};
@@ -108,7 +110,7 @@ impl Context {
     /// Records a draw or dispatch if a capture is running.
     fn draw(&self, call: &'static str, args: &[i64]) {
         if capture::armed() {
-            capture::on_draw(&self.inner, self.id, self.deferred, call, args);
+            capture::on_draw(self.ctx(), call, args);
         }
     }
 
@@ -120,7 +122,44 @@ impl Context {
             } else {
                 unsafe { core::slice::from_raw_parts(rtvs, count.min(8) as usize) }
             };
-            unsafe { capture::targets_changing(&self.inner, self.id, self.deferred, rtvs, dsv) };
+            unsafe { capture::targets_changing(self.ctx(), rtvs, dsv) };
+        }
+    }
+
+    /// An update: recorded while a capture runs, else only noted on the resource's registry entry.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn update(
+        &self,
+        call: &'static str,
+        dst: *mut c_void,
+        sub: u32,
+        region: *const D3D11_BOX,
+        data: *const c_void,
+        row: u32,
+        depth: u32,
+        flags: u32,
+    ) {
+        if dst.is_null() || data.is_null() {
+            return;
+        }
+        if capture::armed() {
+            unsafe { ops::update(self.ctx(), call, dst, sub, region, data, row, depth, flags) };
+        } else if let Some(r) = unsafe { ID3D11Resource::from_raw_borrowed(&dst) } {
+            let region = if region.is_null() {
+                None
+            } else {
+                Some(unsafe { &*region })
+            };
+            unsafe { registry::updated(r, sub, region, data, row, depth, false) };
+        }
+    }
+
+    /// This context as the capture's ops name it.
+    fn ctx(&self) -> ops::Ctx<'_> {
+        ops::Ctx {
+            c: &self.inner,
+            id: self.id,
+            deferred: self.deferred,
         }
     }
 
@@ -132,14 +171,7 @@ impl Context {
     /// Records an indirect draw or dispatch if a capture is running: its arguments are the buffer's id and offset.
     unsafe fn draw_indirect(&self, call: &'static str, buffer: *mut c_void, offset: u32) {
         if capture::armed() {
-            let id = unsafe { capture::buffer_id(buffer) };
-            capture::on_draw(
-                &self.inner,
-                self.id,
-                self.deferred,
-                call,
-                &[id as i64, i64::from(offset)],
-            );
+            unsafe { capture::on_indirect(self.ctx(), call, buffer, offset) };
         }
     }
 }
@@ -430,6 +462,85 @@ unsafe impl DeviceMethods for Device {
         hr
     }
 
+    unsafe fn CreateBuffer(
+        &self,
+        a0: *const D3D11_BUFFER_DESC,
+        a1: *const D3D11_SUBRESOURCE_DATA,
+        a2: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateBuffer(self.inner(), a0, a1, a2) };
+        unsafe { registry::created(hr, a2, a1) };
+        hr
+    }
+
+    unsafe fn CreateTexture1D(
+        &self,
+        a0: *const D3D11_TEXTURE1D_DESC,
+        a1: *const D3D11_SUBRESOURCE_DATA,
+        a2: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateTexture1D(self.inner(), a0, a1, a2) };
+        unsafe { registry::created(hr, a2, a1) };
+        hr
+    }
+
+    unsafe fn CreateTexture2D(
+        &self,
+        a0: *const D3D11_TEXTURE2D_DESC,
+        a1: *const D3D11_SUBRESOURCE_DATA,
+        a2: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateTexture2D(self.inner(), a0, a1, a2) };
+        unsafe { registry::created(hr, a2, a1) };
+        hr
+    }
+
+    unsafe fn CreateTexture3D(
+        &self,
+        a0: *const D3D11_TEXTURE3D_DESC,
+        a1: *const D3D11_SUBRESOURCE_DATA,
+        a2: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateTexture3D(self.inner(), a0, a1, a2) };
+        unsafe { registry::created(hr, a2, a1) };
+        hr
+    }
+
+    unsafe fn CreateTexture2D1(
+        &self,
+        a0: *const D3D11_TEXTURE2D_DESC1,
+        a1: *const D3D11_SUBRESOURCE_DATA,
+        a2: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateTexture2D1(self.inner(), a0, a1, a2) };
+        unsafe { registry::created(hr, a2, a1) };
+        hr
+    }
+
+    unsafe fn CreateTexture3D1(
+        &self,
+        a0: *const D3D11_TEXTURE3D_DESC1,
+        a1: *const D3D11_SUBRESOURCE_DATA,
+        a2: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateTexture3D1(self.inner(), a0, a1, a2) };
+        unsafe { registry::created(hr, a2, a1) };
+        hr
+    }
+
+    unsafe fn CreateInputLayout(
+        &self,
+        a0: *const D3D11_INPUT_ELEMENT_DESC,
+        a1: u32,
+        a2: *const c_void,
+        a3: usize,
+        a4: *mut *mut c_void,
+    ) -> HRESULT {
+        let hr = unsafe { real::CreateInputLayout(self.inner(), a0, a1, a2, a3, a4) };
+        unsafe { capture::input_layout_created(hr, a0, a1, a2, a3, a4) };
+        hr
+    }
+
     unsafe fn CreateDeferredContext(&self, a0: u32, a1: *mut *mut c_void) -> HRESULT {
         unsafe { self.wrap_deferred(real::CreateDeferredContext(self.inner(), a0, a1), a1) }
     }
@@ -610,6 +721,197 @@ unsafe impl ContextMethods for Context {
         }
     }
 
+    unsafe fn Map(
+        &self,
+        a0: *mut c_void,
+        a1: u32,
+        a2: D3D11_MAP,
+        a3: u32,
+        a4: *mut D3D11_MAPPED_SUBRESOURCE,
+    ) -> HRESULT {
+        unsafe {
+            ops::map(self.ctx(), a0, a1, a2, a4, || {
+                real_context::Map(self.inner(), a0, a1, a2, a3, a4)
+            })
+        }
+    }
+
+    unsafe fn Unmap(&self, a0: *mut c_void, a1: u32) {
+        unsafe { ops::unmap(&self.inner, a0, a1, || real_context::Unmap(self.inner(), a0, a1)) }
+    }
+
+    unsafe fn UpdateSubresource(
+        &self,
+        a0: *mut c_void,
+        a1: u32,
+        a2: *const D3D11_BOX,
+        a3: *const c_void,
+        a4: u32,
+        a5: u32,
+    ) {
+        unsafe {
+            self.update("UpdateSubresource", a0, a1, a2, a3, a4, a5, 0);
+            real_context::UpdateSubresource(self.inner(), a0, a1, a2, a3, a4, a5)
+        }
+    }
+
+    unsafe fn UpdateSubresource1(
+        &self,
+        a0: *mut c_void,
+        a1: u32,
+        a2: *const D3D11_BOX,
+        a3: *const c_void,
+        a4: u32,
+        a5: u32,
+        a6: u32,
+    ) {
+        unsafe {
+            self.update("UpdateSubresource1", a0, a1, a2, a3, a4, a5, a6);
+            real_context::UpdateSubresource1(self.inner(), a0, a1, a2, a3, a4, a5, a6)
+        }
+    }
+
+    unsafe fn CopyResource(&self, a0: *mut c_void, a1: *mut c_void) {
+        if capture::armed() {
+            ops::copy_resource(self.ctx(), a0, a1);
+        }
+        unsafe { real_context::CopyResource(self.inner(), a0, a1) }
+    }
+
+    unsafe fn CopySubresourceRegion(
+        &self,
+        a0: *mut c_void,
+        a1: u32,
+        a2: u32,
+        a3: u32,
+        a4: u32,
+        a5: *mut c_void,
+        a6: u32,
+        a7: *const D3D11_BOX,
+    ) {
+        if capture::armed() {
+            let call = "CopySubresourceRegion";
+            ops::copy_region(self.ctx(), call, a0, a1, [a2, a3, a4], a5, a6, a7, 0);
+        }
+        unsafe { real_context::CopySubresourceRegion(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7) }
+    }
+
+    unsafe fn CopySubresourceRegion1(
+        &self,
+        a0: *mut c_void,
+        a1: u32,
+        a2: u32,
+        a3: u32,
+        a4: u32,
+        a5: *mut c_void,
+        a6: u32,
+        a7: *const D3D11_BOX,
+        a8: u32,
+    ) {
+        if capture::armed() {
+            let call = "CopySubresourceRegion1";
+            ops::copy_region(self.ctx(), call, a0, a1, [a2, a3, a4], a5, a6, a7, a8);
+        }
+        unsafe { real_context::CopySubresourceRegion1(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7, a8) }
+    }
+
+    unsafe fn ClearRenderTargetView(&self, a0: *mut c_void, a1: *const f32) {
+        if capture::armed() {
+            ops::clear_rtv(self.ctx(), a0, a1);
+        }
+        unsafe { real_context::ClearRenderTargetView(self.inner(), a0, a1) }
+    }
+
+    unsafe fn ClearDepthStencilView(&self, a0: *mut c_void, a1: u32, a2: f32, a3: u8) {
+        if capture::armed() {
+            ops::clear_dsv(self.ctx(), a0, a1, a2, a3);
+        }
+        unsafe { real_context::ClearDepthStencilView(self.inner(), a0, a1, a2, a3) }
+    }
+
+    unsafe fn ClearUnorderedAccessViewUint(&self, a0: *mut c_void, a1: *const u32) {
+        if capture::armed() {
+            let values = if a1.is_null() {
+                [0u32; 4]
+            } else {
+                unsafe { *(a1 as *const [u32; 4]) }
+            };
+            let call = "ClearUnorderedAccessViewUint";
+            ops::clear_uav(self.ctx(), call, a0, values.to_vec().into());
+        }
+        unsafe { real_context::ClearUnorderedAccessViewUint(self.inner(), a0, a1) }
+    }
+
+    unsafe fn ClearUnorderedAccessViewFloat(&self, a0: *mut c_void, a1: *const f32) {
+        if capture::armed() {
+            let values = if a1.is_null() {
+                [0f32; 4]
+            } else {
+                unsafe { *(a1 as *const [f32; 4]) }
+            };
+            let call = "ClearUnorderedAccessViewFloat";
+            ops::clear_uav(self.ctx(), call, a0, values.to_vec().into());
+        }
+        unsafe { real_context::ClearUnorderedAccessViewFloat(self.inner(), a0, a1) }
+    }
+
+    unsafe fn ClearView(&self, a0: *mut c_void, a1: *const f32, a2: *const RECT, a3: u32) {
+        if capture::armed() {
+            ops::clear_view(self.ctx(), a0, a1, a2, a3);
+        }
+        unsafe { real_context::ClearView(self.inner(), a0, a1, a2, a3) }
+    }
+
+    unsafe fn ResolveSubresource(&self, a0: *mut c_void, a1: u32, a2: *mut c_void, a3: u32, a4: DXGI_FORMAT) {
+        if capture::armed() {
+            ops::resolve(self.ctx(), a0, a1, a2, a3, a4.0);
+        }
+        unsafe { real_context::ResolveSubresource(self.inner(), a0, a1, a2, a3, a4) }
+    }
+
+    unsafe fn GenerateMips(&self, a0: *mut c_void) {
+        if capture::armed() {
+            ops::generate_mips(self.ctx(), a0);
+        }
+        unsafe { real_context::GenerateMips(self.inner(), a0) }
+    }
+
+    unsafe fn CopyStructureCount(&self, a0: *mut c_void, a1: u32, a2: *mut c_void) {
+        if capture::armed() {
+            ops::copy_structure_count(self.ctx(), a0, a1, a2);
+        }
+        unsafe { real_context::CopyStructureCount(self.inner(), a0, a1, a2) }
+    }
+
+    unsafe fn DiscardResource(&self, a0: *mut c_void) {
+        if capture::armed() {
+            ops::discard(self.ctx(), "DiscardResource", a0);
+        }
+        unsafe { real_context::DiscardResource(self.inner(), a0) }
+    }
+
+    unsafe fn DiscardView(&self, a0: *mut c_void) {
+        if capture::armed() {
+            ops::discard(self.ctx(), "DiscardView", a0);
+        }
+        unsafe { real_context::DiscardView(self.inner(), a0) }
+    }
+
+    unsafe fn DiscardView1(&self, a0: *mut c_void, a1: *const RECT, a2: u32) {
+        if capture::armed() {
+            ops::discard(self.ctx(), "DiscardView1", a0);
+        }
+        unsafe { real_context::DiscardView1(self.inner(), a0, a1, a2) }
+    }
+
+    unsafe fn CSSetUnorderedAccessViews(&self, a0: u32, a1: u32, a2: *const *mut c_void, a3: *const u32) {
+        if capture::armed() {
+            let call = "CSSetUnorderedAccessViews";
+            ops::uav_counters(self.ctx(), call, a0, a2, a3, a1);
+        }
+        unsafe { real_context::CSSetUnorderedAccessViews(self.inner(), a0, a1, a2, a3) }
+    }
+
     unsafe fn OMSetRenderTargets(&self, a0: u32, a1: *const *mut c_void, a2: *mut c_void) {
         unsafe { self.targets_changing(a0, a1, a2) };
         unsafe { real_context::OMSetRenderTargets(self.inner(), a0, a1, a2) }
@@ -627,6 +929,10 @@ unsafe impl ContextMethods for Context {
     ) {
         if a0 != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL {
             unsafe { self.targets_changing(a0, a1, a2) };
+        }
+        if capture::armed() && a4 != D3D11_KEEP_UNORDERED_ACCESS_VIEWS {
+            let call = "OMSetRenderTargetsAndUnorderedAccessViews";
+            ops::uav_counters(self.ctx(), call, a3, a5, a6, a4);
         }
         unsafe {
             real_context::OMSetRenderTargetsAndUnorderedAccessViews(self.inner(), a0, a1, a2, a3, a4, a5, a6)
@@ -648,7 +954,7 @@ unsafe impl ContextMethods for Context {
 
     unsafe fn ExecuteCommandList(&self, a0: *mut c_void, a1: BOOL) {
         if capture::armed() {
-            capture::on_execute_list(&self.inner, self.id, self.deferred, a0);
+            capture::on_execute_list(self.ctx(), a0);
         }
         unsafe { real_context::ExecuteCommandList(self.inner(), a0, a1) }
     }

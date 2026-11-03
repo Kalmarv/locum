@@ -11,6 +11,7 @@ mod com;
 mod d3d11;
 mod dxgi;
 mod log;
+mod settings;
 mod system;
 mod vtables;
 

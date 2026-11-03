@@ -273,17 +273,6 @@ fn deferred_value(frame: u32) -> f32 {
     frame as f32
 }
 
-/// The hex locum writes for a constant buffer holding `value` four times.
-fn cb_hex(value: f32) -> String {
-    value
-        .to_le_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>()
-        .repeat(4)
-}
-
-/// Draws a triangle on each context every frame, requests a capture and checks what it holds.
 /// A 64x64 render target of the swap chain's format, and its view.
 fn target(device: &ID3D11Device) -> Result<(ID3D11Texture2D, ID3D11RenderTargetView)> {
     let desc = D3D11_TEXTURE2D_DESC {
@@ -473,10 +462,94 @@ fn channel(value: f32) -> u8 {
     (value / 2000.0 * 255.0).round() as u8
 }
 
-/// Each frame: a draw on the immediate context to target A, then the command list recorded the frame before, which
-/// draws to the back buffer, switches to target B and draws again. A capture of one frame is requested, with targets,
-/// and checked: three draws in that order, their shaders and constants, and each pass's target read back after its
-/// last draw (at the command list's start, inside the list, at the end of the frame).
+/// A texture made with initial data whose rows are padded (5x3 B8G8R8A8, three mips, row pitch 32), so the hash taken
+/// at creation and the one of its contents read back agree only if both are packed the same way.
+fn uploaded_texture(device: &ID3D11Device) -> Result<(ID3D11Texture2D, ID3D11ShaderResourceView, Vec<u8>)> {
+    let desc = D3D11_TEXTURE2D_DESC {
+        Width: 5,
+        Height: 3,
+        MipLevels: 3,
+        ArraySize: 1,
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        ..Default::default()
+    };
+    // Each mip: rows of 32 bytes, the pixels then 0xEE padding; the tight bytes are what the blob should hold.
+    let mips = [(5usize, 3usize), (2, 1), (1, 1)];
+    let mut padded: Vec<Vec<u8>> = Vec::new();
+    let mut tight = Vec::new();
+    for (m, &(w, h)) in mips.iter().enumerate() {
+        let mut data = vec![0xEEu8; 32 * h];
+        for y in 0..h {
+            for x in 0..w * 4 {
+                let b = (m * 64 + y * 16 + x) as u8;
+                data[y * 32 + x] = b;
+                tight.push(b);
+            }
+        }
+        padded.push(data);
+    }
+    let initial: Vec<D3D11_SUBRESOURCE_DATA> = padded
+        .iter()
+        .map(|d| D3D11_SUBRESOURCE_DATA {
+            pSysMem: d.as_ptr().cast(),
+            SysMemPitch: 32,
+            SysMemSlicePitch: d.len() as u32,
+        })
+        .collect();
+    let (mut texture, mut view) = (None, None);
+    unsafe {
+        device.CreateTexture2D(&desc, Some(initial.as_ptr()), Some(&mut texture))?;
+        device.CreateShaderResourceView(texture.as_ref().expect("texture"), None, Some(&mut view))?;
+    }
+    Ok((texture.expect("texture"), view.expect("view"), tight))
+}
+
+/// An immutable 48-byte vertex buffer.
+fn immutable_buffer(device: &ID3D11Device) -> Result<(ID3D11Buffer, Vec<u8>)> {
+    let bytes: Vec<u8> = (0..48u8).map(|b| b.wrapping_mul(7)).collect();
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: 48,
+        Usage: D3D11_USAGE_IMMUTABLE,
+        BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
+        ..Default::default()
+    };
+    let initial = D3D11_SUBRESOURCE_DATA {
+        pSysMem: bytes.as_ptr().cast(),
+        ..Default::default()
+    };
+    let mut buffer = None;
+    unsafe { device.CreateBuffer(&desc, Some(&initial), Some(&mut buffer)) }?;
+    Ok((buffer.expect("buffer"), bytes))
+}
+
+/// A resource's id, the key of its contents, where they came from, and the key of its upload.
+type ResourceRow = (i64, Option<String>, Option<String>, Option<String>);
+
+/// `value` four times, as bytes.
+fn cb_bytes(value: f32) -> Vec<u8> {
+    value.to_le_bytes().repeat(4)
+}
+
+/// Waits up to ten seconds for the writer thread to finish `path`.
+fn wait_for(path: &std::path::Path) -> bool {
+    for _ in 0..100 {
+        if path.is_file() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    false
+}
+
+/// Each frame: a draw on the immediate context to target A (with a texture and a vertex buffer bound that were made
+/// with initial data), then the command list recorded the frame before, which maps its constant buffer, draws to the
+/// back buffer, switches to target B and draws again. A capture of one frame is requested and its `capture.db` and
+/// blobs checked: the three draws in order with their shaders, constants, viewports and targets; the update and the
+/// map with the bytes they wrote; every resource the frame used with its contents as the frame began; and the hash of
+/// a texture's initial data equal to that of its contents read back.
 fn capture(
     checks: &mut Checks,
     device: &ID3D11Device,
@@ -503,15 +576,22 @@ fn capture(
     let deferred_cb = constant_buffer(device, true)?;
     let (_a, target_a) = target(device)?;
     let (_b, target_b) = target(device)?;
+    let (_texture, texture_view, texture_bytes) = uploaded_texture(device)?;
+    let (vertices, vertex_bytes) = immutable_buffer(device)?;
 
-    std::fs::write(dir.join("capture"), b"targets\n").expect("write the capture request");
+    let _ = std::fs::remove_dir_all(dir.join("captures").join(format!("frame-{CAPTURED}")));
+    std::fs::write(dir.join("capture"), b"").expect("write the capture request");
     let mut next_list: Option<ID3D11CommandList> = None;
     for frame in 1..=CAPTURED + 2 {
         unsafe {
             let value = [immediate_value(frame); 4];
             immediate.UpdateSubresource(&immediate_cb, 0, None, value.as_ptr().cast(), 0, 0);
             sh.bind(immediate, &target_a, &immediate_cb);
+            immediate.PSSetShaderResources(0, Some(&[Some(texture_view.clone())]));
+            immediate.IASetVertexBuffers(0, 1, Some(&Some(vertices.clone())), Some(&16), Some(&0));
             immediate.Draw(3, 0);
+            immediate.PSSetShaderResources(0, Some(&[None]));
+            immediate.IASetVertexBuffers(0, 1, Some(&None), Some(&0), Some(&0));
             if let Some(list) = next_list.take() {
                 immediate.ExecuteCommandList(&list, false);
             }
@@ -531,84 +611,216 @@ fn capture(
     }
 
     let folder = dir.join("captures").join(format!("frame-{CAPTURED}"));
-    let Ok(text) = std::fs::read_to_string(folder.join("draws.jsonl")) else {
-        checks.check(false, &format!("capture written to {}", folder.display()));
+    let path = folder.join("capture.db");
+    if !wait_for(&path) {
+        checks.check(false, &format!("capture written to {}", path.display()));
         return Ok(());
+    }
+    checks.check(true, &format!("capture written to {}", path.display()));
+    let db = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("open capture.db");
+    let meta = |key: &str| -> String {
+        db.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .unwrap_or_default()
     };
-    checks.check(true, &format!("capture written to {}", folder.display()));
-    let lines: Vec<serde_json::Value> = text
-        .lines()
-        .map(|l| serde_json::from_str(l).expect("a JSON line"))
-        .collect();
-    let of = |e: &'static str| lines.iter().filter(move |l| l["e"] == e);
-    let frame = of("frame").next().expect("a frame line");
-    println!("frame line: {frame}");
+    let blobs = locum_capture::blobs::Blobs::new(meta("blobs"));
+    let blob = |key: Option<String>| key.and_then(|k| blobs.get(&k).ok());
+    let counts: serde_json::Value = serde_json::from_str(&meta("counts")).unwrap_or_default();
+    println!("counts: {counts}");
     checks.check(
-        frame["draws"] == 3
-            && frame["lists_spliced"] == 1
-            && frame["lists_prerecorded"] == 1
-            && frame["lists_unrecorded"] == 0
-            && frame["copy_failures"] == 0
-            && frame["targets"] == 3,
-        "capture: three draws, the command list (recorded the frame before) spliced in, three targets read back",
+        counts["draws"] == 3
+            && counts["lists_spliced"] == 1
+            && counts["lists_recorded_before"] == 1
+            && counts["lists_unrecorded"] == 0
+            && counts["cb_copy_failures"] == 0
+            && counts["targets"] == 3
+            && counts["contents_missing"] == 0,
+        "capture: three draws, the command list (recorded the frame before) spliced in, three targets read back, \
+         no used resource without contents",
     );
-    let draws: Vec<&serde_json::Value> = of("draw").collect();
-    let content = |hash: &serde_json::Value| {
-        of("cb")
-            .find(|c| &c["hash"] == hash)
-            .and_then(|c| c["hex"].as_str())
-            .map(String::from)
+    let gaps: Vec<(String, String, i64)> = db
+        .prepare("SELECT what, detail, count FROM gaps")
+        .and_then(|mut q| {
+            q.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                    r.get(2)?,
+                ))
+            })?
+            .collect()
+        })
+        .unwrap_or_default();
+    checks.check(gaps.is_empty(), &format!("capture: no gaps ({gaps:?})"));
+
+    // The update and the map, with the bytes each wrote.
+    let event = |kind: &str| -> Option<(bool, Option<String>)> {
+        db.query_row(
+            "SELECT deferred, data FROM events WHERE kind = ?1 ORDER BY seq",
+            [kind],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok()
     };
+    let update = event("update");
+    checks.check(
+        update.as_ref().is_some_and(|(d, _)| !d)
+            && blob(update.and_then(|u| u.1)) == Some(cb_bytes(immediate_value(CAPTURED))),
+        "capture: the UpdateSubresource on the immediate context, with the bytes it wrote",
+    );
+    let map = event("map");
+    checks.check(
+        map.as_ref().is_some_and(|(d, _)| *d)
+            && blob(map.and_then(|m| m.1)) == Some(cb_bytes(deferred_value(CAPTURED))),
+        "capture: the Map(WRITE_DISCARD) in the command list, with the bytes it wrote",
+    );
+
     let expected = [
+        (false, immediate_value(CAPTURED), "the immediate draw to target A"),
         (
-            false,
-            immediate_value(CAPTURED),
-            "the immediate draw to target A (read back when the command list starts)",
+            true,
+            deferred_value(CAPTURED),
+            "the command list's draw to the back buffer",
         ),
         (
             true,
             deferred_value(CAPTURED),
-            "the command list's draw to the back buffer (read back when it switches)",
-        ),
-        (
-            true,
-            deferred_value(CAPTURED),
-            "the command list's draw to target B (read back at the end of the frame)",
+            "the command list's draw to target B",
         ),
     ];
     for (i, (deferred, value, which)) in expected.into_iter().enumerate() {
-        let Some(d) = draws.get(i) else {
+        let row = db.query_row(
+            "SELECT d.call, d.args, d.vs, d.ps, e.deferred FROM draws d JOIN events e ON e.seq = d.event \
+             WHERE d.n = ?1",
+            [i as i64],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, bool>(4)?,
+                ))
+            },
+        );
+        let Ok((call, args, vs, ps, is_deferred)) = row else {
             checks.check(false, &format!("draw {i} captured"));
             continue;
         };
         checks.check(
-            d["deferred"] == deferred && d["call"] == "Draw" && d["args"] == serde_json::json!([3, 0]),
+            is_deferred == deferred && call == "Draw" && args == "[3,0]",
             &format!("draw {i} is {which}"),
         );
         checks.check(
-            d["shaders"]["vs"] == sh.vs_hash.as_str() && d["shaders"]["ps"] == sh.ps_hash.as_str(),
+            vs.as_deref() == Some(sh.vs_hash.as_str()) && ps.as_deref() == Some(sh.ps_hash.as_str()),
             &format!("draw {i}: its shaders' hashes are those of their bytecode"),
         );
-        let cb = &d["cbs"][0];
+        let cb: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT c.bytes FROM bindings b JOIN cb_data c ON c.hash = b.content \
+                 WHERE b.draw = ?1 AND b.stage = 'ps' AND b.kind = 'cb' AND b.slot = 3",
+                [i as i64],
+                |r| r.get(0),
+            )
+            .ok();
         checks.check(
-            cb["stage"] == "ps" && cb["slot"] == 3 && content(&cb["content"]) == Some(cb_hex(value)),
+            cb == Some(cb_bytes(value)),
             &format!("draw {i}: ps b3 holds {value} four times, as the draw saw it"),
         );
-        // The whole target (the triangle covers it) holds the draw's colour in every channel.
-        let file = d["after"][0]["file"]
-            .as_str()
-            .map(|f| folder.join("targets").join(f));
-        let pixel = file
-            .and_then(|f| std::fs::read(f).ok())
-            .and_then(|b| b.get(148..152).map(<[u8]>::to_vec));
-        let expected = channel(value);
-        println!("draw {i}: after it {}, first pixel {pixel:?}", d["after"]);
+        let viewport: Option<(f64, f64)> = db
+            .query_row(
+                "SELECT width, height FROM viewports WHERE draw = ?1 AND i = 0",
+                [i as i64],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
         checks.check(
-            d["after"].as_array().map(Vec::len) == Some(1)
-                && pixel.is_some_and(|p| p.iter().all(|&c| c.abs_diff(expected) <= 1)),
+            viewport == Some((64.0, 64.0)),
+            &format!("draw {i}: its 64x64 viewport"),
+        );
+        // The whole target (the triangle covers it) holds the draw's colour in every channel.
+        let key: Option<String> = db
+            .query_row(
+                "SELECT blob FROM targets WHERE draw = ?1 AND target = 'rt0'",
+                [i as i64],
+                |r| r.get(0),
+            )
+            .ok()
+            .flatten();
+        let pixel = blob(key).and_then(|b| b.get(..4).map(<[u8]>::to_vec));
+        let expected = channel(value);
+        println!("draw {i}: first pixel of its target {pixel:?}");
+        checks.check(
+            pixel.is_some_and(|p| p.iter().all(|&c| c.abs_diff(expected) <= 1)),
             &format!("draw {i}: its target, read back after it, holds {expected} in every channel"),
         );
     }
+
+    // Contents as the frame began: the constant buffer before this frame's update, the texture and vertex buffer as
+    // they were made.
+    let resource = |sql: &str| -> Option<ResourceRow> {
+        db.query_row(sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .ok()
+    };
+    let cb = resource(
+        "SELECT r.id, r.content, r.content_source, r.upload FROM resources r JOIN bindings b ON b.resource = r.id \
+         WHERE b.draw = 0 AND b.stage = 'ps' AND b.kind = 'cb' AND b.slot = 3",
+    );
+    println!("immediate constant buffer: {cb:?}");
+    checks.check(
+        cb.and_then(|c| blob(c.1)) == Some(cb_bytes(immediate_value(CAPTURED - 1))),
+        "contents: the immediate constant buffer as the frame began (the frame before's value)",
+    );
+    let texture = resource(
+        "SELECT r.id, r.content, r.content_source, r.upload FROM resources r JOIN bindings b ON b.resource = r.id \
+         WHERE b.draw = 0 AND b.stage = 'ps' AND b.kind = 'srv' AND b.slot = 0",
+    );
+    println!("texture: {texture:?}");
+    checks.check(
+        texture.as_ref().is_some_and(|t| {
+            t.1.is_some()
+                && t.1 == t.3
+                && t.2.as_deref() == Some("end")
+                && blob(t.1.clone()) == Some(texture_bytes)
+        }),
+        "contents: a texture made with padded rows reads back tightly packed, its key equal to its upload's",
+    );
+    let subs: Vec<Option<String>> = texture
+        .map(|t| {
+            db.prepare("SELECT hash FROM subresources WHERE resource = ?1 ORDER BY sub")
+                .and_then(|mut q| q.query_map([t.0], |r| r.get(0))?.collect())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    checks.check(
+        subs.len() == 3 && subs.iter().all(Option::is_some),
+        "contents: each of the texture's three mips has its own hash",
+    );
+    let vb = resource(
+        "SELECT r.id, r.content, r.content_source, r.upload FROM resources r JOIN bindings b ON b.resource = r.id \
+         WHERE b.draw = 0 AND b.kind = 'vb' AND b.slot = 0",
+    );
+    println!("vertex buffer: {vb:?}");
+    checks.check(
+        vb.is_some_and(|v| v.2.as_deref() == Some("upload") && blob(v.1) == Some(vertex_bytes)),
+        "contents: an immutable vertex buffer's come from its upload, without a readback",
+    );
+    let unread: i64 = db
+        .query_row(
+            "SELECT count(*) FROM resources WHERE used = 1 AND content IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(i64::MAX);
+    checks.check(unread == 0, "contents: every resource the frame used has them");
+    let shader_blobs: Vec<Option<String>> = db
+        .prepare("SELECT blob FROM shaders")
+        .and_then(|mut q| q.query_map([], |r| r.get(0))?.collect())
+        .unwrap_or_default();
+    checks.check(
+        shader_blobs.len() == 2 && shader_blobs.into_iter().all(|k| blob(k).is_some()),
+        "capture: both shaders' bytecode in the blob store",
+    );
     Ok(())
 }
 

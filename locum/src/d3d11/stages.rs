@@ -11,6 +11,9 @@ pub const CB_SLOTS: u32 = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
 /// Shader resource view slots per stage.
 pub const SRV_SLOTS: usize = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT as usize;
 
+/// Sampler slots per stage.
+pub const SAMPLER_SLOTS: usize = D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT as usize;
+
 /// A constant buffer bound to a slot, with its range in constants (16 bytes each).
 pub struct CbBinding {
     pub buffer: Option<ID3D11Buffer>,
@@ -19,7 +22,7 @@ pub struct CbBinding {
 }
 
 macro_rules! per_stage {
-    ($($stage:ident => $ty:ident, $get:ident, $set:ident, $get_cbs:ident, $set_cbs:ident, $get_srvs:ident, $create:ident;)*) => {
+    ($($stage:ident => $ty:ident, $get:ident, $set:ident, $get_cbs:ident, $set_cbs:ident, $get_srvs:ident, $get_samplers:ident, $create:ident;)*) => {
         /// The shader bound to `stage`.
         pub unsafe fn shader(c: &ID3D11DeviceContext4, stage: Stage) -> Option<ID3D11DeviceChild> {
             match stage {
@@ -82,6 +85,15 @@ macro_rules! per_stage {
             views
         }
 
+        /// The samplers bound to `stage`.
+        pub unsafe fn samplers(c: &ID3D11DeviceContext4, stage: Stage) -> [Option<ID3D11SamplerState>; SAMPLER_SLOTS] {
+            let mut samplers = [const { None }; SAMPLER_SLOTS];
+            match stage {
+                $(Stage::$stage => unsafe { c.$get_samplers(0, Some(&mut samplers)) },)*
+            }
+            samplers
+        }
+
         /// Creates a shader of `stage` from bytecode on the real device.
         pub unsafe fn create_shader(device: &ID3D11Device, stage: Stage, code: &[u8]) -> Result<ID3D11DeviceChild> {
             match stage {
@@ -96,10 +108,10 @@ macro_rules! per_stage {
 }
 
 per_stage! {
-    Vertex => ID3D11VertexShader, VSGetShader, VSSetShader, VSGetConstantBuffers1, VSSetConstantBuffers1, VSGetShaderResources, CreateVertexShader;
-    Hull => ID3D11HullShader, HSGetShader, HSSetShader, HSGetConstantBuffers1, HSSetConstantBuffers1, HSGetShaderResources, CreateHullShader;
-    Domain => ID3D11DomainShader, DSGetShader, DSSetShader, DSGetConstantBuffers1, DSSetConstantBuffers1, DSGetShaderResources, CreateDomainShader;
-    Geometry => ID3D11GeometryShader, GSGetShader, GSSetShader, GSGetConstantBuffers1, GSSetConstantBuffers1, GSGetShaderResources, CreateGeometryShader;
-    Pixel => ID3D11PixelShader, PSGetShader, PSSetShader, PSGetConstantBuffers1, PSSetConstantBuffers1, PSGetShaderResources, CreatePixelShader;
-    Compute => ID3D11ComputeShader, CSGetShader, CSSetShader, CSGetConstantBuffers1, CSSetConstantBuffers1, CSGetShaderResources, CreateComputeShader;
+    Vertex => ID3D11VertexShader, VSGetShader, VSSetShader, VSGetConstantBuffers1, VSSetConstantBuffers1, VSGetShaderResources, VSGetSamplers, CreateVertexShader;
+    Hull => ID3D11HullShader, HSGetShader, HSSetShader, HSGetConstantBuffers1, HSSetConstantBuffers1, HSGetShaderResources, HSGetSamplers, CreateHullShader;
+    Domain => ID3D11DomainShader, DSGetShader, DSSetShader, DSGetConstantBuffers1, DSSetConstantBuffers1, DSGetShaderResources, DSGetSamplers, CreateDomainShader;
+    Geometry => ID3D11GeometryShader, GSGetShader, GSSetShader, GSGetConstantBuffers1, GSSetConstantBuffers1, GSGetShaderResources, GSGetSamplers, CreateGeometryShader;
+    Pixel => ID3D11PixelShader, PSGetShader, PSSetShader, PSGetConstantBuffers1, PSSetConstantBuffers1, PSGetShaderResources, PSGetSamplers, CreatePixelShader;
+    Compute => ID3D11ComputeShader, CSGetShader, CSSetShader, CSGetConstantBuffers1, CSSetConstantBuffers1, CSGetShaderResources, CSGetSamplers, CreateComputeShader;
 }

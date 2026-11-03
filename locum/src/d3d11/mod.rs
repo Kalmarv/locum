@@ -4,5 +4,6 @@
 pub mod capture;
 pub mod device;
 pub mod overrides;
+pub mod registry;
 pub mod shaders;
 pub mod stages;

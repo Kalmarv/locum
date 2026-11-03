@@ -17,8 +17,8 @@ use windows::Win32::Foundation::{HWND, LUID};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
-use crate::d3d11::capture;
 use crate::com::answer_query;
+use crate::d3d11::capture;
 use crate::d3d11::device::Device;
 use crate::log::log;
 use crate::vtables::adapter::{AdapterMethods, real as real_adapter};
@@ -494,9 +494,15 @@ impl SwapChain {
     }
 }
 
+static FRAMES: AtomicU64 = AtomicU64::new(0);
+
+/// Frames presented so far.
+pub fn frames() -> u64 {
+    FRAMES.load(Ordering::Relaxed)
+}
+
 /// Counts a frame and logs the frame rate every 600.
 fn count_frame() -> u64 {
-    static FRAMES: AtomicU64 = AtomicU64::new(0);
     static SINCE: Mutex<Option<Instant>> = Mutex::new(None);
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
     if frame == 1 || frame.is_multiple_of(600) {
