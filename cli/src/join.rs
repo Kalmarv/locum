@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use locum_capture::index::{File, Index};
+use locum_capture::index::{File, Index, Like};
 
 use crate::describe::shape;
 use crate::open::Capture;
@@ -65,11 +65,11 @@ impl Names {
         self.indexes.is_empty()
     }
 
-    fn whole(&self, key: &str) -> Option<(File, usize)> {
+    fn whole(&self, key: &str, like: &Like) -> Option<(File, usize)> {
         let mut found = None;
         let mut count = 0;
         for index in &self.indexes {
-            let (files, n) = index.whole(key, 1);
+            let (files, n) = index.whole(key, like, 1);
             count += n;
             if found.is_none() {
                 found = files.into_iter().next();
@@ -96,8 +96,14 @@ impl Names {
             c.row("SELECT upload, content FROM resources WHERE id = ?1", [id], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?;
+        let s = shape(c, id)?;
+        let like = if s.kind == "buffer" {
+            Like::Buffer
+        } else {
+            Like::texture(s.format, s.width, s.height)
+        };
         for (key, how) in [(&upload, "upload"), (&content, "contents")] {
-            if let Some((file, others)) = key.as_deref().and_then(|k| self.whole(k)) {
+            if let Some((file, others)) = key.as_deref().and_then(|k| self.whole(k, &like)) {
                 return Some(Match {
                     file,
                     how: how.into(),
@@ -106,16 +112,20 @@ impl Names {
             }
         }
         // Subresource by subresource: a texture made from part of a file (fewer mips, one face).
-        let subs: Vec<(i64, i64, i64, Option<String>)> = c.rows(
-            "SELECT sub, mip, slice, hash FROM subresources WHERE resource = ?1 ORDER BY sub",
+        if s.kind == "buffer" {
+            return None;
+        }
+        let subs: Vec<(i64, i64, i64, Option<String>, u32, u32)> = c.rows(
+            "SELECT sub, mip, slice, hash, width, height FROM subresources WHERE resource = ?1 ORDER BY sub",
             [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         );
         let total = subs.len();
         let mut matched: Vec<(i64, i64, File, u32, u32, usize)> = Vec::new();
-        for (_, mip, slice, hash) in &subs {
+        for (_, mip, slice, hash, width, height) in &subs {
             let Some(hash) = hash else { continue };
-            if let Some((s, n)) = self.indexes.iter().find_map(|i| i.sub(hash)) {
+            let like = Like::texture(s.format, *width, *height);
+            if let Some((s, n)) = self.indexes.iter().find_map(|i| i.sub(hash, &like)) {
                 matched.push((*mip, *slice, s.file, s.mip, s.slice, n));
             }
         }

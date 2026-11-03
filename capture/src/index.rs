@@ -12,6 +12,7 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::dds;
+use crate::format;
 use crate::hash::key;
 use crate::layout;
 
@@ -51,6 +52,54 @@ pub struct FileSub {
 
 pub struct Index {
     db: Connection,
+}
+
+/// What a resource is, so it is matched only with files that could have made it: a buffer with buffers; a texture
+/// with textures of its size whose texels are laid out alike (the same blocks of the same bytes: `BC7_UNORM` and
+/// `BC7_UNORM_SRGB`, or any two formats of four bytes a texel). The same bytes in another arrangement are not the
+/// same data, only the same bytes (all zeros, say).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Like {
+    Buffer,
+    Texture {
+        formats: Vec<u32>,
+        width: u32,
+        height: u32,
+    },
+}
+
+impl Like {
+    /// A texture of `format`, `width` x `height` texels (a subresource's size, for [`Index::sub`]).
+    pub fn texture(format: u32, width: u32, height: u32) -> Like {
+        let layout = format::layout(format);
+        let formats = match layout {
+            Some(_) => (0..=255).filter(|&f| format::layout(f) == layout).collect(),
+            None => Vec::new(),
+        };
+        Like::Texture {
+            formats,
+            width,
+            height,
+        }
+    }
+
+    /// SQL that keeps the rows of `table` (files or subs) this matches.
+    fn filter(&self, table: &str) -> String {
+        match self {
+            Like::Buffer => "f.kind = 'buffer'".into(),
+            Like::Texture {
+                formats,
+                width,
+                height,
+            } => {
+                let formats: Vec<String> = formats.iter().map(u32::to_string).collect();
+                format!(
+                    "f.kind = 'texture' AND f.format IN ({}) AND {table}.width = {width} AND {table}.height = {height}",
+                    formats.join(",")
+                )
+            }
+        }
+    }
 }
 
 const FILE_COLUMNS: &str = "f.id, f.name, f.kind, f.format, f.width, f.height, f.mips, f.array";
@@ -163,13 +212,16 @@ impl Index {
             .map_err(|e| e.to_string())
     }
 
-    /// The files whose whole bytes have `key`, at most `limit`, and how many there are.
-    pub fn whole(&self, key: &str, limit: usize) -> (Vec<File>, usize) {
+    /// The files like `like` whose whole bytes have `key`, at most `limit`, and how many there are.
+    pub fn whole(&self, key: &str, like: &Like, limit: usize) -> (Vec<File>, usize) {
+        let filter = like.filter("f");
         let count = self
             .db
-            .query_row("SELECT count(*) FROM files WHERE key = ?1", [key], |r| {
-                r.get::<_, i64>(0)
-            })
+            .query_row(
+                &format!("SELECT count(*) FROM files f WHERE f.key = ?1 AND {filter}"),
+                [key],
+                |r| r.get::<_, i64>(0),
+            )
             .unwrap_or(0) as usize;
         if count == 0 {
             return (Vec::new(), 0);
@@ -177,7 +229,7 @@ impl Index {
         let files = self
             .db
             .prepare_cached(&format!(
-                "SELECT {FILE_COLUMNS} FROM files f WHERE f.key = ?1 ORDER BY f.name LIMIT ?2"
+                "SELECT {FILE_COLUMNS} FROM files f WHERE f.key = ?1 AND {filter} ORDER BY f.name LIMIT ?2"
             ))
             .and_then(|mut s| {
                 s.query_map(params![key, limit as i64], file_from)?
@@ -187,13 +239,19 @@ impl Index {
         (files, count)
     }
 
-    /// A subresource of a file whose bytes have `key`, and how many there are.
-    pub fn sub(&self, key: &str) -> Option<(FileSub, usize)> {
+    /// A subresource like `like` (a texture subresource's format and size) of a file, whose bytes have `key`, and how
+    /// many there are.
+    pub fn sub(&self, key: &str, like: &Like) -> Option<(FileSub, usize)> {
+        let filter = like.filter("s");
         let count = self
             .db
-            .query_row("SELECT count(*) FROM subs WHERE key = ?1", [key], |r| {
-                r.get::<_, i64>(0)
-            })
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM subs s JOIN files f ON f.id = s.file WHERE s.key = ?1 AND {filter}"
+                ),
+                [key],
+                |r| r.get::<_, i64>(0),
+            )
             .unwrap_or(0) as usize;
         if count == 0 {
             return None;
@@ -201,7 +259,7 @@ impl Index {
         self.db
             .prepare_cached(&format!(
                 "SELECT {FILE_COLUMNS}, s.sub, s.mip, s.slice FROM subs s JOIN files f ON f.id = s.file \
-                 WHERE s.key = ?1 ORDER BY f.name, s.sub LIMIT 1"
+                 WHERE s.key = ?1 AND {filter} ORDER BY f.name, s.sub LIMIT 1"
             ))
             .and_then(|mut s| {
                 s.query_row([key], |r| {
@@ -268,12 +326,35 @@ mod tests {
             );
         }
         let index = Index::open(&path).unwrap();
-        let (files, count) = index.whole(&key(&payload), 10);
+        // R8G8B8A8_UNORM (28) is laid out as B8G8R8A8_UNORM (87) is: four bytes a texel.
+        let (files, count) = index.whole(&key(&payload), &Like::texture(28, 4, 2), 10);
         assert_eq!((files[0].name.as_str(), count), ("a/b.dds", 1));
-        let (s, _) = index.sub(&key(&payload[32..40])).unwrap();
+        let (s, _) = index
+            .sub(&key(&payload[32..40]), &Like::texture(87, 2, 1))
+            .unwrap();
         assert_eq!((s.file.name.as_str(), s.mip, s.slice), ("a/b.dds", 1, 0));
-        assert_eq!(index.whole(&key(b"vertex bytes"), 10).0[0].kind, "buffer");
-        assert!(index.sub(&key(b"nothing")).is_none());
+        assert_eq!(
+            index.whole(&key(b"vertex bytes"), &Like::Buffer, 10).0[0].kind,
+            "buffer"
+        );
+        assert!(index.sub(&key(b"nothing"), &Like::texture(87, 2, 1)).is_none());
+        // The same bytes are not the same data as a buffer, in another layout, or at another size.
+        assert_eq!(index.whole(&key(&payload), &Like::Buffer, 10).1, 0);
+        assert_eq!(
+            index.whole(&key(b"vertex bytes"), &Like::texture(87, 4, 2), 10).1,
+            0
+        );
+        assert!(
+            index
+                .sub(&key(&payload[32..40]), &Like::texture(56, 2, 2))
+                .is_none()
+        );
+        assert!(
+            index
+                .sub(&key(&payload[32..40]), &Like::texture(87, 1, 2))
+                .is_none()
+        );
+        assert!(index.sub(&key(&payload[32..40]), &Like::Buffer).is_none());
         assert_eq!(
             index.counts(),
             vec![("buffer".to_string(), 1), ("texture".to_string(), 1)]
