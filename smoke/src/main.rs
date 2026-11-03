@@ -1429,22 +1429,28 @@ fn adversarial_capture(
     Ok(())
 }
 
-/// Each thread takes the next free slot with an atomic add and writes its id there: which record lands where depends
-/// on the order the GPU runs the threads.
+/// Each thread takes the next free slot with an atomic add and writes its id there, and its slot beside its id:
+/// which record lands where depends on the order the GPU runs the threads, and so does what each slot record holds
+/// (as a light list's tiles hold the offsets they were given).
 const SLOTS_CS: &str = "RWByteAddressBuffer counter : register(u0);
 RWStructuredBuffer<uint2> records : register(u1);
+RWStructuredBuffer<uint2> slots : register(u2);
 [numthreads(64, 1, 1)] void main(uint id : SV_DispatchThreadID) {
     uint slot;
     counter.InterlockedAdd(0, 1, slot);
     records[slot] = uint2(id, id * 2654435761u);
+    slots[id] = uint2(slot, id);
 }";
 
-/// Draws record `y * 64 + x` at pixel (x, y), so the picture shows the order the records were written in. Its
-/// colours are whole steps of the 8-bit target, which every rasterizer (WARP too) writes the same.
+/// Draws record `y * 64 + x` and slot record `y * 64 + x` at pixel (x, y), so the picture shows the order both were
+/// written in. Its colours are whole steps of the 8-bit target, which every rasterizer (WARP too) writes the same.
 const SLOTS_PS: &str = "StructuredBuffer<uint2> records : register(t0);
+StructuredBuffer<uint2> slots : register(t1);
 float4 main(float4 p : SV_Position) : SV_Target {
-    uint v = records[uint(p.y) * 64 + uint(p.x)].x;
-    return float4((v & 255) / 255.0, (v >> 8) / 255.0, 0, 1);
+    uint i = uint(p.y) * 64 + uint(p.x);
+    uint v = records[i].x;
+    uint s = slots[i].x;
+    return float4((v & 255) / 255.0, (s & 255) / 255.0, ((v >> 8) | ((s >> 8) << 4)) / 255.0, 1);
 }";
 
 /// Threads of `SLOTS_CS`, one record each.
@@ -1480,7 +1486,15 @@ fn ordered_capture(
         pSysMem: zeros.as_ptr().cast(),
         ..Default::default()
     };
-    let (mut counter, mut records) = (None, None);
+    let (mut counter, mut records, mut slots) = (None, None, None);
+    let structured = D3D11_BUFFER_DESC {
+        ByteWidth: SLOTS * 8,
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: (D3D11_BIND_UNORDERED_ACCESS.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
+        MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
+        StructureByteStride: 8,
+        ..Default::default()
+    };
     unsafe {
         device.CreateBuffer(
             &D3D11_BUFFER_DESC {
@@ -1493,21 +1507,16 @@ fn ordered_capture(
             Some(&initial),
             Some(&mut counter),
         )?;
-        device.CreateBuffer(
-            &D3D11_BUFFER_DESC {
-                ByteWidth: SLOTS * 8,
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: (D3D11_BIND_UNORDERED_ACCESS.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-                MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
-                StructureByteStride: 8,
-                ..Default::default()
-            },
-            Some(&initial),
-            Some(&mut records),
-        )?;
+        device.CreateBuffer(&structured, Some(&initial), Some(&mut records))?;
+        device.CreateBuffer(&structured, Some(&initial), Some(&mut slots))?;
     }
-    let (counter, records) = (counter.expect("counter"), records.expect("records"));
+    let (counter, records, slots) = (
+        counter.expect("counter"),
+        records.expect("records"),
+        slots.expect("slots"),
+    );
     let (mut counter_view, mut records_view, mut records_srv) = (None, None, None);
+    let (mut slots_view, mut slots_srv) = (None, None);
     unsafe {
         device.CreateUnorderedAccessView(
             &counter,
@@ -1526,6 +1535,8 @@ fn ordered_capture(
         )?;
         device.CreateUnorderedAccessView(&records, None, Some(&mut records_view))?;
         device.CreateShaderResourceView(&records, None, Some(&mut records_srv))?;
+        device.CreateUnorderedAccessView(&slots, None, Some(&mut slots_view))?;
+        device.CreateShaderResourceView(&slots, None, Some(&mut slots_srv))?;
     }
     let (texture, view) = target(device)?;
     let cb = constant_buffer(device, false)?;
@@ -1548,18 +1559,18 @@ fn ordered_capture(
         c.CSSetShader(cs.as_ref(), None);
         c.CSSetUnorderedAccessViews(
             0,
-            2,
-            Some([counter_view.clone(), records_view.clone()].as_ptr()),
+            3,
+            Some([counter_view.clone(), records_view.clone(), slots_view.clone()].as_ptr()),
             None,
         );
         c.Dispatch(SLOTS / 64, 1, 1);
-        c.CSSetUnorderedAccessViews(0, 2, Some([None, None].as_ptr()), None);
+        c.CSSetUnorderedAccessViews(0, 3, Some([None, None, None].as_ptr()), None);
         c.CSSetShader(None, None);
         sh.bind(c, &view, &cb);
         c.PSSetShader(ps.as_ref(), None);
-        c.PSSetShaderResources(0, Some(&[records_srv.clone()]));
+        c.PSSetShaderResources(0, Some(&[records_srv.clone(), slots_srv.clone()]));
         c.Draw(3, 0);
-        c.PSSetShaderResources(0, Some(&[None]));
+        c.PSSetShaderResources(0, Some(&[None, None]));
         c.OMSetRenderTargets(None, None);
     }
     unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
@@ -1590,8 +1601,8 @@ fn ordered_capture(
         .collect();
     println!("ordered: the dispatch's recorded outputs {kept:?}, sizes {sizes:?}");
     checks.check(
-        kept.len() == 2,
-        "ordered: what the dispatch wrote is recorded for both its UAVs",
+        kept.len() == 3,
+        "ordered: what the dispatch wrote is recorded for each of its three UAVs",
     );
     checks.check(
         kept.iter()

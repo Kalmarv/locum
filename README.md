@@ -160,10 +160,13 @@ locum-cli replay last 812 --rules mine.txt --mode frame
 (contents, command lists, constants); checks the capture could not make (targets skipped, a repeated list's earlier
 executions, the memory dump) are listed as not compared.
 
-After an order-dependent draw or dispatch, replay compares what it wrote with what the game's GPU wrote (`results`):
-identical; the same records in another order (a structured buffer's structures, otherwise 4-byte words), in which
-case replay puts the game's bytes in place and goes on from them, so everything after follows the game's order; or
-different in more than order, which replay leaves as it made it and which fails verify.
+After an order-dependent draw or dispatch, replay compares what it wrote with what the game's GPU wrote (`results`)
+and says how they compare: identical; the same records in another order (a structured buffer's structures, otherwise
+4-byte words); or different in more than order, as when the shader writes what its atomics returned (Sekiro's light
+tiles each hold the offset into the light list their group was given). Then it puts the game's bytes in place and
+goes on from them, so everything after follows the game's order and can be compared exactly. Outputs that differ in
+more than order are listed as not compared: what verify proves is that every target is the game's given what those
+events wrote in the game. Rules do not change what such an event writes.
 
 A draw is replayed with what it depends on: walking back from it, each earlier event that wrote a resource it (or an
 event already taken) reads or writes is taken too, and every resource starts with its contents as the frame began.

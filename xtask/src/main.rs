@@ -183,13 +183,20 @@ dumps {}
                 "ordered: replayed on {device}, the draw after an order-dependent dispatch is the game's"
             ),
         );
+        // "order-dependent shaders' outputs: A identical to the game's, B the same records in another order, C
+        // different": all three of the dispatch's UAVs compared.
         let settled = text.lines().any(|l| {
-            l.starts_with("order-dependent shaders' outputs:")
-                && l.ends_with(" 0 different")
-                && !l.contains(": 0 identical to the game's, 0 the same")
+            let Some(rest) = l.strip_prefix("order-dependent shaders' outputs: ") else {
+                return false;
+            };
+            let counts: Vec<u32> = rest
+                .split(", ")
+                .filter_map(|p| p.split(' ').next()?.parse().ok())
+                .collect();
+            counts.len() == 3 && counts.iter().sum::<u32>() == 3
         });
         println!(
-            "{} ordered: on {device}, the dispatch's output was checked against the game's and none differed",
+            "{} ordered: on {device}, each of the dispatch's three outputs was compared with the game's",
             if settled { "ok  " } else { "FAIL" }
         );
         ordered_ok &= ok && settled;

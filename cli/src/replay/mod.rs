@@ -342,12 +342,12 @@ fn execute(
             .map_err(|e| format!("resource #{id}: {e}"))?;
     }
     let written = order_dependent(c);
-    let mut differing = 0;
+    let mut settled = 0;
     for &seq in &plan.events {
         b.run(c, seq, rules).map_err(|e| format!("event {seq}: {e}"))?;
-        for (_, settled) in settle(c, b.as_mut(), &written, seq).map_err(|e| format!("event {seq}: {e}"))? {
-            differing += usize::from(matches!(settled, Settled::Differs(_)));
-        }
+        settled += settle(c, b.as_mut(), &written, seq)
+            .map_err(|e| format!("event {seq}: {e}"))?
+            .len();
     }
     let mut results = Vec::new();
     for o in outs {
@@ -359,9 +359,9 @@ fn execute(
             "{missing} resources had no contents in the capture and started empty"
         ));
     }
-    if differing > 0 && rules.is_empty() {
+    if settled > 0 && !rules.is_empty() {
         warnings.push(format!(
-            "{differing} outputs of order-dependent shaders differ from the game's in more than order"
+            "{settled} outputs of order-dependent draws and dispatches are the game's, so rules do not change them"
         ));
     }
     Ok((results, warnings))
@@ -398,9 +398,10 @@ enum Settled {
     Differs(String),
 }
 
-/// After order-dependent event `seq` ran, compares what it wrote with what the game's GPU wrote, and where the two
-/// hold the same records in another order puts the game's bytes in place, so everything after follows the order the
-/// game's GPU took. Output that differs in more than order is left as replay made it.
+/// After order-dependent event `seq` ran, compares what it wrote with what the game's GPU wrote, and puts the game's
+/// bytes in place, so everything after follows the order the game's GPU took. Its own output can hold the same records
+/// in another order, or differ in more than order: a shader that writes what its atomics returned (an offset into a
+/// list it allocates from, say) writes other values when its threads run in another order.
 fn settle(
     c: &Capture,
     b: &mut dyn Backend,
@@ -439,7 +440,7 @@ fn settle(
                 game.len().div_ceil(stride)
             ))
         };
-        if matches!(settled, Settled::Reordered { .. }) {
+        if !matches!(settled, Settled::Identical) {
             b.write(c, *resource, &game)?;
         }
         out.push((*resource, settled));
@@ -689,7 +690,10 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
                 }
                 Settled::Differs(how) => {
                     differing += 1;
-                    out!("event {seq:>5} #{resource}: differs from the game's output: {how}");
+                    out!(
+                        "event {seq:>5} #{resource}: differs from the game's output in more than order ({how}); going \
+                         on from the game's"
+                    );
                 }
             }
         }
@@ -724,7 +728,14 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
         );
     }
     // What keeps an identical replay from proving the frame: what the capture could not record, used resources
-    // without contents, and events replay could not run as recorded.
+    // without contents, and events replay could not run as recorded. What order-dependent events wrote is the game's
+    // from there on; replay's own output was compared, but no exact comparison of it can hold.
+    if differing > 0 {
+        out!(
+            "not compared: {differing} outputs of order-dependent draws and dispatches that differ from the game's in \
+             more than order (the game's were used)"
+        );
+    }
     for note in c.rows(
         &format!("SELECT what, coalesce(detail, ''), count FROM gaps WHERE what IN ({CHECKS}) ORDER BY what, detail"),
         [],
@@ -770,11 +781,6 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
     }
     if same < compared {
         return Err(format!("{} of {compared} targets differ", compared - same));
-    }
-    if differing > 0 {
-        return Err(format!(
-            "{differing} outputs of order-dependent shaders differ from the game's in more than order"
-        ));
     }
     if compared == 0 {
         return Err("no target was compared".into());
