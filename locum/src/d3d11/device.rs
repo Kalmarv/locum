@@ -101,7 +101,18 @@ impl Context {
     /// Runs the real draw or dispatch, with the overrides that hold for it if any are loaded.
     fn run(&self, compute: bool, real: impl FnOnce()) {
         if overrides::active() {
-            unsafe { overrides::around(&self.inner, compute, real) }
+            unsafe {
+                overrides::around(
+                    &self.inner,
+                    compute,
+                    |rule| {
+                        if capture::armed() {
+                            capture::rule_applied(self.ctx(), rule);
+                        }
+                    },
+                    real,
+                )
+            }
         } else {
             real()
         }

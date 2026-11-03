@@ -238,6 +238,17 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             }
         }
         let Some(d) = e.draw.as_deref_mut() else { continue };
+        for rule in &d.overrides {
+            *gaps
+                .entry((
+                    "overrides".into(),
+                    format!(
+                        "{} at event {seq}: live rule {rule:?} changed or skipped the recorded draw",
+                        e.call
+                    ),
+                ))
+                .or_insert(0) += 1;
+        }
         for cb in &d.cb_copies {
             if let Some((chunk, offset, _)) = cb.copy
                 && last_cb.get(&(chunk, offset)) != Some(&index)

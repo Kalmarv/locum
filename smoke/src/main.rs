@@ -15,6 +15,7 @@
 //!   with their shaders' hashes and the constant-buffer contents each draw saw.
 
 mod layers;
+mod live_capture;
 mod replay_rows;
 
 use std::process::ExitCode;
@@ -215,6 +216,7 @@ fn run(checks: &mut Checks) -> Result<()> {
     adversarial_capture(checks, &device, &immediate, &deferred, &swapchain)?;
     unsafe { immediate.ClearState() };
     ordered_capture(checks, &device, &immediate, &swapchain)?;
+    live_capture::run(checks, &device, &immediate, &deferred, &swapchain)?;
     layers::run(checks, &device, &immediate, &swapchain)?;
     replay_rows::row16(checks, &device, &immediate, &deferred, &swapchain)?;
     replay_rows::row17(checks, &device, &immediate, &swapchain)?;

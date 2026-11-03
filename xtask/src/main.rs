@@ -445,6 +445,45 @@ fn smoke(root: &Path, debug: bool) {
         rows_ok &= ok;
     }
     rows_ok &= layer_checks(&cli, &log_dir, debug);
+    for warp in [false, true] {
+        for label in [
+            "live-skip",
+            "live-solid",
+            "live-constant",
+            "live-deferred",
+            "live-unmatched",
+            "live-unexecuted",
+        ] {
+            let mut cmd = Command::new(&cli);
+            cmd.arg("verify")
+                .arg(log_dir.join("captures").join(label))
+                .env("LOCUM_DIR", &log_dir);
+            if warp {
+                cmd.arg("--warp");
+            }
+            if debug {
+                cmd.arg("--debug");
+            }
+            let output = cmd.output().expect("verify live-rule capture");
+            let text = String::from_utf8_lossy(&output.stdout).into_owned()
+                + &String::from_utf8_lossy(&output.stderr);
+            let passed = output.status.success();
+            println!("--- {label} (WARP={warp})\n{text}");
+            let ok = if matches!(label, "live-unmatched" | "live-unexecuted") {
+                passed
+            } else {
+                !passed
+                    && text.contains("capture gap: overrides")
+                    && text.contains("event 0")
+                    && text.contains("1 of 1 targets identical")
+            };
+            println!(
+                "{} {label}: live-rule completeness gate",
+                if ok { "ok  " } else { "FAIL" }
+            );
+            rows_ok &= ok;
+        }
+    }
     if !status.success()
         || !late.success()
         || !overlay.success()

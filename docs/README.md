@@ -152,6 +152,10 @@ locum-cli replay last 812 --rules mine.txt --mode frame
 nothing the replay needs is missing (contents, command lists, constants); checks the capture could not make (targets
 or outputs skipped, a repeated list's earlier executions, the memory dump) are listed as not compared.
 
+A capture taken while a rule in `overrides.txt` changed or skipped one of its draws records the draw as the game
+asked for it, not as the GPU ran it: an `overrides` gap names the draw, the event and the rule, and verify fails even
+if the pixels happen to match. A rule that matched nothing, or a draw in a command list that never ran, doesn't count.
+
 After each draw or dispatch, replay compares what it wrote through UAVs with what the game's GPU wrote (`results`).
 Each clear is also compared immediately, including unbound views and clears with no following draw. A frame with
 only clears can therefore be verified. These checkpoints copy the whole resource, including bytes outside the

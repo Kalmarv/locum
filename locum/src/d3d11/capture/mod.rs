@@ -161,6 +161,8 @@ pub(super) struct Draw {
     closed: bool,
     /// Whether one of its shaders writes what depends on the order the GPU runs its threads.
     order_dependent: bool,
+    /// Live rules actually applied after this snapshot (kept with deferred draws until execution).
+    overrides: Vec<String>,
 }
 
 /// One thing a context did, as recorded on it.
@@ -578,6 +580,22 @@ pub fn after_draw(ctx: Ctx) {
 /// A clear can write a view which was never bound, and need not be followed by a draw.
 pub fn after_clear(ctx: Ctx) {
     after_output(ctx, true);
+}
+
+/// The snapshot preceded this live rule. Keep the reason with the draw so an unexecuted list does not create a gap.
+pub fn rule_applied(Ctx { id, deferred, .. }: Ctx, rule: &str) {
+    let mut s = state();
+    if !s.records(deferred) {
+        return;
+    }
+    let event = if deferred {
+        s.pending.get_mut(&id).and_then(|p| p.last_mut())
+    } else {
+        s.timeline.last_mut()
+    };
+    if let Some(draw) = event.and_then(|e| e.draw.as_deref_mut()) {
+        draw.overrides.push(rule.to_owned());
+    }
 }
 
 fn after_output(

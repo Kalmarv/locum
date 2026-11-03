@@ -142,13 +142,19 @@ enum Undo {
 }
 
 /// Runs `draw` (the real draw or dispatch on `c`) with the rules that hold for it applied, then undoes them.
-pub unsafe fn around(c: &ID3D11DeviceContext4, compute: bool, draw: impl FnOnce()) {
+pub unsafe fn around(
+    c: &ID3D11DeviceContext4,
+    compute: bool,
+    mut applied: impl FnMut(&str),
+    draw: impl FnOnce(),
+) {
     let Some(rules) = current() else { return draw() };
     let mut bound = Bound { c, hashes: [None; 6] };
     let applies = |r: &Rule| r.rule.applies(compute);
     if rules.rules.iter().any(|r| {
         matches!(r.rule.action, Action::Skip) && applies(r) && bound.holds(r) && {
             r.applied.fetch_add(1, Ordering::Relaxed);
+            applied(&r.rule.text);
             true
         }
     }) {
@@ -178,6 +184,7 @@ pub unsafe fn around(c: &ID3D11DeviceContext4, compute: bool, draw: impl FnOnce(
             _ => continue,
         }
         r.applied.fetch_add(1, Ordering::Relaxed);
+        applied(&r.rule.text);
     }
     draw();
     for u in undo.into_iter().rev() {
