@@ -468,6 +468,42 @@ fn dynamic_vertex_buffer(device: &ID3D11Device) -> Result<ID3D11Buffer> {
     Ok(buffer.expect("buffer"))
 }
 
+/// Distinct sizes let the database checks identify each contents fixture unambiguously.
+fn contents_buffer(device: &ID3D11Device, bytes: u32, staging: bool, value: u8) -> Result<ID3D11Buffer> {
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: bytes,
+        Usage: if staging {
+            D3D11_USAGE_STAGING
+        } else {
+            D3D11_USAGE_DEFAULT
+        },
+        CPUAccessFlags: if staging {
+            D3D11_CPU_ACCESS_READ.0 as u32
+        } else {
+            0
+        },
+        ..Default::default()
+    };
+    let data = vec![value; bytes as usize];
+    let initial = D3D11_SUBRESOURCE_DATA {
+        pSysMem: data.as_ptr().cast(),
+        ..Default::default()
+    };
+    let mut buffer = None;
+    unsafe { device.CreateBuffer(&desc, Some(&initial), Some(&mut buffer)) }?;
+    Ok(buffer.expect("contents buffer"))
+}
+
+fn read_buffer(c: &ID3D11DeviceContext, buffer: &ID3D11Buffer, size: usize) -> Result<Vec<u8>> {
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe {
+        c.Map(buffer, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        let bytes = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), size).to_vec();
+        c.Unmap(buffer, 0);
+        Ok(bytes)
+    }
+}
+
 /// Writes `value` four times to a dynamic buffer with Map(WRITE_DISCARD) on `c`.
 fn write_dynamic(c: &ID3D11DeviceContext, cb: &ID3D11Buffer, value: f32) -> Result<()> {
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
@@ -601,6 +637,14 @@ fn capture(
     let (_texture, texture_view, texture_bytes) = uploaded_texture(device)?;
     let (vertices, vertex_bytes) = immutable_buffer(device)?;
     let dynamic_vertices = dynamic_vertex_buffer(device)?;
+    let repeated = contents_buffer(device, 80, false, 0x11)?;
+    let first_in_list = contents_buffer(device, 96, false, 0x12)?;
+    let staging_read = contents_buffer(device, 112, true, 0x13)?;
+    let staging_source = contents_buffer(device, 112, false, 0x34)?;
+    // This staging buffer's ONLY captured touch is Map(READ), to catch a copy issued after real Map.
+    let read_only = contents_buffer(device, 128, true, 0x14)?;
+    let read_only_source = contents_buffer(device, 128, false, 0x45)?;
+    let written_between = contents_buffer(device, 144, false, 0x15)?;
     // The texture as files for locum-cli's index: whole, and from its second mip on (as a game that skips its top
     // mip would have it).
     let texture_file = |mips: u32, first: usize| {
@@ -627,6 +671,15 @@ fn capture(
     let mut next_list: Option<ID3D11CommandList> = None;
     for frame in 1..=CAPTURED + 2 {
         unsafe {
+            // Record the never-executed write BEFORE the captured frame reads this resource.
+            if frame == DYNAMIC_FILLED || frame == CAPTURED {
+                write_dynamic(deferred, &dynamic_vertices, dynamic_vertex_value(frame))?;
+                let mut fill = None;
+                deferred.FinishCommandList(false, Some(&mut fill))?;
+                if frame == DYNAMIC_FILLED {
+                    immediate.ExecuteCommandList(fill.as_ref(), false);
+                }
+            }
             let value = [immediate_value(frame); 4];
             immediate.UpdateSubresource(&immediate_cb, 0, None, value.as_ptr().cast(), 0, 0);
             sh.bind(immediate, &target_a, &immediate_cb);
@@ -639,15 +692,45 @@ fn capture(
                 immediate.ExecuteCommandList(&list, false);
             }
 
-            // A command list that fills the dynamic vertex buffer: executed a few frames before the capture; in
-            // the captured frame recorded and never executed, so its map is not what the frame's draws read.
-            if frame == DYNAMIC_FILLED || frame == CAPTURED {
-                write_dynamic(deferred, &dynamic_vertices, dynamic_vertex_value(frame))?;
-                let mut fill = None;
-                deferred.FinishCommandList(false, Some(&mut fill))?;
-                if frame == DYNAMIC_FILLED {
-                    immediate.ExecuteCommandList(fill.as_ref(), false);
-                }
+            if frame == DYNAMIC_FILLED {
+                // Frame-start contents that differ from the uploads, written well before the capture is requested,
+                // so nothing about the frames just before it explains them.
+                immediate.UpdateSubresource(&repeated, 0, None, [0x21u8; 80].as_ptr().cast(), 0, 0);
+                immediate.UpdateSubresource(&first_in_list, 0, None, [0x22u8; 96].as_ptr().cast(), 0, 0);
+                immediate.CopyResource(&read_only, &read_only_source);
+                immediate.UpdateSubresource(&written_between, 0, None, [0x23u8; 144].as_ptr().cast(), 0, 0);
+            }
+            if frame == CAPTURED {
+                deferred.UpdateSubresource(&repeated, 0, None, [0x71u8; 80].as_ptr().cast(), 0, 0);
+                let mut twice = None;
+                deferred.FinishCommandList(false, Some(&mut twice))?;
+                immediate.ExecuteCommandList(twice.as_ref(), false);
+                // A different value between executions catches replacing the initial copy on the second use.
+                immediate.UpdateSubresource(&repeated, 0, None, [0x61u8; 80].as_ptr().cast(), 0, 0);
+                immediate.ExecuteCommandList(twice.as_ref(), false);
+
+                deferred.UpdateSubresource(&first_in_list, 0, None, [0x72u8; 96].as_ptr().cast(), 0, 0);
+                let mut first = None;
+                deferred.FinishCommandList(false, Some(&mut first))?;
+                immediate.ExecuteCommandList(first.as_ref(), false);
+
+                // A list recorded first, then the immediate context writes the resource, then the list runs: the
+                // timeline's first touch is the immediate write, before the list.
+                deferred.UpdateSubresource(&written_between, 0, None, [0x73u8; 144].as_ptr().cast(), 0, 0);
+                let mut later = None;
+                deferred.FinishCommandList(false, Some(&mut later))?;
+                immediate.UpdateSubresource(&written_between, 0, None, [0x63u8; 144].as_ptr().cast(), 0, 0);
+                immediate.ExecuteCommandList(later.as_ref(), false);
+
+                immediate.CopyResource(&staging_read, &staging_source);
+                checks.check(
+                    read_buffer(immediate, &staging_read, 112)? == vec![0x34; 112],
+                    "staging READ sees the GPU copy made in the captured frame",
+                );
+                checks.check(
+                    read_buffer(immediate, &read_only, 128)? == vec![0x45; 128],
+                    "staging first-touch READ sees the GPU copy made before the frame",
+                );
             }
 
             // The next frame's command list.
@@ -663,6 +746,15 @@ fn capture(
 
             swapchain.Present(0, DXGI_PRESENT(0)).ok()?;
         }
+    }
+
+    for (buffer, size, value) in [(&repeated, 80, 0x71), (&first_in_list, 96, 0x72)] {
+        let readback = contents_buffer(device, size, true, 0)?;
+        unsafe { immediate.CopyResource(&readback, buffer) };
+        checks.check(
+            read_buffer(immediate, &readback, size as usize)? == vec![value; size as usize],
+            &format!("contents fixture {size}: command-list write reached the real GPU buffer"),
+        );
     }
 
     let folder = dir.join("captures").join(format!("frame-{CAPTURED}"));
@@ -684,13 +776,13 @@ fn capture(
     println!("counts: {counts}");
     checks.check(
         counts["draws"] == 3
-            && counts["lists_spliced"] == 1
+            && counts["lists_spliced"] == 5
             && counts["lists_recorded_before"] == 1
             && counts["lists_unrecorded"] == 0
             && counts["cb_copy_failures"] == 0
             && counts["targets"] == 3
             && counts["contents_missing"] == 0,
-        "capture: three draws, the command list (recorded the frame before) spliced in, three targets read back, \
+        "capture: three draws, five list executions (one recorded the frame before), three targets read back, \
          no used resource without contents",
     );
     let gaps: Vec<(String, String, i64)> = db
@@ -835,7 +927,7 @@ fn capture(
         texture.as_ref().is_some_and(|t| {
             t.1.is_some()
                 && t.1 == t.3
-                && t.2.as_deref() == Some("end")
+                && t.2.as_deref() == Some("first-use")
                 && blob(t.1.clone()) == Some(texture_bytes)
         }),
         "contents: a texture made with padded rows reads back tightly packed, its key equal to its upload's",
@@ -874,10 +966,65 @@ fn capture(
     println!("dynamic vertex buffer: {dynamic:?}");
     checks.check(
         dynamic.is_some_and(|v| {
-            v.2.as_deref() == Some("end") && blob(v.1) == Some(cb_bytes(dynamic_vertex_value(DYNAMIC_FILLED)))
+            v.2.as_deref() == Some("first-use") && blob(v.1) == Some(cb_bytes(dynamic_vertex_value(DYNAMIC_FILLED)))
         }),
-        "contents: a dynamic vertex buffer the frame only read holds what it was last filled with, not what a          command list recorded in the frame and never executed maps into it",
+        "contents: a dynamic vertex buffer the frame only read holds what it was last filled with, not what a command list recorded in the frame and never executed maps into it",
     );
+    for (size, value, case) in [
+        (
+            80,
+            0x21,
+            "list executed twice retains contents before its first execution",
+        ),
+        (
+            96,
+            0x22,
+            "first touch inside a list retains contents before execution, not frame end",
+        ),
+        (
+            112,
+            0x13,
+            "staging copied then mapped READ retains contents before the GPU copy",
+        ),
+        (
+            128,
+            0x45,
+            "staging first-touch Map READ copies before the CPU map",
+        ),
+        (
+            144,
+            0x23,
+            "a resource written on the immediate context between a list's recording and its execution keeps its contents before that write",
+        ),
+    ] {
+        let sql = format!(
+            "SELECT id, content, content_source, upload FROM resources WHERE kind = 'buffer' AND bytes = {size} AND usage = {}",
+            if size == 112 || size == 128 { 3 } else { 0 }
+        );
+        let row = resource(&sql);
+        println!("contents fixture {size}: {row:?}");
+        if let Some((id, _, _, _)) = &row {
+            let (expected_events, kind) = match size {
+                80 => (2, "update"),
+                96 | 144 => (1, "update"),
+                _ => (1, "map_read"),
+            };
+            let events: i64 = db.query_row(
+                "SELECT count(*) FROM events WHERE kind = ?1 AND \
+                 CASE WHEN kind = 'update' THEN json_extract(args, '$.dst') ELSE json_extract(args, '$.resource') END = ?2 \
+                 AND (kind != 'update' OR deferred = 1)",
+                rusqlite::params![kind, id], |r| r.get(0),
+            ).unwrap_or(-1);
+            checks.check(
+                events == expected_events,
+                &format!("contents fixture {size}: {expected_events} expected timeline event(s)"),
+            );
+        }
+        checks.check(
+            row.is_some_and(|r| r.2.as_deref() == Some("first-use") && blob(r.1) == Some(vec![value; size])),
+            case,
+        );
+    }
     let shader_blobs: Vec<Option<String>> = db
         .prepare("SELECT blob FROM shaders")
         .and_then(|mut q| q.query_map([], |r| r.get(0))?.collect())

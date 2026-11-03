@@ -200,9 +200,9 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
                 t.contains("Frame.value")
                     && t.contains("1032")
                     && t.contains("(upload)")
-                    && t.contains("(end)")
+                    && t.contains("(first-use)")
             },
-            "locum-cli draw 0: ps b3 named Frame.value holding 1032; contents from the upload and read at the end",
+            "locum-cli draw 0: ps b3 named Frame.value holding 1032; upload and first-use contents",
         ),
         (
             run(&["find", "32"]).contains("Frame.value.x"),

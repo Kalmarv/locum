@@ -57,11 +57,15 @@ pub fn subs(resource: &ID3D11Resource) -> Result<Vec<Sub>, String> {
     Err("not a buffer or texture".into())
 }
 
-/// Records a copy of `resource` into a new staging resource on `c`.
+/// Records a copy of `resource` into a new staging resource on `c`, whatever predicate `c` has set.
 ///
 /// # Safety
 /// `c` must be a context of the device that made `resource`.
 pub unsafe fn issue(c: &ID3D11DeviceContext, resource: &ID3D11Resource) -> Result<Readback, String> {
+    unsafe { crate::predication::unpredicated(c, || issue_now(c, resource)) }
+}
+
+unsafe fn issue_now(c: &ID3D11DeviceContext, resource: &ID3D11Resource) -> Result<Readback, String> {
     let device = unsafe { c.GetDevice() }.map_err(|e| format!("no device: {e}"))?;
     let subs = subs(resource)?;
     if let Ok(b) = resource.cast::<ID3D11Buffer>() {

@@ -70,17 +70,23 @@ Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` beside the game's executable. locum
   often each rule applied every 600 frames.
 
 locum numbers every resource as it is created and keeps its description, creation stack and upload hash, so a
-capture lists all the resources alive, not only those the frame touched. The capture runs over three frames: the one
-before records command lists ahead of time and notes which resources are written; at the frame's start those are
-copied; during it every call is recorded, and any other resource is copied on its own context just before its first
-write. At the end, resources the frame only read are taken from their upload (immutable ones) or read back.
+capture lists all the resources alive, not only those the frame touched. The capture runs over two frames: the one
+before records command lists ahead of time (a list recorded then may be executed in the captured frame), and during
+the captured frame every call is recorded.
+
+Each resource's contents as the frame began are copied on the immediate context just before the first thing on the
+GPU's timeline that touches it: before an immediate-context call that reads or writes it, or before the
+`ExecuteCommandList` whose list touches it first. Nothing has touched it since the frame began, so the copy is exact
+whatever the frame does to it later, on whichever context, and however many times a list runs; a list recorded but
+never executed changes nothing. Immutable resources whose upload was stored are not copied: the upload is their
+contents. locum's own copies run whatever predicate the game has set.
 
 `capture.db` has these tables (`capture/src/db.rs` has the schema with comments):
 
 - `meta`: the API, frame, process, request and counts; `gaps`: what could not be recorded, and why;
 - `resources` and `subresources`: every live resource with its description, upload hash, whether the frame used or
-  wrote it, and the key of its contents as the frame began with where they came from (`upload`, `start`,
-  `first-write`, `end`) and any doubt about them;
+  wrote it, and the key of its contents as the frame began with where they came from (`first-use` or `upload`) and
+  any doubt about them;
 - `views` and `states` (rasterizer, blend, depth-stencil, sampler, input layout), with their descriptions;
 - `events`: everything on the GPU's timeline in order: draws, dispatches, clears, copies, updates and maps (with the
   key of the bytes written), resolves and mip generation, each with its context, command list and call stack;
@@ -163,6 +169,20 @@ Draws are matched by what stays the same across a relaunch: their shaders, the c
 of the textures and buffers they read (or their shapes, for what the frame wrote), the shapes of their targets, and
 how many draws like them came before. Matched draws are compared constant by constant (named from the shaders),
 input by input and state by state.
+
+A capture's textures and buffers are named from the files they were made from with an index of those files, keyed
+the way captures key contents (a texture's canonical layout is a DDS file's order, so a DDS file is keyed whole and
+mip by mip as it is):
+
+```
+locum-cli index files.db DIR...            # key every DDS file under each DIR
+locum-cli --index files.db join last       # what each texture and buffer the frame used was made from
+locum-cli --index files.db draw last 120   # bound resources are shown with their file's name
+```
+
+A resource is matched by its upload, its contents, or subresource by subresource (a texture made from fewer mips
+than its file holds, or from one face). `LOCUM_INDEX` (paths separated by `;`) stands in for `--index`. A game's own
+extractor can add what it reads from its archives through `locum_capture::index`.
 
 Constants are named from each shader's reflection, as `cbuffer.variable[index].component`. PNGs of depth and other
 one-channel images are stretched from their smallest to largest value, float colour is tone-mapped, and `--range

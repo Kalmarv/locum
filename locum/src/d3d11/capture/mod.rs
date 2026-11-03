@@ -8,16 +8,18 @@
 //! - `max_mb N`: the most memory target readback may use (default 4096);
 //! - `skip memory`: no memory dump of the process (see [`super::dump`]).
 //!
-//! A capture runs over three presents:
+//! A capture runs over two frames:
 //! - **before** (from the present that sees the file): deferred contexts record their work, so command lists
-//!   recorded now and executed in the captured frame are complete; every context's writes are noted;
-//! - **start** (that frame's present): the resources written during it are copied: their contents when the captured
-//!   frame begins;
+//!   recorded now and executed in the captured frame are complete;
 //! - **recording** (the next frame): every draw, dispatch and resource-changing call on every context, in the order
-//!   the GPU runs them (a command list's work where it is executed). A resource the frame writes that was not copied
-//!   at the start is copied just before its first write, on that context;
-//! - **finish** (the present ending that frame): the frame's other resources (never written by it) are read back or
-//!   taken from their upload, copies are read, and the capture is handed to the writer thread.
+//!   the GPU runs them (a command list's work where it is executed);
+//! - **finish** (the present ending that frame): the copies are read and the capture is handed to the writer thread.
+//!
+//! A resource's contents as the frame began are copied on the immediate context just before the first event on the
+//! GPU's timeline that touches it (reads or writes it): before an immediate-context call, or before the
+//! `ExecuteCommandList` whose list touches it first. Nothing has touched it since the frame began, so the copy is
+//! exact whatever the frame does to it later, on whichever context, and however often a list runs. Immutable
+//! resources whose upload is stored are not copied: the upload is their contents.
 //!
 //! The state of each draw is read from the real context with its getters. Constant buffers are copied by the GPU on
 //! the draw's own context, so each draw's constants are the ones the GPU read. A pass ends where the targets in
@@ -167,8 +169,6 @@ pub(super) struct Event {
     draw: Option<Box<Draw>>,
     reads: Vec<u64>,
     writes: Vec<u64>,
-    /// Resources copied just before this event, on its context, because it writes them first.
-    first_writes: Vec<u64>,
     /// The number of the command list execution it came in with (set when spliced).
     list: Option<u64>,
 }
@@ -185,12 +185,8 @@ struct List {
 pub(super) struct Tracked {
     resource: ID3D11Resource,
     dims: Dims,
-    /// Written while the capture was getting ready: its contents are copied when the frame starts.
-    written_before: bool,
-    /// Copied on a context just before its first write in the captured frame.
-    first_write: Option<contents::Readback>,
-    /// Whether an event carries that copy.
-    claimed: bool,
+    /// Whether an event on the timeline has touched it (so its contents were copied, or are its upload).
+    touched: bool,
 }
 
 struct State {
@@ -217,9 +213,11 @@ struct State {
     views: Vec<db::View>,
     states: Vec<db::State>,
     resources: BTreeMap<u64, Tracked>,
-    /// Whether the start copies were taken, and of which resources (key and subresource keys of their contents).
-    started: bool,
-    start: BTreeMap<u64, Result<(String, Vec<String>), String>>,
+    /// Copies of contents not read yet, and their bytes.
+    in_flight: Vec<(u64, Result<contents::Readback, String>)>,
+    in_flight_bytes: u64,
+    /// Contents read so far (key and subresource keys), or why there are none.
+    contents: BTreeMap<u64, Result<(String, Vec<String>), String>>,
     gaps: BTreeMap<(String, String), u64>,
 }
 
@@ -249,19 +247,14 @@ static STATE: Mutex<State> = Mutex::new(State {
     views: Vec::new(),
     states: Vec::new(),
     resources: BTreeMap::new(),
-    started: false,
-    start: BTreeMap::new(),
+    in_flight: Vec::new(),
+    in_flight_bytes: 0,
+    contents: BTreeMap::new(),
     gaps: BTreeMap::new(),
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Counts something the capture could not record, for the `gaps` table.
-pub(super) fn gap(what: &str, detail: impl Into<String>) {
-    let mut s = state();
-    *s.gaps.entry((what.to_string(), detail.into())).or_insert(0) += 1;
 }
 
 impl State {
@@ -291,8 +284,9 @@ impl State {
         self.views.clear();
         self.states.clear();
         self.resources.clear();
-        self.started = false;
-        self.start.clear();
+        self.in_flight.clear();
+        self.in_flight_bytes = 0;
+        self.contents.clear();
         self.gaps.clear();
     }
 }
@@ -352,120 +346,101 @@ pub fn after_present(finished: bool, immediate: &ID3D11DeviceContext4) {
             );
             log!("  {}", crate::cost::line());
         }
-        Phase::Before => start(immediate),
+        Phase::Before => start(),
         Phase::Recording => {}
     }
 }
 
-/// The present before the captured frame: copies what was written while getting ready, then records the frame.
-fn start(immediate: &ID3D11DeviceContext4) {
-    let (todo, contents) = {
-        let mut s = state();
-        s.started = true;
-        s.phase = Phase::Recording;
-        let todo: Vec<(u64, ID3D11Resource, Dims)> = s
-            .resources
-            .iter()
-            .filter(|(_, t)| t.written_before)
-            .map(|(&id, t)| (id, t.resource.clone(), t.dims.clone()))
-            .collect();
-        (todo, s.request.contents)
-    };
-    let count = todo.len();
-    let start = if contents {
-        unsafe { contents::read_now(immediate, todo) }
-    } else {
-        BTreeMap::new()
-    };
-    let bytes: u64 = start.len() as u64;
-    log!("capture: start copies of {count} resources written before the frame ({bytes} read); recording");
+/// The present before the captured frame: the frame is recorded from here.
+fn start() {
+    state().phase = Phase::Recording;
+    log!("capture: recording");
     log!("  getting ready, {}", crate::cost::line());
-    state().start = start;
 }
 
-/// Notes what an event writes: while getting ready, that it was written (so it is copied at the start); in the
-/// captured frame, a resource written for the first time that was not copied at the start is copied now, on this
-/// context, before the caller runs the real call. Returns whether the event is to be recorded.
-fn writes(c: &ID3D11DeviceContext4, event: &mut Event) -> bool {
-    let (records, phase, started, contents) = {
-        let s = state();
-        (s.records(event.deferred), s.phase, s.started, s.request.contents)
-    };
-    if phase == Phase::Idle {
-        return false;
-    }
-    if !started {
-        let mut s = state();
-        for id in &event.writes {
-            if let Some(t) = s.resources.get_mut(id) {
-                t.written_before = true;
-            }
-        }
-    }
-    if !records || !started || !contents {
-        return records;
-    }
-    let todo: Vec<(u64, ID3D11Resource)> = {
-        let s = state();
-        event
-            .writes
-            .iter()
-            .filter(|id| !s.start.contains_key(id))
-            .filter_map(|id| {
-                let t = s.resources.get(id)?;
-                t.first_write.is_none().then(|| (*id, t.resource.clone()))
-            })
-            .collect()
-    };
-    for (id, resource) in todo {
-        match unsafe { contents::issue(c, &resource) } {
-            Ok(rb) => {
-                if let Some(t) = state().resources.get_mut(&id) {
-                    t.first_write = Some(rb);
-                }
-            }
-            Err(why) => gap("contents", format!("not copied before its first write: {why}")),
-        }
-    }
-    // The event that carries a copy is the first write the copy is before (a map's copy is made at the map and
-    // carried by its unmap, which is the event recorded).
-    if event.kind != "map_begin" {
-        let mut s = state();
-        for id in &event.writes {
-            if let Some(t) = s.resources.get_mut(id)
-                && t.first_write.is_some()
-                && !t.claimed
-            {
-                t.claimed = true;
-                event.first_writes.push(*id);
-            }
-        }
-    }
-    true
-}
-
-/// Records an event on a context, while armed (see [`writes`]).
-pub(super) fn record(c: &ID3D11DeviceContext4, mut event: Event) {
+/// Copies the contents of each resource `event` touches that the timeline has not touched before, on the immediate
+/// context `immediate`, before the caller makes the real call (see the module's documentation). A copy that would
+/// take the bytes in flight past [`contents::IN_FLIGHT`] has those read first.
+fn first_touch(immediate: &ID3D11DeviceContext4, event: &Event) {
     let started = std::time::Instant::now();
-    if !writes(c, &mut event) {
+    let todo: Vec<(u64, ID3D11Resource, u64)> = {
+        let mut s = state();
+        if s.phase != Phase::Recording || !s.request.contents {
+            return;
+        }
+        let mut todo = Vec::new();
+        for id in event.reads.iter().chain(&event.writes) {
+            if let Some(t) = s.resources.get_mut(id)
+                && !t.touched
+            {
+                t.touched = true;
+                let bytes = t.dims.subs().map_or(0, |s| locum_capture::layout::total(&s));
+                todo.push((*id, t.resource.clone(), bytes));
+            }
+        }
+        todo
+    };
+    if todo.is_empty() {
         return;
     }
-    let mut s = state();
-    if event.deferred {
-        s.pending.entry(event.context).or_default().push(event);
-    } else {
-        s.timeline.push(event);
+    let mut bytes = 0;
+    for (id, resource, size) in todo {
+        if write::upload_of(id).is_some() {
+            continue;
+        }
+        let full = state().in_flight_bytes + size > contents::IN_FLIGHT;
+        if full {
+            read_in_flight(immediate);
+        }
+        let copy = unsafe { contents::issue(immediate, &resource) };
+        bytes += size;
+        let mut s = state();
+        s.in_flight.push((id, copy));
+        s.in_flight_bytes += size;
     }
-    drop(s);
+    COPIED.add(started, bytes);
+}
+
+/// Reads the copies in flight (waiting for the GPU to make them), outside the capture's lock.
+fn read_in_flight(immediate: &ID3D11DeviceContext4) {
+    let copies = {
+        let mut s = state();
+        s.in_flight_bytes = 0;
+        std::mem::take(&mut s.in_flight)
+    };
+    let read = unsafe { contents::read_all(immediate, copies) };
+    state().contents.extend(read);
+}
+
+/// Contents copied before the timeline first touched them, with the time it took (and any reads keeping the copies
+/// in flight under their limit).
+pub static COPIED: Cost = Cost::new();
+
+/// Records an event on a context, while armed. An event on the immediate context in the captured frame first has
+/// the contents of what it touches copied (see [`first_touch`]); a deferred context's wait for its command list.
+pub(super) fn record(c: &ID3D11DeviceContext4, event: Event) {
+    let started = std::time::Instant::now();
+    if !state().records(event.deferred) {
+        return;
+    }
+    if event.deferred {
+        state().pending.entry(event.context).or_default().push(event);
+    } else {
+        first_touch(c, &event);
+        state().timeline.push(event);
+    }
     RECORDED.add(started, 0);
 }
 
-/// Events recorded, with the time spent noting what they write (first-write copies included).
+/// Events recorded (the copies before them are [`COPIED`]).
 pub static RECORDED: Cost = Cost::new();
 
-/// Does what [`record`] does for an event's writes without recording it.
-pub(super) fn first_writes_only(c: &ID3D11DeviceContext4, mut event: Event) {
-    writes(c, &mut event);
+/// What [`record`] does before recording an event, for a call recorded later: a map's resource is copied before the
+/// map, and the map is recorded at the unmap, when its data is known.
+pub(super) fn touch_only(c: &ID3D11DeviceContext4, event: &Event) {
+    if !event.deferred {
+        first_touch(c, event);
+    }
 }
 
 fn new_event(kind: &'static str, call: &'static str, context: u32, deferred: bool, args: Value) -> Event {
@@ -480,7 +455,6 @@ fn new_event(kind: &'static str, call: &'static str, context: u32, deferred: boo
         draw: None,
         reads: Vec::new(),
         writes: Vec::new(),
-        first_writes: Vec::new(),
         list: None,
     }
 }
@@ -674,8 +648,23 @@ pub fn on_execute_list(
             }
         }
     };
-    if !deferred && let Some(first) = first {
-        close_timeline_pass(context, Some(&first));
+    if !deferred {
+        if let Some(first) = first {
+            close_timeline_pass(context, Some(&first));
+        }
+        // What the list touches first is copied before it runs.
+        let touches = {
+            let s = state();
+            let mut e = new_event("execute", "ExecuteCommandList", id, false, Value::Null);
+            if let Some(l) = s.lists.get(&(list as usize)) {
+                for le in &l.events {
+                    e.reads.extend_from_slice(&le.reads);
+                    e.writes.extend_from_slice(&le.writes);
+                }
+            }
+            e
+        };
+        first_touch(context, &touches);
     }
     let mut s = state();
     let number = u64::from(s.lists_spliced);

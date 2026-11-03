@@ -22,7 +22,7 @@ use windows::core::{HRESULT, Interface};
 
 pub use super::Ctx;
 use super::ids::{resource_id, view_ids};
-use super::{Event, armed, new_event, record};
+use super::{armed, new_event, record};
 use crate::d3d11::registry;
 use crate::settings::settings;
 
@@ -115,31 +115,27 @@ pub unsafe fn map(
     };
     let id = resource_id(r);
     let write = map_type != D3D11_MAP_READ;
+    let mut e = new_event(
+        "map",
+        "Map",
+        context,
+        deferred,
+        json!({"resource": id, "sub": sub, "type": map_type.0}),
+    );
+    // The resource is copied before the map (a mapped resource cannot be copied); a write is recorded at the unmap,
+    // a read now.
     if write {
-        // The map writes the resource: a first write is copied before it.
-        let mut e = new_event(
-            "map",
-            "Map",
-            context,
-            deferred,
-            json!({"resource": id, "sub": sub, "type": map_type.0}),
-        );
-        e.writes.push(id);
         e.kind = "map_begin";
-        prepare(c, e);
+        e.writes.push(id);
+        super::touch_only(c, &e);
+    } else {
+        e.kind = "map_read";
+        e.reads.push(id);
+        super::touch_only(c, &e);
     }
     let hr = real();
     if hr.is_err() || out.is_null() || !write {
         if hr.is_ok() && !write {
-            let mut e = new_event(
-                "map",
-                "Map",
-                context,
-                deferred,
-                json!({"resource": id, "sub": sub, "type": map_type.0}),
-            );
-            e.reads.push(id);
-            e.kind = "map_read";
             record(c, e);
         }
         return hr;
@@ -266,13 +262,6 @@ pub unsafe fn unmap(c: &ID3D11DeviceContext4, resource: *mut c_void, sub: u32, r
     e.writes.push(shadow.resource_id);
     record(c, e);
     SHADOWED.add(started, 0);
-}
-
-/// Copies a resource the event writes first, without recording the event (a map's start: the event is recorded at
-/// the unmap, when its data is known).
-fn prepare(c: &ID3D11DeviceContext4, mut e: Event) {
-    e.kind = "map_begin";
-    super::first_writes_only(c, e);
 }
 
 fn res(raw: *mut c_void) -> Option<ID3D11Resource> {
@@ -631,12 +620,18 @@ pub fn discard(
     call: &'static str,
     target: *mut c_void,
 ) {
+    // A discard leaves the resource undefined: it counts as a write, so the contents are copied before it.
     let id = if call == "DiscardResource" {
-        res(target).map(|r| ("resource", resource_id(&r)))
+        res(target).map(|r| {
+            let id = resource_id(&r);
+            ("resource", id, id)
+        })
     } else {
-        view_target(target).map(|(v, _)| ("view", v))
+        view_target(target).map(|(v, r)| ("view", v, r))
     };
-    let Some((what, id)) = id else { return };
+    let Some((what, id, resource)) = id else {
+        return;
+    };
     let mut args = serde_json::Map::new();
     args.insert(what.into(), id.into());
     op(
@@ -649,7 +644,7 @@ pub fn discard(
         call,
         Value::Object(args),
         &[],
-        &[],
+        &[resource],
     );
 }
 

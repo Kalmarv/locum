@@ -1,6 +1,5 @@
-//! The end of a capture: the contents of every resource the frame used are settled (copied at the start, before
-//! their first write, taken from their upload, or read back now), the copies are read, and the whole capture is
-//! handed to the writer thread as `captures/<name>/capture.db`.
+//! The end of a capture: the copies of the contents of every resource the frame used (made before the timeline
+//! first touched each) are read, and the whole capture is handed to the writer thread as `captures/<name>/capture.db`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -13,7 +12,7 @@ use windows::Win32::Graphics::Direct3D11::*;
 use super::contents;
 use super::snapshot::CHUNK;
 use super::{Tracked, state, touched};
-use crate::d3d11::registry::{self, Dims};
+use crate::d3d11::registry;
 use crate::log::{folder, log};
 use crate::settings::settings;
 
@@ -22,7 +21,18 @@ struct Content {
     key: String,
     subs: Vec<String>,
     source: &'static str,
-    note: Option<String>,
+    note: Option<&'static str>,
+}
+
+/// An immutable resource's contents when its upload is stored: the upload's key and its subresources' keys.
+pub(super) fn upload_of(id: u64) -> Option<(String, Vec<String>)> {
+    let e = registry::entry(id).filter(|e| e.dims.immutable() && e.upload_stored)?;
+    let subs = e
+        .sub_hashes
+        .iter()
+        .map(|h| h.clone().unwrap_or_default())
+        .collect();
+    Some((e.upload?, subs))
 }
 
 /// The ids without repeats, in order.
@@ -45,8 +55,9 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         return;
     };
     let timeline = std::mem::take(&mut s.timeline);
-    let mut tracked: BTreeMap<u64, Tracked> = std::mem::take(&mut s.resources);
-    let start = std::mem::take(&mut s.start);
+    let tracked: BTreeMap<u64, Tracked> = std::mem::take(&mut s.resources);
+    let in_flight = std::mem::take(&mut s.in_flight);
+    let mut read = std::mem::take(&mut s.contents);
     let views = std::mem::take(&mut s.views);
     let states = std::mem::take(&mut s.states);
     let staging = std::mem::take(&mut s.staging);
@@ -99,113 +110,34 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     }
     drop(staging);
 
-    // Contents of the resources the frame used.
+    // Contents of the resources the frame used, as the timeline first touched them.
     let (used, written) = touched(&timeline);
     let mut content: BTreeMap<u64, Result<Content, String>> = BTreeMap::new();
     if request.contents {
-        for (&id, r) in &start {
-            if used.contains(&id) {
-                content.insert(
-                    id,
-                    r.clone().map(|(key, subs)| Content {
-                        key,
-                        subs,
-                        source: "start",
-                        note: None,
-                    }),
-                );
-            }
-        }
-        // Copies made before first writes: right unless the timeline wrote the resource earlier than that copy, or
-        // ran the copy more than once (a command list executed twice).
-        let mut first_writer: HashMap<u64, usize> = HashMap::new();
-        let mut copies: HashMap<u64, u32> = HashMap::new();
-        for (i, e) in timeline.iter().enumerate() {
-            for w in &e.writes {
-                first_writer.entry(*w).or_insert(i);
-            }
-            for w in &e.first_writes {
-                *copies.entry(*w).or_insert(0) += 1;
-            }
-        }
-        for (&id, t) in tracked.iter_mut() {
-            if content.contains_key(&id) || !used.contains(&id) {
-                continue;
-            }
-            let Some(rb) = t.first_write.take() else { continue };
-            let note = match (first_writer.get(&id), copies.get(&id).copied().unwrap_or(0)) {
-                // The copy is in a command list the frame never executed, so it never ran on the timeline. If no
-                // event the frame ran wrote the resource, the frame left it as it began, and it is read at the end
-                // (below); if one did, nothing copied it before that write.
-                (None, 0) => continue,
-                (Some(&i), 0) => {
-                    content.insert(
-                        id,
-                        Err(format!(
-                            "event {i} wrote it, and its only copy before a write is in a command list the frame                              never executed"
-                        )),
-                    );
-                    continue;
-                }
-                (Some(&i), _) if !timeline[i].first_writes.contains(&id) => Some(format!(
-                    "event {i} wrote it before the command list holding its copy ran: contents may include that write"
-                )),
-                (_, n) if n > 1 => Some(format!(
-                    "copied in a command list executed {n} times: contents are from its last execution"
-                )),
-                _ => None,
-            };
-            let r = unsafe { contents::read(immediate, &rb) }.map(|(key, subs)| Content {
-                key,
-                subs,
-                source: "first-write",
-                note,
-            });
-            content.insert(id, r);
-        }
-        // The rest the frame only read: unchanged by it, so their upload or their contents now.
-        let mut end: Vec<(u64, ID3D11Resource, Dims)> = Vec::new();
+        read.extend(unsafe { contents::read_all(immediate, in_flight) });
         for &id in &used {
-            if content.contains_key(&id) {
-                continue;
-            }
-            let Some(t) = tracked.get(&id) else { continue };
-            if written.contains(&id) {
-                content.insert(id, Err("written by the frame but not copied before".into()));
-                continue;
-            }
-            let entry = registry::entry(id);
-            if let Some(e) = entry.filter(|e| e.dims.immutable() && e.upload_stored)
-                && let Some(key) = e.upload.clone()
-            {
-                let subs = e
-                    .sub_hashes
-                    .iter()
-                    .map(|h| h.clone().unwrap_or_default())
-                    .collect();
-                content.insert(
-                    id,
-                    Ok(Content {
+            let multisampled = tracked.get(&id).is_some_and(|t| t.dims.samples > 1);
+            let c = match read.remove(&id) {
+                Some(r) => r.map(|(key, subs)| Content {
+                    key,
+                    subs,
+                    source: "first-use",
+                    note: multisampled.then_some("multisampled: the copy is the resolve of its samples"),
+                }),
+                None => match upload_of(id) {
+                    Some((key, subs)) => Ok(Content {
                         key,
                         subs,
                         source: "upload",
                         note: None,
                     }),
-                );
-                continue;
-            }
-            end.push((id, t.resource.clone(), t.dims.clone()));
-        }
-        for (id, r) in unsafe { contents::read_now(immediate, end) } {
-            content.insert(
-                id,
-                r.map(|(key, subs)| Content {
-                    key,
-                    subs,
-                    source: "end",
-                    note: None,
-                }),
-            );
+                    None if tracked.contains_key(&id) => {
+                        Err("not copied before the timeline first touched it".into())
+                    }
+                    None => Err("not known to the capture".into()),
+                },
+            };
+            content.insert(id, c);
         }
     }
 
@@ -398,7 +330,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                 content_bytes += bytes;
                 row.content = Some(c.key);
                 row.content_source = Some(c.source);
-                row.content_note = c.note;
+                row.content_note = c.note.map(String::from);
                 for (i, h) in c.subs.into_iter().enumerate() {
                     if let Some(slot) = sub_hashes.get_mut(i)
                         && !h.is_empty()

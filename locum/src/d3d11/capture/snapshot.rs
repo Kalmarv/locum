@@ -12,6 +12,7 @@ use super::ids::{resource_id, state_id, view_ids};
 use super::{CbCopy, Draw, state};
 use crate::d3d11::shaders::{self, Stage};
 use crate::d3d11::stages;
+use locum_d3d11::predication::unpredicated;
 
 /// Staging buffers for constant-buffer copies: 32 MiB each, at most 16 (512 MiB) per capture.
 pub(super) const CHUNK: u32 = 32 << 20;
@@ -316,6 +317,10 @@ pub(super) unsafe fn copy_cb(c: &ID3D11DeviceContext4, cb: &mut CbCopy) -> Optio
         bottom: 1,
         back: 1,
     };
-    unsafe { c.CopySubresourceRegion(&staging, 0, offset, 0, 0, &source, 0, Some(&source_box)) };
+    unsafe {
+        unpredicated(c, || {
+            c.CopySubresourceRegion(&staging, 0, offset, 0, 0, &source, 0, Some(&source_box))
+        })
+    };
     Some((chunk, offset, bytes))
 }

@@ -9,6 +9,7 @@ use windows::core::Interface;
 use super::ids::view_ids;
 use super::state;
 use crate::log::log;
+use locum_d3d11::predication::unpredicated;
 
 #[derive(Clone)]
 pub struct Target {
@@ -219,7 +220,11 @@ unsafe fn copy_one(
             return None;
         }
         let t = t?;
-        unsafe { c.ResolveSubresource(&t, 0, &source, source_sub, view_format) };
+        unsafe {
+            unpredicated(c, || {
+                c.ResolveSubresource(&t, 0, &source, source_sub, view_format)
+            })
+        };
         source = t.cast().expect("a texture is a resource");
         source_sub = 0;
     }
@@ -240,7 +245,11 @@ unsafe fn copy_one(
         return None;
     }
     let staging = staging?;
-    unsafe { c.CopySubresourceRegion(&staging, 0, 0, 0, 0, &source, source_sub, None) };
+    unsafe {
+        unpredicated(c, || {
+            c.CopySubresourceRegion(&staging, 0, 0, 0, 0, &source, source_sub, None)
+        })
+    };
     let _ = dimension;
     let (view, resource) = view_ids(view);
     Some(Target {

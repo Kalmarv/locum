@@ -47,9 +47,7 @@ pub(super) fn resource_id(resource: &ID3D11Resource) -> u64 {
         slot.insert(Tracked {
             resource: resource.clone(),
             dims: dims.unwrap_or_default(),
-            written_before: false,
-            first_write: None,
-            claimed: false,
+            touched: false,
         });
     }
     id

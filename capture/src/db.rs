@@ -34,7 +34,7 @@ CREATE TABLE resources(
   used INTEGER NOT NULL DEFAULT 0, -- bound or written by the captured frame
   written INTEGER NOT NULL DEFAULT 0,
   content TEXT,                    -- key of its contents when the frame began
-  content_source TEXT,             -- upload | start | first-write | end
+  content_source TEXT,             -- first-use (copied just before the timeline first touched it) | upload
   content_note TEXT                -- why content is missing, or how it may differ
 );
 CREATE TABLE subresources(
