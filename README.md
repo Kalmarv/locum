@@ -42,7 +42,7 @@ Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` beside the game's executable. locum
   - `max_mb N`: the most memory the target copies may use (default 4096); targets past it are skipped and counted.
 - `overrides.txt` (written by you): rules that change what is drawn, read again when the file changes and dropped when
   it is removed. One per line:
-  - `skip vs=<hash>`: draws with that shader bound are not drawn;
+  - `skip vs=<hash>`: draws with that shader bound are not drawn (`skip cs=<hash>`: dispatches are not run);
   - `solid vs=<hash> R G B A`: those draws get a pixel shader writing that colour to every target;
   - `shader ps=<hash> FILE`: that shader is replaced by the bytecode in FILE (relative to the folder);
   - `constant ps b3 c0 X Y Z W`: the draw sees constant 0 of its ps b3 range as X Y Z W (floats, or `0x` and 8 hex

@@ -1,7 +1,7 @@
 //! Changing what the game draws, by rules in `overrides.txt` in locum's folder. The file is read again when it
 //! changes (checked every 30 frames); removing it removes the rules. One rule per line, `#` starts a comment:
 //!
-//! - `skip vs=<hash>`: draws with that shader bound are not drawn;
+//! - `skip vs=<hash>`: draws with that shader bound are not drawn (`skip cs=<hash>`: dispatches are not run);
 //! - `solid vs=<hash> R G B A`: draws with that shader bound get a pixel shader writing that colour to every target;
 //! - `shader ps=<hash> FILE`: that shader is replaced by the bytecode in FILE (relative to locum's folder);
 //! - `constant ps b3 c0 X Y Z W`: the draw sees constant 0 of its ps b3 buffer (counted from the first constant
@@ -261,7 +261,7 @@ pub unsafe fn around(c: &ID3D11DeviceContext4, compute: bool, draw: impl FnOnce(
     let mut bound = Bound { c, hashes: [None; 6] };
     let applies = |r: &Rule| compute == (r.stage == Stage::Compute);
     if rules.rules.iter().any(|r| {
-        matches!(r.action, Action::Skip) && bound.holds(r) && {
+        matches!(r.action, Action::Skip) && applies(r) && bound.holds(r) && {
             r.applied.fetch_add(1, Ordering::Relaxed);
             true
         }

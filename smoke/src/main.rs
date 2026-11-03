@@ -374,6 +374,67 @@ impl Shaders {
     }
 }
 
+const CS: &str = "RWByteAddressBuffer output : register(u0);
+[numthreads(1, 1, 1)] void main() { output.Store(0, 0xc0ffee); }";
+
+/// What the compute shader `CS` writes.
+const DISPATCH_VALUE: u32 = 0xc0ffee;
+
+/// Runs `CS` once on `immediate`, leaving the other stages' shaders bound, and returns what it wrote (0 if it did
+/// not run).
+fn dispatch(device: &ID3D11Device, immediate: &ID3D11DeviceContext) -> Result<u32> {
+    let code = compile(CS, s!("cs_5_0"))?;
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: 16,
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: D3D11_BIND_UNORDERED_ACCESS.0 as u32,
+        MiscFlags: D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS.0 as u32,
+        ..Default::default()
+    };
+    let zeros = [0u32; 4];
+    let initial = D3D11_SUBRESOURCE_DATA {
+        pSysMem: zeros.as_ptr().cast(),
+        ..Default::default()
+    };
+    let view_desc = D3D11_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D11_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D11_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D11_BUFFER_UAV {
+                FirstElement: 0,
+                NumElements: 4,
+                Flags: D3D11_BUFFER_UAV_FLAG_RAW.0 as u32,
+            },
+        },
+    };
+    let staging_desc = D3D11_BUFFER_DESC {
+        ByteWidth: 16,
+        Usage: D3D11_USAGE_STAGING,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        ..Default::default()
+    };
+    let (mut cs, mut buffer, mut view, mut staging) = (None, None, None, None);
+    unsafe {
+        device.CreateComputeShader(&code, None, Some(&mut cs))?;
+        device.CreateBuffer(&desc, Some(&initial), Some(&mut buffer))?;
+        let buffer = buffer.as_ref().expect("buffer");
+        device.CreateUnorderedAccessView(buffer, Some(&view_desc), Some(&mut view))?;
+        device.CreateBuffer(&staging_desc, None, Some(&mut staging))?;
+        let staging = staging.as_ref().expect("staging buffer");
+        immediate.CSSetShader(cs.as_ref(), None);
+        immediate.CSSetUnorderedAccessViews(0, 1, Some(&view), None);
+        immediate.Dispatch(1, 1, 1);
+        immediate.CSSetUnorderedAccessViews(0, 1, Some(&None), None);
+        immediate.CSSetShader(None, None);
+        immediate.CopyResource(staging, buffer);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        immediate.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        let written = *(mapped.pData as *const u32);
+        immediate.Unmap(staging, 0);
+        Ok(written)
+    }
+}
+
 /// A 16-byte constant buffer: default usage (updated with UpdateSubresource) or dynamic (Map).
 fn constant_buffer(device: &ID3D11Device, dynamic: bool) -> Result<ID3D11Buffer> {
     let desc = D3D11_BUFFER_DESC {
@@ -652,6 +713,12 @@ fn overrides(
     checks.check(
         pixel[0].abs_diff(191) <= 1 && pixel[1].abs_diff(128) <= 1 && pixel[2].abs_diff(64) <= 1,
         "override: skipped draw leaves the clear colour",
+    );
+    let written = dispatch(device, immediate)?;
+    println!("dispatch with the skipped vertex shader still bound: wrote {written:#x}");
+    checks.check(
+        written == DISPATCH_VALUE,
+        "override: a skip rule on a vertex shader leaves dispatches alone",
     );
 
     set_overrides(&dir, swapchain, None)?;
