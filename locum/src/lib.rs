@@ -1,5 +1,6 @@
-//! locum: a stand-in d3d11.dll and dxgi.dll. Every Direct3D 11 call the game makes passes through it to the real
-//! runtime, to be recorded, read back or changed.
+//! locum: records a frame of a Direct3D 11 game so it can be replayed exactly, looked at and changed. The game loads
+//! locum's d3d11.dll and dxgi.dll from its own folder; they forward to this DLL, which hands every call on to the
+//! real runtime and watches it go by.
 //!
 //! The exports below are what `d3d11.dll` and `dxgi.dll` beside the game forward to. Each calls the same function
 //! in the real DLL and wraps what comes back: the device and its contexts, the DXGI factory and its swap chains.

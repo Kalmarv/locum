@@ -1,36 +1,69 @@
 # locum
 
-A stand-in `d3d11.dll` and `dxgi.dll` for looking inside a Direct3D 11 game. The game asks for a device and gets
-locum's; every call it makes arrives at locum first, which passes it on to the real runtime. Nothing in the system's
-DLLs is patched, and the game keeps rendering on its own driver.
+locum records one frame of a Direct3D 11 game, everything the GPU did and everything it read, and plays it back
+offline, checking that the replayed frame's render targets are the game's, bit for bit. From there any draw in the
+frame can be looked at (its shaders, constants, textures, state and output), traced back to the game's files and
+memory, or changed to see what it does.
 
-Status: early. The wrappers forward everything, shaders are hashed and dumped, and one frame can be captured whole:
-every draw and every call that changed a resource in GPU order, each draw's full state, the contents of every
-resource the frame used as the frame began, and the render targets at the end of each pass, in one SQLite file and a
-store of blobs. Rules in a file change what is drawn: skip draws, swap shaders, change constants.
+It needs nothing installed and patches nothing. Windows loads a game's `d3d11.dll` and `dxgi.dll` from the game's
+own folder before the system's, so locum ships two of those that hand every call on to the real Direct3D, through
+`locum.dll`, which watches the calls go by. Remove the three files and the game is as it was.
 
-## What it is for
+## What it does
 
-- **Watching**: every draw with its full state: shaders, constant buffers, textures, render targets, vertex and index
-  buffers, blend and raster state.
-- **Reading back**: copying a texture, render target or buffer to memory at the moment it is used.
-- **Changing**: overriding a constant, skipping a draw, swapping a shader or texture by hash, then looking at the
-  screen.
+- **Capture** a frame: every draw and dispatch with its full state, every call that changed a resource, the contents
+  of every resource as the frame began, and the render targets after each pass. One SQLite file per capture, the
+  bytes in a shared store.
+- **Verify** it: `locum-cli verify` replays the whole frame on its own device and compares every render target with
+  the game's, failing on any difference or on anything the capture could not record. Captures verified bit for bit
+  so far: Sekiro (146 of 146 targets), SkateBIRD (Unity, 33 of 33) and Factorio (11 of 11), each on repeated runs.
+- **Look**: `locum-cli` lists draws, passes, resources, constants by name and shader disassembly, and exports
+  textures and targets; `viewer/` is a local website over a capture to step through the frame draw by draw.
+- **Change**: rules (skip a draw, swap a shader, set a constant, paint a draw one colour) apply live in the game or
+  offline in a replay, which writes the targets before and after and a picture of what changed.
+- **Trace**: name textures and buffers after the files they were loaded from, find a constant's value in a memory
+  dump of the game taken at the capture, and match draws between two captures of the same scene.
+
+## Quick start
+
+```
+cargo build --release
+```
+
+1. Copy `target/release/locum.dll`, `d3d11.dll` and `dxgi.dll` beside the game's executable (the `.exe` that makes the
+   Direct3D device: for Unreal games, the one under `Binaries/Win64`).
+2. Run the game. locum writes to `%LOCALAPPDATA%\locum` (or the folder in `LOCUM_DIR`); `locum.log` there says what it
+   wrapped.
+3. To capture, create an empty file named `capture` in that folder. locum takes it and writes
+   `captures/frame-<n>/capture.db` a few seconds later.
+4. `locum-cli verify last`, then `locum-cli draws last`, or `cd viewer && bun install && bun run viewer --db PATH`.
+5. Delete the three DLLs from the game's folder when done.
+
+## Limits
+
+- Direct3D 11 only. A Direct3D 12 or Vulkan game runs as normal, unseen (locum passes D3D12 swap chains through).
+- 64-bit games only.
+- Games with anti-cheat refuse (or flag) unknown DLLs in their folder: don't use it on them.
+- Not read back yet: render targets that are not plain 2D textures (3D, arrays), and what compute shaders write
+  outside order-dependent ones; a frame that uses those is verified only as far as its 2D targets show.
+- Multisampled textures start empty in replay (their contents are read back resolved).
+- Shaders whose output depends on the order the GPU runs their threads are replayed from what the game's GPU wrote
+  (below).
 
 ## How it works
 
-- `d3d11.dll` and `dxgi.dll` go beside the game's executable. They contain no code: each export forwards to
-  `locum.dll` (the same names and ordinals as the system DLLs, the list DXVK exports).
-- `locum.dll` loads the real `d3d11.dll` and `dxgi.dll` from the system folder and wraps the device, its contexts,
-  the DXGI factory and the swap chain in objects of its own.
+- `d3d11.dll` and `dxgi.dll` contain no code: each export forwards to `locum.dll` (the same names and ordinals as the
+  system DLLs, the list DXVK exports).
+- `locum.dll` loads its own two DLLs, then the real `d3d11.dll` and `dxgi.dll` from the system folder, and wraps the
+  device, its contexts, the DXGI factory and the swap chains in objects of its own. Loading its own first keeps a
+  game that loads `d3d11.dll` late, by name, on locum's.
 - The wrappers are generated. The `windows` crate publishes each interface's vtable as a `#[repr(C)]` struct with the
   exact ABI; `cargo xtask gen` reads those structs and writes `locum/src/vtables/`: one forwarding thunk per method
   and a trait whose default methods call the real object. A wrapper overrides only the methods it cares about.
 
-## Using it
+## Files and settings
 
-Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` beside the game's executable. locum writes to the folder named by
-`LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
+locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
 
 - `locum.log`: what was wrapped, the frame rate every 600 frames, and each interface the game asked for that locum
   passes to the real object unwrapped.
@@ -217,16 +250,27 @@ Constants are named from each shader's reflection, as `cbuffer.variable[index].c
 one-channel images are stretched from their smallest to largest value, float colour is tone-mapped, and `--range
 LO:HI` sets the mapping.
 
+## The viewer
+
+`viewer/` is a local website over a capture (Bun and Vite): the frame's timeline grouped by pass, each draw's
+pipeline with its target pictures and constants by name, resources, shaders and a SQL tab. It reads the capture
+read-only and serves only to this machine. `viewer/README.md` has the details.
+
+```
+cd viewer && bun install && bun run viewer --db PATH/TO/capture.db
+```
+
 ## Building
 
 ```
 cargo build --release
 ```
 
-The DLLs are `target/release/locum.dll`, `d3d11.dll` and `dxgi.dll`, and the reader `target/release/locum-cli.exe`. Regenerate the vtables after changing the
-`windows` version with `cargo xtask gen`. `cargo xtask smoke` builds everything and runs a small Direct3D program
-through locum's DLLs, checking identity, deferred contexts, a capture and overrides, then reads the capture with
-`locum-cli`.
+This builds the DLLs (`target/release/locum.dll`, `d3d11.dll`, `dxgi.dll`) and the reader
+(`target/release/locum-cli.exe`). `cargo xtask smoke` builds everything and runs small Direct3D programs through
+locum's DLLs: object identity, deferred contexts, a late `d3d11.dll`, captures read back with `locum-cli`, replays
+verified on the GPU and on WARP, and overrides. `cargo xtask gen` regenerates the vtables after a `windows` crate
+update.
 
 ## References
 

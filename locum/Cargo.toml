@@ -1,6 +1,6 @@
 [package]
 name = "locum"
-description = "A stand-in d3d11.dll and dxgi.dll: every Direct3D 11 call passes through it to the real runtime."
+description = "Records a frame of a Direct3D 11 game and replays it exactly: d3d11.dll and dxgi.dll beside the game that watch every call on its way to the real runtime."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
