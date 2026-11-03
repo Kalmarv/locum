@@ -838,6 +838,20 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
             "locum-cli export --at: a buffer updated three times holds, at each event, what the update before it wrote",
         ),
         (
+            {
+                let word = r#""name":"Frame.value.x","value":1032.0"#;
+                let one = run(&["draw", "0", "--json"]);
+                let every = run(&["draw", "all", "--json"]);
+                let cb = run(&["cb", "0", "ps", "3", "--json"]);
+                one.contains(word)
+                    && one.contains(r#""named_args":"count=3 start=0""#)
+                    && every.lines().filter(|l| l.starts_with(r#"{"draw":"#)).count() == 3
+                    && cb.contains(r#""name":"Frame""#)
+                    && cb.contains(word)
+            },
+            "locum-cli draw/cb --json: draw 0, every draw one per line, and ps b3, with Frame.value.x = 1032",
+        ),
+        (
             run(&["find", "32"]).contains("Frame.value.x"),
             "locum-cli find 32: the command list's constant, by name",
         ),

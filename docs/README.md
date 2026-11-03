@@ -154,7 +154,9 @@ locum-cli passes last
 locum-cli resources last --used --format BC7_UNORM
 locum-cli resource last 812                # where it was made (call stack), hashes, views, draws, events
 locum-cli events last --kind copy          # the timeline; --resource N for what touched one resource
-locum-cli shader last 9f2c -d              # constant buffers and disassembly
+locum-cli shader last 9f2c -d              # constant buffers, textures and samplers by register, and disassembly
+locum-cli draw last all --json > d.jsonl   # every draw as JSON, one per line (also: draw N --json, cb --json,
+                                           # shader --json with every constant by its full name)
 locum-cli export last 812 -o tex.dds       # contents as the frame began: .dds (all of it), .png (one mip), or raw
 locum-cli export last 812 --at 3301 -o t.dds  # as event 3301 saw them, replayed with the events that wrote them
 locum-cli target last 120 rt0 -o gbuf0.png # a target read back after a pass

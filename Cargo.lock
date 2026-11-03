@@ -264,6 +264,7 @@ dependencies = [
  "memmap2",
  "png",
  "rusqlite",
+ "serde",
  "serde_json",
  "windows",
 ]

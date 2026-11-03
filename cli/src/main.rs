@@ -3,6 +3,7 @@
 
 mod describe;
 mod diff;
+mod draw;
 mod draws;
 mod export;
 mod info;
@@ -74,10 +75,14 @@ enum Command {
     /// One draw: its shaders, state, everything bound, its constants by name, and the targets read after it.
     Draw {
         capture: String,
-        n: i64,
+        /// The draw's number, `last`, or `all` for every draw.
+        n: String,
         /// Every constant register, not only those the shader uses.
         #[arg(long)]
         all: bool,
+        /// As JSON: one object per draw, one per line.
+        #[arg(long)]
+        json: bool,
     },
     /// A draw's constant buffer, every register, with names from the shader.
     Cb {
@@ -87,8 +92,11 @@ enum Command {
         stage: String,
         slot: u32,
         /// Hex bytes instead.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         raw: bool,
+        /// As JSON: each 4-byte word with its register, name and value.
+        #[arg(long)]
+        json: bool,
     },
     /// Where a value sits in the frame's constants: each buffer, register, name and the draws that saw it.
     Find {
@@ -152,8 +160,12 @@ enum Command {
     Shader {
         capture: String,
         hash: String,
-        #[arg(long, short)]
+        #[arg(long, short, conflicts_with = "json")]
         disassemble: bool,
+        /// The reflection as JSON: every binding, and each constant buffer's variables and every 4-byte value by
+        /// its full name.
+        #[arg(long)]
+        json: bool,
     },
     /// A resource's contents as the frame began, or with --at as an event saw them: .dds (whole, or one
     /// subresource), .png (one subresource), or raw.
@@ -390,14 +402,20 @@ fn run(cli: Cli) -> Result<(), String> {
                 call,
             },
         ),
-        Command::Draw { capture, n, all } => draws::draw(&open(&capture)?, n, all),
+        Command::Draw {
+            capture,
+            n,
+            all,
+            json,
+        } => draw::draw(&open(&capture)?, &n, all, json),
         Command::Cb {
             capture,
             draw,
             stage,
             slot,
             raw,
-        } => draws::cb(&open(&capture)?, draw, &stage, slot, raw),
+            json,
+        } => draw::cb(&open(&capture)?, draw, &stage, slot, raw, json),
         Command::Find {
             capture,
             value,
@@ -448,7 +466,8 @@ fn run(cli: Cli) -> Result<(), String> {
             capture,
             hash,
             disassemble,
-        } => shaders::shader(&open(&capture)?, &hash, disassemble),
+            json,
+        } => shaders::shader(&open(&capture)?, &hash, disassemble, json),
         Command::Export {
             capture,
             id,
