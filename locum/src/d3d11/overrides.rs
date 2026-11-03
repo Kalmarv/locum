@@ -100,7 +100,7 @@ pub fn poll(frame: u64) {
 }
 
 fn load(text: &str, dir: &std::path::Path) -> Vec<Rule> {
-    let (parsed, errors) = rules::parse_all(text, dir);
+    let (parsed, errors) = rules::parse_all(text, dir, &rules::hex);
     for (line, e) in errors {
         log!("overrides.txt line {line}: {e}: ignored");
     }

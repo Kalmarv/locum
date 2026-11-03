@@ -487,6 +487,27 @@ pub struct Options {
     pub range: Range,
 }
 
+/// The shader a rule names, by its hash or the start of it, among the capture's shaders of that stage: a hash that
+/// names none of them, or more than one, is an error rather than a rule that never applies.
+fn shader_named(c: &Capture, stage: usize, hash: &str) -> Result<u64, String> {
+    let name = rules::STAGES[stage];
+    if hash.is_empty() || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!("{hash:?} is not a hex hash"));
+    }
+    let found: Vec<String> = c.rows(
+        "SELECT hash FROM shaders WHERE stage = ?1 AND hash LIKE ?2 || '%' ORDER BY hash LIMIT 3",
+        (name, hash.to_ascii_lowercase()),
+        |r| r.get(0),
+    );
+    match found.as_slice() {
+        [one] => u64::from_str_radix(one, 16).map_err(|_| format!("{one:?} is not a hex hash")),
+        [] => Err(format!("the capture has no {name} shader {hash}")),
+        [a, b, ..] => Err(format!(
+            "{name}={hash} names more than one shader ({a}, {b}): give more of the hash"
+        )),
+    }
+}
+
 pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     let target: i64 = c
         .row("SELECT event FROM draws WHERE n = ?1", [draw], |r| r.get(0))
@@ -495,14 +516,16 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     if let Some(file) = &o.rules_file {
         let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
         let dir = file.parent().unwrap_or(Path::new("."));
-        let (r, errors) = rules::parse_all(&text, dir);
+        let (r, errors) = rules::parse_all(&text, dir, &|stage, hash| shader_named(c, stage, hash));
         if let Some((line, e)) = errors.first() {
             return Err(format!("{} line {line}: {e}", file.display()));
         }
         parsed.extend(r);
     }
     for text in &o.rules {
-        parsed.push(rules::parse(text, Path::new("."))?);
+        parsed.push(rules::parse(text, Path::new("."), &|stage, hash| {
+            shader_named(c, stage, hash)
+        })?);
     }
     let plan = plan(c, target, o.mode);
     let bytes: u64 = plan

@@ -9,7 +9,8 @@
 //!
 //! Any rule can end with conditions, `if vs=<hash> ps=<hash>`, all of which must hold; `vs=<hash>` after `skip`,
 //! `solid` and `shader` is such a condition too. Any stage can be named: vs hs ds gs ps cs. Stages are numbered in
-//! that order (as in the capture's `draws` table).
+//! that order (as in the capture's `draws` table). In the game a hash is the whole hash; replay also takes the start of
+//! one, if it names exactly one shader of that stage in the capture.
 
 use std::path::Path;
 
@@ -49,14 +50,21 @@ pub fn stage_named(name: &str) -> Option<usize> {
     STAGES.iter().position(|s| *s == name)
 }
 
+/// How the hash in `stage=hash` names a shader, given the stage's number and the text after `=`.
+pub type Resolve<'a> = &'a dyn Fn(usize, &str) -> Result<u64, String>;
+
+/// The text read as the hash, in hex: for the game, where a rule can name a shader made after it is read.
+pub fn hex(_stage: usize, hash: &str) -> Result<u64, String> {
+    u64::from_str_radix(hash, 16).map_err(|_| format!("{hash:?} is not a hex hash"))
+}
+
 /// `vs=0123456789abcdef`.
-fn condition(word: &str) -> Result<(usize, u64), String> {
+fn condition(word: &str, resolve: Resolve) -> Result<(usize, u64), String> {
     let (stage, hash) = word
         .split_once('=')
         .ok_or_else(|| format!("{word:?} is not stage=hash"))?;
     let stage = stage_named(stage).ok_or_else(|| format!("unknown stage {stage:?}"))?;
-    let hash = u64::from_str_radix(hash, 16).map_err(|_| format!("{hash:?} is not a hex hash"))?;
-    Ok((stage, hash))
+    Ok((stage, resolve(stage, hash)?))
 }
 
 fn value_bits(word: &str) -> Result<u32, String> {
@@ -74,13 +82,13 @@ fn numbered(word: Option<&str>, prefix: char, what: &str) -> Result<u32, String>
         .ok_or_else(|| format!("expected {what} ({prefix}N)"))
 }
 
-/// One rule; `dir` is where a `shader` rule's file is looked for.
-pub fn parse(line: &str, dir: &Path) -> Result<Rule, String> {
+/// One rule; `dir` is where a `shader` rule's file is looked for, and `resolve` names the shaders.
+pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
     let (body, conditions) = match line.split_once(" if ") {
         Some((b, c)) => (
             b,
             c.split_whitespace()
-                .map(condition)
+                .map(|w| condition(w, resolve))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
         None => (line, Vec::new()),
@@ -90,7 +98,7 @@ pub fn parse(line: &str, dir: &Path) -> Result<Rule, String> {
     let mut when = conditions;
     let (stage, action) = match verb {
         "skip" | "solid" | "shader" => {
-            let first = condition(words.next().ok_or("expected stage=hash")?)?;
+            let first = condition(words.next().ok_or("expected stage=hash")?, resolve)?;
             when.insert(0, first);
             match verb {
                 "skip" => (first.0, Action::Skip),
@@ -139,14 +147,14 @@ pub fn parse(line: &str, dir: &Path) -> Result<Rule, String> {
 }
 
 /// Every rule in `text`, and for each line that is not one, its number (from 1) and why.
-pub fn parse_all(text: &str, dir: &Path) -> (Vec<Rule>, Vec<(usize, String)>) {
+pub fn parse_all(text: &str, dir: &Path, resolve: Resolve) -> (Vec<Rule>, Vec<(usize, String)>) {
     let (mut rules, mut errors) = (Vec::new(), Vec::new());
     for (n, line) in text.lines().enumerate() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
-        match parse(line, dir) {
+        match parse(line, dir, resolve) {
             Ok(r) => rules.push(r),
             Err(e) => errors.push((n + 1, e)),
         }
@@ -182,7 +190,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn rule(line: &str) -> Result<Rule, String> {
-        parse(line, &PathBuf::from("."))
+        parse(line, &PathBuf::from("."), &hex)
     }
 
     #[test]
