@@ -5,6 +5,7 @@ mod describe;
 mod draws;
 mod export;
 mod info;
+mod memory;
 mod open;
 mod replay;
 mod resources;
@@ -220,6 +221,54 @@ enum Command {
         #[arg(long)]
         limit: Option<i64>,
     },
+    /// Writes a full-memory minidump of a process from a snapshot of it (locum runs this at a capture: settings.txt
+    /// `dumper`).
+    Dump {
+        #[arg(long)]
+        pid: u32,
+        #[arg(long)]
+        out: PathBuf,
+        /// An event to set once the snapshot is taken.
+        #[arg(long)]
+        signal: Option<String>,
+    },
+    /// Searches a capture's memory dump (or a .dmp file) for a value: a float, an integer, bytes, or the registers of
+    /// a constant buffer a draw had bound.
+    Memfind {
+        /// A capture, or a .dmp file.
+        target: String,
+        #[arg(long, allow_negative_numbers = true)]
+        float: Option<f32>,
+        /// Relative tolerance for --float.
+        #[arg(long, default_value_t = 1e-6)]
+        tolerance: f32,
+        #[arg(long, allow_negative_numbers = true)]
+        int: Option<i64>,
+        /// Hex bytes, like 0000803f.
+        #[arg(long)]
+        bytes: Option<String>,
+        /// DRAW STAGE SLOT: each non-zero register of that constant buffer (or --register N alone).
+        #[arg(long, num_args = 3, value_names = ["DRAW", "STAGE", "SLOT"])]
+        cb: Option<Vec<String>>,
+        #[arg(long)]
+        register: Option<u32>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Compares two memory dumps at the same addresses: words that went from one float to another, or with neither
+    /// given, how many words changed in each region.
+    Memdiff {
+        a: String,
+        b: String,
+        #[arg(long, allow_negative_numbers = true)]
+        from: Option<f32>,
+        #[arg(long, allow_negative_numbers = true)]
+        to: Option<f32>,
+        #[arg(long, default_value_t = 1e-6)]
+        tolerance: f32,
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+    },
     /// Any SQL on the capture; rows tab-separated.
     Sql { capture: String, query: String },
 }
@@ -405,6 +454,54 @@ fn run(cli: Cli) -> Result<(), String> {
             )
         }
         Command::Verify { capture, warp, limit } => replay::verify(&open(&capture)?, warp, limit),
+        Command::Dump { pid, out, signal } => memory::dump(pid, &out, signal.as_deref()),
+        Command::Memfind {
+            target,
+            float,
+            tolerance,
+            int,
+            bytes,
+            cb,
+            register,
+            limit,
+        } => {
+            let needle = match (float, int, bytes, cb) {
+                (Some(f), None, None, None) => memory::Needle::Float(f, tolerance),
+                (None, Some(i), None, None) => memory::Needle::Int(i),
+                (None, None, Some(hex), None) => {
+                    let hex: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+                    let bytes = (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(hex.get(i..i + 2).unwrap_or("x"), 16))
+                        .collect::<Result<Vec<u8>, _>>()
+                        .map_err(|_| format!("--bytes {hex}: not hex bytes"))?;
+                    memory::Needle::Bytes(bytes)
+                }
+                (None, None, None, Some(cb)) => memory::Needle::Cb(
+                    cb[0]
+                        .parse()
+                        .map_err(|_| format!("{}: not a draw number", cb[0]))?,
+                    cb[1].clone(),
+                    cb[2].parse().map_err(|_| format!("{}: not a slot", cb[2]))?,
+                    register,
+                ),
+                _ => return Err("give one of --float, --int, --bytes or --cb".into()),
+            };
+            let (dump, capture) = memory::open(&target, blobs)?;
+            memory::memfind(&dump, capture.as_ref(), &needle, limit)
+        }
+        Command::Memdiff {
+            a,
+            b,
+            from,
+            to,
+            tolerance,
+            limit,
+        } => {
+            let (a, _) = memory::open(&a, blobs)?;
+            let (b, _) = memory::open(&b, blobs)?;
+            memory::memdiff(&a, &b, from, to, tolerance, limit)
+        }
         Command::Sql { capture, query } => sql(&open(&capture)?, &query),
     }
 }

@@ -9,6 +9,7 @@
 
 mod com;
 mod d3d11;
+mod dump;
 mod dxgi;
 mod log;
 mod settings;

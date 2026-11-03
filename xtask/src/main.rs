@@ -128,9 +128,27 @@ fn smoke(root: &Path) {
     let log_dir = stage.join("log");
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&log_dir).expect("create target/smoke");
-    for file in ["locum.dll", "d3d11.dll", "dxgi.dll", "locum-smoke.exe"] {
+    for file in [
+        "locum.dll",
+        "d3d11.dll",
+        "dxgi.dll",
+        "locum-smoke.exe",
+        "locum-cli.exe",
+    ] {
         std::fs::copy(release.join(file), stage.join(file)).unwrap_or_else(|e| panic!("copy {file}: {e}"));
     }
+    // Captures dump the process's memory with locum-cli, into log/dumps.
+    std::fs::write(
+        log_dir.join("settings.txt"),
+        format!(
+            "dumper {}
+dumps {}
+",
+            stage.join("locum-cli.exe").display(),
+            log_dir.join("dumps").display()
+        ),
+    )
+    .expect("write settings.txt");
     let status = Command::new(stage.join("locum-smoke.exe"))
         .current_dir(&stage)
         .env("LOCUM_DIR", &log_dir)
@@ -147,7 +165,7 @@ fn smoke(root: &Path) {
     if !status.success() {
         std::process::exit(status.code().unwrap_or(1));
     }
-    if !cli_checks(&release.join("locum-cli.exe"), &log_dir) {
+    if !cli_checks(&stage.join("locum-cli.exe"), &log_dir) {
         std::process::exit(1);
     }
 }
@@ -193,6 +211,21 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
         (
             run(&["events", "--kind", "map"]).contains("Unmap"),
             "locum-cli events --kind map: the map in the command list",
+        ),
+        (
+            {
+                // The dump is written after the capture, by its own process: wait for it.
+                let dump = log_dir.join("dumps").join("frame-32.dmp");
+                for _ in 0..600 {
+                    if dump.is_file() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                let t = run(&["memfind", "--cb", "0", "ps", "3"]);
+                t.contains("Frame.value: ") && !t.contains("Frame.value: 0 found")
+            },
+            "locum-cli memfind --cb 0 ps 3: the constant draw 0 saw, found in the process's memory",
         ),
         (
             run(&["verify"]).contains("3 of 3 targets identical"),

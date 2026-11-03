@@ -64,6 +64,27 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     drop(s);
     super::ops::reset();
 
+    // The process's memory, as close to the frame as can be: before anything is read back.
+    let memory = if request.memory {
+        match crate::dump::dump(&name, &dir) {
+            Ok(d) => {
+                log!(
+                    "memory dump started: {} (the game waited {:.0} ms for the snapshot)",
+                    d.path.display(),
+                    d.held.as_secs_f64() * 1000.0
+                );
+                json!({"path": d.path.display().to_string(), "held_ms": d.held.as_millis() as u64})
+            }
+            Err(e) => {
+                log!("no memory dump: {e}");
+                gaps.insert(("memory".into(), e.clone()), 1);
+                json!({"error": e})
+            }
+        }
+    } else {
+        serde_json::Value::Null
+    };
+
     // Constant-buffer copies (waits for the GPU to finish the frame).
     let mut chunks: Vec<Vec<u8>> = Vec::new();
     for (i, buffer) in staging.iter().enumerate() {
@@ -441,6 +462,9 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             .unwrap_or_default(),
     );
     capture.meta("pid", std::process::id());
+    if !memory.is_null() {
+        capture.meta("memory", memory.to_string());
+    }
     capture.meta("locum", env!("CARGO_PKG_VERSION"));
     capture.meta("blobs", settings().blobs.root().display());
     capture.meta(

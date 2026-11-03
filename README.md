@@ -50,7 +50,12 @@ Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` beside the game's executable. locum
   - `uploads store` (default), `hash` or `off`: whether the data each resource is created with, and each update
     covering a whole subresource, is hashed and stored as it happens. Stored uploads are the game's own textures and
     meshes without a readback, and their hashes match the files they were loaded from when those hold the same bytes;
-  - `blobs DIR`: where the blob store is (the variable `LOCUM_BLOBS` overrides it).
+  - `blobs DIR`: where the blob store is (the variable `LOCUM_BLOBS` overrides it);
+  - `dumper PATH`: `locum-cli.exe`, which writes a memory dump of the game at each capture (unless the request says
+    `skip memory`). The game waits in Present only while it takes a snapshot of the process (tens of milliseconds);
+    the dump is written from the snapshot while the game runs on;
+  - `dumps DIR`: where the dumps go (default the capture's folder). They hold all of the game's memory: keep them
+    private.
 - `overrides.txt` (written by you): rules that change what is drawn, read again when the file changes and dropped when
   it is removed. One per line:
   - `skip vs=<hash>`: draws with that shader bound are not drawn (`skip cs=<hash>`: dispatches are not run);
@@ -133,6 +138,19 @@ event already taken) reads or writes is taken too, and every resource starts wit
 Each draw runs from the full state captured at it, with its constant buffers made from the bytes the GPU read. With
 rules, the targets are written before (`rt0.before.png`) and after (`rt0.after.png`) them, and `rt0.diff.png` shows
 the texels that changed in magenta over the unchanged ones in grey.
+
+The memory dump ties what the GPU saw back to the game's memory:
+
+```
+locum-cli memfind last --cb 812 ps 3       # where each register of that constant buffer sits in memory
+locum-cli memfind last --float 0.35        # or --int N, --bytes 0000803f
+locum-cli memdiff before.dmp after.dmp --from 0.35 --to 0.5   # what changed between two dumps
+locum-cli stack last 17                    # a call stack recorded at a map or update, as module+offset
+```
+
+Each hit is named: a module and offset, a thread's stack, or a heap allocation and the offset into it. Material
+parameters copied straight into constant buffers are found this way; values the game computes each frame (matrices)
+usually are not in memory as the GPU saw them.
 
 Constants are named from each shader's reflection, as `cbuffer.variable[index].component`. PNGs of depth and other
 one-channel images are stretched from their smallest to largest value, float colour is tone-mapped, and `--range

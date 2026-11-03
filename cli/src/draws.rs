@@ -184,7 +184,7 @@ fn bindings(c: &Capture, draw: i64) -> Vec<Binding> {
 }
 
 /// The shader a draw had bound at `stage`.
-fn shader_of(c: &Capture, draw: i64, stage: &str) -> Option<String> {
+pub fn shader_of(c: &Capture, draw: i64, stage: &str) -> Option<String> {
     if !SHADER_COLUMNS.contains(&stage) {
         return None;
     }
