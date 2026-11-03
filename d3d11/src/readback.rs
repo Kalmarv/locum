@@ -79,6 +79,61 @@ pub unsafe fn issue(c: &ID3D11DeviceContext, resource: &ID3D11Resource) -> Resul
     unsafe { crate::predication::unpredicated(c, || issue_now(c, resource)) }
 }
 
+/// Copies only the supplied, mapped, non-packed tiles, in canonical 64 KiB layout.
+///
+/// # Safety
+/// Every coordinate must name a mapped non-packed tile on this context's device.
+pub unsafe fn issue_tiles(
+    c: &ID3D11DeviceContext2,
+    resource: &ID3D11Resource,
+    coordinates: &[[u32; 4]],
+) -> Result<Readback, String> {
+    let bytes = u32::try_from(coordinates.len())
+        .ok()
+        .and_then(|n| n.checked_mul(65536))
+        .filter(|&n| n != 0)
+        .ok_or("tile staging size out of range")?;
+    let device = unsafe { c.GetDevice() }.map_err(|e| e.to_string())?;
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: bytes,
+        Usage: D3D11_USAGE_STAGING,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        ..Default::default()
+    };
+    let mut buffer = None;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut buffer)) }.map_err(|e| e.to_string())?;
+    let buffer = buffer.ok_or("no tile staging buffer")?;
+    unsafe {
+        crate::predication::unpredicated(c, || {
+            for (i, &[x, y, z, sub]) in coordinates.iter().enumerate() {
+                let at = D3D11_TILED_RESOURCE_COORDINATE {
+                    X: x,
+                    Y: y,
+                    Z: z,
+                    Subresource: sub,
+                };
+                let size = D3D11_TILE_REGION_SIZE {
+                    NumTiles: 1,
+                    ..Default::default()
+                };
+                c.CopyTiles(
+                    resource,
+                    &at,
+                    &size,
+                    &buffer,
+                    i as u64 * 65536,
+                    D3D11_TILE_COPY_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER.0 as u32,
+                );
+            }
+        })
+    };
+    Ok(Readback {
+        staging: buffer.cast().map_err(|e| e.to_string())?,
+        subs: layout::buffer(bytes),
+        buffer: true,
+    })
+}
+
 unsafe fn issue_now(c: &ID3D11DeviceContext, resource: &ID3D11Resource) -> Result<Readback, String> {
     let device = unsafe { c.GetDevice() }.map_err(|e| format!("no device: {e}"))?;
     let subs = subs(resource)?;

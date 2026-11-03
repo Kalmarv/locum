@@ -227,6 +227,7 @@ pub fn live() -> Vec<u64> {
 }
 
 unsafe extern "system" fn destroyed(data: *mut c_void) {
+    super::capture::tiled::destroyed(data as u64);
     if let Some(e) = entries().as_mut() {
         e.remove(&(data as u64));
     }

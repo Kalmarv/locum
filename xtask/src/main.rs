@@ -399,19 +399,78 @@ fn smoke(root: &Path, debug: bool) {
             if warp {
                 cmd.arg("--warp");
             }
-            let output = cmd.output().expect("verify tiled gap");
+            let output = cmd.output().expect("verify native tiled replay");
             let text = format!(
                 "{}{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
-            let ok = !output.status.success() && text.contains("capture gap: tiled");
+            let ok = output.status.success() && text.contains("6 of 6 targets identical");
             println!("--- verify {label} WARP={warp}\n{text}");
             println!(
-                "{} tiles: incomplete pool state prevents a completeness claim",
+                "{} tiles: native mapping and shared-pool replay is bit-exact",
                 if ok { "ok  " } else { "FAIL" }
             );
             rows_ok &= ok;
+            let mut command = Command::new(&cli);
+            command
+                .arg("replay")
+                .arg(log_dir.join(format!("captures/{label}")))
+                .args(["last", "--mode", "slice", "--out"])
+                .arg(log_dir.join(format!("{label}-slice-{warp}")));
+            if warp {
+                command.arg("--warp");
+            }
+            if debug {
+                command.arg("--debug");
+            }
+            let output = command.output().expect("replay tiled alias slice");
+            let text = String::from_utf8_lossy(&output.stdout).into_owned()
+                + &String::from_utf8_lossy(&output.stderr);
+            let ok = output.status.success()
+                && text.contains("against the game's: identical")
+                && !text.contains("warning:");
+            println!("--- {label} slice WARP={warp}\n{text}");
+            println!(
+                "{} tiles: slice retains writes through pool aliases",
+                if ok { "ok  " } else { "FAIL" }
+            );
+            rows_ok &= ok;
+        }
+    }
+
+    for driver in ["gpu", "warp"] {
+        for (suffix, expected) in [
+            ("-omit-alias", "targets differ"),
+            ("-packed", "packed mip tile seeds"),
+        ] {
+            let label = if suffix == "-packed" {
+                format!("tiles-packed-{driver}")
+            } else {
+                format!("tiles-{driver}{suffix}")
+            };
+            if !log_dir.join(format!("captures/{label}/capture.db")).exists() {
+                continue;
+            }
+            for warp in [false, true] {
+                let mut cmd = Command::new(&cli);
+                cmd.arg("verify").arg(log_dir.join(format!("captures/{label}")));
+                if warp {
+                    cmd.arg("--warp");
+                }
+                let output = cmd.output().expect("verify tiled negative control");
+                let text = String::from_utf8_lossy(&output.stdout).into_owned()
+                    + &String::from_utf8_lossy(&output.stderr);
+                let ok = !output.status.success()
+                    && (text.contains(expected)
+                        || (suffix == "-packed" && text.contains("device tiling differs")));
+                println!("--- {label} WARP={warp}\n{text}");
+                println!(
+                    "{} tiles: rejects missing alias writes or packed seeds",
+                    if ok { "ok  " } else { "FAIL" }
+                );
+                rows_ok &= ok;
+            }
         }
     }
 

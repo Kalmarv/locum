@@ -55,6 +55,9 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         return;
     };
     let timeline = std::mem::take(&mut s.timeline);
+    let tile_initialized = std::mem::take(&mut s.tile_initialized);
+    // Seeds still in flight are read below, as the timeline is written.
+    s.tile_seeds.clear();
     let tracked: BTreeMap<u64, Tracked> = std::mem::take(&mut s.resources);
     let in_flight = std::mem::take(&mut s.in_flight);
     let mut read = std::mem::take(&mut s.contents);
@@ -113,21 +116,13 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
 
     // Contents of the resources the frame used, as the timeline first touched them.
     let (used, written) = touched(&timeline);
-    if used.iter().any(|id| {
-        tracked.get(id).is_some_and(|t| {
-            t.dims.misc & (D3D11_RESOURCE_MISC_TILED.0 as u32 | D3D11_RESOURCE_MISC_TILE_POOL.0 as u32) != 0
-        })
-    }) {
-        gaps.entry((
-            "tiled".into(),
-            "native tile mappings and pool contents are not replayed yet".into(),
-        ))
-        .or_insert(1);
-    }
     let mut content: BTreeMap<u64, Result<Content, String>> = BTreeMap::new();
     if request.contents {
         read.extend(unsafe { contents::read_all(immediate, in_flight) });
         for &id in &used {
+            if tile_initialized.contains(&id) {
+                continue;
+            }
             let multisampled = tracked.get(&id).is_some_and(|t| t.dims.samples > 1);
             let c = match read.remove(&id) {
                 Some(r) => r.map(|(key, subs)| Content {
@@ -203,16 +198,13 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         let seq = seq as u64;
         let stack = interner.id(&e.stack);
         let draw_n = e.draw.as_ref().map(|_| n);
-        if e.kind.starts_with("tile_") {
-            *gaps
-                .entry((
-                    "tiled".into(),
-                    format!(
-                        "{} recorded, but tile mappings and pool contents are not replayed yet",
-                        e.call
-                    ),
-                ))
-                .or_default() += 1;
+        if let Some(rb) = e.data_readback.take() {
+            match unsafe { contents::read(immediate, &rb) } {
+                Ok((key, _)) => e.data = Some(key),
+                Err(error) => {
+                    *gaps.entry(("tiled".into(), error)).or_default() += 1;
+                }
+            }
         }
         capture.events.push(db::Event {
             seq,
@@ -396,10 +388,10 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     let (mut with_content, mut content_bytes, mut missing) = (0u64, 0u64, 0u64);
     for id in ids {
         let entry = registry::entry(id);
-        let dims = entry
-            .as_ref()
-            .map(|e| e.dims.clone())
-            .or_else(|| tracked.get(&id).map(|t| t.dims.clone()))
+        let dims = tracked
+            .get(&id)
+            .map(|t| t.dims.clone())
+            .or_else(|| entry.as_ref().map(|e| e.dims.clone()))
             .unwrap_or_default();
         let subs = dims.subs().unwrap_or_default();
         let bytes = locum_capture::layout::total(&subs);
@@ -462,6 +454,9 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                 missing += 1;
                 row.content_note = Some(why.clone());
                 *gaps.entry(("contents".into(), why)).or_insert(0) += 1;
+            }
+            None if tile_initialized.contains(&id) => {
+                row.content_source = Some("tile-events");
             }
             None if row.used && request.contents => {
                 missing += 1;

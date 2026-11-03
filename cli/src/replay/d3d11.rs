@@ -19,6 +19,7 @@ use crate::describe::shape;
 use crate::open::Capture;
 
 use super::Backend;
+mod tiles;
 
 /// Description structs, from the bytes the capture holds (shorter blobs leave the rest at its default).
 fn from_bytes<T: Default>(bytes: &[u8]) -> T {
@@ -29,8 +30,14 @@ fn from_bytes<T: Default>(bytes: &[u8]) -> T {
 }
 
 /// Misc flags kept when a resource is made again: mip generation, cube, indirect arguments, raw and structured
-/// buffers. Sharing, tiling and protection flags are dropped.
-const KEPT_MISC: u32 = 0x1 | 0x4 | 0x10 | 0x20 | 0x40;
+/// buffers, tiled resources and tile pools. Sharing and protection flags are dropped.
+const KEPT_MISC: u32 = 0x1
+    | 0x4
+    | 0x10
+    | 0x20
+    | 0x40
+    | D3D11_RESOURCE_MISC_TILED.0 as u32
+    | D3D11_RESOURCE_MISC_TILE_POOL.0 as u32;
 
 enum View {
     Srv(ID3D11ShaderResourceView),
@@ -951,6 +958,21 @@ impl Backend for D3d11 {
             })
             .flatten()
             .ok_or("its description was not recorded")?;
+        let misc: u32 = c
+            .row("SELECT misc FROM resources WHERE id=?1", [id], |r| r.get(0))
+            .unwrap_or(0);
+        if misc & (D3D11_RESOURCE_MISC_TILED.0 as u32 | D3D11_RESOURCE_MISC_TILE_POOL.0 as u32) != 0 {
+            let native: bool = c
+                .row(
+                    "SELECT content_source = 'tile-events' FROM resources WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+            if !native {
+                return Err("tiled resource has no recorded native mapping/pool state".into());
+            }
+        }
         let subs = s.subs();
         let contents = contents.filter(|b| b.len() as u64 == layout::total(&subs));
         let msaa = s.samples > 1;
@@ -1061,6 +1083,9 @@ impl Backend for D3d11 {
             .and_then(|a| serde_json::from_str(a).ok())
             .unwrap_or_default();
         let ctx = self.ctx.clone();
+        if kind.starts_with("tile_") {
+            return tiles::run(self, c, &kind, &a, data.as_deref());
+        }
         match kind.as_str() {
             "draw" | "dispatch" => {
                 let list: Vec<i64> = a

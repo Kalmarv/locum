@@ -41,9 +41,18 @@ pub(super) fn resource_id(resource: &ID3D11Resource) -> u64 {
     let id = registry::id_of(resource);
     let mut s = state();
     if let std::collections::btree_map::Entry::Vacant(slot) = s.resources.entry(id) {
-        let dims = registry::entry(id)
+        let mut dims = registry::entry(id)
             .map(|e| e.dims)
             .or_else(|| registry::dims_of(resource));
+        if let Some(dims) = &mut dims
+            && dims.misc & D3D11_RESOURCE_MISC_TILE_POOL.0 as u32 != 0
+            && let Some(size) = super::tiled::pool_size(id)
+        {
+            dims.width = size as u32;
+            if let Some(width) = dims.desc.get_mut(..4) {
+                width.copy_from_slice(&dims.width.to_ne_bytes());
+            }
+        }
         slot.insert(Tracked {
             resource: resource.clone(),
             dims: dims.unwrap_or_default(),

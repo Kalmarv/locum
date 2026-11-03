@@ -725,6 +725,7 @@ unsafe impl ContextMethods for Context {
         let left = self.refs.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let device = self.device;
+            tiled::context_destroyed(self.id);
             drop(unsafe { Box::from_raw(self as *const Context as *mut Context) });
             unsafe { (*device).Release() };
         }
@@ -1048,9 +1049,10 @@ unsafe impl ContextMethods for Context {
         a8: *const u32,
         a9: u32,
     ) -> HRESULT {
+        tiled::before(self.ctx(), &[a0, a4]);
         let hr =
             unsafe { real_context::UpdateTileMappings(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) };
-        if capture::armed() && hr.is_ok() {
+        if hr.is_ok() {
             unsafe {
                 let dst = tiled::id(a0);
                 let pool = tiled::id(a4);
@@ -1065,11 +1067,12 @@ unsafe impl ContextMethods for Context {
                     self.ctx(),
                     "tile_map",
                     "UpdateTileMappings",
-                    args,
+                    args.clone(),
                     &[pool],
                     &[dst],
                     None,
                 );
+                tiled::changed(self.ctx(), "tile_map", args, a0, a4);
             }
         }
         hr
@@ -1083,23 +1086,26 @@ unsafe impl ContextMethods for Context {
         a4: *const D3D11_TILE_REGION_SIZE,
         a5: u32,
     ) -> HRESULT {
+        tiled::before(self.ctx(), &[a0, a2]);
         let hr = unsafe { real_context::CopyTileMappings(self.inner(), a0, a1, a2, a3, a4, a5) };
-        if capture::armed() && hr.is_ok() {
+        if hr.is_ok() {
             unsafe {
                 let dst = tiled::id(a0);
                 let src = tiled::id(a2);
+                let args = serde_json::json!({
+                    "dst": dst, "dst_at": tiled::coord(a1), "src": src, "src_at": tiled::coord(a3),
+                    "size": tiled::region(a4), "flags": a5,
+                });
                 tiled::event(
                     self.ctx(),
                     "tile_copy_map",
                     "CopyTileMappings",
-                    serde_json::json!({
-                        "dst": dst, "dst_at": tiled::coord(a1), "src": src, "src_at": tiled::coord(a3),
-                        "size": tiled::region(a4), "flags": a5,
-                    }),
+                    args.clone(),
                     &[src],
                     &[dst],
                     None,
                 );
+                tiled::changed(self.ctx(), "tile_copy_map", args, a0, a2);
             }
         }
         hr
@@ -1164,6 +1170,7 @@ unsafe impl ContextMethods for Context {
         unsafe { real_context::UpdateTiles(self.inner(), a0, a1, a2, a3, a4) };
     }
     unsafe fn ResizeTilePool(&self, a0: *mut c_void, a1: u64) -> HRESULT {
+        tiled::before(self.ctx(), &[a0]);
         let hr = unsafe { real_context::ResizeTilePool(self.inner(), a0, a1) };
         if capture::armed() && hr.is_ok() {
             let pool = tiled::id(a0);
@@ -1176,6 +1183,9 @@ unsafe impl ContextMethods for Context {
                 &[pool],
                 None,
             );
+        }
+        if hr.is_ok() {
+            tiled::resized(a0, a1);
         }
         hr
     }
@@ -1200,6 +1210,7 @@ unsafe impl ContextMethods for Context {
         let hr = unsafe { real_context::FinishCommandList(self.inner(), a0, a1) };
         if hr.is_ok() {
             let complete = self.coverage.finish();
+            unsafe { tiled::finish(self.id, if a1.is_null() { core::ptr::null_mut() } else { *a1 }) };
             if capture::armed() && !a1.is_null() {
                 capture::on_finish_list(self.id, unsafe { *a1 }, complete);
             }
@@ -1211,6 +1222,7 @@ unsafe impl ContextMethods for Context {
         if capture::armed() {
             capture::on_execute_list(self.ctx(), a0);
         }
+        unsafe { tiled::execute(self.ctx(), a0) };
         unsafe { real_context::ExecuteCommandList(self.inner(), a0, a1) }
     }
 

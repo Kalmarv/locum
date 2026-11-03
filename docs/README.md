@@ -119,13 +119,25 @@ event with its box, subresource and bytes, and replay makes the same write. Such
 with no pointer back); its contents are copied before that map. One mapped already when the capture began has no
 such copy, and a `default_map` gap marks the capture incomplete.
 
+Tiled resources and tile pools replay as themselves. locum follows every successful mapping call, armed or not, in a
+model of each resource's page table (which pool tile each of its tiles maps to), so a capture knows the mappings as
+the frame began. The first time the frame uses a tiled resource, a `tile_bootstrap` event records its page table, and
+`tile_seed` events record the contents of each pool tile it maps that no other resource seeded yet, read through its
+mapping as 64 KiB tiles; a resource mapped again during the frame has its newly mapped pool tiles seeded the next time
+it is used. A pool's size includes resizes made before the capture. Every event on a tiled resource also reads or
+writes its pool, so a sliced replay keeps the writes made through another resource mapping the same tiles. Replay
+checks the device's tiling against the capture's and refuses one that differs.
+
 Calls on tiled resources and tile pools are recorded in order as `tile_*` events with all their arguments:
-UpdateTileMappings (an array the game passed as null stays null), CopyTileMappings, CopyTiles with its direction
-and byte offset, UpdateTiles with the bytes it wrote, ResizeTilePool and TiledResourceBarrier. A call that fails is
-not recorded, and one made on a deferred context is placed where its command list is executed. Replay doesn't
-rebuild tile mappings or pool contents yet, so a capture that uses a tiled resource or makes these calls has a
-`tiled` gap and verify won't call it complete. Tiled resources and pools aren't read back whole, as targets or as
-contents: on tier 1 hardware such a copy can touch an unmapped tile.
+UpdateTileMappings (an array the game passed as null stays null), CopyTileMappings, CopyTiles with its direction and
+byte offset, UpdateTiles with the bytes it wrote, ResizeTilePool and TiledResourceBarrier. A call that fails is not
+recorded. Replay spells out the documented one tile per range where several ranges have null counts (WARP crashes on
+the null pointer). An upload on a deferred context runs where its command list is executed, and so does a mapping
+change, but a mapping change in a command list is a `tiled` gap: the tiles it maps aren't seeded yet. Packed mips
+aren't seeded either, nor tiles of a shrunken pool still mapped beyond its new size: both are `tiled` gaps. Tiled
+render and depth targets and tiled UAV outputs aren't read back to compare. No readback copies a whole tiled resource
+(on tier 1 hardware it could touch an unmapped tile). A capture from before this, with no mappings or seeds, is
+refused rather than replayed as ordinary resources.
 
 A pass ends where the targets in effect change on the GPU's timeline: an `OMSetRenderTargets` that binds other
 targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame. Its

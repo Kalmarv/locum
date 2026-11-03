@@ -182,6 +182,8 @@ pub(super) struct Event {
     args: Value,
     /// Key of the bytes an update or map wrote.
     data: Option<String>,
+    /// A tile seed copied at this event, read and hashed before serialization.
+    data_readback: Option<contents::Readback>,
     stack: Vec<u64>,
     draw: Option<Box<Draw>>,
     reads: Vec<u64>,
@@ -245,6 +247,12 @@ struct State {
     counter_views: BTreeMap<u64, ID3D11UnorderedAccessView>,
     counter_copies: BTreeMap<u64, Result<ID3D11Buffer, String>>,
     gaps: BTreeMap<(String, String), u64>,
+    tile_initialized: BTreeSet<u64>,
+    tile_seeded: BTreeSet<(u64, u32)>,
+    /// The generation of each tiled resource's mappings the capture last looked at (`tiled::touch`).
+    tile_seen: BTreeMap<u64, u64>,
+    /// Where in the timeline the tile seeds whose copies are still in flight are.
+    tile_seeds: Vec<usize>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -279,6 +287,10 @@ static STATE: Mutex<State> = Mutex::new(State {
     counter_views: BTreeMap::new(),
     counter_copies: BTreeMap::new(),
     gaps: BTreeMap::new(),
+    tile_initialized: BTreeSet::new(),
+    tile_seeded: BTreeSet::new(),
+    tile_seen: BTreeMap::new(),
+    tile_seeds: Vec::new(),
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -318,6 +330,10 @@ impl State {
         self.counter_views.clear();
         self.counter_copies.clear();
         self.gaps.clear();
+        self.tile_initialized.clear();
+        self.tile_seeded.clear();
+        self.tile_seen.clear();
+        self.tile_seeds.clear();
     }
 }
 
@@ -420,7 +436,10 @@ fn first_touch(immediate: &ID3D11DeviceContext4, event: &Event) {
         let mut todo = Vec::new();
         for id in event.reads.iter().chain(&event.writes) {
             if let Some(t) = s.resources.get_mut(id)
-                && !t.touched
+                && (!t.touched
+                    || t.dims.misc
+                        & (D3D11_RESOURCE_MISC_TILED.0 as u32 | D3D11_RESOURCE_MISC_TILE_POOL.0 as u32)
+                        != 0)
             {
                 t.touched = true;
                 let bytes = t.dims.subs().map_or(0, |s| locum_capture::layout::total(&s));
@@ -435,6 +454,10 @@ fn first_touch(immediate: &ID3D11DeviceContext4, event: &Event) {
     }
     let mut bytes = 0;
     for (id, resource, size) in todo {
+        if tiled::special(&resource) {
+            tiled::touch(immediate, &resource);
+            continue;
+        }
         if write::upload_of(id).is_some() {
             continue;
         }
@@ -460,6 +483,25 @@ fn read_in_flight(immediate: &ID3D11DeviceContext4) {
     };
     let read = unsafe { contents::read_all(immediate, copies) };
     state().contents.extend(read);
+    let seeds: Vec<_> = {
+        let mut s = state();
+        let at = std::mem::take(&mut s.tile_seeds);
+        at.into_iter()
+            .filter_map(|seq| Some((seq, s.timeline.get_mut(seq)?.data_readback.take()?)))
+            .collect()
+    };
+    for (seq, rb) in seeds {
+        match unsafe { contents::read(immediate, &rb) } {
+            Ok((key, _)) => {
+                if let Some(e) = state().timeline.get_mut(seq) {
+                    e.data = Some(key);
+                }
+            }
+            Err(error) => {
+                *state().gaps.entry(("tiled".into(), error)).or_default() += 1;
+            }
+        }
+    }
 }
 
 /// Contents copied before the timeline first touched them, with the time it took (and any reads keeping the copies
@@ -468,7 +510,7 @@ pub static COPIED: Cost = Cost::new();
 
 /// Records an event on a context, while armed. An event on the immediate context in the captured frame first has
 /// the contents of what it touches copied (see [`first_touch`]); a deferred context's wait for its command list.
-pub(super) fn record(c: &ID3D11DeviceContext4, event: Event) {
+pub(super) fn record(c: &ID3D11DeviceContext4, mut event: Event) {
     let started = std::time::Instant::now();
     if !state().records(event.deferred) {
         return;
@@ -476,6 +518,7 @@ pub(super) fn record(c: &ID3D11DeviceContext4, event: Event) {
     if event.deferred {
         state().pending.entry(event.context).or_default().push(event);
     } else {
+        tiled::dependencies(&mut event);
         first_touch(c, &event);
         state().timeline.push(event);
     }
@@ -509,6 +552,7 @@ fn new_event(kind: &'static str, call: &'static str, context: u32, deferred: boo
         deferred,
         args,
         data: None,
+        data_readback: None,
         stack: Vec::new(),
         draw: None,
         reads: Vec::new(),
@@ -872,7 +916,11 @@ pub fn on_execute_list(
         }
         s.lists_spliced += 1;
         s.lists_before += u32::from(before);
-        s.timeline.extend(events);
+        drop(s);
+        for e in &mut events {
+            tiled::dependencies(e);
+        }
+        state().timeline.extend(events);
     }
 }
 

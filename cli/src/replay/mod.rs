@@ -407,7 +407,16 @@ fn execute(
         let contents = match key {
             Some(k) => Some(c.blob(&k)?),
             None => {
-                missing += 1;
+                let tiled: bool = c
+                    .row(
+                        "SELECT content_source = 'tile-events' FROM resources WHERE id=?1",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(false);
+                if !tiled {
+                    missing += 1;
+                }
                 None
             }
         };
@@ -1020,7 +1029,7 @@ pub fn verify(
     );
     let missing: i64 = c
         .row(
-            "SELECT count(*) FROM resources WHERE used = 1 AND content IS NULL",
+            "SELECT count(*) FROM resources WHERE used = 1 AND content IS NULL AND coalesce(content_source, '') != 'tile-events'",
             [],
             |r| r.get(0),
         )
