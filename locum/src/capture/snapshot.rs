@@ -8,64 +8,13 @@ use windows::core::Interface;
 use super::ids::{resource_id, state_id, view_ids};
 use super::{CbBind, Draw, state};
 use crate::shaders::{self, Stage};
+use crate::stages;
 
 /// Staging buffers for constant-buffer copies: 32 MiB each, at most 16 (512 MiB) per capture.
 pub(super) const CHUNK: u32 = 32 << 20;
 const MAX_CHUNKS: usize = 16;
 /// The most of one bound constant-buffer range copied (the whole D3D11 limit is 64 KiB: 4096 constants).
 const MAX_CB_COPY: u32 = 65536;
-
-const CB_SLOTS: u32 = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;
-const SRV_SLOTS: usize = D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT as usize;
-
-/// What is bound to one shader stage.
-struct StageBindings {
-    shader: Option<ID3D11DeviceChild>,
-    buffers: [Option<ID3D11Buffer>; CB_SLOTS as usize],
-    firsts: [u32; CB_SLOTS as usize],
-    counts: [u32; CB_SLOTS as usize],
-    views: [Option<ID3D11ShaderResourceView>; SRV_SLOTS],
-}
-
-/// Reads one stage's shader, constant buffers (with their ranges) and shader resource views.
-unsafe fn stage_bindings(c: &ID3D11DeviceContext4, stage: Stage) -> StageBindings {
-    let mut b = StageBindings {
-        shader: None,
-        buffers: Default::default(),
-        firsts: [0; CB_SLOTS as usize],
-        counts: [0; CB_SLOTS as usize],
-        views: [const { None }; SRV_SLOTS],
-    };
-    let (buffers, firsts, counts) = (
-        b.buffers.as_mut_ptr(),
-        b.firsts.as_mut_ptr(),
-        b.counts.as_mut_ptr(),
-    );
-    macro_rules! read {
-        ($($stage:ident => $shader:ident, $cbs:ident, $srvs:ident;)*) => {
-            match stage {
-                $(Stage::$stage => unsafe {
-                    let mut shader = None;
-                    c.$shader(&mut shader, None, None);
-                    b.shader = shader.map(|s| s.cast().expect("a shader is a device child"));
-                    if b.shader.is_some() {
-                        c.$cbs(0, CB_SLOTS, Some(buffers), Some(firsts), Some(counts));
-                        c.$srvs(0, Some(&mut b.views));
-                    }
-                })*
-            }
-        };
-    }
-    read! {
-        Vertex => VSGetShader, VSGetConstantBuffers1, VSGetShaderResources;
-        Hull => HSGetShader, HSGetConstantBuffers1, HSGetShaderResources;
-        Domain => DSGetShader, DSGetConstantBuffers1, DSGetShaderResources;
-        Geometry => GSGetShader, GSGetConstantBuffers1, GSGetShaderResources;
-        Pixel => PSGetShader, PSGetConstantBuffers1, PSGetShaderResources;
-        Compute => CSGetShader, CSGetConstantBuffers1, CSGetShaderResources;
-    }
-    b
-}
 
 /// Reads the state a draw runs with from the real context.
 pub(super) unsafe fn snapshot(c: &ID3D11DeviceContext4, compute: bool, draw: &mut Draw) {
@@ -75,26 +24,30 @@ pub(super) unsafe fn snapshot(c: &ID3D11DeviceContext4, compute: bool, draw: &mu
         &Stage::GRAPHICS
     };
     for &stage in stages {
-        let b = unsafe { stage_bindings(c, stage) };
-        let Some(shader) = b.shader else { continue };
+        let Some(shader) = (unsafe { stages::shader(c, stage) }) else {
+            continue;
+        };
         let name = stage.short();
         let hash = unsafe { shaders::hash_of(shader.as_raw()) };
         draw.shaders.insert(name, hash.map(|h| format!("{h:016x}")));
-        for (slot, buffer) in b.buffers.iter().enumerate() {
-            let Some(buffer) = buffer else { continue };
+        for (slot, b) in unsafe { stages::constant_buffers(c, stage) }
+            .into_iter()
+            .enumerate()
+        {
+            let Some(buffer) = b.buffer else { continue };
             let resource: ID3D11Resource = buffer.cast().expect("a buffer is a resource");
             draw.cbs.push(CbBind {
                 stage: name,
                 slot: slot as u32,
                 buffer: unsafe { resource_id(&resource) },
-                first: b.firsts[slot],
-                count: b.counts[slot],
+                first: b.first,
+                count: b.count,
                 content: None,
-                source: Some(buffer.clone()),
+                source: Some(buffer),
                 copy: None,
             });
         }
-        for (slot, view) in b.views.iter().enumerate() {
+        for (slot, view) in unsafe { stages::shader_resources(c, stage) }.iter().enumerate() {
             let Some(view) = view else { continue };
             let mut d = D3D11_SHADER_RESOURCE_VIEW_DESC::default();
             unsafe { view.GetDesc(&mut d) };

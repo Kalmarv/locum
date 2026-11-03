@@ -1,15 +1,19 @@
-//! The DXGI factory and the swap chains it makes.
+//! The DXGI factory, its adapters and the swap chains it makes.
 //!
 //! A swap chain is created from a device: the factory gives the real DXGI the real device under our wrapper, and
 //! wraps the swap chain it gets back so that `GetDevice` returns our device and every `Present` passes through
 //! locum (the frame boundary).
+//!
+//! Adapters are wrapped so that the way from a device to its factory (`IDXGIDevice::GetAdapter`, then
+//! `IDXGIAdapter::GetParent`) ends at one of our factories; a game that makes its swap chain from that factory gets
+//! one of our swap chains.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, LUID};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
@@ -17,6 +21,7 @@ use crate::capture;
 use crate::com::answer_query;
 use crate::device::Device;
 use crate::log::log;
+use crate::vtables::adapter::{AdapterMethods, real as real_adapter};
 use crate::vtables::factory::{FactoryMethods, real as real_factory};
 use crate::vtables::swapchain::{SwapChainMethods, real as real_swapchain};
 
@@ -38,8 +43,29 @@ pub struct SwapChain {
     factory: *const Factory,
 }
 
+#[repr(C)]
+pub struct Adapter {
+    vtbl: *const IDXGIAdapter4_Vtbl,
+    refs: AtomicU32,
+    inner: IDXGIAdapter4,
+    /// Our factory, its parent, with one reference: the factory that enumerated it, or else the real parent wrapped
+    /// when first asked for (0 until then, 1 if that failed).
+    factory: OnceLock<usize>,
+}
+
 static FACTORY_VTBL: IDXGIFactory7_Vtbl = crate::vtables::factory::vtable::<Factory>();
+static ADAPTER_VTBL: IDXGIAdapter4_Vtbl = crate::vtables::adapter::vtable::<Adapter>();
 static SWAPCHAIN_VTBL: IDXGISwapChain4_Vtbl = crate::vtables::swapchain::vtable::<SwapChain>();
+
+const ADAPTER_IIDS: [GUID; 7] = [
+    IUnknown::IID,
+    IDXGIObject::IID,
+    IDXGIAdapter::IID,
+    IDXGIAdapter1::IID,
+    IDXGIAdapter2::IID,
+    IDXGIAdapter3::IID,
+    IDXGIAdapter4::IID,
+];
 
 const FACTORY_IIDS: [GUID; 10] = [
     IUnknown::IID,
@@ -99,6 +125,73 @@ impl Factory {
             Err(real) => unsafe { *out = real.into_raw() },
         }
         hr
+    }
+
+    /// Replaces the real adapter an enumeration wrote to `out` with a wrapper whose parent is this factory.
+    unsafe fn wrap_adapter(&self, hr: HRESULT, out: *mut *mut c_void) -> HRESULT {
+        if hr.is_err() || out.is_null() || unsafe { (*out).is_null() } {
+            return hr;
+        }
+        let real = unsafe { IUnknown::from_raw(*out) };
+        match Adapter::wrap(real, Some(self)) {
+            Ok(w) => unsafe { *out = w.cast() },
+            Err(real) => unsafe { *out = real.into_raw() },
+        }
+        hr
+    }
+}
+
+impl Adapter {
+    /// Wraps a real adapter, taking over the caller's reference; `factory`, its parent if known, gains a reference.
+    pub fn wrap(adapter: IUnknown, factory: Option<&Factory>) -> Result<*mut Adapter, IUnknown> {
+        let Ok(inner) = adapter.cast::<IDXGIAdapter4>() else {
+            log!("adapter is not an IDXGIAdapter4: left unwrapped");
+            return Err(adapter);
+        };
+        let parent = OnceLock::new();
+        if let Some(f) = factory {
+            unsafe { f.AddRef() };
+            let _ = parent.set(f as *const Factory as usize);
+        }
+        let wrapper = Box::into_raw(Box::new(Adapter {
+            vtbl: &ADAPTER_VTBL,
+            refs: AtomicU32::new(1),
+            inner,
+            factory: parent,
+        }));
+        log!("wrapped adapter {:p} as {wrapper:p}", adapter.as_raw());
+        Ok(wrapper)
+    }
+
+    /// If `object` is one of our adapters, the real adapter under it; otherwise `object` unchanged.
+    pub fn unwrap_raw(object: *mut c_void) -> *mut c_void {
+        if object.is_null() {
+            return object;
+        }
+        let vtbl = unsafe { *(object as *const *const IDXGIAdapter4_Vtbl) };
+        if core::ptr::eq(vtbl, &ADAPTER_VTBL) {
+            unsafe { (*(object as *const Adapter)).inner.as_raw() }
+        } else {
+            object
+        }
+    }
+
+    /// Our factory for this adapter's parent.
+    fn factory(&self) -> Option<&Factory> {
+        let p = *self.factory.get_or_init(|| {
+            let real = match unsafe { self.inner.GetParent::<IDXGIFactory7>() } {
+                Ok(f) => f,
+                Err(e) => {
+                    log!("IDXGIAdapter::GetParent on the real adapter failed: {e}");
+                    return 1;
+                }
+            };
+            match Factory::wrap(real.into()) {
+                Ok(w) => w as usize,
+                Err(_) => 1,
+            }
+        });
+        (p > 1).then(|| unsafe { &*(p as *const Factory) })
     }
 }
 
@@ -233,6 +326,85 @@ unsafe impl FactoryMethods for Factory {
             let hr =
                 real_factory::CreateSwapChainForComposition(self.inner(), Device::unwrap_raw(a0), a1, a2, a3);
             self.wrap_swapchain(hr, a0, a3)
+        }
+    }
+
+    unsafe fn EnumAdapters(&self, a0: u32, a1: *mut *mut c_void) -> HRESULT {
+        unsafe { self.wrap_adapter(real_factory::EnumAdapters(self.inner(), a0, a1), a1) }
+    }
+
+    unsafe fn EnumAdapters1(&self, a0: u32, a1: *mut *mut c_void) -> HRESULT {
+        unsafe { self.wrap_adapter(real_factory::EnumAdapters1(self.inner(), a0, a1), a1) }
+    }
+
+    unsafe fn EnumAdapterByLuid(&self, a0: LUID, a1: *const GUID, a2: *mut *mut c_void) -> HRESULT {
+        unsafe { self.wrap_adapter(real_factory::EnumAdapterByLuid(self.inner(), a0, a1, a2), a2) }
+    }
+
+    unsafe fn EnumWarpAdapter(&self, a0: *const GUID, a1: *mut *mut c_void) -> HRESULT {
+        unsafe { self.wrap_adapter(real_factory::EnumWarpAdapter(self.inner(), a0, a1), a1) }
+    }
+
+    unsafe fn EnumAdapterByGpuPreference(
+        &self,
+        a0: u32,
+        a1: DXGI_GPU_PREFERENCE,
+        a2: *const GUID,
+        a3: *mut *mut c_void,
+    ) -> HRESULT {
+        unsafe {
+            self.wrap_adapter(
+                real_factory::EnumAdapterByGpuPreference(self.inner(), a0, a1, a2, a3),
+                a3,
+            )
+        }
+    }
+}
+
+unsafe impl AdapterMethods for Adapter {
+    fn inner(&self) -> *mut c_void {
+        self.inner.as_raw()
+    }
+
+    unsafe fn QueryInterface(&self, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        unsafe {
+            answer_query(
+                "adapter",
+                self as *const _ as _,
+                self.inner(),
+                &ADAPTER_IIDS,
+                iid,
+                out,
+                || {
+                    self.AddRef();
+                },
+            )
+        }
+    }
+
+    unsafe fn AddRef(&self) -> u32 {
+        self.refs.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    unsafe fn Release(&self) -> u32 {
+        let left = self.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+        if left == 0 {
+            let parent = self.factory.get().copied();
+            drop(unsafe { Box::from_raw(self as *const Adapter as *mut Adapter) });
+            if let Some(p) = parent
+                && p > 1
+            {
+                unsafe { (*(p as *const Factory)).Release() };
+            }
+        }
+        left
+    }
+
+    /// The parent of an adapter is its factory: ours.
+    unsafe fn GetParent(&self, a0: *const GUID, a1: *mut *mut c_void) -> HRESULT {
+        match self.factory() {
+            Some(factory) => unsafe { factory.QueryInterface(a0, a1) },
+            None => unsafe { real_adapter::GetParent(self.inner(), a0, a1) },
         }
     }
 }

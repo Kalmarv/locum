@@ -6,6 +6,9 @@
 //! - the `d3d11.dll` and `dxgi.dll` in use are locum's, and `locum.dll` is loaded;
 //! - object identity: `QueryInterface(IUnknown)`, `GetDevice` and `GetImmediateContext` give back the objects the game
 //!   already holds, and the swap chain's device is the game's device;
+//! - the way from the device to a swap chain that games use (device -> IDXGIDevice -> GetAdapter -> GetParent, the
+//!   factory -> CreateSwapChainForHwnd) stays on locum's objects, and an adapter a factory enumerates has that factory
+//!   as its parent;
 //! - work recorded on a deferred context reaches the swap chain's back buffer: a clear to a known colour, read back;
 //! - a one-frame capture: a frame with one draw on the immediate context and one from a command list recorded the
 //!   frame before (as engines that build the next frame while the GPU draws this one do) gives both draws, in order,
@@ -131,10 +134,34 @@ fn run(checks: &mut Checks) -> Result<()> {
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         ..Default::default()
     };
-    let swapchain = unsafe { factory.CreateSwapChainForHwnd(&device, hwnd, &desc, None, None) }?;
+    // The swap chain is made the way games usually do it: from the factory that made the device's adapter.
+    let dxgi_device: IDXGIDevice = device.cast()?;
+    checks.check(
+        same(&dxgi_device, &device),
+        "device: QueryInterface(IDXGIDevice) is the same object",
+    );
+    let adapter = unsafe { dxgi_device.GetAdapter() }?;
+    checks.check(
+        same(&unsafe { dxgi_device.GetParent::<IDXGIAdapter>() }?, &adapter),
+        "IDXGIDevice: GetParent is the adapter GetAdapter gives",
+    );
+    let device_factory: IDXGIFactory2 = unsafe { adapter.GetParent() }?;
+    let enumerated = unsafe { factory.EnumAdapters(0) }?;
+    checks.check(
+        same(&unsafe { enumerated.GetParent::<IDXGIFactory2>() }?, &factory),
+        "factory: an adapter it enumerates has it as parent",
+    );
+    let swapchain = unsafe { device_factory.CreateSwapChainForHwnd(&device, hwnd, &desc, None, None) }?;
     checks.check(
         same(&unsafe { swapchain.GetDevice::<ID3D11Device>() }?, &device),
-        "swap chain: GetDevice is the game's device",
+        "swap chain (made from the device's adapter's factory): GetDevice is the game's device",
+    );
+    checks.check(
+        same(
+            &unsafe { swapchain.GetParent::<IDXGIFactory2>() }?,
+            &device_factory,
+        ),
+        "swap chain: GetParent is the factory that made it",
     );
 
     let back: ID3D11Texture2D = unsafe { swapchain.GetBuffer(0) }?;

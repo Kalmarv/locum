@@ -3,19 +3,32 @@
 //! The immediate context lives inside the device and shares its reference count, as in DXVK: a game that holds only
 //! the immediate context keeps the device alive. A deferred context has its own count and holds one reference to the
 //! device.
+//!
+//! The device is also its own DXGI device (`IDXGIDevice` to `IDXGIDevice4`), as in DXVK: the usual way to a swap chain
+//! is device -> IDXGIDevice -> GetAdapter -> GetParent (the factory) -> CreateSwapChain, and every object on that path
+//! has to be locum's for the swap chain to be. The DXGI device lives inside the device like the immediate context.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use std::sync::OnceLock;
+
+use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, S_OK};
 use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dxgi::{
+    IDXGIDevice, IDXGIDevice1, IDXGIDevice2, IDXGIDevice3, IDXGIDevice4, IDXGIDevice4_Vtbl, IDXGIObject,
+};
 use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface};
 
 use crate::capture;
 use crate::com::answer_query;
+use crate::dxgi::Adapter;
 use crate::log::log;
 use crate::shaders::{self, Stage};
+use crate::vtables::adapter::AdapterMethods;
 use crate::vtables::context::{ContextMethods, real as real_context};
 use crate::vtables::device::{DeviceMethods, real};
+use crate::vtables::dxgi_device::DxgiDeviceMethods;
 
 #[repr(C)]
 pub struct Device {
@@ -23,6 +36,17 @@ pub struct Device {
     refs: AtomicU32,
     inner: ID3D11Device5,
     immediate: Context,
+    dxgi: DxgiDevice,
+    /// Our wrapper of the device's adapter, with one reference (0 until asked for, 1 if it could not be wrapped).
+    adapter: OnceLock<usize>,
+}
+
+/// The device's `IDXGIDevice4` face. Counts on the device.
+#[repr(C)]
+pub struct DxgiDevice {
+    vtbl: *const IDXGIDevice4_Vtbl,
+    inner: IDXGIDevice4,
+    device: *const Device,
 }
 
 #[repr(C)]
@@ -39,6 +63,16 @@ pub struct Context {
 
 static DEVICE_VTBL: ID3D11Device5_Vtbl = crate::vtables::device::vtable::<Device>();
 static CONTEXT_VTBL: ID3D11DeviceContext4_Vtbl = crate::vtables::context::vtable::<Context>();
+static DXGI_DEVICE_VTBL: IDXGIDevice4_Vtbl = crate::vtables::dxgi_device::vtable::<DxgiDevice>();
+
+const DXGI_DEVICE_IIDS: [GUID; 6] = [
+    IDXGIObject::IID,
+    IDXGIDevice::IID,
+    IDXGIDevice1::IID,
+    IDXGIDevice2::IID,
+    IDXGIDevice3::IID,
+    IDXGIDevice4::IID,
+];
 
 const DEVICE_IIDS: [GUID; 7] = [
     IUnknown::IID,
@@ -111,10 +145,23 @@ impl Device {
                     return Err(device);
                 }
             };
+        let dxgi = match inner.cast::<IDXGIDevice4>() {
+            Ok(d) => d,
+            Err(e) => {
+                log!("device is not an IDXGIDevice4 ({e}): left unwrapped");
+                return Err(device);
+            }
+        };
         let wrapper = Box::into_raw(Box::new(Device {
             vtbl: &DEVICE_VTBL,
             refs: AtomicU32::new(1),
             inner,
+            dxgi: DxgiDevice {
+                vtbl: &DXGI_DEVICE_VTBL,
+                inner: dxgi,
+                device: core::ptr::null(),
+            },
+            adapter: OnceLock::new(),
             immediate: Context {
                 vtbl: &CONTEXT_VTBL,
                 refs: AtomicU32::new(0),
@@ -124,12 +171,15 @@ impl Device {
                 id: capture::next_context_id(),
             },
         }));
-        unsafe { (*wrapper).immediate.device = wrapper };
+        unsafe {
+            (*wrapper).immediate.device = wrapper;
+            (*wrapper).dxgi.device = wrapper;
+        }
         log!("wrapped device {:p} as {wrapper:p}", device.as_raw());
         Ok(wrapper)
     }
 
-    /// If `object` is one of our devices, the real device under it; otherwise `object` unchanged.
+    /// If `object` is one of our devices (either face), the real device under it; otherwise `object` unchanged.
     pub fn unwrap_raw(object: *mut c_void) -> *mut c_void {
         match Self::from_raw(object) {
             Some(device) => device.inner.as_raw(),
@@ -137,13 +187,37 @@ impl Device {
         }
     }
 
-    /// `object` as one of our devices, if it is one.
+    /// `object` as one of our devices, if it is one: its `ID3D11Device` face or its `IDXGIDevice` face.
     pub fn from_raw<'a>(object: *mut c_void) -> Option<&'a Device> {
         if object.is_null() {
             return None;
         }
-        let vtbl = unsafe { *(object as *const *const ID3D11Device5_Vtbl) };
-        core::ptr::eq(vtbl, &DEVICE_VTBL).then(|| unsafe { &*(object as *const Device) })
+        let vtbl = unsafe { *(object as *const *const c_void) };
+        if core::ptr::eq(vtbl, (&DEVICE_VTBL as *const ID3D11Device5_Vtbl).cast()) {
+            return Some(unsafe { &*(object as *const Device) });
+        }
+        if core::ptr::eq(vtbl, (&DXGI_DEVICE_VTBL as *const IDXGIDevice4_Vtbl).cast()) {
+            return Some(unsafe { &*(*(object as *const DxgiDevice)).device });
+        }
+        None
+    }
+
+    /// Our wrapper of the device's adapter, made the first time it is asked for.
+    fn adapter(&self) -> Option<&Adapter> {
+        let p = *self.adapter.get_or_init(|| {
+            let real = match unsafe { self.dxgi.inner.GetAdapter() } {
+                Ok(a) => a,
+                Err(e) => {
+                    log!("IDXGIDevice::GetAdapter on the real device failed: {e}");
+                    return 1;
+                }
+            };
+            match Adapter::wrap(real.into(), None) {
+                Ok(w) => w as usize,
+                Err(_) => 1,
+            }
+        });
+        (p > 1).then(|| unsafe { &*(p as *const Adapter) })
     }
 
     pub fn immediate(&self) -> &Context {
@@ -199,6 +273,13 @@ unsafe impl DeviceMethods for Device {
     }
 
     unsafe fn QueryInterface(&self, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        if !iid.is_null() && !out.is_null() && DXGI_DEVICE_IIDS.contains(unsafe { &*iid }) {
+            unsafe {
+                self.AddRef();
+                *out = &self.dxgi as *const DxgiDevice as *mut c_void;
+            }
+            return S_OK;
+        }
         unsafe {
             answer_query(
                 "device",
@@ -348,6 +429,56 @@ unsafe impl DeviceMethods for Device {
 
     unsafe fn CreateDeferredContext3(&self, a0: u32, a1: *mut *mut c_void) -> HRESULT {
         unsafe { self.wrap_deferred(real::CreateDeferredContext3(self.inner(), a0, a1), a1) }
+    }
+}
+
+impl Drop for Device {
+    fn drop(&mut self) {
+        if let Some(&p) = self.adapter.get()
+            && p > 1
+        {
+            unsafe { AdapterMethods::Release(&*(p as *const Adapter)) };
+        }
+    }
+}
+
+unsafe impl DxgiDeviceMethods for DxgiDevice {
+    fn inner(&self) -> *mut c_void {
+        self.inner.as_raw()
+    }
+
+    unsafe fn QueryInterface(&self, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+        unsafe { (*self.device).QueryInterface(iid, out) }
+    }
+
+    unsafe fn AddRef(&self) -> u32 {
+        unsafe { (*self.device).AddRef() }
+    }
+
+    unsafe fn Release(&self) -> u32 {
+        unsafe { (*self.device).Release() }
+    }
+
+    unsafe fn GetAdapter(&self, a0: *mut *mut c_void) -> HRESULT {
+        if a0.is_null() {
+            return E_POINTER;
+        }
+        match unsafe { (*self.device).adapter() } {
+            Some(adapter) => unsafe {
+                adapter.AddRef();
+                *a0 = adapter as *const Adapter as *mut c_void;
+                S_OK
+            },
+            None => E_NOINTERFACE,
+        }
+    }
+
+    /// The parent of a DXGI device is its adapter.
+    unsafe fn GetParent(&self, a0: *const GUID, a1: *mut *mut c_void) -> HRESULT {
+        match unsafe { (*self.device).adapter() } {
+            Some(adapter) => unsafe { adapter.QueryInterface(a0, a1) },
+            None => E_NOINTERFACE,
+        }
     }
 }
 

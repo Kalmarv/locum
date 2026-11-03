@@ -52,6 +52,18 @@ const CLASSES: &[Class] = &[
         interface: "IDXGISwapChain4",
         source: &["Win32", "Graphics", "Dxgi"],
     },
+    Class {
+        module: "dxgi_device",
+        trait_name: "DxgiDeviceMethods",
+        interface: "IDXGIDevice4",
+        source: &["Win32", "Graphics", "Dxgi"],
+    },
+    Class {
+        module: "adapter",
+        trait_name: "AdapterMethods",
+        interface: "IDXGIAdapter4",
+        source: &["Win32", "Graphics", "Dxgi"],
+    },
 ];
 
 /// Source modules whose vtable structs are read (bases can live in another module than the interface).

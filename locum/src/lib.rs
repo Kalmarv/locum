@@ -13,6 +13,7 @@ mod device;
 mod dxgi;
 mod log;
 mod shaders;
+mod stages;
 mod system;
 mod vtables;
 
@@ -26,7 +27,7 @@ use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
 use crate::device::Device;
-use crate::dxgi::{Factory, SwapChain};
+use crate::dxgi::{Adapter, Factory, SwapChain};
 use crate::log::log;
 use crate::system::{caller_of_caller, export, is_system_caller, module_of, module_path, system};
 use crate::vtables::device::DeviceMethods;
@@ -128,6 +129,30 @@ pub unsafe extern "system" fn D3D11CreateDevice(
     let Some(real) = (unsafe { export::<CreateDeviceFn>(system().d3d11, c"D3D11CreateDevice") }) else {
         return E_NOTIMPL;
     };
+    let adapter = Adapter::unwrap_raw(adapter);
+    if is_system_caller(caller) {
+        // The system's and the driver's own devices (overlays, NVIDIA's camera) stay real, as their factories do.
+        let hr = unsafe {
+            real(
+                adapter,
+                driver_type,
+                software,
+                flags,
+                levels,
+                level_count,
+                sdk_version,
+                device_out,
+                level_out,
+                context_out,
+            )
+        };
+        log!(
+            "D3D11CreateDevice from {} flags {:#x} -> {hr:?} (real device)",
+            caller_name(caller),
+            flags.0
+        );
+        return hr;
+    }
     let mut device = core::ptr::null_mut();
     let wants = !device_out.is_null() || !context_out.is_null();
     let hr = unsafe {
@@ -177,6 +202,7 @@ pub unsafe extern "system" fn D3D11CreateDeviceAndSwapChain(
     else {
         return E_NOTIMPL;
     };
+    let adapter = Adapter::unwrap_raw(adapter);
     let mut device = core::ptr::null_mut();
     let mut swapchain = core::ptr::null_mut();
     let hr = unsafe {
