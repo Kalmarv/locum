@@ -298,9 +298,121 @@ fn smoke(root: &Path, debug: bool) {
         );
         rows_ok &= ok;
     }
+    rows_ok &= layer_checks(&cli, &log_dir, debug);
     if !status.success() || !late.success() || !cli_ok || !adversarial_ok || !ordered_ok || !rows_ok {
         std::process::exit(1);
     }
+}
+
+fn layer_checks(cli: &Path, log_dir: &Path, debug: bool) -> bool {
+    let mut ok = true;
+    for warp in [false, true] {
+        for (label, expected) in [
+            ("layers-array", "4 of 4 targets identical"),
+            ("layers-volume", "2 of 2 targets identical"),
+            ("layers-legacy", "4 of 4 targets identical"),
+            (
+                "layers-deferred",
+                "clear outputs: 3 identical to the game's, 0 different",
+            ),
+            ("layers-budget-array", "1 of 1 targets identical"),
+            ("layers-budget-volume", "1 of 1 targets identical"),
+            (
+                "layers-budget-shared",
+                "clear outputs: 1 identical to the game's, 0 different",
+            ),
+            (
+                "layers-clear",
+                "clear outputs: 6 identical to the game's, 0 different",
+            ),
+        ] {
+            for bad in [false, true] {
+                if bad && !matches!(label, "layers-array" | "layers-volume" | "layers-clear") {
+                    continue;
+                }
+                let name = if bad {
+                    format!("{label}-tampered")
+                } else {
+                    label.into()
+                };
+                let mut cmd = Command::new(cli);
+                cmd.arg("verify")
+                    .arg(log_dir.join("captures").join(&name))
+                    .env("LOCUM_DIR", log_dir);
+                if warp {
+                    cmd.arg("--warp");
+                }
+                if debug {
+                    cmd.arg("--debug");
+                }
+                let output = cmd.output().expect("layers verify");
+                let text = String::from_utf8_lossy(&output.stdout).into_owned()
+                    + &String::from_utf8_lossy(&output.stderr);
+                let pass = if bad {
+                    !output.status.success()
+                        && text.contains("(event ")
+                        && if label == "layers-clear" {
+                            text.contains("ClearRenderTargetView (event 0)")
+                                && text.contains("1 clear outputs differ")
+                        } else {
+                            text.contains("1 of ")
+                                && text.contains("targets differ")
+                                && text.contains(if label == "layers-volume" {
+                                    "rt0[z2]"
+                                } else {
+                                    "rt0[slice2]"
+                                })
+                        }
+                } else {
+                    output.status.success()
+                        && text.contains(expected)
+                        && (!label.contains("budget") || text.contains("max_mb"))
+                };
+                println!(
+                    "--- verify {name} (WARP={warp})\n{text}\n{} layers: {name}",
+                    if pass { "ok  " } else { "FAIL" }
+                );
+                ok &= pass;
+            }
+        }
+        for (label, names) in [
+            (
+                "layers-array",
+                vec!["rt0[slice1]", "rt0[slice2]", "depth[slice1]", "depth[slice2]"],
+            ),
+            ("layers-volume", vec!["rt0[z1]", "rt0[z2]"]),
+        ] {
+            let dest = log_dir.join(format!("{label}-preview-{warp}"));
+            let mut cmd = Command::new(cli);
+            cmd.arg("replay")
+                .arg(log_dir.join("captures").join(label))
+                .arg("0")
+                .args(["--mode", "frame"])
+                .arg("-o")
+                .arg(&dest)
+                .env("LOCUM_DIR", log_dir);
+            if warp {
+                cmd.arg("--warp");
+            }
+            if debug {
+                cmd.arg("--debug");
+            }
+            let output = cmd.output().expect("layers preview");
+            let text = String::from_utf8_lossy(&output.stdout).into_owned()
+                + &String::from_utf8_lossy(&output.stderr);
+            let pass = output.status.success()
+                && text.matches("against the game's: identical").count() == names.len()
+                && names
+                    .iter()
+                    .all(|name| dest.join(format!("{name}.png")).is_file());
+            println!(
+                "--- replay {label} (WARP={warp})\n{text}\n{} layers: every layer previewed",
+                if pass { "ok  " } else { "FAIL" }
+            );
+            ok &= pass;
+        }
+    }
+    ok
 }
 
 /// Runs `locum-cli verify` on the smoke test's capture `label` (on WARP if `warp`): whether it passed, with every

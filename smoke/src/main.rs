@@ -14,6 +14,7 @@
 //!   frame before (as engines that build the next frame while the GPU draws this one do) gives both draws, in order,
 //!   with their shaders' hashes and the constant-buffer contents each draw saw.
 
+mod layers;
 mod replay_rows;
 
 use std::process::ExitCode;
@@ -214,6 +215,7 @@ fn run(checks: &mut Checks) -> Result<()> {
     adversarial_capture(checks, &device, &immediate, &deferred, &swapchain)?;
     unsafe { immediate.ClearState() };
     ordered_capture(checks, &device, &immediate, &swapchain)?;
+    layers::run(checks, &device, &immediate, &swapchain)?;
     replay_rows::row16(checks, &device, &immediate, &deferred, &swapchain)?;
     replay_rows::row17(checks, &device, &immediate, &swapchain)?;
     replay_rows::row18(checks, &device, &immediate, &swapchain)?;

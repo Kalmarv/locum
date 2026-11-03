@@ -63,7 +63,6 @@ cargo build --release
 
 - Direct3D 11 and 64-bit only. Direct3D 12 and Vulkan games run as normal, unseen.
 - Don't use it on games with anti-cheat.
-- Replay doesn't compare 3D or array render targets yet (what draws and dispatches write through UAVs is compared).
 
 ## Development
 

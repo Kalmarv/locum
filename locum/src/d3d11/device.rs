@@ -848,6 +848,9 @@ unsafe impl ContextMethods for Context {
             ops::clear_rtv(self.ctx(), a0, a1);
         }
         unsafe { real_context::ClearRenderTargetView(self.inner(), a0, a1) }
+        if capture::armed() {
+            capture::after_clear(self.ctx());
+        }
     }
 
     unsafe fn ClearDepthStencilView(&self, a0: *mut c_void, a1: u32, a2: f32, a3: u8) {
@@ -855,6 +858,9 @@ unsafe impl ContextMethods for Context {
             ops::clear_dsv(self.ctx(), a0, a1, a2, a3);
         }
         unsafe { real_context::ClearDepthStencilView(self.inner(), a0, a1, a2, a3) }
+        if capture::armed() {
+            capture::after_clear(self.ctx());
+        }
     }
 
     unsafe fn ClearUnorderedAccessViewUint(&self, a0: *mut c_void, a1: *const u32) {
@@ -868,6 +874,9 @@ unsafe impl ContextMethods for Context {
             ops::clear_uav(self.ctx(), call, a0, values.to_vec().into());
         }
         unsafe { real_context::ClearUnorderedAccessViewUint(self.inner(), a0, a1) }
+        if capture::armed() {
+            capture::after_clear(self.ctx());
+        }
     }
 
     unsafe fn ClearUnorderedAccessViewFloat(&self, a0: *mut c_void, a1: *const f32) {
@@ -881,6 +890,9 @@ unsafe impl ContextMethods for Context {
             ops::clear_uav(self.ctx(), call, a0, values.to_vec().into());
         }
         unsafe { real_context::ClearUnorderedAccessViewFloat(self.inner(), a0, a1) }
+        if capture::armed() {
+            capture::after_clear(self.ctx());
+        }
     }
 
     unsafe fn ClearView(&self, a0: *mut c_void, a1: *const f32, a2: *const RECT, a3: u32) {
@@ -888,6 +900,9 @@ unsafe impl ContextMethods for Context {
             ops::clear_view(self.ctx(), a0, a1, a2, a3);
         }
         unsafe { real_context::ClearView(self.inner(), a0, a1, a2, a3) }
+        if capture::armed() {
+            capture::after_clear(self.ctx());
+        }
     }
 
     unsafe fn ResolveSubresource(&self, a0: *mut c_void, a1: u32, a2: *mut c_void, a3: u32, a4: DXGI_FORMAT) {

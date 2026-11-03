@@ -77,7 +77,7 @@ CREATE TABLE passes(n INTEGER PRIMARY KEY, first_draw INTEGER NOT NULL, last_dra
 -- Targets read back where a pass ends, after its last draw.
 -- event: the event after which they were read, the draw itself or a clear, copy or dispatch after it in the pass.
 CREATE TABLE targets(draw INTEGER NOT NULL, target TEXT NOT NULL, view INTEGER, resource INTEGER, width INTEGER,
-  height INTEGER, format INTEGER, sub INTEGER, blob TEXT, event INTEGER, PRIMARY KEY(draw, target));
+  height INTEGER, format INTEGER, sub INTEGER, blob TEXT, event INTEGER, z INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(draw, target));
 -- What the capture could not record, for `locum-cli info`.
 CREATE TABLE gaps(what TEXT NOT NULL, detail TEXT, count INTEGER NOT NULL);
 -- What a draw or dispatch wrote through UAVs, as the game's GPU wrote it (key of the resource's whole contents right
@@ -269,6 +269,8 @@ pub struct Target {
     pub blob: Option<String>,
     /// The event after which they were read.
     pub event: u64,
+    /// Depth plane of a 3D mip (2D targets use zero).
+    pub z: u32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -520,7 +522,8 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
         for p in &capture.passes {
             s.execute(params![p.n as i64, p.first_draw as i64, p.last_draw as i64])?;
         }
-        let mut s = tx.prepare("INSERT OR REPLACE INTO targets VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)")?;
+        let mut s =
+            tx.prepare("INSERT OR REPLACE INTO targets VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")?;
         for t in &capture.targets {
             s.execute(params![
                 t.draw as i64,
@@ -532,7 +535,8 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
                 t.format,
                 t.sub,
                 t.blob,
-                t.event as i64
+                t.event as i64,
+                t.z
             ])?;
         }
         let mut s = tx.prepare("INSERT INTO results VALUES(?1,?2,?3,?4)")?;

@@ -298,7 +298,7 @@ pub(super) fn row17(
     finish(checks, swapchain, &dir, "row17")
 }
 
-fn begin(swapchain: &IDXGISwapChain1, label: &str) -> Result<std::path::PathBuf> {
+pub(super) fn begin(swapchain: &IDXGISwapChain1, label: &str) -> Result<std::path::PathBuf> {
     begin_with(swapchain, label, || Ok(()))
 }
 
@@ -307,9 +307,18 @@ fn begin_with(
     label: &str,
     before: impl FnOnce() -> Result<()>,
 ) -> Result<std::path::PathBuf> {
+    begin_config(swapchain, label, "", before)
+}
+
+pub(super) fn begin_config(
+    swapchain: &IDXGISwapChain1,
+    label: &str,
+    options: &str,
+    before: impl FnOnce() -> Result<()>,
+) -> Result<std::path::PathBuf> {
     let dir = std::path::PathBuf::from(std::env::var_os("LOCUM_DIR").expect("LOCUM_DIR"));
     let request = dir.join("capture");
-    std::fs::write(&request, format!("label {label}\nskip memory\n")).unwrap();
+    std::fs::write(&request, format!("label {label}\nskip memory\n{options}\n")).unwrap();
     for _ in 0..31 {
         unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
         if !request.exists() {
@@ -322,7 +331,7 @@ fn begin_with(
     Ok(dir)
 }
 
-fn finish(
+pub(super) fn finish(
     checks: &mut Checks,
     swapchain: &IDXGISwapChain1,
     dir: &std::path::Path,

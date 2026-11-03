@@ -23,7 +23,9 @@ pub struct Target {
     pub format: i32,
     /// The subresource of the resource the view writes.
     pub sub: u32,
-    staging: Option<ID3D11Texture2D>,
+    /// Depth plane within a 3D mip; zero for 2D targets.
+    pub z: u32,
+    staging: Option<ID3D11Resource>,
 }
 
 /// A target bound at a draw, kept with the draw so that it can be copied later, on another context.
@@ -33,9 +35,10 @@ pub struct Bound {
     target: String,
     view: ID3D11View,
     format: DXGI_FORMAT,
-    dimension: i32,
     mip: u32,
     slice: u32,
+    slices: u32,
+    volume: bool,
     depth: bool,
 }
 
@@ -50,24 +53,35 @@ pub(super) fn same(a: &[Bound], b: &[Bound]) -> bool {
 fn render_target(slot: usize, view: &ID3D11RenderTargetView) -> Bound {
     let mut d = D3D11_RENDER_TARGET_VIEW_DESC::default();
     unsafe { view.GetDesc(&mut d) };
-    let (mip, slice) = unsafe {
+    let (mip, slice, slices) = unsafe {
         match d.ViewDimension {
-            D3D11_RTV_DIMENSION_TEXTURE2D => (d.Anonymous.Texture2D.MipSlice, 0),
+            D3D11_RTV_DIMENSION_TEXTURE2D => (d.Anonymous.Texture2D.MipSlice, 0, 1),
             D3D11_RTV_DIMENSION_TEXTURE2DARRAY => (
                 d.Anonymous.Texture2DArray.MipSlice,
                 d.Anonymous.Texture2DArray.FirstArraySlice,
+                d.Anonymous.Texture2DArray.ArraySize,
             ),
-            D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY => (0, d.Anonymous.Texture2DMSArray.FirstArraySlice),
-            _ => (0, 0),
+            D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY => (
+                0,
+                d.Anonymous.Texture2DMSArray.FirstArraySlice,
+                d.Anonymous.Texture2DMSArray.ArraySize,
+            ),
+            D3D11_RTV_DIMENSION_TEXTURE3D => (
+                d.Anonymous.Texture3D.MipSlice,
+                d.Anonymous.Texture3D.FirstWSlice,
+                d.Anonymous.Texture3D.WSize,
+            ),
+            _ => (0, 0, 1),
         }
     };
     Bound {
         target: format!("rt{slot}"),
         view: view.cast().expect("a render target view is a view"),
         format: d.Format,
-        dimension: d.ViewDimension.0,
+        volume: d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE3D,
         mip,
         slice,
+        slices,
         depth: false,
     }
 }
@@ -75,24 +89,30 @@ fn render_target(slot: usize, view: &ID3D11RenderTargetView) -> Bound {
 fn depth_target(view: &ID3D11DepthStencilView) -> Bound {
     let mut d = D3D11_DEPTH_STENCIL_VIEW_DESC::default();
     unsafe { view.GetDesc(&mut d) };
-    let (mip, slice) = unsafe {
+    let (mip, slice, slices) = unsafe {
         match d.ViewDimension {
-            D3D11_DSV_DIMENSION_TEXTURE2D => (d.Anonymous.Texture2D.MipSlice, 0),
+            D3D11_DSV_DIMENSION_TEXTURE2D => (d.Anonymous.Texture2D.MipSlice, 0, 1),
             D3D11_DSV_DIMENSION_TEXTURE2DARRAY => (
                 d.Anonymous.Texture2DArray.MipSlice,
                 d.Anonymous.Texture2DArray.FirstArraySlice,
+                d.Anonymous.Texture2DArray.ArraySize,
             ),
-            D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY => (0, d.Anonymous.Texture2DMSArray.FirstArraySlice),
-            _ => (0, 0),
+            D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY => (
+                0,
+                d.Anonymous.Texture2DMSArray.FirstArraySlice,
+                d.Anonymous.Texture2DMSArray.ArraySize,
+            ),
+            _ => (0, 0, 1),
         }
     };
     Bound {
         target: "depth".into(),
         view: view.cast().expect("a depth stencil view is a view"),
         format: d.Format,
-        dimension: d.ViewDimension.0,
+        volume: false,
         mip,
         slice,
+        slices,
         depth: true,
     }
 }
@@ -133,22 +153,38 @@ pub(super) unsafe fn copy(c: &ID3D11DeviceContext4, targets: &[Bound]) -> Vec<Ta
     let Ok(device) = (unsafe { c.GetDevice() }) else {
         return Vec::new();
     };
-    targets
-        .iter()
-        .filter_map(|t| unsafe {
-            copy_one(
-                c,
-                &device,
-                &t.view,
-                t.target.clone(),
-                t.format,
-                t.dimension,
-                t.mip,
-                t.slice,
-                t.depth,
-            )
-        })
-        .collect()
+    let mut out = Vec::new();
+    for t in targets {
+        let Ok(resource) = (unsafe { t.view.GetResource() }) else {
+            continue;
+        };
+        let layers = if t.volume {
+            let Ok(texture) = resource.cast::<ID3D11Texture3D>() else {
+                continue;
+            };
+            let mut d = D3D11_TEXTURE3D_DESC::default();
+            unsafe { texture.GetDesc(&mut d) };
+            (d.Depth >> t.mip).max(1)
+        } else {
+            let Ok(texture) = resource.cast::<ID3D11Texture2D>() else {
+                skip("not a 2D or 3D texture");
+                continue;
+            };
+            let mut d = D3D11_TEXTURE2D_DESC::default();
+            unsafe { texture.GetDesc(&mut d) };
+            d.ArraySize
+        };
+        let count = t.slices.min(layers.saturating_sub(t.slice));
+        for slice in t.slice..t.slice + count {
+            let name = if count > 1 || t.volume {
+                format!("{}[{}{}]", t.target, if t.volume { "z" } else { "slice" }, slice)
+            } else {
+                t.target.clone()
+            };
+            out.extend(unsafe { copy_one(c, &device, t, name, slice) });
+        }
+    }
+    out
 }
 
 fn skip(why: &str) {
@@ -159,25 +195,28 @@ fn skip(why: &str) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 unsafe fn copy_one(
     c: &ID3D11DeviceContext4,
     device: &ID3D11Device,
-    view: &ID3D11View,
+    bound: &Bound,
     target: String,
-    view_format: DXGI_FORMAT,
-    dimension: i32,
-    mip: u32,
     slice: u32,
-    depth: bool,
 ) -> Option<Target> {
+    let (view, view_format, mip, depth) = (&bound.view, bound.format, bound.mip, bound.depth);
     let resource = unsafe { view.GetResource() }.ok()?;
-    let Ok(texture) = resource.cast::<ID3D11Texture2D>() else {
-        skip("not a 2D texture");
-        return None;
-    };
     let mut d = D3D11_TEXTURE2D_DESC::default();
-    unsafe { texture.GetDesc(&mut d) };
+    if bound.volume {
+        let texture = resource.cast::<ID3D11Texture3D>().ok()?;
+        let mut v = D3D11_TEXTURE3D_DESC::default();
+        unsafe { texture.GetDesc(&mut v) };
+        d.Width = v.Width;
+        d.Height = v.Height;
+        d.MipLevels = v.MipLevels;
+        d.Format = v.Format;
+        d.SampleDesc.Count = 1;
+    } else {
+        unsafe { resource.cast::<ID3D11Texture2D>().ok()?.GetDesc(&mut d) };
+    }
     let format = file_format(view_format, d.Format, depth);
     let Some(bits) = bits_per_pixel(format) else {
         skip(&format!("format {} has no readable layout", format.0));
@@ -197,7 +236,12 @@ unsafe fn copy_one(
     }
 
     let mut source: ID3D11Resource = resource.clone();
-    let mut source_sub = mip + slice * d.MipLevels;
+    let sub = if bound.volume {
+        mip
+    } else {
+        mip + slice * d.MipLevels
+    };
+    let mut source_sub = sub;
     if d.SampleDesc.Count > 1 {
         if depth {
             skip("multisampled depth");
@@ -239,18 +283,54 @@ unsafe fn copy_one(
         CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
         ..Default::default()
     };
-    let mut staging = None;
-    if let Err(e) = unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) } {
-        skip(&format!("no staging texture of format {} ({e})", d.Format.0));
-        return None;
-    }
-    let staging = staging?;
+    let staging: windows::core::Result<ID3D11Resource> = if bound.volume {
+        let desc = D3D11_TEXTURE3D_DESC {
+            Width: width,
+            Height: height,
+            Depth: 1,
+            MipLevels: 1,
+            Format: d.Format,
+            Usage: D3D11_USAGE_STAGING,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            ..Default::default()
+        };
+        let mut staging = None;
+        unsafe { device.CreateTexture3D(&desc, None, Some(&mut staging)) }
+            .and_then(|()| staging.expect("created texture").cast())
+    } else {
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging)) }
+            .and_then(|()| staging.expect("created texture").cast())
+    };
+    let staging = match staging {
+        Ok(s) => s,
+        Err(e) => {
+            skip(&format!("no staging texture of format {} ({e})", d.Format.0));
+            return None;
+        }
+    };
+    let region = D3D11_BOX {
+        left: 0,
+        top: 0,
+        front: slice,
+        right: width,
+        bottom: height,
+        back: slice + 1,
+    };
     unsafe {
         unpredicated(c, || {
-            c.CopySubresourceRegion(&staging, 0, 0, 0, 0, &source, source_sub, None)
+            c.CopySubresourceRegion(
+                &staging,
+                0,
+                0,
+                0,
+                0,
+                &source,
+                source_sub,
+                bound.volume.then_some(&region as *const _),
+            )
         })
     };
-    let _ = dimension;
     let (view, resource) = view_ids(view);
     Some(Target {
         target,
@@ -259,7 +339,8 @@ unsafe fn copy_one(
         width,
         height,
         format: format.0,
-        sub: mip + slice * d.MipLevels,
+        sub,
+        z: if bound.volume { slice } else { 0 },
         staging: Some(staging),
     })
 }

@@ -145,6 +145,7 @@ struct Output {
     name: String,
     resource: i64,
     sub: Option<u32>,
+    z: u32,
 }
 
 fn outputs(c: &Capture, draw: i64) -> Vec<Output> {
@@ -162,7 +163,7 @@ fn outputs(c: &Capture, draw: i64) -> Vec<Output> {
         },
     )
     .into_iter()
-    .map(|(kind, slot, resource, json)| {
+    .flat_map(|(kind, slot, resource, json)| {
         let name = match kind.as_str() {
             "rtv" => format!("rt{slot}"),
             "dsv" => "depth".into(),
@@ -172,18 +173,24 @@ fn outputs(c: &Capture, draw: i64) -> Vec<Output> {
             .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
             .map(|j| j["range"].clone())
             .unwrap_or_default();
-        let sub = shape(c, resource).and_then(|s| {
-            (s.kind != "buffer").then(|| {
-                let mip = range["mip"].as_u64().unwrap_or(0) as u32;
-                let slice = range["first_slice"].as_u64().unwrap_or(0) as u32;
-                mip + slice * s.mips.max(1)
-            })
-        });
-        Output {
-            name,
-            resource,
-            sub,
+        let Some(s) = shape(c, resource) else { return Vec::new(); };
+        if s.kind == "buffer" {
+            return vec![Output { name, resource, sub: None, z: 0 }];
         }
+        let mip = range["mip"].as_u64().unwrap_or(0) as u32;
+        let volume = s.kind == "texture3d";
+        let first = range[if volume { "first_w" } else { "first_slice" }].as_u64().unwrap_or(0) as u32;
+        let available = if volume { (s.depth >> mip).max(1) } else { s.array.max(1) };
+        let count = (range[if volume { "w" } else { "slices" }].as_u64().unwrap_or(1) as u32)
+            .min(available.saturating_sub(first));
+        (first..first + count).map(|slice| Output {
+            name: if count > 1 || volume {
+                format!("{name}[{}{slice}]", if volume { "z" } else { "slice" })
+            } else { name.clone() },
+            resource,
+            sub: Some(if volume { mip } else { mip + slice * s.mips.max(1) }),
+            z: if volume { slice } else { 0 },
+        }).collect::<Vec<_>>()
     })
     .collect()
 }
@@ -197,6 +204,25 @@ fn sub_of<'a>(
     let subs = s.subs();
     let x = *subs.iter().find(|x| Some(x.index) == sub.or(Some(0)))?;
     Some((bytes.get(x.offset as usize..(x.offset + x.size) as usize)?, x))
+}
+
+/// One depth plane, with a shape describing only those bytes.
+fn plane_of<'a>(
+    s: &Shape,
+    bytes: &'a [u8],
+    sub: Option<u32>,
+    z: u32,
+) -> Option<(&'a [u8], locum_capture::layout::Sub)> {
+    let (bytes, mut x) = sub_of(s, bytes, sub)?;
+    if z >= x.depth {
+        return None;
+    }
+    let size = x.slice_bytes();
+    let start = u64::from(z) * size;
+    x.offset += start;
+    x.size = size;
+    x.depth = 1;
+    Some((bytes.get(start as usize..(start + size) as usize)?, x))
 }
 
 /// How two images of the same format differ: texels that differ, of how many, the largest difference in a decoded
@@ -302,7 +328,7 @@ fn write_output(
     name: &str,
     s: &Shape,
     bytes: &[u8],
-    sub: Option<u32>,
+    output: &Output,
     range: Range,
 ) -> Result<PathBuf, String> {
     if s.kind == "buffer" {
@@ -310,12 +336,15 @@ fn write_output(
         std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
         return Ok(path);
     }
-    let (data, x) = sub_of(s, bytes, sub).ok_or("no such subresource")?;
+    let (data, x) = plane_of(s, bytes, output.sub, output.z).ok_or("no such subresource or depth plane")?;
     let path = dir.join(format!("{name}.png"));
     let image = texels::decode(s.format, x.width, x.height, &data[..x.slice_bytes() as usize])?;
     png(&path, x.width, x.height, &image.rgba8(range))?;
     Ok(path)
 }
+
+/// Canonical bytes keyed by resource, shared by all its output views and planes.
+type ResourceBytes = HashMap<i64, Vec<u8>>;
 
 /// Makes the plan's resources on a new backend and runs its events with `rules`; returns each output's contents.
 fn execute(
@@ -325,7 +354,7 @@ fn execute(
     warp: bool,
     debug: bool,
     outs: &[Output],
-) -> Result<(Vec<Vec<u8>>, Vec<String>), String> {
+) -> Result<(ResourceBytes, Vec<String>), String> {
     let mut b = backend(c, warp, debug)?;
     let mut missing = 0;
     for &id in &plan.resources {
@@ -353,9 +382,11 @@ fn execute(
             .filter(|s| s.ordered)
             .count();
     }
-    let mut results = Vec::new();
+    let mut results = HashMap::new();
     for o in outs {
-        results.push(b.read(o.resource)?);
+        if let std::collections::hash_map::Entry::Vacant(e) = results.entry(o.resource) {
+            e.insert(b.read(o.resource)?);
+        }
     }
     let mut warnings = b.warnings();
     if missing > 0 {
@@ -371,7 +402,7 @@ fn execute(
     Ok((results, warnings))
 }
 
-/// What the game's GPU wrote through a UAV in a draw or dispatch, recorded right after it.
+/// A resource checkpoint after a draw/dispatch UAV write or a clear.
 struct Written {
     resource: i64,
     key: String,
@@ -379,7 +410,7 @@ struct Written {
     ordered: bool,
 }
 
-/// What the game's GPU wrote through UAVs in each draw and dispatch, by event. Captures from before every output was
+/// Output checkpoints from draws, dispatches and clears, by event. Captures from before every output was
 /// recorded hold only order-dependent ones, without the column saying so; older ones have none.
 fn recorded(c: &Capture) -> HashMap<i64, Vec<Written>> {
     let mut out: HashMap<i64, Vec<Written>> = HashMap::new();
@@ -626,22 +657,22 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         )
         .into_iter()
         .collect();
-    for (i, output) in outs.iter().enumerate() {
+    for output in &outs {
         let s = shape(c, output.resource).ok_or("resource vanished")?;
         let suffix = if edited.is_some() { ".before" } else { "" };
         let path = write_output(
             &o.out,
             &format!("{}{suffix}", output.name),
             &s,
-            &base[i],
-            output.sub,
+            &base[&output.resource],
+            output,
             o.range,
         )?;
         out!("{}: {s} -> {}", output.name, path.display());
         if s.kind == "buffer" {
             continue;
         }
-        let Some((now, x)) = sub_of(&s, &base[i], output.sub) else {
+        let Some((now, x)) = plane_of(&s, &base[&output.resource], output.sub, output.z) else {
             continue;
         };
         let fmt = format::readable(s.format);
@@ -651,15 +682,15 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
             out!("  against the game's: {}", compare(fmt, &x, &game, now));
         }
         if let Some(after) = &edited {
-            let Some((then, _)) = sub_of(&s, &after[i], output.sub) else {
+            let Some((then, _)) = plane_of(&s, &after[&output.resource], output.sub, output.z) else {
                 continue;
             };
             let p = write_output(
                 &o.out,
                 &format!("{}.after", output.name),
                 &s,
-                &after[i],
-                output.sub,
+                &after[&output.resource],
+                output,
                 o.range,
             )?;
             let d = o.out.join(format!("{}.diff.png", output.name));
@@ -702,13 +733,31 @@ pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Resul
     } else {
         "d.event"
     };
-    let checks: Vec<(i64, i64, String, i64, String, i64)> = c.rows(
+    let has_z = c
+        .row(
+            "SELECT count(*) FROM pragma_table_info('targets') WHERE name = 'z'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_some_and(|n| n > 0);
+    let z = if has_z { "coalesce(t.z, 0)" } else { "0" };
+    let checks: Vec<(i64, i64, String, i64, String, i64, u32)> = c.rows(
         &format!(
-            "SELECT t.draw, {at} AS at, t.target, t.resource, t.blob, coalesce(t.sub, 0) FROM targets t \
+            "SELECT t.draw, {at} AS at, t.target, t.resource, t.blob, coalesce(t.sub, 0), {z} FROM targets t \
              JOIN draws d ON d.n = t.draw WHERE t.blob IS NOT NULL AND t.resource IS NOT NULL ORDER BY at"
         ),
         [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+                r.get(6)?,
+            ))
+        },
     );
     out!(
         "replaying {} events over {} resources; {} targets to compare",
@@ -742,22 +791,38 @@ pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Resul
         })
         .into_iter()
         .collect();
+    let calls: HashMap<i64, String> = c
+        .rows("SELECT seq, call FROM events", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .into_iter()
+        .collect();
     let mut next = 0;
     let (mut same, mut compared) = (0, 0);
     let (mut settled_same, mut reordered, mut differing) = (0, 0, 0);
     let (mut outputs_same, mut outputs_differing) = (0, 0);
+    let (mut clears_same, mut clears_differing) = (0, 0);
     let t = std::time::Instant::now();
     for &seq in &plan.events {
         b.run(c, seq, &[]).map_err(|e| format!("event {seq}: {e}"))?;
         let who = numbered.get(&seq).map_or_else(
-            || format!("event {seq}"),
+            || {
+                format!(
+                    "{} (event {seq})",
+                    calls.get(&seq).map_or("unknown", String::as_str)
+                )
+            },
             |(n, call)| format!("{call} {n} (event {seq})"),
         );
         for out in settle(c, b.as_mut(), &written, seq, true).map_err(|e| format!("event {seq}: {e}"))? {
             let resource = out.resource;
             match (out.ordered, out.settled) {
                 (true, Settled::Identical) => settled_same += 1,
-                (false, Settled::Identical) => outputs_same += 1,
+                (false, Settled::Identical) => {
+                    if numbered.contains_key(&seq) {
+                        outputs_same += 1;
+                    } else {
+                        clears_same += 1;
+                    }
+                }
                 (_, Settled::Reordered { stride }) => {
                     reordered += 1;
                     out!(
@@ -773,31 +838,46 @@ pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Resul
                     );
                 }
                 (false, Settled::Differs(how)) => {
-                    outputs_differing += 1;
+                    if numbered.contains_key(&seq) {
+                        outputs_differing += 1;
+                    } else {
+                        clears_differing += 1;
+                    }
                     out!(
                         "{who} #{resource}: wrote other bytes than the game's ({how}); going on from the game's"
                     );
                 }
             }
         }
+        // Several planes of one resource share a checkpoint; read its canonical bytes only once.
+        let mut read = HashMap::new();
         while next < checks.len() && checks[next].1 == seq {
-            let (draw, _, name, resource, key, sub) = &checks[next];
+            let (draw, _, name, resource, key, sub, z) = &checks[next];
             next += 1;
             if limit.is_some_and(|l| compared >= l) {
                 continue;
             }
             let s = shape(c, *resource).ok_or("resource vanished")?;
-            let now = b.read(*resource)?;
-            let Some((mine, x)) = sub_of(&s, &now, Some(*sub as u32)) else {
-                continue;
+            let now = match read.entry(*resource) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => e.insert(b.read(*resource)?),
             };
+            let (mine, x) = plane_of(&s, now, Some(*sub as u32), *z)
+                .ok_or_else(|| format!("event {seq}: target {name} has no subresource {sub}, plane {z}"))?;
             let game = c.blob(key)?;
+            if game.len() != mine.len() {
+                return Err(format!(
+                    "event {seq}: target {name} has {} recorded bytes, expected {}",
+                    game.len(),
+                    mine.len()
+                ));
+            }
             let d = compare(format::readable(s.format), &x, &game, mine);
             compared += 1;
             if d.differ == 0 {
                 same += 1;
             }
-            out!("draw {draw:>5} {name:<6} {s}: {d}");
+            out!("draw {draw:>5} {name:<6} {s} (event {seq}): {d}");
         }
     }
     out!(
@@ -809,6 +889,9 @@ pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Resul
             "what draws and dispatches wrote through UAVs: {outputs_same} identical to the game's, {outputs_differing} \
              different"
         );
+    }
+    if clears_same + clears_differing > 0 {
+        out!("clear outputs: {clears_same} identical to the game's, {clears_differing} different");
     }
     if settled_same + reordered + differing > 0 {
         out!(
@@ -878,11 +961,14 @@ pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Resul
             outputs_same + outputs_differing
         ));
     }
+    if clears_differing > 0 {
+        failed.push(format!("{clears_differing} clear outputs differ"));
+    }
     if !failed.is_empty() {
         return Err(failed.join("; "));
     }
-    if compared == 0 {
-        return Err("no target was compared".into());
+    if compared + outputs_same + clears_same + settled_same + reordered == 0 {
+        return Err("no target or event output was compared".into());
     }
     if !incomplete.is_empty() {
         return Err(format!(

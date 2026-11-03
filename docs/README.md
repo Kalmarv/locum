@@ -26,9 +26,9 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
   locum removes it, records the next frames and writes the capture. Each line of the file is an option, and an empty
   file captures everything:
   - `label NAME`: the capture's folder name (default `frame-<n>`);
-  - `skip targets`: no render and depth targets read back at the end of each pass;
+  - `skip targets`: no render and depth targets read back at pass ends, and no clear-output checkpoints;
   - `skip contents`: no resource contents (draws, state and constants only);
-  - `max_mb N`: the most memory the copies of targets and of what draws and dispatches wrote through UAVs may use
+  - `max_mb N`: the most memory the copies of targets, clear outputs and what draws and dispatches wrote through UAVs may use
     (default 4096); copies past it are skipped and counted.
 - `blobs/<2 hex>/<32 hex>`: the blob store, shared by every capture: resource contents, targets, the bytes each update
   and map wrote, and shader bytecode, each under the xxh3-128 hash of its bytes. Contents are in a canonical layout:
@@ -84,9 +84,11 @@ contents. locum's own copies run whatever predicate the game has set.
   kind (`cb`, `srv`, `uav`, `sampler`, `rtv`, `dsv`, `vb`, `ib`, `so`) and slot, constant buffers with the bytes the
   GPU read (`cb_data`);
 - `passes` and `targets`: runs of draws with the same targets, and the targets read back after each one's last draw
-  (in the format the pass drew in; depth as the colour format of the same bits, D24S8 as R24_UNORM_X8);
-- `results`: what each draw or dispatch wrote through its UAVs, as the GPU wrote it, and whether its shader is
-  order-dependent (below);
+  (in the format the pass drew in; depth as the colour format of the same bits, D24S8 as R24_UNORM_X8). Every
+  array slice and 3D depth plane covered by the view has a row: `sub` identifies its subresource, `z` its depth
+  plane (zero for 2D). Layered names are `rt0[slice2]`, `depth[slice2]`, or `rt0[z2]`;
+- `results`: resource contents immediately after each draw/dispatch writes its UAVs or a clear writes its view,
+  and whether its shader is order-dependent (below). Clears have `order_dependent=0`;
 - `shaders`, `modules`, `stacks`: bytecode keys, and what the call stacks need to be read.
 
 Some shaders write different bytes depending on the order the GPU happens to run their threads: a thread that takes
@@ -146,11 +148,15 @@ locum-cli replay last last --rule "constant vs b11 c0 8 8 0 0"   # before, after
 locum-cli replay last 812 --rules mine.txt --mode frame
 ```
 
-`verify` exits with success only when every target and every output of a draw or dispatch compared is identical and
+`verify` exits with success only when every target and every draw, dispatch or clear output compared is identical and
 nothing the replay needs is missing (contents, command lists, constants); checks the capture could not make (targets
 or outputs skipped, a repeated list's earlier executions, the memory dump) are listed as not compared.
 
 After each draw or dispatch, replay compares what it wrote through UAVs with what the game's GPU wrote (`results`).
+Each clear is also compared immediately, including unbound views and clears with no following draw. A frame with
+only clears can therefore be verified. These checkpoints copy the whole resource, including bytes outside the
+cleared view; like pass targets and UAV outputs, they spend the shared `max_mb` budget and report gaps when it runs
+out. Older captures without `targets.z` remain readable (depth plane zero).
 Where it differs, `verify` names the event (`Dispatch 218 (event 567) #4770: wrote other bytes than the game's`),
 fails, and goes on from the game's bytes, so a difference further on is that later event's own: the first such line
 is where the replay and the game part. `replay` with rules puts back only order-dependent outputs, so a rule's

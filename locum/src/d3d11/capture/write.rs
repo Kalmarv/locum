@@ -165,6 +165,11 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     let mut last_target: HashMap<usize, usize> = HashMap::new();
     let mut last_result: HashMap<usize, usize> = HashMap::new();
     for (seq, e) in timeline.iter().enumerate() {
+        for (_, r) in &e.results {
+            if let Ok(rb) = r {
+                last_result.insert(rb.copy_id(), seq);
+            }
+        }
         let Some(d) = e.draw.as_deref() else { continue };
         for cb in &d.cb_copies {
             if let Some((chunk, offset, _)) = cb.copy {
@@ -174,11 +179,6 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         for t in &d.after {
             if let Some(id) = t.copy_id() {
                 last_target.insert(id, seq);
-            }
-        }
-        for (_, r) in &d.results {
-            if let Ok(rb) = r {
-                last_result.insert(rb.copy_id(), seq);
             }
         }
     }
@@ -206,6 +206,37 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             reads: sorted(&e.reads),
             writes: sorted(&e.writes),
         });
+        // Without an order-dependent event's output replay cannot go on in the game's order (a gap that leaves the
+        // capture incomplete); without another's, that output is only not compared.
+        let ordered = e.draw.as_ref().is_some_and(|d| d.order_dependent);
+        for (resource, r) in std::mem::take(&mut e.results) {
+            let read = match r {
+                Ok(rb) if last_result.get(&rb.copy_id()) != Some(&index) => {
+                    if ordered {
+                        results_repeated += 1;
+                    } else {
+                        outputs_repeated += 1;
+                    }
+                    continue;
+                }
+                Ok(rb) => unsafe { contents::read(immediate, &rb) },
+                Err(e) => Err(e),
+            };
+            match read {
+                Ok((key, _)) => capture.results.push((seq, resource, key, ordered)),
+                Err(e) => {
+                    let gap = if ordered {
+                        (
+                            "results".into(),
+                            format!("an order-dependent shader's output not read: {e}"),
+                        )
+                    } else {
+                        ("outputs".into(), format!("event output not read: {e}"))
+                    };
+                    *gaps.entry(gap).or_insert(0) += 1;
+                }
+            }
+        }
         let Some(d) = e.draw.as_deref_mut() else { continue };
         for cb in &d.cb_copies {
             if let Some((chunk, offset, _)) = cb.copy
@@ -267,40 +298,6 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                 shader_hashes.insert((h.clone(), db::stage_names()[i]));
             }
         }
-        // Without an order-dependent event's output replay cannot go on in the game's order (a gap that leaves the
-        // capture incomplete); without another's, that output is only not compared.
-        let ordered = d.order_dependent;
-        for (resource, r) in std::mem::take(&mut d.results) {
-            let read = match r {
-                Ok(rb) if last_result.get(&rb.copy_id()) != Some(&index) => {
-                    if ordered {
-                        results_repeated += 1;
-                    } else {
-                        outputs_repeated += 1;
-                    }
-                    continue;
-                }
-                Ok(rb) => unsafe { contents::read(immediate, &rb) },
-                Err(e) => Err(e),
-            };
-            match read {
-                Ok((key, _)) => capture.results.push((seq, resource, key, ordered)),
-                Err(e) => {
-                    let gap = if ordered {
-                        (
-                            "results".into(),
-                            format!("an order-dependent shader's output not read: {e}"),
-                        )
-                    } else {
-                        (
-                            "outputs".into(),
-                            format!("what a draw or dispatch wrote through UAVs, not read: {e}"),
-                        )
-                    };
-                    *gaps.entry(gap).or_insert(0) += 1;
-                }
-            }
-        }
         let after = seq + u64::from(d.after_events);
         for t in &mut d.after {
             if t.copy_id().is_some_and(|id| last_target.get(&id) != Some(&index)) {
@@ -319,6 +316,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                     height: t.height,
                     format: t.format as u32,
                     sub: t.sub,
+                    z: t.z,
                     blob: Some(key),
                     event: after,
                 });
@@ -550,7 +548,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         gaps.insert(
             (
                 "outputs".into(),
-                "what a draw or dispatch in a command list executed more than once wrote through UAVs: only its last \
+                "outputs in a command list executed more than once: only its last \
                  execution's output was kept"
                     .into(),
             ),
@@ -580,6 +578,15 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                 "over the target memory limit or unreadable".into(),
             ),
             u64::from(targets_skipped),
+        );
+    }
+    if skipped_bytes > 0 {
+        gaps.insert(
+            (
+                "targets".into(),
+                format!("{} bytes {}", skipped_bytes, super::OVER_LIMIT),
+            ),
+            1,
         );
     }
     for ((what, detail), count) in gaps {

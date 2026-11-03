@@ -4,8 +4,8 @@
 //! Requested by creating the file `capture` in locum's folder; it is removed when seen. Everything is captured by
 //! default; its lines can change that:
 //! - `label NAME`: the capture's folder name (default `frame-<n>`);
-//! - `skip targets`: no target readback at pass ends; `skip contents`: no resource contents;
-//! - `max_mb N`: the most memory the copies of targets and of what draws and dispatches wrote through UAVs may use
+//! - `skip targets`: no target readback at pass ends or clear-output checkpoints; `skip contents`: no resource contents;
+//! - `max_mb N`: the most memory the copies of targets, clears and what draws and dispatches wrote through UAVs may use
 //!   (default 4096);
 //! - `skip memory`: no memory dump of the process (see [`super::dump`]).
 //!
@@ -161,9 +161,6 @@ pub(super) struct Draw {
     closed: bool,
     /// Whether one of its shaders writes what depends on the order the GPU runs its threads.
     order_dependent: bool,
-    /// Copies of what it wrote through UAVs, made right after it ran (or why there is none).
-    results: Vec<(u64, Result<contents::Readback, String>)>,
-    results_taken: bool,
 }
 
 /// One thing a context did, as recorded on it.
@@ -184,6 +181,9 @@ pub(super) struct Event {
     counters: Vec<u64>,
     /// The number of the command list execution it came in with (set when spliced).
     list: Option<u64>,
+    /// Output checkpoints made immediately after a draw, dispatch or clear.
+    results: Vec<(u64, Result<contents::Readback, String>)>,
+    results_taken: bool,
 }
 
 /// A finished command list's events, whether it was finished before the captured frame, and how often the captured
@@ -504,6 +504,8 @@ fn new_event(kind: &'static str, call: &'static str, context: u32, deferred: boo
         writes: Vec::new(),
         counters,
         list: None,
+        results: Vec::new(),
+        results_taken: false,
     }
 }
 
@@ -569,16 +571,32 @@ fn draw_event(
 /// the first event whose output differs is the one named, and what follows is compared from the game's state. For a
 /// shader whose writes depend on the order the GPU runs its threads, the same records in another order are that
 /// order, not a difference.
-pub fn after_draw(
+pub fn after_draw(ctx: Ctx) {
+    after_output(ctx, false);
+}
+
+/// A clear can write a view which was never bound, and need not be followed by a draw.
+pub fn after_clear(ctx: Ctx) {
+    after_output(ctx, true);
+}
+
+fn after_output(
     Ctx {
         c: context,
         id,
         deferred,
     }: Ctx,
+    clear: bool,
 ) {
-    let uavs: Vec<(u64, ID3D11Resource)> = {
+    let outputs: Vec<(u64, ID3D11Resource)> = {
         let mut s = state();
-        if !s.records(deferred) || !s.request.contents {
+        if !s.records(deferred)
+            || !(if clear {
+                s.request.targets
+            } else {
+                s.request.contents
+            })
+        {
             return;
         }
         let last = if deferred {
@@ -586,26 +604,32 @@ pub fn after_draw(
         } else {
             s.timeline.last_mut()
         };
-        let Some(d) = last.and_then(|e| e.draw.as_deref_mut()) else {
+        let Some(e) = last else {
             return;
         };
-        if d.results_taken {
+        if e.results_taken || (clear && e.kind != "clear") || (!clear && e.draw.is_none()) {
             return;
         }
-        d.results_taken = true;
-        let mut ids: Vec<u64> = d
-            .bindings
-            .iter()
-            .filter(|b| b.kind == "uav")
-            .filter_map(|b| b.resource)
-            .collect();
+        e.results_taken = true;
+        let mut ids: Vec<u64> = if clear {
+            e.writes.clone()
+        } else {
+            e.draw
+                .as_ref()
+                .expect("draw")
+                .bindings
+                .iter()
+                .filter(|b| b.kind == "uav")
+                .filter_map(|b| b.resource)
+                .collect()
+        };
         ids.sort_unstable();
         ids.dedup();
         ids.into_iter()
             .filter_map(|i| s.resources.get(&i).map(|t| (i, t.resource.clone())))
             .collect()
     };
-    let results: Vec<(u64, Result<contents::Readback, String>)> = uavs
+    let results: Vec<(u64, Result<contents::Readback, String>)> = outputs
         .into_iter()
         .map(|(i, r)| (i, unsafe { output_copy(context, &r) }))
         .collect();
@@ -615,12 +639,12 @@ pub fn after_draw(
     } else {
         s.timeline.last_mut()
     };
-    if let Some(d) = last.and_then(|e| e.draw.as_deref_mut()) {
-        d.results = results;
+    if let Some(e) = last {
+        e.results = results;
     }
 }
 
-/// A copy of what a draw or dispatch wrote to `resource`, unless it would take the capture past its memory limit.
+/// An event's output, unless its copy would take the capture past its memory limit.
 ///
 /// # Safety
 /// `resource` must be a live resource of `context`'s device.
