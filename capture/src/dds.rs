@@ -2,6 +2,8 @@
 //! DDS stores them in, so a file is a header and the bytes as they are, both ways: [`file`] writes one, [`read`]
 //! takes one apart (the DX10 header, and the older pixel formats named the way DirectXTex names them).
 
+use crate::layout;
+
 /// What a DDS file holds.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Texture {
@@ -159,6 +161,12 @@ fn legacy_format(flags: u32, fourcc: u32, bits: u32, masks: [u32; 4]) -> Option<
     None
 }
 
+/// Whether `payload` holds every subresource of `t`.
+fn holds(t: &Texture, payload: &[u8]) -> bool {
+    layout::texture(t.format, t.width, t.height, t.depth, t.mips, t.array)
+        .is_some_and(|subs| layout::total(&subs) <= payload.len() as u64)
+}
+
 /// What a DDS file holds and its bytes after the header(s), which are the canonical layout of every subresource
 /// (and possibly more).
 pub fn read(bytes: &[u8]) -> Result<(Texture, &[u8]), String> {
@@ -190,7 +198,7 @@ pub fn read(bytes: &[u8]) -> Result<(Texture, &[u8]), String> {
             4 => 3,
             d => return Err(format!("DDS: resource dimension {d}")),
         };
-        let t = Texture {
+        let mut t = Texture {
             format,
             dimensions,
             width,
@@ -200,11 +208,21 @@ pub fn read(bytes: &[u8]) -> Result<(Texture, &[u8]), String> {
             array: array.max(1) * if cube { 6 } else { 1 },
             cube,
         };
-        return Ok((t, &bytes[148..]));
+        let payload = &bytes[148..];
+        // The array size of a cube counts cubes, but some writers (FromSoftware's, for one) count its faces there: a
+        // file whose bytes hold that many faces and not six times as many is read that way.
+        let faces = Texture {
+            array: array.max(1),
+            ..t
+        };
+        if cube && array % 6 == 0 && !holds(&t, payload) && holds(&faces, payload) {
+            t = faces;
+        }
+        return Ok((t, payload));
     }
     let format = legacy_format(pf_flags, fourcc, bits, masks).ok_or_else(|| {
         format!(
-            "DDS: pixel format without a DXGI format (flags {pf_flags:#x}, fourcc {fourcc:#x}, {bits} bits, masks              {masks:x?})"
+            "DDS: pixel format without a DXGI format (flags {pf_flags:#x}, fourcc {fourcc:#x}, {bits} bits, masks {masks:x?})"
         )
     })?;
     let cube = caps2 & CUBEMAP != 0;
@@ -252,6 +270,30 @@ mod tests {
         assert_eq!(&h[84..88], b"DX10");
         assert_eq!(u32_at(&h, 128), 87);
         assert_eq!(u32_at(&h, 132), 3);
+    }
+
+    #[test]
+    fn a_cube_whose_array_size_counts_faces_reads_as_its_bytes_say() {
+        let one = Texture {
+            format: 71,
+            dimensions: 2,
+            width: 8,
+            height: 8,
+            depth: 1,
+            mips: 1,
+            array: 6,
+            cube: true,
+        };
+        // Eight 4x4 blocks of 8 bytes would be 2x2 blocks: 32 bytes a face.
+        let mut file = file(&one, &[7u8; 6 * 32]);
+        // As FromSoftware writes them: the faces counted in the array size.
+        file[140..144].copy_from_slice(&6u32.to_le_bytes());
+        let (t, _) = read(&file).unwrap();
+        assert_eq!((t.array, t.cube), (6, true));
+        // Six cubes, with all their bytes, stay six cubes.
+        let six = Texture { array: 36, ..one };
+        let (t, _) = read(&super::file(&six, &[7u8; 36 * 32])).unwrap();
+        assert_eq!(t.array, 36);
     }
 
     #[test]
