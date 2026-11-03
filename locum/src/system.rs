@@ -86,12 +86,105 @@ pub fn load_system_dll(name: &'static str) -> Option<HMODULE> {
 
 /// The address of `name` in `module`, as the function type `F`.
 ///
+/// Overlays can redirect a system DLL's exports to their own code (Epic Online Services' overlay does, for
+/// `D3D11CreateDevice`), and their code then calls the export they found under the bare name, which is ours: an
+/// address outside `module` is therefore not used, but the export's own, read from the DLL's file.
+///
 /// # Safety
 /// `F` must be the export's real function pointer type.
 pub unsafe fn export<F: Copy>(module: HMODULE, name: &'static core::ffi::CStr) -> Option<F> {
     assert_eq!(size_of::<F>(), size_of::<usize>());
-    let f = unsafe { GetProcAddress(module, PCSTR(name.as_ptr().cast())) }?;
-    Some(unsafe { core::mem::transmute_copy(&f) })
+    let found = unsafe { GetProcAddress(module, PCSTR(name.as_ptr().cast())) }? as usize;
+    let base = module.0 as usize;
+    let size = unsafe { image_size(module) };
+    let address = if (base..base + size).contains(&found) {
+        found
+    } else {
+        let own = own_export(module, name)?;
+        static LOGGED: std::sync::Mutex<Vec<(usize, &'static core::ffi::CStr)>> =
+            std::sync::Mutex::new(Vec::new());
+        let mut logged = LOGGED.lock().unwrap_or_else(|e| e.into_inner());
+        if !logged.contains(&(base, name)) {
+            logged.push((base, name));
+            let by = module_of(found as *const c_void).map(module_path);
+            log!(
+                "{} of {} leads to {:#x} in {}: called at its own address {:#x} instead",
+                name.to_string_lossy(),
+                module_path(module).display(),
+                found,
+                by.map_or("no module".into(), |p| p.display().to_string()),
+                own
+            );
+        }
+        own
+    };
+    Some(unsafe { core::mem::transmute_copy(&address) })
+}
+
+/// The size of a loaded module's image, from its PE headers.
+///
+/// # Safety
+/// `module` must be a loaded module.
+unsafe fn image_size(module: HMODULE) -> usize {
+    let base = module.0 as *const u8;
+    unsafe {
+        let pe = base.add(base.add(0x3c).cast::<u32>().read_unaligned() as usize);
+        // SizeOfImage: the optional header (after the 4-byte signature and 20-byte file header), offset 56.
+        pe.add(24 + 56).cast::<u32>().read_unaligned() as usize
+    }
+}
+
+/// The address of `name` in `module` as the module's file exports it (what its in-memory export table said before
+/// anything changed it). None for an export forwarded to another DLL or not found.
+fn own_export(module: HMODULE, name: &core::ffi::CStr) -> Option<usize> {
+    let file = std::fs::read(module_path(module)).ok()?;
+    let rva = pe_export_rva(&file, name.to_bytes())?;
+    Some(module.0 as usize + rva as usize)
+}
+
+/// The RVA of an exported function in a PE32+ file's bytes, or None (forwarded, absent or malformed).
+fn pe_export_rva(file: &[u8], name: &[u8]) -> Option<u32> {
+    let u16_at = |o: usize| Some(u16::from_le_bytes(file.get(o..o + 2)?.try_into().ok()?));
+    let u32_at = |o: usize| Some(u32::from_le_bytes(file.get(o..o + 4)?.try_into().ok()?));
+    let pe = u32_at(0x3c)? as usize;
+    if file.get(pe..pe + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let sections = u16_at(pe + 6)? as usize;
+    let optional = pe + 24;
+    let optional_size = u16_at(pe + 20)? as usize;
+    if u16_at(optional)? != 0x20b {
+        return None;
+    }
+    // Data directory 0 (exports) of a PE32+ optional header.
+    let (dir, dir_size) = (u32_at(optional + 112)?, u32_at(optional + 116)?);
+    let table = optional + optional_size;
+    let offset = |rva: u32| -> Option<usize> {
+        (0..sections).find_map(|i| {
+            let s = table + i * 40;
+            let (size, address, raw) = (u32_at(s + 8)?, u32_at(s + 12)?, u32_at(s + 20)?);
+            (address..address.checked_add(size)?)
+                .contains(&rva)
+                .then(|| (rva - address + raw) as usize)
+        })
+    };
+    let d = offset(dir)?;
+    let (count, functions, names, ordinals) = (
+        u32_at(d + 24)? as usize,
+        u32_at(d + 28)?,
+        u32_at(d + 32)?,
+        u32_at(d + 36)?,
+    );
+    let (functions, names, ordinals) = (offset(functions)?, offset(names)?, offset(ordinals)?);
+    let index = (0..count).find(|&i| {
+        u32_at(names + 4 * i)
+            .and_then(offset)
+            .and_then(|o| file.get(o..o + name.len() + 1))
+            .is_some_and(|s| &s[..name.len()] == name && s[name.len()] == 0)
+    })?;
+    let rva = u32_at(functions + 4 * u16_at(ordinals + 2 * index)? as usize)?;
+    // An address inside the export directory names another DLL's export, not code.
+    (!(dir..dir + dir_size).contains(&rva)).then_some(rva)
 }
 
 /// The address the function calling this one will return to, i.e. its caller's code.
@@ -126,4 +219,36 @@ pub fn is_system_caller(address: *const c_void) -> bool {
     let path = module_path(module).to_string_lossy().to_lowercase();
     let system = system().folder.to_string_lossy().to_lowercase();
     path.starts_with(&system) || path.contains("\\driverstore\\")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The file's export table gives the address the loader gives for an unchanged system DLL.
+    #[test]
+    fn own_export_matches_the_loader() {
+        let folder = system_folder();
+        for (dll, names) in [
+            (
+                "d3d11.dll",
+                &[c"D3D11CreateDevice", c"D3D11CreateDeviceAndSwapChain"][..],
+            ),
+            ("dxgi.dll", &[c"CreateDXGIFactory1", c"CreateDXGIFactory2"][..]),
+        ] {
+            let module = load(&folder, dll).expect("system DLL");
+            for name in names {
+                let loader =
+                    unsafe { GetProcAddress(module, PCSTR(name.as_ptr().cast())) }.expect("export") as usize;
+                assert_eq!(own_export(module, name), Some(loader), "{dll} {name:?}");
+            }
+            assert_eq!(own_export(module, c"NoSuchExport"), None);
+        }
+    }
+
+    fn system_folder() -> PathBuf {
+        let mut buf = [0u16; 260];
+        let n = unsafe { GetSystemDirectoryW(Some(&mut buf)) } as usize;
+        PathBuf::from(String::from_utf16_lossy(&buf[..n]))
+    }
 }

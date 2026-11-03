@@ -19,5 +19,7 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
     "Win32_UI_WindowsAndMessaging",
 ] }

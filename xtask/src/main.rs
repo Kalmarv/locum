@@ -134,6 +134,7 @@ fn smoke(root: &Path, debug: bool) {
         "dxgi.dll",
         "locum-smoke.exe",
         "locum-smoke-late.exe",
+        "locum-smoke-overlay.exe",
         "locum-cli.exe",
     ] {
         std::fs::copy(release.join(file), stage.join(file)).unwrap_or_else(|e| panic!("copy {file}: {e}"));
@@ -168,6 +169,21 @@ fn smoke(root: &Path, debug: bool) {
         .env("LOCUM_DIR", &late_dir)
         .status()
         .expect("run locum-smoke-late");
+    // A program whose overlay redirects the system d3d11.dll's D3D11CreateDevice export to code that calls locum's
+    // (as Epic Online Services' overlay does), in a log folder of its own.
+    let overlay_dir = log_dir.join("overlay");
+    std::fs::create_dir_all(&overlay_dir).expect("create the overlay log folder");
+    let overlay = Command::new(stage.join("locum-smoke-overlay.exe"))
+        .current_dir(&stage)
+        .env("LOCUM_DIR", &overlay_dir)
+        .status()
+        .expect("run locum-smoke-overlay");
+    let overlay_logged = std::fs::read_to_string(overlay_dir.join("locum.log"))
+        .is_ok_and(|l| l.contains("D3D11CreateDevice of ") && l.contains("called at its own address"));
+    println!(
+        "{} overlay: locum's log names the redirected export",
+        if overlay_logged { "ok  " } else { "FAIL" }
+    );
     let cli = stage.join("locum-cli.exe");
     let cli_ok = cli_checks(&cli, &log_dir);
     let (adversarial_ok, _) = verified(
@@ -299,7 +315,15 @@ fn smoke(root: &Path, debug: bool) {
         rows_ok &= ok;
     }
     rows_ok &= layer_checks(&cli, &log_dir, debug);
-    if !status.success() || !late.success() || !cli_ok || !adversarial_ok || !ordered_ok || !rows_ok {
+    if !status.success()
+        || !late.success()
+        || !overlay.success()
+        || !overlay_logged
+        || !cli_ok
+        || !adversarial_ok
+        || !ordered_ok
+        || !rows_ok
+    {
         std::process::exit(1);
     }
 }
