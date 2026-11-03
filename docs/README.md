@@ -30,9 +30,11 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
   - `skip contents`: no resource contents (draws, state and constants only);
   - `max_mb N`: the most memory the copies of targets, clear outputs and what draws and dispatches wrote through UAVs may use
     (default 4096); copies past it are skipped and counted.
-- `blobs/<2 hex>/<32 hex>`: the blob store, shared by every capture: resource contents, targets, the bytes each update
-  and map wrote, and shader bytecode, each under the xxh3-128 hash of its bytes. Contents are in a canonical layout:
-  subresources in order (mip within array slice), rows packed tightly, blocks for compressed formats.
+- `blobs/`: the blob store, shared by every capture: resource contents, targets, the bytes each update and map wrote,
+  and shader bytecode, each under the xxh3-128 hash of its bytes. They are appended to `packs/*.pack` (one per process
+  writing), and `index.db` (table `blobs(key, pack, offset, size)`) says where each one is; stores from before packs
+  hold one file per blob, `<2 hex>/<32 hex>`, and are still read. Contents are in a canonical layout: subresources in
+  order (mip within array slice), rows packed tightly, blocks for compressed formats.
 - `settings.txt` (written by you), one per line:
   - `uploads store` (default), `hash` or `off`: whether the data each resource is created with, and each update
     covering a whole subresource, is hashed and stored as it happens. Stored uploads are the game's own textures and

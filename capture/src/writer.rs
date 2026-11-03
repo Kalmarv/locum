@@ -41,6 +41,23 @@ pub struct Writer {
     changed: Condvar,
 }
 
+/// A store's appended blobs are indexed at the latest after this many bytes.
+const INDEX_AFTER: u64 = 256 << 20;
+
+/// Indexes what was appended to each store, so other processes find it.
+fn index(stores: &mut Vec<Blobs>) {
+    for blobs in stores.drain(..) {
+        let started = std::time::Instant::now();
+        if blobs.flush().is_err() {
+            // Not indexed: forget what was taken for this store, so callers hand those blobs over again.
+            if let Some(t) = taken().as_mut().and_then(|t| t.get_mut(blobs.root())) {
+                t.clear();
+            }
+        }
+        WRITTEN.add(started, 0);
+    }
+}
+
 fn writer() -> &'static Writer {
     static WRITER: OnceLock<Writer> = OnceLock::new();
     WRITER.get_or_init(|| {
@@ -48,24 +65,43 @@ fn writer() -> &'static Writer {
         std::thread::Builder::new()
             .name("locum writer".into())
             .spawn(move || {
-                for job in rx {
+                // Blobs are appended to the store's pack and indexed in batches: when nothing more is queued, when
+                // much is waiting, and before a job runs (a capture's database must not name a blob that other
+                // processes can't find yet).
+                let mut unindexed: Vec<Blobs> = Vec::new();
+                let mut next = None;
+                loop {
+                    let Some(job) = next.take().or_else(|| rx.recv().ok()) else {
+                        break;
+                    };
                     let bytes = match job {
                         Job::Blob(blobs, key, data) => {
                             let started = std::time::Instant::now();
-                            if blobs.put(&key, &data).is_err() {
+                            if blobs.append(&key, &data).is_err() {
                                 // Not there after all: the next caller with it queues it again.
                                 if let Some(t) = taken().as_mut().and_then(|t| t.get_mut(blobs.root())) {
                                     t.remove(&key);
                                 }
                             }
                             WRITTEN.add(started, data.len() as u64);
+                            if !unindexed.iter().any(|b| b.root() == blobs.root()) {
+                                unindexed.push(blobs.clone());
+                            }
+                            if blobs.unflushed() > INDEX_AFTER {
+                                index(&mut unindexed);
+                            }
                             data.len() as u64
                         }
                         Job::Run(f) => {
+                            index(&mut unindexed);
                             f();
                             0
                         }
                     };
+                    next = rx.try_recv().ok();
+                    if next.is_none() {
+                        index(&mut unindexed);
+                    }
                     let w = writer();
                     let mut p = w.pending.lock().unwrap_or_else(|e| e.into_inner());
                     p.0 -= bytes;
@@ -155,8 +191,8 @@ mod tests {
         assert!(blob(&blobs, key.clone(), b"once".to_vec(), true));
         flush();
         assert!(blobs.has(&key));
-        // Gone from the disk behind the writer's back: the second hand-over is not queued, so it stays gone.
-        std::fs::remove_file(blobs.path(&key)).unwrap();
+        // Gone from the store behind the writer's back: the second hand-over is not queued, so it stays gone.
+        blobs.forget(&key);
         assert!(blob(&blobs, key.clone(), b"once".to_vec(), true));
         flush();
         assert!(!blobs.has(&key));

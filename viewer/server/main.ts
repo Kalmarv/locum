@@ -300,7 +300,7 @@ async function api(req: Request, url: URL): Promise<Response> {
       if (!c.hasBlob(key)) throw new HttpError(404, `blob ${key} is not in ${c.blobs}`);
       const offset = Number(q.get("offset") ?? 0), size = Math.min(Number(q.get("size") ?? 65536), 16 << 20);
       return new Response(c.readBlob(key, offset, size), { headers: { "content-type": "application/octet-stream",
-        "x-blob-size": String(statSync(c.blobPath(key)).size) } });
+        "x-blob-size": String(c.blobSize(key)) } });
     }
     case "image": {
       const file = await image(c, parseSource(q.get("src")), q.get("range") || "auto", q.get("channels") || "rgb");

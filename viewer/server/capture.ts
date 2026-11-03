@@ -122,6 +122,7 @@ export class Capture {
   private timelineCache: { rows: TimelineRow[]; groups: Group[] } | null = null;
   private modulesCache: { path: string; base: bigint; size: bigint }[] | null = null;
   private features: { targetEvent: boolean; results: boolean } | null = null;
+  private blobIndex: Database | null = null;
 
   constructor(readonly id: string, readonly path: string, readonly blobs: string, readonly label: string) {}
 
@@ -183,25 +184,36 @@ export class Capture {
     return out;
   }
 
-  blobPath(key: string): string {
-    return join(this.blobs, key.slice(0, 2), key);
+  /** Where a blob is: in a pack (the store's `index.db` says where), or a file of its own (stores from before packs). */
+  private locate(key: string): { path: string; at: number; size: number } | null {
+    const index = join(this.blobs, "index.db");
+    if (!this.blobIndex && existsSync(index)) this.blobIndex = new Database(index, { readonly: true });
+    const row = this.blobIndex?.query("SELECT pack, offset, size FROM blobs WHERE key = ?").get(key) as any;
+    if (row) return { path: join(this.blobs, "packs", row.pack), at: Number(row.offset), size: Number(row.size) };
+    const file = join(this.blobs, key.slice(0, 2), key);
+    return existsSync(file) ? { path: file, at: 0, size: statSync(file).size } : null;
   }
 
   hasBlob(key: string): boolean {
-    return existsSync(this.blobPath(key));
+    return this.locate(key) !== null;
+  }
+
+  blobSize(key: string): number | null {
+    return this.locate(key)?.size ?? null;
   }
 
   /** `size` bytes of a blob from `offset` (all of it without a size). */
   readBlob(key: string, offset = 0, size?: number): Uint8Array<ArrayBuffer> {
-    const path = this.blobPath(key);
-    const total = statSync(path).size;
+    const where = this.locate(key);
+    if (!where) throw new Error(`blob ${key} is not in ${this.blobs}`);
+    const total = where.size;
     const n = Math.max(0, Math.min(size ?? total - offset, total - offset));
     const out = new Uint8Array(n);
-    const fd = openSync(path, "r");
+    const fd = openSync(where.path, "r");
     try {
       let done = 0;
       while (done < n) {
-        const got = readSync(fd, out, done, n - done, offset + done);
+        const got = readSync(fd, out, done, n - done, where.at + offset + done);
         if (got <= 0) break;
         done += got;
       }
@@ -436,7 +448,7 @@ export class Capture {
       const s = shapes.get(r.resource);
       return {
         resource: this.resourceRef(s, r.resource), content: r.content as string,
-        size: this.hasBlob(r.content) ? statSync(this.blobPath(r.content)).size : null, stride: s?.stride ?? 0,
+        size: this.blobSize(r.content), stride: s?.stride ?? 0,
       };
     });
   }
@@ -450,7 +462,7 @@ export class Capture {
     const { rows } = this.timeline();
     const row = rows.find(r => r.seq === seq);
     let data: { key: string; size: number | null } | null = null;
-    if (e.data) data = { key: e.data, size: this.hasBlob(e.data) ? statSync(this.blobPath(e.data)).size : null };
+    if (e.data) data = { key: e.data, size: this.blobSize(e.data) };
     // Views named in the arguments (clears).
     const args = json(e.args);
     let view: any = null;
