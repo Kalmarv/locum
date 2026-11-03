@@ -793,6 +793,34 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
             "locum-cli draw 0: ps b3 named Frame.value holding 1032; upload and first-use contents; topology named",
         ),
         (
+            {
+                // #9 is updated at events 5, 6 and 7 with two contents in turn: each event sees the one before it.
+                let dir = log_dir.join("export-at");
+                let _ = std::fs::create_dir_all(&dir);
+                let file = |name: &str| dir.join(name).display().to_string();
+                let saw = |event: &str| -> Vec<u8> {
+                    run(&[
+                        "export",
+                        "9",
+                        "--at",
+                        event,
+                        "-o",
+                        &file(&format!("at{event}.bin")),
+                    ]);
+                    std::fs::read(file(&format!("at{event}.bin"))).unwrap_or_default()
+                };
+                let wrote = |event: &str| -> Vec<u8> {
+                    let data = run(&["sql", &format!("SELECT data FROM events WHERE seq = {event}")]);
+                    let key = data.lines().nth(1).unwrap_or("").trim().to_string();
+                    run(&["blob", &key, "-o", &file(&format!("data{event}.bin"))]);
+                    std::fs::read(file(&format!("data{event}.bin"))).unwrap_or_default()
+                };
+                let (six, seven) = (wrote("6"), wrote("7"));
+                six.len() == 80 && six != seven && saw("7") == six && saw("8") == seven
+            },
+            "locum-cli export --at: a buffer updated three times holds, at each event, what the update before it wrote",
+        ),
+        (
             run(&["find", "32"]).contains("Frame.value.x"),
             "locum-cli find 32: the command list's constant, by name",
         ),

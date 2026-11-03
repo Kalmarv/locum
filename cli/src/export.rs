@@ -52,20 +52,37 @@ pub struct Which {
     pub z: u32,
     /// The upload instead of the contents as the frame began.
     pub upload: bool,
+    /// The contents just before this event instead, replayed (on WARP with `warp`).
+    pub at: Option<i64>,
+    pub warp: bool,
 }
 
 pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, range: Range) -> Result<(), String> {
     let s = shape(c, id).ok_or_else(|| format!("no resource #{id}"))?;
-    let column = if which.upload { "upload" } else { "content" };
-    let key: String = c
-        .row(
-            &format!("SELECT {column} FROM resources WHERE id = ?1"),
-            [id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .flatten()
-        .ok_or_else(|| format!("#{id} has no {column} in this capture"))?;
-    let bytes = c.blob(&key)?;
+    let (bytes, key) = match which.at {
+        Some(event) => {
+            let (bytes, events, warnings) = crate::replay::contents_at(c, id, event, which.warp)?;
+            for w in &warnings {
+                out!("warning: {w}");
+            }
+            let source =
+                format!("as event {event} saw it: replayed from the frame's start with {events} events");
+            out!("#{id} {source}");
+            (bytes, source)
+        }
+        None => {
+            let column = if which.upload { "upload" } else { "content" };
+            let key: String = c
+                .row(
+                    &format!("SELECT {column} FROM resources WHERE id = ?1"),
+                    [id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .flatten()
+                .ok_or_else(|| format!("#{id} has no {column} in this capture"))?;
+            (c.blob(&key)?, key)
+        }
+    };
     let subs = s.subs();
     if subs.is_empty() {
         return Err(format!("{} has no layout locum knows", format::name(s.format)));
@@ -73,7 +90,7 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, range: Range
     let total = locum_capture::layout::total(&subs);
     if bytes.len() as u64 != total {
         return Err(format!(
-            "blob {key} has {} bytes, {} expected for {s}",
+            "contents ({key}) have {} bytes, {} expected for {s}",
             bytes.len(),
             total
         ));

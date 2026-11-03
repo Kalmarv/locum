@@ -424,14 +424,12 @@ pub fn draw(c: &Capture, n: i64, all: bool) -> Result<(), String> {
         if let Some(r) = b.resource
             && b.kind != "cb"
         {
-            let src: Option<(Option<String>, Option<String>)> = c.row(
-                "SELECT content, content_source FROM resources WHERE id = ?1",
+            type Src = (Option<String>, Option<String>, Option<String>);
+            let src: Option<Src> = c.row(
+                "SELECT content, content_source, content_note FROM resources WHERE id = ?1",
                 [r],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             );
-            if let Some((Some(key), source)) = src {
-                line += &format!("  contents {} ({})", short(&key), source.unwrap_or_default());
-            }
             // Written earlier in the frame: its contents at this draw are not those of the frame's start.
             let earlier: Option<i64> = c
                 .row(
@@ -440,8 +438,25 @@ pub fn draw(c: &Capture, n: i64, all: bool) -> Result<(), String> {
                     |r| r.get(0),
                 )
                 .flatten();
-            if let Some(e) = earlier {
-                line += &format!(", last written at event {e}");
+            if let Some((key, source, note)) = src {
+                if let Some(key) = key {
+                    let source = source.unwrap_or_default();
+                    match earlier {
+                        Some(e) => {
+                            line += &format!(
+                                "  contents {} as the frame began ({source}), not as this draw saw them: written \
+                                 since, last at event {e} (export --at {event} gives what it saw)",
+                                short(&key)
+                            )
+                        }
+                        None => line += &format!("  contents {} ({source})", short(&key)),
+                    }
+                } else if let Some(e) = earlier {
+                    line += &format!("  written earlier, last at event {e}");
+                }
+                if let Some(note) = note {
+                    line += &format!(" [{note}]");
+                }
             }
         }
         out!("{line}");

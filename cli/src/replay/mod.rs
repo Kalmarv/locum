@@ -97,36 +97,59 @@ pub fn plan(c: &Capture, target: i64, mode: Mode) -> Plan {
     let touches = touches(c);
     let mut events: Vec<i64> = Vec::new();
     let mut resources: BTreeSet<i64> = BTreeSet::new();
-    let mut take = |seq: i64, resources: &mut BTreeSet<i64>| {
-        if let Some((r, w)) = touches.get(&seq) {
-            resources.extend(r);
-            resources.extend(w);
-        }
-        events.push(seq);
-    };
     match mode {
-        Mode::Draw => take(target, &mut resources),
+        Mode::Draw => take(&touches, target, &mut events, &mut resources),
         Mode::Frame => {
             for &seq in touches.keys().filter(|&&s| s <= target) {
-                take(seq, &mut resources);
+                take(&touches, seq, &mut events, &mut resources);
             }
         }
         Mode::Slice => {
-            take(target, &mut resources);
-            for (&seq, (_, writes)) in touches.range(..target).rev() {
-                if writes.iter().any(|w| resources.contains(w)) {
-                    take(seq, &mut resources);
-                }
-            }
-            events.reverse();
+            take(&touches, target, &mut events, &mut resources);
+            walk_back(&touches, target, &mut events, &mut resources);
         }
     }
+    with_bound(c, events, resources)
+}
+
+/// The events to run for resource `id` to hold what it held just before event `before`: every earlier event that
+/// wrote it, or wrote what such an event read, and so on.
+pub fn plan_before(c: &Capture, id: i64, before: i64) -> Plan {
+    let touches = touches(c);
+    let (mut events, mut resources) = (Vec::new(), BTreeSet::from([id]));
+    walk_back(&touches, before, &mut events, &mut resources);
+    with_bound(c, events, resources)
+}
+
+type Touches = BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)>;
+
+fn take(touches: &Touches, seq: i64, events: &mut Vec<i64>, resources: &mut BTreeSet<i64>) {
+    if let Some((r, w)) = touches.get(&seq) {
+        resources.extend(r);
+        resources.extend(w);
+    }
+    events.push(seq);
+}
+
+/// Takes, in order, every event before `before` that wrote a resource taken so far (taking what it touches too).
+fn walk_back(touches: &Touches, before: i64, events: &mut Vec<i64>, resources: &mut BTreeSet<i64>) {
+    let mut earlier = Vec::new();
+    for (&seq, (_, writes)) in touches.range(..before).rev() {
+        if writes.iter().any(|w| resources.contains(w)) {
+            take(touches, seq, &mut earlier, resources);
+        }
+    }
+    earlier.reverse();
+    events.splice(0..0, earlier);
+}
+
+/// The plan, with every resource the planned draws have bound.
+fn with_bound(c: &Capture, events: Vec<i64>, mut resources: BTreeSet<i64>) -> Plan {
     // Everything a draw has bound, and the resource of every view an event names, in one query (one per event
     // scans the bindings once per event: minutes on a game's frame).
     let mut bound: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     for (event, resource) in c.rows(
-        "SELECT DISTINCT d.event, b.resource FROM bindings b JOIN draws d ON d.n = b.draw \
-         WHERE b.resource IS NOT NULL AND b.kind <> 'cb'",
+        "SELECT DISTINCT d.event, b.resource FROM bindings b JOIN draws d ON d.n = b.draw          WHERE b.resource IS NOT NULL AND b.kind <> 'cb'",
         [],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
     ) {
@@ -138,6 +161,26 @@ pub fn plan(c: &Capture, target: i64, mode: Mode) -> Plan {
         }
     }
     Plan { events, resources }
+}
+
+/// Resource `id`'s contents just before event `before` (canonical layout), replayed from the frame's start with the
+/// events that led to them; the number of events run, and what the replay could not do as recorded.
+pub fn contents_at(
+    c: &Capture,
+    id: i64,
+    before: i64,
+    warp: bool,
+) -> Result<(Vec<u8>, usize, Vec<String>), String> {
+    let plan = plan_before(c, id, before);
+    let out = Output {
+        name: format!("#{id}"),
+        resource: id,
+        sub: None,
+        z: 0,
+    };
+    let (mut bytes, warnings) = execute(c, &plan, &[], warp, false, &[out])?;
+    let contents = bytes.remove(&id).ok_or("the replay did not read it back")?;
+    Ok((contents, plan.events.len(), warnings))
 }
 
 /// One output of a draw: a target or UAV and the subresource of its resource it covers.

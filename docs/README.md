@@ -156,6 +156,7 @@ locum-cli resource last 812                # where it was made (call stack), has
 locum-cli events last --kind copy          # the timeline; --resource N for what touched one resource
 locum-cli shader last 9f2c -d              # constant buffers and disassembly
 locum-cli export last 812 -o tex.dds       # contents as the frame began: .dds (all of it), .png (one mip), or raw
+locum-cli export last 812 --at 3301 -o t.dds  # as event 3301 saw them, replayed with the events that wrote them
 locum-cli target last 120 rt0 -o gbuf0.png # a target read back after a pass
 locum-cli sql last "SELECT ..."            # anything else
 ```

@@ -155,7 +155,8 @@ enum Command {
         #[arg(long, short)]
         disassemble: bool,
     },
-    /// A resource's contents as the frame began: .dds (whole, or one subresource), .png (one subresource), or raw.
+    /// A resource's contents as the frame began, or with --at as an event saw them: .dds (whole, or one
+    /// subresource), .png (one subresource), or raw.
     Export {
         capture: String,
         id: i64,
@@ -171,8 +172,15 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         z: u32,
         /// The data it was created with instead.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "at")]
         upload: bool,
+        /// Its contents just before this event (a draw's event: what the draw saw), replayed from the frame's start
+        /// with the events that wrote it.
+        #[arg(long)]
+        at: Option<i64>,
+        /// Replay on WARP (with --at).
+        #[arg(long, requires = "at")]
+        warp: bool,
         /// PNG values: auto, clamp, tonemap or LO:HI.
         #[arg(long, default_value = "auto")]
         range: String,
@@ -449,6 +457,8 @@ fn run(cli: Cli) -> Result<(), String> {
             slice,
             z,
             upload,
+            at,
+            warp,
             range: r,
         } => export::export(
             &open(&capture)?,
@@ -460,6 +470,8 @@ fn run(cli: Cli) -> Result<(), String> {
                 slice,
                 z,
                 upload,
+                at,
+                warp,
             },
             range(&r)?,
         ),
