@@ -2,6 +2,7 @@
 //! name under locum's folder (`LOCUM_DIR`, or `%LOCALAPPDATA%\locum`), or `last`.
 
 mod describe;
+mod diff;
 mod draws;
 mod export;
 mod info;
@@ -269,6 +270,17 @@ enum Command {
         #[arg(long, default_value_t = 40)]
         limit: usize,
     },
+    /// Compares two captures draw by draw (matched by shaders, inputs and order, not by numbers that change between
+    /// launches): what differs, in how many draws, and the draws only one has.
+    Diff {
+        a: String,
+        b: String,
+        /// Every differing draw, not only the summary.
+        #[arg(long)]
+        draws: bool,
+        #[arg(long, default_value_t = 30)]
+        limit: usize,
+    },
     /// Any SQL on the capture; rows tab-separated.
     Sql { capture: String, query: String },
 }
@@ -502,6 +514,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let (b, _) = memory::open(&b, blobs)?;
             memory::memdiff(&a, &b, from, to, tolerance, limit)
         }
+        Command::Diff { a, b, draws, limit } => diff::diff(&open(&a)?, &open(&b)?, draws, limit),
         Command::Sql { capture, query } => sql(&open(&capture)?, &query),
     }
 }

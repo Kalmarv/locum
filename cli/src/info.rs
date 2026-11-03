@@ -177,9 +177,9 @@ pub fn info(c: &Capture) -> Result<(), String> {
                     mib(m.len()),
                     memory["held_ms"]
                 ),
-                Err(_) if std::path::Path::new(&format!("{path}.part")).is_file() => {
-                    missing.push(format!("memory: {path} is still being written, or its writer died"))
-                }
+                Err(_) if std::path::Path::new(&format!("{path}.part")).is_file() => missing.push(format!(
+                    "memory: {path} is still being written, or its writer died"
+                )),
                 Err(_) => missing.push(format!("memory: {path} is gone")),
             }
         }

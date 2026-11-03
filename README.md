@@ -152,6 +152,18 @@ Each hit is named: a module and offset, a thread's stack, or a heap allocation a
 parameters copied straight into constant buffers are found this way; values the game computes each frame (matrices)
 usually are not in memory as the GPU saw them.
 
+Two captures, of the same game run twice or of a scene before and after a change, are compared draw by draw:
+
+```
+locum-cli diff before after                # how many draws match, and what differs in how many of them
+locum-cli diff before after --draws        # each matched draw that differs, line by line
+```
+
+Draws are matched by what stays the same across a relaunch: their shaders, the call and its counts, the upload hashes
+of the textures and buffers they read (or their shapes, for what the frame wrote), the shapes of their targets, and
+how many draws like them came before. Matched draws are compared constant by constant (named from the shaders),
+input by input and state by state.
+
 Constants are named from each shader's reflection, as `cbuffer.variable[index].component`. PNGs of depth and other
 one-channel images are stretched from their smallest to largest value, float colour is tone-mapped, and `--range
 LO:HI` sets the mapping.

@@ -246,6 +246,14 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
             },
             "locum-cli replay 0 with a constant rule: as the game drew it before, every texel changed after",
         ),
+        (
+            {
+                let t = run(&["diff", &capture.display().to_string()]);
+                t.contains("3 matched, 0 only in the first, 0 only in the second")
+                    && t.contains("0 matched draws differ")
+            },
+            "locum-cli diff: a capture against itself matches every draw and finds nothing different",
+        ),
     ];
     let mut ok = true;
     for (passed, what) in checks {
