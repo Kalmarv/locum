@@ -207,7 +207,10 @@ fn run(checks: &mut Checks) -> Result<()> {
     capture(checks, &device, &immediate, &deferred, &swapchain, &rtv)?;
     overrides(checks, &device, &immediate, &deferred, &swapchain)?;
 
-    drop((swapchain, back, rtv, deferred, staging));
+    unsafe { immediate.ClearState() };
+    drop((back, rtv, staging));
+    adversarial_capture(checks, &device, &immediate, &deferred, &swapchain)?;
+    drop((swapchain, deferred));
     unsafe { DestroyWindow(hwnd) }?;
     Ok(())
 }
@@ -1151,6 +1154,275 @@ fn overrides(
     checks.check(
         pixel.iter().all(|&c| c.abs_diff(normal) <= 1),
         "override: with the file gone, draws are as before",
+    );
+    Ok(())
+}
+
+/// Read actual GPU buffer contents through a fresh staging copy, never a write-map shadow.
+fn gpu_bytes(device: &ID3D11Device, c: &ID3D11DeviceContext, buffer: &ID3D11Buffer) -> Result<Vec<u8>> {
+    let mut desc = D3D11_BUFFER_DESC::default();
+    unsafe { buffer.GetDesc(&mut desc) };
+    let copy = contents_buffer(device, desc.ByteWidth, true, 0)?;
+    unsafe { c.CopyResource(&copy, buffer) };
+    read_buffer(c, &copy, desc.ByteWidth as usize)
+}
+
+fn map_bytes(
+    c: &ID3D11DeviceContext,
+    b: &ID3D11Buffer,
+    mode: D3D11_MAP,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<()> {
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe {
+        c.Map(b, 0, mode, 0, Some(&mut mapped))?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), mapped.pData.cast::<u8>().add(offset), bytes.len());
+        c.Unmap(b, 0);
+    }
+    Ok(())
+}
+
+/// Run the same byte-preservation probes both before arming and during capture.
+fn adversarial_maps(
+    checks: &mut Checks,
+    device: &ID3D11Device,
+    c: &ID3D11DeviceContext,
+    phase: &str,
+) -> Result<()> {
+    let desc = D3D11_BUFFER_DESC {
+        ByteWidth: 16,
+        Usage: D3D11_USAGE_STAGING,
+        CPUAccessFlags: (D3D11_CPU_ACCESS_READ.0 | D3D11_CPU_ACCESS_WRITE.0) as u32,
+        ..Default::default()
+    };
+    let mut staging = None;
+    unsafe { device.CreateBuffer(&desc, None, Some(&mut staging)) }?;
+    let staging = staging.expect("READ_WRITE staging");
+    let source = contents_buffer(device, 16, false, 0xbb)?;
+    map_bytes(c, &staging, D3D11_MAP_READ_WRITE, 0, &[0xaa; 16])?;
+    unsafe { c.CopyResource(&staging, &source) };
+    map_bytes(c, &staging, D3D11_MAP_READ_WRITE, 12, &[0xcc; 4])?;
+    let actual = gpu_bytes(device, c, &staging)?;
+    println!("adversarial row1 {phase}: GPU bytes={actual:02x?}; expected bb x12, cc x4");
+    checks.check(
+        actual[..12] == [0xbb; 12] && actual[12..] == [0xcc; 4],
+        &format!("adversarial row1 {phase}: staging map preserves GPU copy outside written word"),
+    );
+
+    let vb = dynamic_vertex_buffer(device)?;
+    map_bytes(c, &vb, D3D11_MAP_WRITE_DISCARD, 0, &[0x3a; 16])?;
+    map_bytes(c, &vb, D3D11_MAP_WRITE_NO_OVERWRITE, 8, &[0x7c; 8])?;
+    let actual = gpu_bytes(device, c, &vb)?;
+    println!("adversarial row2 {phase}: GPU bytes={actual:02x?}; expected 3a x8, 7c x8");
+    checks.check(
+        actual[..8] == [0x3a; 8] && actual[8..] == [0x7c; 8],
+        &format!("adversarial row2 {phase}: NO_OVERWRITE preserves unwritten half"),
+    );
+    Ok(())
+}
+
+/// Isolated capture, leaving the existing frame-32 fixture intact. Requests are polled every 30 presents.
+fn adversarial_capture(
+    checks: &mut Checks,
+    device: &ID3D11Device,
+    c: &ID3D11DeviceContext,
+    deferred: &ID3D11DeviceContext,
+    swapchain: &IDXGISwapChain1,
+) -> Result<()> {
+    let dir = std::path::PathBuf::from(std::env::var_os("LOCUM_DIR").expect("LOCUM_DIR"));
+    adversarial_maps(checks, device, c, "unarmed")?;
+    let baseline =
+        unsafe { swapchain.ResizeBuffers(2, 64, 64, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0)) };
+    println!("adversarial row3 unarmed: ResizeBuffers={baseline:?}");
+    checks.check(
+        baseline.is_ok(),
+        "adversarial row3 unarmed: released back buffer can resize",
+    );
+    let sh = Shaders::new(device)?;
+    let cb = constant_buffer(device, false)?;
+    let (texture, view) = target(device)?;
+    let (clear_texture, clear_view) = target(device)?;
+    let request = dir.join("capture");
+    std::fs::write(&request, "label adversarial\nskip memory\n").expect("request adversarial capture");
+    for _ in 0..31 {
+        unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
+        if !request.exists() {
+            break;
+        }
+    }
+    checks.check(!request.exists(), "adversarial capture request consumed");
+    if request.exists() {
+        return Ok(());
+    }
+    unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
+    // Now recording, until the next Present.
+    adversarial_maps(checks, device, c, "armed")?;
+
+    sh.bind(deferred, &view, &cb);
+    unsafe {
+        deferred.Draw(3, 0);
+        deferred.OMSetRenderTargets(None, None); // close the pass INSIDE the reusable list
+    }
+    let mut list = None;
+    unsafe { deferred.FinishCommandList(false, Some(&mut list)) }?;
+    let list = list.expect("repeated list");
+    let colors = [[2000.0f32, 0.0, 0.0, 2000.0], [0.0, 2000.0, 0.0, 2000.0]];
+    let mut pixels = Vec::new();
+    for (execution, color) in colors.iter().enumerate() {
+        unsafe {
+            c.UpdateSubresource(&cb, 0, None, color.as_ptr().cast(), 0, 0);
+            c.ExecuteCommandList(&list, false);
+        }
+        let pixel = first_pixel(device, c, &texture)?;
+        println!("adversarial row6 execution {execution}: GPU BGRA={pixel:?}, CB={color:?}");
+        pixels.push(pixel);
+    }
+    checks.check(
+        pixels == [[0, 0, 255, 255], [0, 255, 0, 255]],
+        "adversarial row6: real GPU sees red then green",
+    );
+
+    unsafe { c.UpdateSubresource(&cb, 0, None, colors[0].as_ptr().cast(), 0, 0) };
+    sh.bind(c, &clear_view, &cb);
+    unsafe { c.Draw(3, 0) };
+    let red = first_pixel(device, c, &clear_texture)?;
+    unsafe {
+        c.ClearRenderTargetView(&clear_view, &[0.0, 0.0, 1.0, 1.0]);
+        c.OMSetRenderTargets(None, None);
+    }
+    let blue = first_pixel(device, c, &clear_texture)?;
+    println!("adversarial row7: GPU after draw BGRA={red:?}, after clear BGRA={blue:?}");
+    checks.check(
+        red == [0, 0, 255, 255] && blue == [255, 0, 0, 255],
+        "adversarial row7: real GPU draw red then clear blue",
+    );
+
+    unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
+    drop(list);
+
+    let path = dir.join("captures/adversarial/capture.db");
+    checks.check(wait_for(&path), "adversarial capture written");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let db = rusqlite::Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .expect("adversarial database");
+    let blob_dir: String = db
+        .query_row("SELECT value FROM meta WHERE key='blobs'", [], |r| r.get(0))
+        .expect("blobs path");
+    let blobs = locum_capture::blobs::Blobs::new(blob_dir);
+    // A list executed twice made its copies into the same places both times: the first execution's constants and
+    // target are not kept (not the second's under the first's name), and the second's are right.
+    for execution in 0..2 {
+        let bytes: Option<Vec<u8>> = db
+            .query_row(
+                "SELECT c.bytes FROM bindings b JOIN cb_data c ON c.hash = b.content \
+                 WHERE b.draw = ?1 AND b.stage = 'ps' AND b.slot = 3 AND b.kind = 'cb'",
+                [execution as i64],
+                |r| r.get(0),
+            )
+            .ok();
+        let expected: Option<Vec<u8>> =
+            (execution == 1).then(|| colors[execution].iter().flat_map(|v| v.to_le_bytes()).collect());
+        println!(
+            "adversarial row6 execution {execution}: captured CB bytes={bytes:02x?}, expected={expected:02x?}"
+        );
+        checks.check(
+            bytes == expected,
+            &format!(
+                "adversarial row6 execution {execution}: constants kept only when they are this execution's"
+            ),
+        );
+        let key: Option<String> = db
+            .query_row(
+                "SELECT blob FROM targets WHERE draw=?1 AND target='rt0'",
+                [execution as i64],
+                |r| r.get(0),
+            )
+            .ok();
+        let pixel = key
+            .and_then(|k| blobs.get(&k).ok())
+            .and_then(|b| b.get(..4).map(|p| p.to_vec()));
+        println!(
+            "adversarial row6 execution {execution}: captured target BGRA={pixel:?}, GPU={:?}",
+            pixels[execution]
+        );
+        let expected = (execution == 1).then(|| pixels[execution].to_vec());
+        checks.check(
+            pixel == expected,
+            &format!(
+                "adversarial row6 execution {execution}: pass target kept only when it is this execution's"
+            ),
+        );
+    }
+    // The pass's targets were read after the clear that followed its draw: the row says so, and holds blue.
+    let row: Option<(String, i64, i64)> = db
+        .query_row(
+            "SELECT t.blob, t.event, d.event FROM targets t JOIN draws d ON d.n = t.draw \
+             WHERE t.draw = 2 AND t.target = 'rt0'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    let clear: Option<i64> = row.as_ref().and_then(|(_, _, draw_event)| {
+        db.query_row(
+            "SELECT min(seq) FROM events WHERE kind = 'clear' AND seq > ?1",
+            [draw_event],
+            |r| r.get(0),
+        )
+        .ok()
+    });
+    let pixel = row
+        .as_ref()
+        .and_then(|(k, _, _)| blobs.get(k).ok())
+        .and_then(|b| b.get(..4).map(|p| p.to_vec()));
+    println!(
+        "adversarial row7: checkpoint BGRA={pixel:?} read after event {:?} (the clear is {clear:?}); after draw \
+         {red:?}, after clear {blue:?}",
+        row.as_ref().map(|r| r.1)
+    );
+    checks.check(
+        pixel.as_deref() == Some(blue.as_slice()) && clear.is_some() && row.map(|r| r.1) == clear,
+        "adversarial row7: a pass's targets are tied to the event they were read after (the clear after its draw)",
+    );
+    drop(db);
+
+    // Row 3: a capture holds references to the back buffers, so a resize during one gives it up first.
+    let request = dir.join("capture");
+    std::fs::write(&request, "label resized\nskip memory\n").expect("request a capture");
+    for _ in 0..31 {
+        unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
+        if !request.exists() {
+            break;
+        }
+    }
+    unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
+    sh.bind(c, &view, &cb);
+    unsafe { c.Draw(3, 0) };
+    {
+        let back: ID3D11Texture2D = unsafe { swapchain.GetBuffer(0) }?;
+        let mut rtv = None;
+        unsafe {
+            device.CreateRenderTargetView(&back, None, Some(&mut rtv))?;
+            c.ClearRenderTargetView(rtv.as_ref().expect("back RTV"), &[0.0; 4]);
+            c.ClearState();
+        }
+        // Every reference of the program's to the back buffers is dropped before ResizeBuffers.
+    }
+    let resize =
+        unsafe { swapchain.ResizeBuffers(2, 96, 96, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0)) };
+    println!("adversarial row3 armed: ResizeBuffers={resize:?}");
+    checks.check(
+        resize.is_ok(),
+        "adversarial row3: a resize during a capture succeeds (the capture is given up)",
+    );
+    unsafe { swapchain.Present(0, DXGI_PRESENT(0)) }.ok()?;
+    let log = std::fs::read_to_string(dir.join("locum.log")).unwrap_or_default();
+    checks.check(
+        log.contains("capture abandoned: the game resized its swap chain")
+            && !dir.join("captures/resized/capture.db").exists(),
+        "adversarial row3: the capture during the resize is abandoned, and says why",
     );
     Ok(())
 }

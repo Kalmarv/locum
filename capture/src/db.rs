@@ -73,8 +73,9 @@ CREATE TABLE scissors(draw INTEGER NOT NULL, i INTEGER NOT NULL, left INTEGER, t
 -- Passes: runs of draws with the same targets on the GPU's timeline.
 CREATE TABLE passes(n INTEGER PRIMARY KEY, first_draw INTEGER NOT NULL, last_draw INTEGER NOT NULL);
 -- Targets read back where a pass ends, after its last draw.
+-- event: the event after which they were read, the draw itself or a clear, copy or dispatch after it in the pass.
 CREATE TABLE targets(draw INTEGER NOT NULL, target TEXT NOT NULL, view INTEGER, resource INTEGER, width INTEGER,
-  height INTEGER, format INTEGER, sub INTEGER, blob TEXT, PRIMARY KEY(draw, target));
+  height INTEGER, format INTEGER, sub INTEGER, blob TEXT, event INTEGER, PRIMARY KEY(draw, target));
 -- What the capture could not record, for `locum-cli info`.
 CREATE TABLE gaps(what TEXT NOT NULL, detail TEXT, count INTEGER NOT NULL);
 CREATE INDEX bindings_draw ON bindings(draw);
@@ -258,6 +259,8 @@ pub struct Target {
     pub format: u32,
     pub sub: u32,
     pub blob: Option<String>,
+    /// The event after which they were read.
+    pub event: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -502,7 +505,7 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
         for p in &capture.passes {
             s.execute(params![p.n as i64, p.first_draw as i64, p.last_draw as i64])?;
         }
-        let mut s = tx.prepare("INSERT OR REPLACE INTO targets VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)")?;
+        let mut s = tx.prepare("INSERT OR REPLACE INTO targets VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)")?;
         for t in &capture.targets {
             s.execute(params![
                 t.draw as i64,
@@ -513,7 +516,8 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
                 t.height,
                 t.format,
                 t.sub,
-                t.blob
+                t.blob,
+                t.event as i64
             ])?;
         }
         let mut s = tx.prepare("INSERT INTO gaps VALUES(?1,?2,?3)")?;

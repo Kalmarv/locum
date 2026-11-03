@@ -147,10 +147,30 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     let mut cb_seen: HashMap<String, ()> = HashMap::new();
     let mut shader_hashes: BTreeSet<(String, &'static str)> = BTreeSet::new();
     let (mut targets_read, mut target_bytes) = (0u32, 0u64);
+    // A command list executed more than once made its copies (constants, targets) into the same places each time,
+    // so they hold what its last execution saw: earlier executions' are not kept (replay works their constants out
+    // from the replayed buffers instead).
+    let mut last_cb: HashMap<(u32, u32), usize> = HashMap::new();
+    let mut last_target: HashMap<usize, usize> = HashMap::new();
+    for (seq, e) in timeline.iter().enumerate() {
+        let Some(d) = e.draw.as_deref() else { continue };
+        for cb in &d.cb_copies {
+            if let Some((chunk, offset, _)) = cb.copy {
+                last_cb.insert((chunk, offset), seq);
+            }
+        }
+        for t in &d.after {
+            if let Some(id) = t.copy_id() {
+                last_target.insert(id, seq);
+            }
+        }
+    }
+    let (mut cbs_repeated, mut targets_repeated) = (0u64, 0u64);
     let mut n = 0u64;
     let mut pass: Option<(u64, Vec<(u32, u64)>)> = None;
     let mut timeline = timeline;
     for (seq, e) in timeline.iter_mut().enumerate() {
+        let index = seq;
         let seq = seq as u64;
         let stack = interner.id(&e.stack);
         let draw_n = e.draw.as_ref().map(|_| n);
@@ -170,6 +190,12 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         });
         let Some(d) = e.draw.as_deref_mut() else { continue };
         for cb in &d.cb_copies {
+            if let Some((chunk, offset, _)) = cb.copy
+                && last_cb.get(&(chunk, offset)) != Some(&index)
+            {
+                cbs_repeated += 1;
+                continue;
+            }
             let data = cb.copy.and_then(|(chunk, offset, bytes)| {
                 chunks
                     .get(chunk as usize)?
@@ -219,7 +245,12 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                 shader_hashes.insert((h.clone(), db::stage_names()[i]));
             }
         }
+        let after = seq + u64::from(d.after_events);
         for t in &mut d.after {
+            if t.copy_id().is_some_and(|id| last_target.get(&id) != Some(&index)) {
+                targets_repeated += 1;
+                continue;
+            }
             if let Some((key, bytes)) = unsafe { t.read(immediate) } {
                 targets_read += 1;
                 target_bytes += bytes;
@@ -233,6 +264,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                     format: t.format as u32,
                     sub: t.sub,
                     blob: Some(key),
+                    event: after,
                 });
             }
         }
@@ -434,6 +466,27 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         gaps.insert(
             ("lists".into(), "executed without a recording".into()),
             u64::from(unrecorded),
+        );
+    }
+    if cbs_repeated > 0 {
+        gaps.insert(
+            (
+                "evidence".into(),
+                "constants of a command list executed more than once: only its last execution's were kept (replay \
+                 reads the others from the replayed buffers)"
+                    .into(),
+            ),
+            cbs_repeated,
+        );
+    }
+    if targets_repeated > 0 {
+        gaps.insert(
+            (
+                "evidence".into(),
+                "targets of a command list executed more than once: only its last execution's were read back"
+                    .into(),
+            ),
+            targets_repeated,
         );
     }
     if copy_failures > 0 {

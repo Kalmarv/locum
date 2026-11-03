@@ -508,7 +508,12 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     Ok(())
 }
 
-/// Replays the whole frame and compares every target the capture read back with the replay's at the same point.
+/// Gaps that are checks the capture could not make or keep (targets not read back, a command list's earlier
+/// executions, the CPU's memory), not inputs the replay lacks: shown, but they leave the proof complete.
+const CHECKS: &str = "'evidence', 'targets', 'memory'";
+
+/// Replays the whole frame and compares every target the capture read back with the replay's at the same point. Fails
+/// unless every target compared is identical and nothing kept the capture or the replay from being complete.
 pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String> {
     let last: i64 = c
         .row("SELECT max(seq) FROM events", [], |r| r.get::<_, Option<i64>>(0))
@@ -517,9 +522,24 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
     let started = std::time::Instant::now();
     let plan = plan(c, last, Mode::Frame);
     let planned = started.elapsed();
+    // Each target is compared after the event it was read after (in captures from before that was recorded, its draw).
+    let has_event = c
+        .row(
+            "SELECT count(*) FROM pragma_table_info('targets') WHERE name = 'event'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_some_and(|n| n > 0);
+    let at = if has_event {
+        "coalesce(t.event, d.event)"
+    } else {
+        "d.event"
+    };
     let checks: Vec<(i64, i64, String, i64, String, i64)> = c.rows(
-        "SELECT t.draw, d.event, t.target, t.resource, t.blob, coalesce(t.sub, 0) FROM targets t \
-         JOIN draws d ON d.n = t.draw WHERE t.blob IS NOT NULL AND t.resource IS NOT NULL ORDER BY d.event",
+        &format!(
+            "SELECT t.draw, {at} AS at, t.target, t.resource, t.blob, coalesce(t.sub, 0) FROM targets t \
+             JOIN draws d ON d.n = t.draw WHERE t.blob IS NOT NULL AND t.resource IS NOT NULL ORDER BY at"
+        ),
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
     );
@@ -576,8 +596,62 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
         "{same} of {compared} targets identical; replayed in {:.1} s",
         t.elapsed().as_secs_f64()
     );
-    for w in b.warnings() {
-        out!("warning: {w}");
+    // What keeps an identical replay from proving the frame: what the capture could not record, used resources
+    // without contents, and events replay could not run as recorded.
+    for note in c.rows(
+        &format!("SELECT what, coalesce(detail, ''), count FROM gaps WHERE what IN ({CHECKS}) ORDER BY what, detail"),
+        [],
+        |r| {
+            Ok(format!(
+                "{} {} ({}x)",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?
+            ))
+        },
+    ) {
+        out!("not compared: {note}");
+    }
+    let mut incomplete: Vec<String> = c.rows(
+        &format!("SELECT what, coalesce(detail, ''), count FROM gaps WHERE what NOT IN ({CHECKS}) ORDER BY what, detail"),
+        [],
+        |r| {
+            Ok(format!(
+                "capture gap: {} {} ({}x)",
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?
+            ))
+        },
+    );
+    let missing: i64 = c
+        .row(
+            "SELECT count(*) FROM resources WHERE used = 1 AND content IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if missing > 0 {
+        incomplete.push(format!("{missing} resources the frame used have no contents"));
+    }
+    incomplete.extend(b.warnings().into_iter().map(|w| format!("replay: {w}")));
+    for i in &incomplete {
+        out!("incomplete: {i}");
+    }
+    if limit.is_some_and(|l| compared >= l) {
+        out!("(stopped after {compared} comparisons: --limit)");
+    }
+    if same < compared {
+        return Err(format!("{} of {compared} targets differ", compared - same));
+    }
+    if compared == 0 {
+        return Err("no target was compared".into());
+    }
+    if !incomplete.is_empty() {
+        return Err(format!(
+            "every target identical, but the capture is incomplete ({} reasons above)",
+            incomplete.len()
+        ));
     }
     Ok(())
 }

@@ -162,10 +162,36 @@ dumps {}
 "
         ))
     );
-    if !status.success() {
-        std::process::exit(status.code().unwrap_or(1));
-    }
-    if !cli_checks(&stage.join("locum-cli.exe"), &log_dir) {
+    // Run CLI evidence checks even when a GPU/database assertion failed, so every adversarial case reports.
+    let cli_ok = cli_checks(&stage.join("locum-cli.exe"), &log_dir);
+    let adversarial = Command::new(stage.join("locum-cli.exe"))
+        .arg("verify")
+        .arg(log_dir.join("captures/adversarial"))
+        .env("LOCUM_DIR", &log_dir)
+        .output()
+        .expect("verify adversarial capture");
+    let text = String::from_utf8_lossy(&adversarial.stdout).into_owned()
+        + &String::from_utf8_lossy(&adversarial.stderr);
+    println!(
+        "--- adversarial rows6/7 verify (exit {:?})\n{text}",
+        adversarial.status.code()
+    );
+    // Every target compared identical, at least one compared, and verify's exit status says so.
+    let all_same = text.lines().any(|l| {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        w.len() > 4
+            && w[1] == "of"
+            && w[3] == "targets"
+            && w[4] == "identical;"
+            && w[0] == w[2]
+            && w[0] != "0"
+    });
+    let adversarial_ok = adversarial.status.success() && all_same;
+    println!(
+        "{} adversarial rows6/7: all recorded checkpoints match replay",
+        if adversarial_ok { "ok  " } else { "FAIL" }
+    );
+    if !status.success() || !cli_ok || !adversarial_ok {
         std::process::exit(1);
     }
 }

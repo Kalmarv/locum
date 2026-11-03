@@ -100,10 +100,16 @@ contents. locum's own copies run whatever predicate the game has set.
 While a capture is recording, the game's writes through `Map` go to memory locum owns and are copied to the driver's
 at `Unmap`, so a map records only the bytes the game wrote. A discarding map starts as a fixed pattern
 (`locum_capture::maps`), which is what the GPU reads wherever the game wrote nothing; replay writes the same pattern
-under the recorded bytes, so a shader reading past what the game filled in sees what it saw in the game.
+under the recorded bytes, so a shader reading past what the game filled in sees what it saw in the game. Any other map
+starts as the resource's memory and gets back only the words the game changed, so what the game left alone stays as
+it was (a staging resource the GPU copied into keeps that copy). A swap chain resize during a capture gives the
+capture up (it holds references to the back buffers): request another.
 
 A pass ends where the targets in effect change on the GPU's timeline: an `OMSetRenderTargets` that binds other
-targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame.
+targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame. Its
+targets are read there, and the capture records the event they were read after (the pass's last draw, or a clear, copy
+or dispatch after it), which is where verify compares them. A command list executed more than once makes its copies
+into the same places each time, so only its last execution's constants and targets are kept.
 
 Draws recorded on deferred contexts are placed where their command list is executed. Constant buffers and targets
 are copied by the GPU on the draw's own context, so each draw's constants and each pass's targets are the ones the
@@ -140,6 +146,10 @@ locum-cli replay last 812                  # the draw and the earlier events it 
 locum-cli replay last last --rule "constant vs b11 c0 8 8 0 0"   # before, after and a diff picture of the change
 locum-cli replay last 812 --rules mine.txt --mode frame
 ```
+
+`verify` exits with success only when every target compared is identical and nothing the replay needs is missing
+(contents, command lists, constants); checks the capture could not make (targets skipped, a repeated list's earlier
+executions, the memory dump) are listed as not compared.
 
 A draw is replayed with what it depends on: walking back from it, each earlier event that wrote a resource it (or an
 event already taken) reads or writes is taken too, and every resource starts with its contents as the frame began.

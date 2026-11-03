@@ -265,6 +265,11 @@ unsafe fn copy_one(
 }
 
 impl Target {
+    /// Which copy holds it: the same for each execution of the command list it was copied in.
+    pub(super) fn copy_id(&self) -> Option<usize> {
+        self.staging.as_ref().map(|s| s.as_raw() as usize)
+    }
+
     /// Maps the copy (waiting for the GPU) and hands its rows, tightly packed, to the blob store. Returns the key and
     /// the bytes read.
     pub(super) unsafe fn read(&mut self, immediate: &ID3D11DeviceContext4) -> Option<(String, u64)> {

@@ -543,15 +543,36 @@ impl D3d11 {
             let stage = rules::stage_named(&stage_name);
             match (kind.as_str(), stage) {
                 ("cb", Some(st)) if (slot as usize) < 14 => {
-                    let Some(key) = content else {
-                        self.warn(format!(
-                            "{stage_name} b{slot}: contents not captured; left unbound"
-                        ));
-                        continue;
+                    let mut bytes: Vec<u8> = match (content, resource) {
+                        (Some(key), _) => c
+                            .row("SELECT bytes FROM cb_data WHERE hash = ?1", [&key], |r| r.get(0))
+                            .ok_or("constant buffer contents missing")?,
+                        // Not captured (a command list executed more than once kept only its last execution's):
+                        // the replayed buffer holds them, its contents being the game's at this point.
+                        (None, Some(r)) => {
+                            let size: Option<i64> = c
+                                .row(
+                                    "SELECT size FROM bindings WHERE draw = ?1 AND stage = ?2 AND kind = 'cb' \
+                                     AND slot = ?3",
+                                    rusqlite::params![n, stage_name, slot],
+                                    |r| r.get(0),
+                                )
+                                .flatten();
+                            let all = self.read(r)?;
+                            let start = (offset.unwrap_or(0) as usize).min(all.len());
+                            let end = match size {
+                                Some(s) if s > 0 => (start + s as usize).min(all.len()),
+                                _ => all.len().min(start + 65536),
+                            };
+                            all[start..end].to_vec()
+                        }
+                        (None, None) => {
+                            self.warn(format!(
+                                "{stage_name} b{slot}: contents not captured; left unbound"
+                            ));
+                            continue;
+                        }
                     };
-                    let mut bytes: Vec<u8> = c
-                        .row("SELECT bytes FROM cb_data WHERE hash = ?1", [&key], |r| r.get(0))
-                        .ok_or("constant buffer contents missing")?;
                     for r in &applying {
                         if let Action::Constant { slot: s, index, bits } = r.action
                             && r.stage == st

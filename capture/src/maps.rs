@@ -17,8 +17,18 @@ pub fn fill(data: &mut [u8]) {
 }
 
 /// The byte ranges (start, end) of `data` that differ from `reference` (or from the pattern), merged across gaps of
-/// 64 bytes.
+/// 64 bytes: what a map records.
 pub fn written(data: &[u8], reference: Option<&[u8]>) -> Vec<(usize, usize)> {
+    differing(data, reference, 64)
+}
+
+/// The byte ranges of `data` that differ from `reference` (or from the pattern), word by word with nothing between
+/// them: what an unmap copies back, so it writes no byte the game did not write.
+pub fn changed(data: &[u8], reference: Option<&[u8]>) -> Vec<(usize, usize)> {
+    differing(data, reference, 0)
+}
+
+fn differing(data: &[u8], reference: Option<&[u8]>, gap: usize) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for (i, chunk) in data.chunks(4).enumerate() {
         let differs = match reference {
@@ -30,7 +40,7 @@ pub fn written(data: &[u8], reference: Option<&[u8]>) -> Vec<(usize, usize)> {
         }
         let (start, end) = (i * 4, i * 4 + chunk.len());
         match ranges.last_mut() {
-            Some(last) if start <= last.1 + 64 => last.1 = end,
+            Some(last) if start <= last.1 + gap => last.1 = end,
             _ => ranges.push((start, end)),
         }
     }
@@ -64,6 +74,12 @@ mod tests {
         shadow[600..604].copy_from_slice(&1.5f32.to_le_bytes());
         let ranges = written(&shadow, None);
         assert_eq!(ranges, vec![(8, 88), (600, 604)]);
+        // An unmap copies back only the words written.
+        let mut reference = shadow.clone();
+        reference[40..44].copy_from_slice(&[9, 9, 9, 9]);
+        reference[52..56].copy_from_slice(&[9, 9, 9, 9]);
+        assert_eq!(changed(&shadow, Some(&reference)), vec![(40, 44), (52, 56)]);
+        assert_eq!(written(&shadow, Some(&reference)), vec![(40, 56)]);
         let bytes: Vec<u8> = ranges.iter().flat_map(|&(a, b)| shadow[a..b].to_vec()).collect();
         let spans: Vec<(usize, usize)> = ranges.iter().map(|&(a, b)| (a, b - a)).collect();
         assert_eq!(discarded(1000, &spans, &bytes), shadow);

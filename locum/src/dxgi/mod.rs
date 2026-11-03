@@ -474,6 +474,33 @@ unsafe impl SwapChainMethods for SwapChain {
             real_swapchain::Present1(self.inner(), a0, a1, a2)
         })
     }
+
+    // A resize needs every reference to the back buffers released; a capture holds some, so it is given up first.
+    unsafe fn ResizeBuffers(
+        &self,
+        a0: u32,
+        a1: u32,
+        a2: u32,
+        a3: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        a4: u32,
+    ) -> HRESULT {
+        capture::abandon("the game resized its swap chain");
+        unsafe { real_swapchain::ResizeBuffers(self.inner(), a0, a1, a2, a3, a4) }
+    }
+
+    unsafe fn ResizeBuffers1(
+        &self,
+        a0: u32,
+        a1: u32,
+        a2: u32,
+        a3: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        a4: u32,
+        a5: *const u32,
+        a6: *const *mut c_void,
+    ) -> HRESULT {
+        capture::abandon("the game resized its swap chain");
+        unsafe { real_swapchain::ResizeBuffers1(self.inner(), a0, a1, a2, a3, a4, a5, a6) }
+    }
 }
 
 impl SwapChain {

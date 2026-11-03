@@ -128,11 +128,17 @@ pub unsafe fn map(
         maps::fill(&mut data);
         None
     } else {
-        let mirror = MIRRORS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-            .and_then(|m| m.get(&(context, id, sub)).filter(|v| v.len() == size).cloned());
+        // A dynamic resource changes only through maps, so what locum last wrote through this context is what its
+        // memory holds; anything else (a staging resource the GPU copies into) is read from the map itself.
+        let mirror = dynamic(r)
+            .then(|| {
+                MIRRORS
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|m| m.get(&(context, id, sub)).filter(|v| v.len() == size).cloned())
+            })
+            .flatten();
         match mirror {
             Some(v) => data = v,
             None => unsafe { core::ptr::copy_nonoverlapping(m.pData.cast::<u8>(), data.as_mut_ptr(), size) },
@@ -175,9 +181,24 @@ pub unsafe fn unmap(c: &ID3D11DeviceContext4, resource: *mut c_void, sub: u32, r
         .and_then(|m| m.remove(&(c.as_raw() as usize, resource as usize, sub)));
     let Some(shadow) = shadow else { return real() };
     OUTSTANDING.fetch_sub(1, Ordering::Relaxed);
-    unsafe {
-        core::ptr::copy_nonoverlapping(shadow.data.as_ptr(), shadow.real.cast::<u8>(), shadow.data.len())
-    };
+    // A discarding map hands out memory with nothing in it, so all of the shadow goes (the pattern where the game
+    // wrote nothing); any other map gets back only the words the game wrote, and the rest stays as it was.
+    match &shadow.reference {
+        None => unsafe {
+            core::ptr::copy_nonoverlapping(shadow.data.as_ptr(), shadow.real.cast::<u8>(), shadow.data.len())
+        },
+        Some(reference) => {
+            for (a, b) in maps::changed(&shadow.data, Some(reference)) {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        shadow.data.as_ptr().add(a),
+                        shadow.real.cast::<u8>().add(a),
+                        b - a,
+                    )
+                };
+            }
+        }
+    }
     real();
     if !armed() {
         return;
@@ -230,6 +251,30 @@ pub unsafe fn unmap(c: &ID3D11DeviceContext4, resource: *mut c_void, sub: u32, r
     e.writes.push(shadow.resource_id);
     record(c, e);
     SHADOWED.add(started, 0);
+}
+
+/// Whether `r` was made with `D3D11_USAGE_DYNAMIC`.
+fn dynamic(r: &ID3D11Resource) -> bool {
+    let usage = if let Ok(b) = r.cast::<ID3D11Buffer>() {
+        let mut d = D3D11_BUFFER_DESC::default();
+        unsafe { b.GetDesc(&mut d) };
+        d.Usage
+    } else if let Ok(t) = r.cast::<ID3D11Texture2D>() {
+        let mut d = D3D11_TEXTURE2D_DESC::default();
+        unsafe { t.GetDesc(&mut d) };
+        d.Usage
+    } else if let Ok(t) = r.cast::<ID3D11Texture1D>() {
+        let mut d = D3D11_TEXTURE1D_DESC::default();
+        unsafe { t.GetDesc(&mut d) };
+        d.Usage
+    } else if let Ok(t) = r.cast::<ID3D11Texture3D>() {
+        let mut d = D3D11_TEXTURE3D_DESC::default();
+        unsafe { t.GetDesc(&mut d) };
+        d.Usage
+    } else {
+        return false;
+    };
+    usage == D3D11_USAGE_DYNAMIC
 }
 
 fn res(raw: *mut c_void) -> Option<ID3D11Resource> {

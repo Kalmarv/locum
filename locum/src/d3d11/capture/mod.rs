@@ -147,8 +147,10 @@ pub(super) struct Draw {
     stencil_ref: Option<u32>,
     predicate: Option<u64>,
     predicate_value: Option<bool>,
-    /// The targets as they were after this draw, the last of its pass.
+    /// The targets as they were when the pass this draw is the last of ended, and how many events (clears, copies,
+    /// dispatches) after the draw on its context ran before that.
     after: Vec<targets::Target>,
+    after_events: u32,
     /// The targets bound at the draw.
     bound: Vec<targets::Bound>,
     /// Whether the pass this draw ends has been dealt with.
@@ -295,6 +297,24 @@ impl State {
 pub fn next_context_id() -> u32 {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Gives up a capture in progress, if any, releasing everything it holds (a swap chain resize needs its back buffers
+/// free). The request is not taken again: a new one is needed.
+pub fn abandon(why: &str) {
+    if !armed() {
+        return;
+    }
+    let mut s = state();
+    if s.phase == Phase::Idle {
+        return;
+    }
+    ARMED.store(false, Ordering::Relaxed);
+    s.phase = Phase::Idle;
+    s.reset();
+    drop(s);
+    ops::reset();
+    log!("capture abandoned: {why}");
 }
 
 /// At each present, before the real one (and after [`end_frame`]). Ends a frame being recorded.
@@ -532,32 +552,33 @@ pub unsafe fn targets_changing(
         close_timeline_pass(context, Some(&next));
         return;
     }
-    let bound = {
+    let (index, bound) = {
         let s = state();
         if !s.records(true) {
             return;
         }
-        let last = s.pending.get(&id).and_then(|d| {
-            d.iter()
-                .rev()
-                .find_map(|e| e.draw.as_deref().filter(|_| e.kind == "draw"))
-        });
-        match last {
+        let Some(pending) = s.pending.get(&id) else {
+            return;
+        };
+        let Some(index) = pending.iter().rposition(|e| e.kind == "draw") else {
+            return;
+        };
+        match pending[index].draw.as_deref() {
             Some(last) if !last.closed && !last.bound.is_empty() && !targets::same(&last.bound, &next) => {
-                last.bound.clone()
+                (index, last.bound.clone())
             }
             _ => return,
         }
     };
     let copied = unsafe { targets::copy(context, &bound) };
     let mut s = state();
-    let last = s.pending.get_mut(&id).and_then(|d| {
-        d.iter_mut()
-            .rev()
-            .find_map(|e| e.draw.as_deref_mut().filter(|_| e.kind == "draw"))
-    });
-    if let Some(last) = last {
+    let Some(pending) = s.pending.get_mut(&id) else {
+        return;
+    };
+    let after_events = (pending.len() - 1 - index) as u32;
+    if let Some(last) = pending.get_mut(index).and_then(|e| e.draw.as_deref_mut()) {
         last.after = copied;
+        last.after_events = after_events;
         last.closed = true;
     }
 }
@@ -587,8 +608,10 @@ fn close_timeline_pass(immediate: &ID3D11DeviceContext4, next: Option<&[targets:
     };
     let copied = unsafe { targets::copy(immediate, &bound) };
     let mut s = state();
+    let after_events = (s.timeline.len() - 1 - index) as u32;
     if let Some(d) = s.timeline[index].draw.as_deref_mut() {
         d.after = copied;
+        d.after_events = after_events;
         d.closed = true;
     }
 }
