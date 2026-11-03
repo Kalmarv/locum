@@ -44,6 +44,9 @@ pub struct D3d11 {
     ctx: ID3D11DeviceContext1,
     resources: HashMap<i64, ID3D11Resource>,
     views: HashMap<i64, Option<View>>,
+    /// Textures made in their family's typeless format because their views use more than one format of it: their
+    /// own format, for views that name none.
+    typed: HashMap<i64, u32>,
     states: HashMap<i64, Option<ID3D11DeviceChild>>,
     shaders: HashMap<(String, usize), Option<ID3D11DeviceChild>>,
     replaced: HashMap<String, Option<ID3D11DeviceChild>>,
@@ -85,6 +88,7 @@ impl D3d11 {
             ctx,
             resources: HashMap::new(),
             views: HashMap::new(),
+            typed: HashMap::new(),
             states: HashMap::new(),
             shaders: HashMap::new(),
             replaced: HashMap::new(),
@@ -118,7 +122,13 @@ impl D3d11 {
             let made = match row {
                 Some((kind, Some(resource), desc)) => {
                     let r = self.resource(resource)?.clone();
-                    let desc = desc.unwrap_or_default();
+                    let mut desc = desc.unwrap_or_default();
+                    // Every view description starts with its format; none (0) means the resource's own.
+                    if let Some(&format) = self.typed.get(&resource)
+                        && desc.get(..4) == Some(&[0; 4])
+                    {
+                        desc[..4].copy_from_slice(&format.to_le_bytes());
+                    }
                     match self.make_view(&kind, &r, &desc) {
                         Ok(v) => Some(v),
                         Err(e) => {
@@ -901,6 +911,21 @@ impl Backend for D3d11 {
             _ => Vec::new(),
         };
         let init_ptr = (!init.is_empty()).then_some(init.as_ptr());
+        // A texture viewed as more than one format of its family (a swap chain's back buffer drawn to through an sRGB
+        // view: DXGI allows that of its own buffers) is made in the family's typeless format, which takes them all.
+        let mut format = s.format;
+        if s.kind != "buffer" {
+            let viewed: Vec<u32> = c.rows(
+                "SELECT DISTINCT format FROM views WHERE resource = ?1 AND format IS NOT NULL AND format <> 0",
+                [id],
+                |r| r.get(0),
+            );
+            if viewed.iter().any(|&f| f != s.format) && locum_capture::format::typeless(s.format) != s.format
+            {
+                format = locum_capture::format::typeless(s.format);
+                self.typed.insert(id, s.format);
+            }
+        }
         let device = self.device.clone();
         let make = |with: Option<*const D3D11_SUBRESOURCE_DATA>| -> windows::core::Result<ID3D11Resource> {
             unsafe {
@@ -916,6 +941,7 @@ impl Backend for D3d11 {
                     }
                     "texture1d" => {
                         let mut d: D3D11_TEXTURE1D_DESC = from_bytes(&desc);
+                        d.Format = DXGI_FORMAT(format as i32);
                         d.MipLevels = s.mips;
                         d.Usage = D3D11_USAGE_DEFAULT;
                         d.CPUAccessFlags = 0;
@@ -926,6 +952,7 @@ impl Backend for D3d11 {
                     }
                     "texture3d" => {
                         let mut d: D3D11_TEXTURE3D_DESC = from_bytes(&desc);
+                        d.Format = DXGI_FORMAT(format as i32);
                         d.MipLevels = s.mips;
                         d.Usage = D3D11_USAGE_DEFAULT;
                         d.CPUAccessFlags = 0;
@@ -936,6 +963,7 @@ impl Backend for D3d11 {
                     }
                     _ => {
                         let mut d: D3D11_TEXTURE2D_DESC = from_bytes(&desc);
+                        d.Format = DXGI_FORMAT(format as i32);
                         d.MipLevels = s.mips;
                         d.Usage = D3D11_USAGE_DEFAULT;
                         d.CPUAccessFlags = 0;

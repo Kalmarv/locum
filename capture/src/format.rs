@@ -103,6 +103,36 @@ pub fn readable(format: u32) -> u32 {
     }
 }
 
+/// The typeless format of `format`'s family (the formats with the same bits that views of one texture may mix), or
+/// `format` itself for a format with no family.
+pub fn typeless(format: u32) -> u32 {
+    match format {
+        1..=4 => 1,
+        5..=8 => 5,
+        9..=14 => 9,
+        15..=18 => 15,
+        19..=22 => 19,
+        23..=25 => 23,
+        27..=32 => 27,
+        33..=38 => 33,
+        39..=43 => 39,
+        44..=47 => 44,
+        48..=52 => 48,
+        53..=59 => 53,
+        60..=64 => 60,
+        70..=72 => 70,
+        73..=75 => 73,
+        76..=78 => 76,
+        79..=81 => 79,
+        82..=84 => 82,
+        87 | 90 | 91 => 90,
+        88 | 92 | 93 => 92,
+        94..=96 => 94,
+        97..=99 => 97,
+        other => other,
+    }
+}
+
 /// The format's name without the `DXGI_FORMAT_` prefix.
 pub fn name(format: u32) -> &'static str {
     NAMES
@@ -278,5 +308,21 @@ mod tests {
         assert_eq!(readable(19), 21);
         assert_eq!(readable(27), 28);
         assert_eq!(readable(98), 98);
+    }
+
+    #[test]
+    fn a_family_is_its_typeless_format_with_the_same_layout() {
+        for &(f, _) in NAMES {
+            let t = typeless(f);
+            if t != f || name(f).ends_with("_TYPELESS") {
+                assert!(name(t).ends_with("_TYPELESS"), "{} -> {}", name(f), name(t));
+            }
+            if t != f && layout(f).is_some() {
+                assert_eq!(layout(t), layout(f), "{} -> {}", name(f), name(t));
+            }
+        }
+        assert_eq!(typeless(29), 27);
+        assert_eq!(typeless(91), 90);
+        assert_eq!(typeless(26), 26);
     }
 }
