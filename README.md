@@ -98,7 +98,9 @@ contents. locum's own copies run whatever predicate the game has set.
 - `shaders`, `modules`, `stacks`: bytecode keys, and what the call stacks need to be read.
 
 While a capture is recording, the game's writes through `Map` go to memory locum owns and are copied to the driver's
-at `Unmap`, so a map records only the bytes the game wrote.
+at `Unmap`, so a map records only the bytes the game wrote. A discarding map starts as a fixed pattern
+(`locum_capture::maps`), which is what the GPU reads wherever the game wrote nothing; replay writes the same pattern
+under the recorded bytes, so a shader reading past what the game filled in sees what it saw in the game.
 
 A pass ends where the targets in effect change on the GPU's timeline: an `OMSetRenderTargets` that binds other
 targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame.

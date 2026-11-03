@@ -217,7 +217,7 @@ struct State {
     in_flight: Vec<(u64, Result<contents::Readback, String>)>,
     in_flight_bytes: u64,
     /// Contents read so far (key and subresource keys), or why there are none.
-    contents: BTreeMap<u64, Result<(String, Vec<String>), String>>,
+    contents: BTreeMap<u64, contents::Read>,
     gaps: BTreeMap<(String, String), u64>,
 }
 

@@ -1021,6 +1021,28 @@ impl Backend for D3d11 {
                             x.row_bytes * x.rows,
                         )
                     };
+                } else if a["type"] == D3D11_MAP_WRITE_DISCARD.0 {
+                    // What the GPU saw: the pattern the capture's shadow started as, under the bytes the game wrote.
+                    let s = shape(c, id).ok_or("map of an undescribed resource")?;
+                    let size = s
+                        .subs()
+                        .into_iter()
+                        .find(|x| x.index == sub)
+                        .ok_or("no such subresource")?
+                        .size as usize;
+                    let ranges: Vec<(usize, usize)> = a["ranges"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|r| {
+                            (
+                                r[0].as_u64().unwrap_or(0) as usize,
+                                r[1].as_u64().unwrap_or(0) as usize,
+                            )
+                        })
+                        .collect();
+                    let whole = locum_capture::maps::discarded(size, &ranges, &bytes);
+                    unsafe { ctx.UpdateSubresource(&r, sub, None, whole.as_ptr().cast(), 0, 0) };
                 } else {
                     let mut at = 0usize;
                     for range in a["ranges"].as_array().into_iter().flatten() {

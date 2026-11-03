@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use locum_capture::cost::Cost;
 use locum_capture::layout;
-use locum_capture::{hash, stacks, writer};
+use locum_capture::{hash, maps, stacks, writer};
 use serde_json::{Value, json};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::core::{HRESULT, Interface};
@@ -52,38 +52,6 @@ static OUTSTANDING: AtomicUsize = AtomicUsize::new(0);
 /// following no-overwrite map starts from.
 type Mirrors = HashMap<(u32, u64, u32), Vec<u8>>;
 static MIRRORS: Mutex<Option<Mirrors>> = Mutex::new(None);
-
-/// The discard pattern's 4-byte word at word `i`.
-fn pattern(i: usize) -> u32 {
-    (i as u32).wrapping_mul(0x9e37_79b9) ^ 0x5bd1_e995
-}
-
-fn fill_pattern(data: &mut [u8]) {
-    for (i, chunk) in data.chunks_mut(4).enumerate() {
-        let p = pattern(i).to_le_bytes();
-        chunk.copy_from_slice(&p[..chunk.len()]);
-    }
-}
-
-/// The byte ranges of `data` that differ from `reference` (or from the pattern), merged across gaps of 64 bytes.
-fn written(data: &[u8], reference: Option<&[u8]>) -> Vec<(usize, usize)> {
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for (i, chunk) in data.chunks(4).enumerate() {
-        let differs = match reference {
-            Some(r) => chunk != &r[i * 4..i * 4 + chunk.len()],
-            None => chunk != &pattern(i).to_le_bytes()[..chunk.len()],
-        };
-        if !differs {
-            continue;
-        }
-        let (start, end) = (i * 4, i * 4 + chunk.len());
-        match ranges.last_mut() {
-            Some(last) if start <= last.1 + 64 => last.1 = end,
-            _ => ranges.push((start, end)),
-        }
-    }
-    ranges
-}
 
 /// Clears the mirrors when a capture ends.
 pub(super) fn reset() {
@@ -157,7 +125,7 @@ pub unsafe fn map(
     let started = std::time::Instant::now();
     let mut data = vec![0u8; size];
     let reference = if map_type == D3D11_MAP_WRITE_DISCARD {
-        fill_pattern(&mut data);
+        maps::fill(&mut data);
         None
     } else {
         let mirror = MIRRORS
@@ -215,7 +183,7 @@ pub unsafe fn unmap(c: &ID3D11DeviceContext4, resource: *mut c_void, sub: u32, r
         return;
     }
     let started = std::time::Instant::now();
-    let ranges = written(&shadow.data, shadow.reference.as_deref());
+    let ranges = maps::written(&shadow.data, shadow.reference.as_deref());
     let texture = registry::sub_of(shadow.resource_id, sub).filter(|(kind, _)| *kind != "buffer");
     let (bytes, args) = match texture {
         // A texture's map is recorded as its whole subresource, tightly packed.

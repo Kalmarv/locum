@@ -12,6 +12,10 @@ use crate::settings::settings;
 /// Bytes of staging copies a capture has in flight before it reads them (waiting for the GPU).
 pub const IN_FLIGHT: u64 = 512 << 20;
 
+/// Contents read back: the key of their bytes in the canonical layout and each subresource's key, or why there are
+/// none.
+pub type Read = Result<(String, Vec<String>), String>;
+
 /// Records a copy of `resource` into a new staging resource on `c`.
 ///
 /// # Safety
@@ -25,7 +29,7 @@ pub unsafe fn issue(c: &ID3D11DeviceContext4, resource: &ID3D11Resource) -> Resu
 ///
 /// # Safety
 /// `immediate` must be the immediate context of the device that made the copy.
-pub unsafe fn read(immediate: &ID3D11DeviceContext4, rb: &Readback) -> Result<(String, Vec<String>), String> {
+pub unsafe fn read(immediate: &ID3D11DeviceContext4, rb: &Readback) -> Read {
     let bytes = unsafe { rb.read(immediate) }?;
     let hashes = rb
         .subs
@@ -45,7 +49,7 @@ pub unsafe fn read(immediate: &ID3D11DeviceContext4, rb: &Readback) -> Result<(S
 pub unsafe fn read_all(
     immediate: &ID3D11DeviceContext4,
     copies: Vec<(u64, Result<Readback, String>)>,
-) -> Vec<(u64, Result<(String, Vec<String>), String>)> {
+) -> Vec<(u64, Read)> {
     copies
         .into_iter()
         .map(|(id, rb)| (id, rb.and_then(|rb| unsafe { read(immediate, &rb) })))
