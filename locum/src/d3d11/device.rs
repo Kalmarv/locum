@@ -20,12 +20,12 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface};
 
-use crate::capture;
+use crate::d3d11::capture;
 use crate::com::answer_query;
 use crate::dxgi::Adapter;
 use crate::log::log;
-use crate::overrides;
-use crate::shaders::{self, Stage};
+use crate::d3d11::overrides;
+use crate::d3d11::shaders::{self, Stage};
 use crate::vtables::adapter::AdapterMethods;
 use crate::vtables::context::{ContextMethods, real as real_context};
 use crate::vtables::device::{DeviceMethods, real};

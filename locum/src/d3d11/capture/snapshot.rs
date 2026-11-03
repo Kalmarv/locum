@@ -7,8 +7,8 @@ use windows::core::Interface;
 
 use super::ids::{resource_id, state_id, view_ids};
 use super::{CbBind, Draw, state};
-use crate::shaders::{self, Stage};
-use crate::stages;
+use crate::d3d11::shaders::{self, Stage};
+use crate::d3d11::stages;
 
 /// Staging buffers for constant-buffer copies: 32 MiB each, at most 16 (512 MiB) per capture.
 pub(super) const CHUNK: u32 = 32 << 20;

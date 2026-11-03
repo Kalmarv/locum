@@ -4,7 +4,7 @@
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::core::{Interface, Result};
 
-use crate::shaders::Stage;
+use crate::d3d11::shaders::Stage;
 
 /// Constant-buffer slots per stage.
 pub const CB_SLOTS: u32 = D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT;

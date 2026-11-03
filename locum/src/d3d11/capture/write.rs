@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Direct3D11::*;
 use super::snapshot::CHUNK;
 use super::{Draw, state};
 use crate::log::{folder, log};
-use crate::shaders;
+use crate::d3d11::shaders;
 
 #[derive(Serialize)]
 struct DrawLine<'a> {

@@ -17,9 +17,9 @@ use windows::Win32::Foundation::{HWND, LUID};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
-use crate::capture;
+use crate::d3d11::capture;
 use crate::com::answer_query;
-use crate::device::Device;
+use crate::d3d11::device::Device;
 use crate::log::log;
 use crate::vtables::adapter::{AdapterMethods, real as real_adapter};
 use crate::vtables::factory::{FactoryMethods, real as real_factory};
@@ -484,7 +484,7 @@ impl SwapChain {
             return real();
         }
         let frame = count_frame();
-        crate::overrides::poll(frame);
+        crate::d3d11::overrides::poll(frame);
         let immediate = unsafe { (*self.device).immediate() };
         capture::end_frame(immediate.real());
         let finished = capture::before_present();

@@ -7,14 +7,10 @@
 // The exports are Direct3D's own entry points: their safety contract is Microsoft's documentation of each.
 #![allow(clippy::missing_safety_doc)]
 
-mod capture;
 mod com;
-mod device;
+mod d3d11;
 mod dxgi;
 mod log;
-mod overrides;
-mod shaders;
-mod stages;
 mod system;
 mod vtables;
 
@@ -27,7 +23,7 @@ use windows::Win32::Graphics::Direct3D11::{D3D11_CREATE_DEVICE_FLAG, ID3D11Devic
 use windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC;
 use windows::core::{GUID, HRESULT, IUnknown, Interface};
 
-use crate::device::Device;
+use crate::d3d11::device::Device;
 use crate::dxgi::{Adapter, Factory, SwapChain};
 use crate::log::log;
 use crate::system::{caller_of_caller, export, is_system_caller, module_of, module_path, system};

@@ -25,8 +25,8 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::core::{HRESULT, Interface, PCSTR};
 
 use crate::log::{folder, log};
-use crate::shaders::{self, Stage};
-use crate::stages::{self, CbBinding};
+use crate::d3d11::shaders::{self, Stage};
+use crate::d3d11::stages::{self, CbBinding};
 use crate::system::{export, load_system_dll};
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
