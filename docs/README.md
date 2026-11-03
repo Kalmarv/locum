@@ -119,6 +119,13 @@ targets are read there, and the capture records the event they were read after (
 or dispatch after it), which is where verify compares them. A command list executed more than once makes its copies
 into the same places each time, so only its last execution's constants and targets are kept.
 
+A command list that the game began recording before the capture was armed, or during an earlier capture, holds GPU
+commands locum never saw. Executing such a list adds a `partial_list` gap, even when the part locum did record
+reproduces every target. The next list the game records on that context is whole again, whether or not a capture is
+running, and a partial list that is never executed doesn't affect the capture. Binding state doesn't make a list
+partial, because each recorded draw reads all the state bound when it runs. While no capture is armed, this costs one
+counter per context and no GPU copies.
+
 Draws recorded on deferred contexts are placed where their command list is executed. Constant buffers and targets
 are copied by the GPU on the draw's own context, so each draw's constants and each pass's targets are the ones the
 GPU saw at that point of the frame.

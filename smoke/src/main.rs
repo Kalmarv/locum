@@ -17,6 +17,7 @@
 mod device_writes;
 mod layers;
 mod live_capture;
+mod partial_lists;
 mod replay_rows;
 
 use std::process::ExitCode;
@@ -220,6 +221,7 @@ fn run(checks: &mut Checks) -> Result<()> {
     live_capture::run(checks, &device, &immediate, &deferred, &swapchain)?;
     layers::run(checks, &device, &immediate, &swapchain)?;
     device_writes::run(checks, &device, &immediate, &swapchain, "gpu")?;
+    partial_lists::run(checks, &device, &immediate, &swapchain)?;
     replay_rows::row16(checks, &device, &immediate, &deferred, &swapchain)?;
     replay_rows::row17(checks, &device, &immediate, &swapchain)?;
     replay_rows::row18(checks, &device, &immediate, &swapchain)?;

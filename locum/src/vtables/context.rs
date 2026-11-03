@@ -17,6 +17,8 @@ use core::ffi::c_void;
 pub unsafe trait ContextMethods: Sized {
     /// The wrapped object, an `ID3D11DeviceContext4`.
     fn inner(&self) -> *mut c_void;
+    /// Called before commands that perform work, including calls with a manual override.
+    fn before_command(&self) {}
     unsafe fn QueryInterface(
         &self,
         iid: *const windows::core::GUID,
@@ -2938,9 +2940,11 @@ unsafe extern "system" fn VSSetShader<T: ContextMethods>(
     unsafe { (*(this as *const T)).VSSetShader(a0, a1, a2) }
 }
 unsafe extern "system" fn DrawIndexed<T: ContextMethods>(this: *mut c_void, a0: u32, a1: u32, a2: i32) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).DrawIndexed(a0, a1, a2) }
 }
 unsafe extern "system" fn Draw<T: ContextMethods>(this: *mut c_void, a0: u32, a1: u32) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).Draw(a0, a1) }
 }
 unsafe extern "system" fn Map<T: ContextMethods>(
@@ -2951,9 +2955,11 @@ unsafe extern "system" fn Map<T: ContextMethods>(
     a3: u32,
     a4: *mut windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE,
 ) -> windows::core::HRESULT {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).Map(a0, a1, a2, a3, a4) }
 }
 unsafe extern "system" fn Unmap<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void, a1: u32) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).Unmap(a0, a1) }
 }
 unsafe extern "system" fn PSSetConstantBuffers<T: ContextMethods>(
@@ -2993,6 +2999,7 @@ unsafe extern "system" fn DrawIndexedInstanced<T: ContextMethods>(
     a3: i32,
     a4: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).DrawIndexedInstanced(a0, a1, a2, a3, a4) }
 }
 unsafe extern "system" fn DrawInstanced<T: ContextMethods>(
@@ -3002,6 +3009,7 @@ unsafe extern "system" fn DrawInstanced<T: ContextMethods>(
     a2: u32,
     a3: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).DrawInstanced(a0, a1, a2, a3) }
 }
 unsafe extern "system" fn GSSetConstantBuffers<T: ContextMethods>(
@@ -3043,9 +3051,11 @@ unsafe extern "system" fn VSSetSamplers<T: ContextMethods>(
     unsafe { (*(this as *const T)).VSSetSamplers(a0, a1, a2) }
 }
 unsafe extern "system" fn Begin<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).Begin(a0) }
 }
 unsafe extern "system" fn End<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).End(a0) }
 }
 unsafe extern "system" fn GetData<T: ContextMethods>(
@@ -3124,6 +3134,7 @@ unsafe extern "system" fn SOSetTargets<T: ContextMethods>(
     unsafe { (*(this as *const T)).SOSetTargets(a0, a1, a2) }
 }
 unsafe extern "system" fn DrawAuto<T: ContextMethods>(this: *mut c_void) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).DrawAuto() }
 }
 unsafe extern "system" fn DrawIndexedInstancedIndirect<T: ContextMethods>(
@@ -3131,6 +3142,7 @@ unsafe extern "system" fn DrawIndexedInstancedIndirect<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).DrawIndexedInstancedIndirect(a0, a1) }
 }
 unsafe extern "system" fn DrawInstancedIndirect<T: ContextMethods>(
@@ -3138,9 +3150,11 @@ unsafe extern "system" fn DrawInstancedIndirect<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).DrawInstancedIndirect(a0, a1) }
 }
 unsafe extern "system" fn Dispatch<T: ContextMethods>(this: *mut c_void, a0: u32, a1: u32, a2: u32) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).Dispatch(a0, a1, a2) }
 }
 unsafe extern "system" fn DispatchIndirect<T: ContextMethods>(
@@ -3148,6 +3162,7 @@ unsafe extern "system" fn DispatchIndirect<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).DispatchIndirect(a0, a1) }
 }
 unsafe extern "system" fn RSSetState<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
@@ -3178,6 +3193,7 @@ unsafe extern "system" fn CopySubresourceRegion<T: ContextMethods>(
     a6: u32,
     a7: *const windows::Win32::Graphics::Direct3D11::D3D11_BOX,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).CopySubresourceRegion(a0, a1, a2, a3, a4, a5, a6, a7) }
 }
 unsafe extern "system" fn CopyResource<T: ContextMethods>(
@@ -3185,6 +3201,7 @@ unsafe extern "system" fn CopyResource<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: *mut core::ffi::c_void,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).CopyResource(a0, a1) }
 }
 unsafe extern "system" fn UpdateSubresource<T: ContextMethods>(
@@ -3196,6 +3213,7 @@ unsafe extern "system" fn UpdateSubresource<T: ContextMethods>(
     a4: u32,
     a5: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).UpdateSubresource(a0, a1, a2, a3, a4, a5) }
 }
 unsafe extern "system" fn CopyStructureCount<T: ContextMethods>(
@@ -3204,6 +3222,7 @@ unsafe extern "system" fn CopyStructureCount<T: ContextMethods>(
     a1: u32,
     a2: *mut core::ffi::c_void,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).CopyStructureCount(a0, a1, a2) }
 }
 unsafe extern "system" fn ClearRenderTargetView<T: ContextMethods>(
@@ -3211,6 +3230,7 @@ unsafe extern "system" fn ClearRenderTargetView<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: *const f32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).ClearRenderTargetView(a0, a1) }
 }
 unsafe extern "system" fn ClearUnorderedAccessViewUint<T: ContextMethods>(
@@ -3218,6 +3238,7 @@ unsafe extern "system" fn ClearUnorderedAccessViewUint<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: *const u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).ClearUnorderedAccessViewUint(a0, a1) }
 }
 unsafe extern "system" fn ClearUnorderedAccessViewFloat<T: ContextMethods>(
@@ -3225,6 +3246,7 @@ unsafe extern "system" fn ClearUnorderedAccessViewFloat<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: *const f32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).ClearUnorderedAccessViewFloat(a0, a1) }
 }
 unsafe extern "system" fn ClearDepthStencilView<T: ContextMethods>(
@@ -3234,9 +3256,11 @@ unsafe extern "system" fn ClearDepthStencilView<T: ContextMethods>(
     a2: f32,
     a3: u8,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).ClearDepthStencilView(a0, a1, a2, a3) }
 }
 unsafe extern "system" fn GenerateMips<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).GenerateMips(a0) }
 }
 unsafe extern "system" fn SetResourceMinLOD<T: ContextMethods>(
@@ -3244,6 +3268,7 @@ unsafe extern "system" fn SetResourceMinLOD<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: f32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).SetResourceMinLOD(a0, a1) }
 }
 unsafe extern "system" fn GetResourceMinLOD<T: ContextMethods>(
@@ -3260,6 +3285,7 @@ unsafe extern "system" fn ResolveSubresource<T: ContextMethods>(
     a3: u32,
     a4: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).ResolveSubresource(a0, a1, a2, a3, a4) }
 }
 unsafe extern "system" fn ExecuteCommandList<T: ContextMethods>(
@@ -3267,6 +3293,7 @@ unsafe extern "system" fn ExecuteCommandList<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: windows::core::BOOL,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).ExecuteCommandList(a0, a1) }
 }
 unsafe extern "system" fn HSSetShaderResources<T: ContextMethods>(
@@ -3702,6 +3729,7 @@ unsafe extern "system" fn CopySubresourceRegion1<T: ContextMethods>(
     a7: *const windows::Win32::Graphics::Direct3D11::D3D11_BOX,
     a8: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).CopySubresourceRegion1(a0, a1, a2, a3, a4, a5, a6, a7, a8) }
 }
 unsafe extern "system" fn UpdateSubresource1<T: ContextMethods>(
@@ -3714,12 +3742,15 @@ unsafe extern "system" fn UpdateSubresource1<T: ContextMethods>(
     a5: u32,
     a6: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).UpdateSubresource1(a0, a1, a2, a3, a4, a5, a6) }
 }
 unsafe extern "system" fn DiscardResource<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).DiscardResource(a0) }
 }
 unsafe extern "system" fn DiscardView<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).DiscardView(a0) }
 }
 unsafe extern "system" fn VSSetConstantBuffers1<T: ContextMethods>(
@@ -3856,6 +3887,7 @@ unsafe extern "system" fn ClearView<T: ContextMethods>(
     a2: *const windows::Win32::Foundation::RECT,
     a3: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).ClearView(a0, a1, a2, a3) }
 }
 unsafe extern "system" fn DiscardView1<T: ContextMethods>(
@@ -3864,6 +3896,7 @@ unsafe extern "system" fn DiscardView1<T: ContextMethods>(
     a1: *const windows::Win32::Foundation::RECT,
     a2: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).DiscardView1(a0, a1, a2) }
 }
 unsafe extern "system" fn UpdateTileMappings<T: ContextMethods>(
@@ -3879,6 +3912,7 @@ unsafe extern "system" fn UpdateTileMappings<T: ContextMethods>(
     a8: *const u32,
     a9: u32,
 ) -> windows::core::HRESULT {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).UpdateTileMappings(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) }
 }
 unsafe extern "system" fn CopyTileMappings<T: ContextMethods>(
@@ -3890,6 +3924,7 @@ unsafe extern "system" fn CopyTileMappings<T: ContextMethods>(
     a4: *const windows::Win32::Graphics::Direct3D11::D3D11_TILE_REGION_SIZE,
     a5: u32,
 ) -> windows::core::HRESULT {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).CopyTileMappings(a0, a1, a2, a3, a4, a5) }
 }
 unsafe extern "system" fn CopyTiles<T: ContextMethods>(
@@ -3901,6 +3936,7 @@ unsafe extern "system" fn CopyTiles<T: ContextMethods>(
     a4: u64,
     a5: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).CopyTiles(a0, a1, a2, a3, a4, a5) }
 }
 unsafe extern "system" fn UpdateTiles<T: ContextMethods>(
@@ -3911,6 +3947,7 @@ unsafe extern "system" fn UpdateTiles<T: ContextMethods>(
     a3: *const core::ffi::c_void,
     a4: u32,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).UpdateTiles(a0, a1, a2, a3, a4) }
 }
 unsafe extern "system" fn ResizeTilePool<T: ContextMethods>(
@@ -3918,6 +3955,7 @@ unsafe extern "system" fn ResizeTilePool<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: u64,
 ) -> windows::core::HRESULT {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).ResizeTilePool(a0, a1) }
 }
 unsafe extern "system" fn TiledResourceBarrier<T: ContextMethods>(
@@ -3925,6 +3963,7 @@ unsafe extern "system" fn TiledResourceBarrier<T: ContextMethods>(
     a0: *mut core::ffi::c_void,
     a1: *mut core::ffi::c_void,
 ) {
+    unsafe { (*(this as *const T)).before_command() };
     unsafe { (*(this as *const T)).TiledResourceBarrier(a0, a1) }
 }
 unsafe extern "system" fn IsAnnotationEnabled<T: ContextMethods>(this: *mut c_void) -> windows::core::BOOL {

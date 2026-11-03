@@ -389,6 +389,50 @@ fn smoke(root: &Path, debug: bool) {
         ordered_ok &= ok && settled && plain && named;
     }
     let mut rows_ok = verified(&cli, &log_dir, "row16", false, debug, "row16: bit-exact replay").0;
+    for label in [
+        "list-prefix",
+        "list-bindings",
+        "list-reset",
+        "list-unexecuted",
+        "list-armed",
+        "list-generation",
+    ] {
+        for warp in [false, true] {
+            if matches!(label, "list-prefix" | "list-generation") {
+                let mut cmd = Command::new(&cli);
+                cmd.arg("verify").arg(log_dir.join(format!("captures/{label}")));
+                if warp {
+                    cmd.arg("--warp");
+                }
+                let output = cmd.output().expect("verify partial list");
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let ok = !output.status.success()
+                    && text.contains("partial_list")
+                    && text.contains("1 of 1 targets identical");
+                println!("--- verify {label} WARP={warp}\n{text}");
+                println!(
+                    "{} {label}: matching pixels cannot hide a partial command list",
+                    if ok { "ok  " } else { "FAIL" }
+                );
+                rows_ok &= ok;
+            } else {
+                rows_ok &= verified(
+                    &cli,
+                    &log_dir,
+                    label,
+                    warp,
+                    debug,
+                    &format!("{label}: complete list verifies"),
+                )
+                .0;
+            }
+        }
+    }
+
     for label in ["row16-warp-raw", "row16-warp-adjusted", "row16-warp-modern"] {
         for warp in [false, true] {
             rows_ok &= verified(
@@ -1061,6 +1105,9 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
     writeln!(out, "pub unsafe trait {}: Sized {{", class.trait_name).unwrap();
     writeln!(out, "    /// The wrapped object, an `{}`.", class.interface).unwrap();
     out.push_str("    fn inner(&self) -> *mut c_void;\n");
+    if class.trait_name == "ContextMethods" {
+        out.push_str("    /// Called before commands that perform work, including calls with a manual override.\n    fn before_command(&self) {}\n");
+    }
     out.push_str("    unsafe fn QueryInterface(&self, iid: *const windows::core::GUID, out: *mut *mut c_void) -> windows::core::HRESULT;\n");
     out.push_str("    unsafe fn AddRef(&self) -> u32;\n");
     out.push_str("    unsafe fn Release(&self) -> u32;\n");
@@ -1103,9 +1150,38 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
                 args = args.join(", "),
             )
             .unwrap();
+            // State setters are read back in the draw snapshot. Commands with effects on resources or query
+            // state cannot be recovered that way: track their list's capture coverage even while unarmed.
+            let work = class.trait_name == "ContextMethods"
+                && ([
+                    "Draw",
+                    "Dispatch",
+                    "Copy",
+                    "Update",
+                    "ClearRenderTarget",
+                    "ClearDepthStencil",
+                    "ClearUnorderedAccess",
+                    "ClearView",
+                    "Discard",
+                    "Resolve",
+                    "GenerateMips",
+                    "ResizeTilePool",
+                    "TiledResourceBarrier",
+                ]
+                .iter()
+                .any(|prefix| e.name.starts_with(prefix))
+                    || matches!(
+                        e.name.as_str(),
+                        "Map" | "Unmap" | "Begin" | "End" | "ExecuteCommandList" | "SetResourceMinLOD"
+                    ));
+            let observe = if work {
+                "    unsafe { (*(this as *const T)).before_command() };\n"
+            } else {
+                ""
+            };
             writeln!(
                 thunks,
-                "unsafe extern \"system\" fn {name}<T: {t}>(this: *mut c_void{comma}{params}){ret} {{\n    unsafe {{ (*(this as *const T)).{name}({args}) }}\n}}",
+                "unsafe extern \"system\" fn {name}<T: {t}>(this: *mut c_void{comma}{params}){ret} {{\n{observe}    unsafe {{ (*(this as *const T)).{name}({args}) }}\n}}",
                 name = e.name,
                 t = class.trait_name,
                 comma = if params.is_empty() { "" } else { ", " },

@@ -28,6 +28,7 @@
 
 pub mod contents;
 mod counters;
+pub mod coverage;
 pub mod ids;
 pub mod ops;
 mod snapshot;
@@ -37,7 +38,7 @@ mod write;
 use core::ffi::c_void;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use locum_capture::cost::Cost;
 use locum_capture::db;
@@ -52,6 +53,11 @@ pub use ids::input_layout_created;
 
 /// True from the request to the end of the captured frame: the only check on the hot paths otherwise.
 static ARMED: AtomicBool = AtomicBool::new(false);
+static EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn epoch() -> u64 {
+    if armed() { EPOCH.load(Ordering::Relaxed) } else { 0 }
+}
 
 pub fn armed() -> bool {
     ARMED.load(Ordering::Relaxed)
@@ -192,6 +198,7 @@ pub(super) struct Event {
 /// frame executed it.
 struct List {
     events: Vec<Event>,
+    complete: bool,
     before: bool,
     executions: u32,
 }
@@ -377,6 +384,7 @@ pub fn after_present(finished: bool, immediate: &ID3D11DeviceContext4) {
             s.request = Request::parse(&text);
             s.phase = Phase::Before;
             s.captures += 1;
+            EPOCH.store(s.captures, Ordering::Relaxed);
             ARMED.store(true, Ordering::Relaxed);
             log!(
                 "capture requested at frame {}: {:?}; recording frame {}",
@@ -778,7 +786,7 @@ pub fn end_frame(immediate: &ID3D11DeviceContext4) {
 }
 
 /// A deferred context's FinishCommandList: its pending events (possibly none) belong to the list.
-pub fn on_finish_list(id: u32, list: *mut c_void) {
+pub fn on_finish_list(id: u32, list: *mut c_void, complete: bool) {
     let mut s = state();
     let events = s.pending.remove(&id).unwrap_or_default();
     let before = s.phase == Phase::Before;
@@ -787,6 +795,7 @@ pub fn on_finish_list(id: u32, list: *mut c_void) {
             list as usize,
             List {
                 events,
+                complete,
                 before,
                 executions: 0,
             },
@@ -850,7 +859,10 @@ pub fn on_execute_list(
         return;
     };
     l.executions += 1;
-    let (mut events, before) = (l.events.clone(), l.before);
+    let (mut events, before, complete) = (l.events.clone(), l.before, l.complete);
+    if !deferred && !complete {
+        *s.gaps.entry(("partial_list".into(), format!("command list {number}: commands before capture arming or from an earlier capture were not recorded"))).or_default() += 1;
+    }
     if deferred {
         s.pending.entry(id).or_default().extend(events);
     } else {

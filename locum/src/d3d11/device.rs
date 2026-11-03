@@ -62,6 +62,7 @@ pub struct Context {
     deferred: bool,
     /// locum's number for the context, in captures.
     id: u32,
+    coverage: capture::coverage::Coverage,
 }
 
 static DEVICE_VTBL: ID3D11Device5_Vtbl = crate::vtables::device::vtable::<Device>();
@@ -255,6 +256,7 @@ impl Device {
                 device: core::ptr::null(),
                 deferred: false,
                 id: capture::next_context_id(),
+                coverage: Default::default(),
             },
         }));
         unsafe {
@@ -341,6 +343,7 @@ impl Device {
                     device: self,
                     deferred: true,
                     id: capture::next_context_id(),
+                    coverage: Default::default(),
                 }));
                 unsafe { *out = wrapper.cast() };
             }
@@ -676,6 +679,12 @@ unsafe impl DxgiDeviceMethods for DxgiDevice {
 }
 
 unsafe impl ContextMethods for Context {
+    fn before_command(&self) {
+        if self.deferred {
+            self.coverage.command();
+        }
+    }
+
     fn inner(&self) -> *mut c_void {
         self.inner.as_raw()
     }
@@ -1028,8 +1037,11 @@ unsafe impl ContextMethods for Context {
 
     unsafe fn FinishCommandList(&self, a0: BOOL, a1: *mut *mut c_void) -> HRESULT {
         let hr = unsafe { real_context::FinishCommandList(self.inner(), a0, a1) };
-        if capture::armed() && hr.is_ok() && !a1.is_null() {
-            capture::on_finish_list(self.id, unsafe { *a1 });
+        if hr.is_ok() {
+            let complete = self.coverage.finish();
+            if capture::armed() && !a1.is_null() {
+                capture::on_finish_list(self.id, unsafe { *a1 }, complete);
+            }
         }
         hr
     }
