@@ -298,6 +298,10 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
     out.push_str("    unsafe fn AddRef(&self) -> u32;\n");
     out.push_str("    unsafe fn Release(&self) -> u32;\n");
     let mut thunks = String::new();
+    let mut real = String::from(
+        "/// Each method called on the real (wrapped) object: the trait's defaults, and overrides that still want the\n\
+         /// real behaviour.\npub mod real {\n    use core::ffi::c_void;\n\n",
+    );
     for (depth, (_, v)) in levels.iter().enumerate() {
         let path = "base__.".repeat(levels.len() - 1 - depth);
         for e in &v.entries {
@@ -305,11 +309,19 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
             let params: Vec<String> = e.params.iter().enumerate().map(|(i, t)| format!("a{i}: {t}")).collect();
             let args: Vec<String> = (0..e.params.len()).map(|i| format!("a{i}")).collect();
             let ret = e.ret.as_ref().map(|r| format!(" -> {r}")).unwrap_or_default();
+            let comma = if params.is_empty() { "" } else { ", " };
             writeln!(
                 out,
-                "    unsafe fn {name}(&self{comma}{params}){ret} {{\n        unsafe {{ ((*(*(self.inner() as *const *const {top}))).{path}{name})(self.inner(){comma}{args}) }}\n    }}",
+                "    unsafe fn {name}(&self{comma}{params}){ret} {{\n        unsafe {{ real::{name}(self.inner(){comma}{args}) }}\n    }}",
                 name = e.name,
-                comma = if params.is_empty() { "" } else { ", " },
+                params = params.join(", "),
+                args = args.join(", "),
+            )
+            .unwrap();
+            writeln!(
+                real,
+                "    /// `{name}` on the real object.\n    pub unsafe fn {name}(inner: *mut c_void{comma}{params}){ret} {{\n        unsafe {{ ((*(*(inner as *const *const {top}))).{path}{name})(inner{comma}{args}) }}\n    }}",
+                name = e.name,
                 params = params.join(", "),
                 args = args.join(", "),
             )
@@ -327,6 +339,8 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
         }
     }
     out.push_str("}\n\n");
+    real.push_str("}\n\n");
+    out.push_str(&real);
     for (name, ret) in [
         ("QueryInterface", "iid: *const windows::core::GUID, out: *mut *mut c_void) -> windows::core::HRESULT"),
         ("AddRef", ") -> u32"),

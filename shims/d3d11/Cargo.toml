@@ -11,3 +11,6 @@ publish = false
 [lib]
 name = "d3d11"
 crate-type = ["cdylib"]
+
+[build-dependencies]
+find-msvc-tools = "0.1"

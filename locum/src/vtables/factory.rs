@@ -30,36 +30,14 @@ pub unsafe trait FactoryMethods: Sized {
         a1: u32,
         a2: *const core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .SetPrivateData)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::SetPrivateData(self.inner(), a0, a1, a2) }
     }
     unsafe fn SetPrivateDataInterface(
         &self,
         a0: *const windows::core::GUID,
         a1: *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .SetPrivateDataInterface)(self.inner(), a0, a1)
-        }
+        unsafe { real::SetPrivateDataInterface(self.inner(), a0, a1) }
     }
     unsafe fn GetPrivateData(
         &self,
@@ -67,82 +45,30 @@ pub unsafe trait FactoryMethods: Sized {
         a1: *mut u32,
         a2: *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetPrivateData)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GetPrivateData(self.inner(), a0, a1, a2) }
     }
     unsafe fn GetParent(
         &self,
         a0: *const windows::core::GUID,
         a1: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetParent)(self.inner(), a0, a1)
-        }
+        unsafe { real::GetParent(self.inner(), a0, a1) }
     }
     unsafe fn EnumAdapters(&self, a0: u32, a1: *mut *mut core::ffi::c_void) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .EnumAdapters)(self.inner(), a0, a1)
-        }
+        unsafe { real::EnumAdapters(self.inner(), a0, a1) }
     }
     unsafe fn MakeWindowAssociation(
         &self,
         a0: windows::Win32::Foundation::HWND,
         a1: windows::Win32::Graphics::Dxgi::DXGI_MWA_FLAGS,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .MakeWindowAssociation)(self.inner(), a0, a1)
-        }
+        unsafe { real::MakeWindowAssociation(self.inner(), a0, a1) }
     }
     unsafe fn GetWindowAssociation(
         &self,
         a0: *mut windows::Win32::Foundation::HWND,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetWindowAssociation)(self.inner(), a0)
-        }
+        unsafe { real::GetWindowAssociation(self.inner(), a0) }
     }
     unsafe fn CreateSwapChain(
         &self,
@@ -150,69 +76,23 @@ pub unsafe trait FactoryMethods: Sized {
         a1: *const windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC,
         a2: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .CreateSwapChain)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CreateSwapChain(self.inner(), a0, a1, a2) }
     }
     unsafe fn CreateSoftwareAdapter(
         &self,
         a0: windows::Win32::Foundation::HMODULE,
         a1: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .CreateSoftwareAdapter)(self.inner(), a0, a1)
-        }
+        unsafe { real::CreateSoftwareAdapter(self.inner(), a0, a1) }
     }
     unsafe fn EnumAdapters1(&self, a0: u32, a1: *mut *mut core::ffi::c_void) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .EnumAdapters1)(self.inner(), a0, a1)
-        }
+        unsafe { real::EnumAdapters1(self.inner(), a0, a1) }
     }
     unsafe fn IsCurrent(&self) -> windows::core::BOOL {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .IsCurrent)(self.inner())
-        }
+        unsafe { real::IsCurrent(self.inner()) }
     }
     unsafe fn IsWindowedStereoEnabled(&self) -> windows::core::BOOL {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .IsWindowedStereoEnabled)(self.inner())
-        }
+        unsafe { real::IsWindowedStereoEnabled(self.inner()) }
     }
     unsafe fn CreateSwapChainForHwnd(
         &self,
@@ -223,15 +103,7 @@ pub unsafe trait FactoryMethods: Sized {
         a4: *mut core::ffi::c_void,
         a5: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .CreateSwapChainForHwnd)(self.inner(), a0, a1, a2, a3, a4, a5)
-        }
+        unsafe { real::CreateSwapChainForHwnd(self.inner(), a0, a1, a2, a3, a4, a5) }
     }
     unsafe fn CreateSwapChainForCoreWindow(
         &self,
@@ -241,30 +113,14 @@ pub unsafe trait FactoryMethods: Sized {
         a3: *mut core::ffi::c_void,
         a4: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .CreateSwapChainForCoreWindow)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::CreateSwapChainForCoreWindow(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn GetSharedResourceAdapterLuid(
         &self,
         a0: windows::Win32::Foundation::HANDLE,
         a1: *mut windows::Win32::Foundation::LUID,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetSharedResourceAdapterLuid)(self.inner(), a0, a1)
-        }
+        unsafe { real::GetSharedResourceAdapterLuid(self.inner(), a0, a1) }
     }
     unsafe fn RegisterStereoStatusWindow(
         &self,
@@ -272,41 +128,17 @@ pub unsafe trait FactoryMethods: Sized {
         a1: u32,
         a2: *mut u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .RegisterStereoStatusWindow)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::RegisterStereoStatusWindow(self.inner(), a0, a1, a2) }
     }
     unsafe fn RegisterStereoStatusEvent(
         &self,
         a0: windows::Win32::Foundation::HANDLE,
         a1: *mut u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .RegisterStereoStatusEvent)(self.inner(), a0, a1)
-        }
+        unsafe { real::RegisterStereoStatusEvent(self.inner(), a0, a1) }
     }
     unsafe fn UnregisterStereoStatus(&self, a0: u32) {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .UnregisterStereoStatus)(self.inner(), a0)
-        }
+        unsafe { real::UnregisterStereoStatus(self.inner(), a0) }
     }
     unsafe fn RegisterOcclusionStatusWindow(
         &self,
@@ -314,41 +146,17 @@ pub unsafe trait FactoryMethods: Sized {
         a1: u32,
         a2: *mut u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .RegisterOcclusionStatusWindow)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::RegisterOcclusionStatusWindow(self.inner(), a0, a1, a2) }
     }
     unsafe fn RegisterOcclusionStatusEvent(
         &self,
         a0: windows::Win32::Foundation::HANDLE,
         a1: *mut u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .RegisterOcclusionStatusEvent)(self.inner(), a0, a1)
-        }
+        unsafe { real::RegisterOcclusionStatusEvent(self.inner(), a0, a1) }
     }
     unsafe fn UnregisterOcclusionStatus(&self, a0: u32) {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .UnregisterOcclusionStatus)(self.inner(), a0)
-        }
+        unsafe { real::UnregisterOcclusionStatus(self.inner(), a0) }
     }
     unsafe fn CreateSwapChainForComposition(
         &self,
@@ -357,25 +165,10 @@ pub unsafe trait FactoryMethods: Sized {
         a2: *mut core::ffi::c_void,
         a3: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .CreateSwapChainForComposition)(self.inner(), a0, a1, a2, a3)
-        }
+        unsafe { real::CreateSwapChainForComposition(self.inner(), a0, a1, a2, a3) }
     }
     unsafe fn GetCreationFlags(&self) -> windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetCreationFlags)(self.inner())
-        }
+        unsafe { real::GetCreationFlags(self.inner()) }
     }
     unsafe fn EnumAdapterByLuid(
         &self,
@@ -383,26 +176,14 @@ pub unsafe trait FactoryMethods: Sized {
         a1: *const windows::core::GUID,
         a2: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .EnumAdapterByLuid)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::EnumAdapterByLuid(self.inner(), a0, a1, a2) }
     }
     unsafe fn EnumWarpAdapter(
         &self,
         a0: *const windows::core::GUID,
         a1: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .EnumWarpAdapter)(self.inner(), a0, a1)
-        }
+        unsafe { real::EnumWarpAdapter(self.inner(), a0, a1) }
     }
     unsafe fn CheckFeatureSupport(
         &self,
@@ -410,12 +191,7 @@ pub unsafe trait FactoryMethods: Sized {
         a1: *mut core::ffi::c_void,
         a2: u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .base__
-                .CheckFeatureSupport)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CheckFeatureSupport(self.inner(), a0, a1, a2) }
     }
     unsafe fn EnumAdapterByGpuPreference(
         &self,
@@ -424,26 +200,484 @@ pub unsafe trait FactoryMethods: Sized {
         a2: *const windows::core::GUID,
         a3: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .base__
-                .EnumAdapterByGpuPreference)(self.inner(), a0, a1, a2, a3)
-        }
+        unsafe { real::EnumAdapterByGpuPreference(self.inner(), a0, a1, a2, a3) }
     }
     unsafe fn RegisterAdaptersChangedEvent(
         &self,
         a0: windows::Win32::Foundation::HANDLE,
         a1: *mut u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .RegisterAdaptersChangedEvent)(self.inner(), a0, a1)
-        }
+        unsafe { real::RegisterAdaptersChangedEvent(self.inner(), a0, a1) }
     }
     unsafe fn UnregisterAdaptersChangedEvent(&self, a0: u32) -> windows::core::HRESULT {
+        unsafe { real::UnregisterAdaptersChangedEvent(self.inner(), a0) }
+    }
+}
+
+/// Each method called on the real (wrapped) object: the trait's defaults, and overrides that still want the
+/// real behaviour.
+pub mod real {
+    use core::ffi::c_void;
+
+    /// `SetPrivateData` on the real object.
+    pub unsafe fn SetPrivateData(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: u32,
+        a2: *const core::ffi::c_void,
+    ) -> windows::core::HRESULT {
         unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
-                .UnregisterAdaptersChangedEvent)(self.inner(), a0)
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .SetPrivateData)(inner, a0, a1, a2)
+        }
+    }
+    /// `SetPrivateDataInterface` on the real object.
+    pub unsafe fn SetPrivateDataInterface(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .SetPrivateDataInterface)(inner, a0, a1)
+        }
+    }
+    /// `GetPrivateData` on the real object.
+    pub unsafe fn GetPrivateData(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut u32,
+        a2: *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetPrivateData)(inner, a0, a1, a2)
+        }
+    }
+    /// `GetParent` on the real object.
+    pub unsafe fn GetParent(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetParent)(inner, a0, a1)
+        }
+    }
+    /// `EnumAdapters` on the real object.
+    pub unsafe fn EnumAdapters(
+        inner: *mut c_void,
+        a0: u32,
+        a1: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .EnumAdapters)(inner, a0, a1)
+        }
+    }
+    /// `MakeWindowAssociation` on the real object.
+    pub unsafe fn MakeWindowAssociation(
+        inner: *mut c_void,
+        a0: windows::Win32::Foundation::HWND,
+        a1: windows::Win32::Graphics::Dxgi::DXGI_MWA_FLAGS,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .MakeWindowAssociation)(inner, a0, a1)
+        }
+    }
+    /// `GetWindowAssociation` on the real object.
+    pub unsafe fn GetWindowAssociation(
+        inner: *mut c_void,
+        a0: *mut windows::Win32::Foundation::HWND,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetWindowAssociation)(inner, a0)
+        }
+    }
+    /// `CreateSwapChain` on the real object.
+    pub unsafe fn CreateSwapChain(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC,
+        a2: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .CreateSwapChain)(inner, a0, a1, a2)
+        }
+    }
+    /// `CreateSoftwareAdapter` on the real object.
+    pub unsafe fn CreateSoftwareAdapter(
+        inner: *mut c_void,
+        a0: windows::Win32::Foundation::HMODULE,
+        a1: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .CreateSoftwareAdapter)(inner, a0, a1)
+        }
+    }
+    /// `EnumAdapters1` on the real object.
+    pub unsafe fn EnumAdapters1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .EnumAdapters1)(inner, a0, a1)
+        }
+    }
+    /// `IsCurrent` on the real object.
+    pub unsafe fn IsCurrent(inner: *mut c_void) -> windows::core::BOOL {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .IsCurrent)(inner)
+        }
+    }
+    /// `IsWindowedStereoEnabled` on the real object.
+    pub unsafe fn IsWindowedStereoEnabled(inner: *mut c_void) -> windows::core::BOOL {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .IsWindowedStereoEnabled)(inner)
+        }
+    }
+    /// `CreateSwapChainForHwnd` on the real object.
+    pub unsafe fn CreateSwapChainForHwnd(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: windows::Win32::Foundation::HWND,
+        a2: *const windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1,
+        a3: *const windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FULLSCREEN_DESC,
+        a4: *mut core::ffi::c_void,
+        a5: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .CreateSwapChainForHwnd)(inner, a0, a1, a2, a3, a4, a5)
+        }
+    }
+    /// `CreateSwapChainForCoreWindow` on the real object.
+    pub unsafe fn CreateSwapChainForCoreWindow(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *mut core::ffi::c_void,
+        a2: *const windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1,
+        a3: *mut core::ffi::c_void,
+        a4: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .CreateSwapChainForCoreWindow)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `GetSharedResourceAdapterLuid` on the real object.
+    pub unsafe fn GetSharedResourceAdapterLuid(
+        inner: *mut c_void,
+        a0: windows::Win32::Foundation::HANDLE,
+        a1: *mut windows::Win32::Foundation::LUID,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetSharedResourceAdapterLuid)(inner, a0, a1)
+        }
+    }
+    /// `RegisterStereoStatusWindow` on the real object.
+    pub unsafe fn RegisterStereoStatusWindow(
+        inner: *mut c_void,
+        a0: windows::Win32::Foundation::HWND,
+        a1: u32,
+        a2: *mut u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .RegisterStereoStatusWindow)(inner, a0, a1, a2)
+        }
+    }
+    /// `RegisterStereoStatusEvent` on the real object.
+    pub unsafe fn RegisterStereoStatusEvent(
+        inner: *mut c_void,
+        a0: windows::Win32::Foundation::HANDLE,
+        a1: *mut u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .RegisterStereoStatusEvent)(inner, a0, a1)
+        }
+    }
+    /// `UnregisterStereoStatus` on the real object.
+    pub unsafe fn UnregisterStereoStatus(inner: *mut c_void, a0: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .UnregisterStereoStatus)(inner, a0)
+        }
+    }
+    /// `RegisterOcclusionStatusWindow` on the real object.
+    pub unsafe fn RegisterOcclusionStatusWindow(
+        inner: *mut c_void,
+        a0: windows::Win32::Foundation::HWND,
+        a1: u32,
+        a2: *mut u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .RegisterOcclusionStatusWindow)(inner, a0, a1, a2)
+        }
+    }
+    /// `RegisterOcclusionStatusEvent` on the real object.
+    pub unsafe fn RegisterOcclusionStatusEvent(
+        inner: *mut c_void,
+        a0: windows::Win32::Foundation::HANDLE,
+        a1: *mut u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .RegisterOcclusionStatusEvent)(inner, a0, a1)
+        }
+    }
+    /// `UnregisterOcclusionStatus` on the real object.
+    pub unsafe fn UnregisterOcclusionStatus(inner: *mut c_void, a0: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .UnregisterOcclusionStatus)(inner, a0)
+        }
+    }
+    /// `CreateSwapChainForComposition` on the real object.
+    pub unsafe fn CreateSwapChainForComposition(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1,
+        a2: *mut core::ffi::c_void,
+        a3: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .CreateSwapChainForComposition)(inner, a0, a1, a2, a3)
+        }
+    }
+    /// `GetCreationFlags` on the real object.
+    pub unsafe fn GetCreationFlags(
+        inner: *mut c_void,
+    ) -> windows::Win32::Graphics::Dxgi::DXGI_CREATE_FACTORY_FLAGS {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetCreationFlags)(inner)
+        }
+    }
+    /// `EnumAdapterByLuid` on the real object.
+    pub unsafe fn EnumAdapterByLuid(
+        inner: *mut c_void,
+        a0: windows::Win32::Foundation::LUID,
+        a1: *const windows::core::GUID,
+        a2: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .EnumAdapterByLuid)(inner, a0, a1, a2)
+        }
+    }
+    /// `EnumWarpAdapter` on the real object.
+    pub unsafe fn EnumWarpAdapter(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .EnumWarpAdapter)(inner, a0, a1)
+        }
+    }
+    /// `CheckFeatureSupport` on the real object.
+    pub unsafe fn CheckFeatureSupport(
+        inner: *mut c_void,
+        a0: windows::Win32::Graphics::Dxgi::DXGI_FEATURE,
+        a1: *mut core::ffi::c_void,
+        a2: u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .base__
+                .CheckFeatureSupport)(inner, a0, a1, a2)
+        }
+    }
+    /// `EnumAdapterByGpuPreference` on the real object.
+    pub unsafe fn EnumAdapterByGpuPreference(
+        inner: *mut c_void,
+        a0: u32,
+        a1: windows::Win32::Graphics::Dxgi::DXGI_GPU_PREFERENCE,
+        a2: *const windows::core::GUID,
+        a3: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .base__
+                .EnumAdapterByGpuPreference)(inner, a0, a1, a2, a3)
+        }
+    }
+    /// `RegisterAdaptersChangedEvent` on the real object.
+    pub unsafe fn RegisterAdaptersChangedEvent(
+        inner: *mut c_void,
+        a0: windows::Win32::Foundation::HANDLE,
+        a1: *mut u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .RegisterAdaptersChangedEvent)(inner, a0, a1)
+        }
+    }
+    /// `UnregisterAdaptersChangedEvent` on the real object.
+    pub unsafe fn UnregisterAdaptersChangedEvent(inner: *mut c_void, a0: u32) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGIFactory7_Vtbl)))
+                .UnregisterAdaptersChangedEvent)(inner, a0)
         }
     }
 }

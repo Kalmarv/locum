@@ -30,32 +30,14 @@ pub unsafe trait SwapChainMethods: Sized {
         a1: u32,
         a2: *const core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .SetPrivateData)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::SetPrivateData(self.inner(), a0, a1, a2) }
     }
     unsafe fn SetPrivateDataInterface(
         &self,
         a0: *const windows::core::GUID,
         a1: *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .SetPrivateDataInterface)(self.inner(), a0, a1)
-        }
+        unsafe { real::SetPrivateDataInterface(self.inner(), a0, a1) }
     }
     unsafe fn GetPrivateData(
         &self,
@@ -63,61 +45,28 @@ pub unsafe trait SwapChainMethods: Sized {
         a1: *mut u32,
         a2: *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetPrivateData)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GetPrivateData(self.inner(), a0, a1, a2) }
     }
     unsafe fn GetParent(
         &self,
         a0: *const windows::core::GUID,
         a1: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetParent)(self.inner(), a0, a1)
-        }
+        unsafe { real::GetParent(self.inner(), a0, a1) }
     }
     unsafe fn GetDevice(
         &self,
         a0: *const windows::core::GUID,
         a1: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetDevice)(self.inner(), a0, a1)
-        }
+        unsafe { real::GetDevice(self.inner(), a0, a1) }
     }
     unsafe fn Present(
         &self,
         a0: u32,
         a1: windows::Win32::Graphics::Dxgi::DXGI_PRESENT,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .Present)(self.inner(), a0, a1)
-        }
+        unsafe { real::Present(self.inner(), a0, a1) }
     }
     unsafe fn GetBuffer(
         &self,
@@ -125,55 +74,27 @@ pub unsafe trait SwapChainMethods: Sized {
         a1: *const windows::core::GUID,
         a2: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetBuffer)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GetBuffer(self.inner(), a0, a1, a2) }
     }
     unsafe fn SetFullscreenState(
         &self,
         a0: windows::core::BOOL,
         a1: *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .SetFullscreenState)(self.inner(), a0, a1)
-        }
+        unsafe { real::SetFullscreenState(self.inner(), a0, a1) }
     }
     unsafe fn GetFullscreenState(
         &self,
         a0: *mut windows::core::BOOL,
         a1: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetFullscreenState)(self.inner(), a0, a1)
-        }
+        unsafe { real::GetFullscreenState(self.inner(), a0, a1) }
     }
     unsafe fn GetDesc(
         &self,
         a0: *mut windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetDesc)(self.inner(), a0)
-        }
+        unsafe { real::GetDesc(self.inner(), a0) }
     }
     unsafe fn ResizeBuffers(
         &self,
@@ -183,106 +104,47 @@ pub unsafe trait SwapChainMethods: Sized {
         a3: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
         a4: u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .ResizeBuffers)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::ResizeBuffers(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn ResizeTarget(
         &self,
         a0: *const windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_DESC,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .ResizeTarget)(self.inner(), a0)
-        }
+        unsafe { real::ResizeTarget(self.inner(), a0) }
     }
     unsafe fn GetContainingOutput(&self, a0: *mut *mut core::ffi::c_void) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetContainingOutput)(self.inner(), a0)
-        }
+        unsafe { real::GetContainingOutput(self.inner(), a0) }
     }
     unsafe fn GetFrameStatistics(
         &self,
         a0: *mut windows::Win32::Graphics::Dxgi::DXGI_FRAME_STATISTICS,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetFrameStatistics)(self.inner(), a0)
-        }
+        unsafe { real::GetFrameStatistics(self.inner(), a0) }
     }
     unsafe fn GetLastPresentCount(&self, a0: *mut u32) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetLastPresentCount)(self.inner(), a0)
-        }
+        unsafe { real::GetLastPresentCount(self.inner(), a0) }
     }
     unsafe fn GetDesc1(
         &self,
         a0: *mut windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .GetDesc1)(self.inner(), a0)
-        }
+        unsafe { real::GetDesc1(self.inner(), a0) }
     }
     unsafe fn GetFullscreenDesc(
         &self,
         a0: *mut windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FULLSCREEN_DESC,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .GetFullscreenDesc)(self.inner(), a0)
-        }
+        unsafe { real::GetFullscreenDesc(self.inner(), a0) }
     }
     unsafe fn GetHwnd(&self, a0: *mut windows::Win32::Foundation::HWND) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .GetHwnd)(self.inner(), a0)
-        }
+        unsafe { real::GetHwnd(self.inner(), a0) }
     }
     unsafe fn GetCoreWindow(
         &self,
         a0: *const windows::core::GUID,
         a1: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .GetCoreWindow)(self.inner(), a0, a1)
-        }
+        unsafe { real::GetCoreWindow(self.inner(), a0, a1) }
     }
     unsafe fn Present1(
         &self,
@@ -290,169 +152,80 @@ pub unsafe trait SwapChainMethods: Sized {
         a1: windows::Win32::Graphics::Dxgi::DXGI_PRESENT,
         a2: *const windows::Win32::Graphics::Dxgi::DXGI_PRESENT_PARAMETERS,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .Present1)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::Present1(self.inner(), a0, a1, a2) }
     }
     unsafe fn IsTemporaryMonoSupported(&self) -> windows::core::BOOL {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .IsTemporaryMonoSupported)(self.inner())
-        }
+        unsafe { real::IsTemporaryMonoSupported(self.inner()) }
     }
     unsafe fn GetRestrictToOutput(&self, a0: *mut *mut core::ffi::c_void) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .GetRestrictToOutput)(self.inner(), a0)
-        }
+        unsafe { real::GetRestrictToOutput(self.inner(), a0) }
     }
     unsafe fn SetBackgroundColor(
         &self,
         a0: *const windows::Win32::Graphics::Dxgi::DXGI_RGBA,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .SetBackgroundColor)(self.inner(), a0)
-        }
+        unsafe { real::SetBackgroundColor(self.inner(), a0) }
     }
     unsafe fn GetBackgroundColor(
         &self,
         a0: *mut windows::Win32::Graphics::Dxgi::DXGI_RGBA,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .GetBackgroundColor)(self.inner(), a0)
-        }
+        unsafe { real::GetBackgroundColor(self.inner(), a0) }
     }
     unsafe fn SetRotation(
         &self,
         a0: windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .SetRotation)(self.inner(), a0)
-        }
+        unsafe { real::SetRotation(self.inner(), a0) }
     }
     unsafe fn GetRotation(
         &self,
         a0: *mut windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .GetRotation)(self.inner(), a0)
-        }
+        unsafe { real::GetRotation(self.inner(), a0) }
     }
     unsafe fn SetSourceSize(&self, a0: u32, a1: u32) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .SetSourceSize)(self.inner(), a0, a1)
-        }
+        unsafe { real::SetSourceSize(self.inner(), a0, a1) }
     }
     unsafe fn GetSourceSize(&self, a0: *mut u32, a1: *mut u32) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .GetSourceSize)(self.inner(), a0, a1)
-        }
+        unsafe { real::GetSourceSize(self.inner(), a0, a1) }
     }
     unsafe fn SetMaximumFrameLatency(&self, a0: u32) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .SetMaximumFrameLatency)(self.inner(), a0)
-        }
+        unsafe { real::SetMaximumFrameLatency(self.inner(), a0) }
     }
     unsafe fn GetMaximumFrameLatency(&self, a0: *mut u32) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .GetMaximumFrameLatency)(self.inner(), a0)
-        }
+        unsafe { real::GetMaximumFrameLatency(self.inner(), a0) }
     }
     unsafe fn GetFrameLatencyWaitableObject(&self) -> windows::Win32::Foundation::HANDLE {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .GetFrameLatencyWaitableObject)(self.inner())
-        }
+        unsafe { real::GetFrameLatencyWaitableObject(self.inner()) }
     }
     unsafe fn SetMatrixTransform(
         &self,
         a0: *const windows::Win32::Graphics::Dxgi::DXGI_MATRIX_3X2_F,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .SetMatrixTransform)(self.inner(), a0)
-        }
+        unsafe { real::SetMatrixTransform(self.inner(), a0) }
     }
     unsafe fn GetMatrixTransform(
         &self,
         a0: *mut windows::Win32::Graphics::Dxgi::DXGI_MATRIX_3X2_F,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .base__
-                .GetMatrixTransform)(self.inner(), a0)
-        }
+        unsafe { real::GetMatrixTransform(self.inner(), a0) }
     }
     unsafe fn GetCurrentBackBufferIndex(&self) -> u32 {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .GetCurrentBackBufferIndex)(self.inner())
-        }
+        unsafe { real::GetCurrentBackBufferIndex(self.inner()) }
     }
     unsafe fn CheckColorSpaceSupport(
         &self,
         a0: windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_TYPE,
         a1: *mut u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .CheckColorSpaceSupport)(self.inner(), a0, a1)
-        }
+        unsafe { real::CheckColorSpaceSupport(self.inner(), a0, a1) }
     }
     unsafe fn SetColorSpace1(
         &self,
         a0: windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_TYPE,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .SetColorSpace1)(self.inner(), a0)
-        }
+        unsafe { real::SetColorSpace1(self.inner(), a0) }
     }
     unsafe fn ResizeBuffers1(
         &self,
@@ -464,11 +237,7 @@ pub unsafe trait SwapChainMethods: Sized {
         a5: *const u32,
         a6: *const *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .base__
-                .ResizeBuffers1)(self.inner(), a0, a1, a2, a3, a4, a5, a6)
-        }
+        unsafe { real::ResizeBuffers1(self.inner(), a0, a1, a2, a3, a4, a5, a6) }
     }
     unsafe fn SetHDRMetaData(
         &self,
@@ -476,9 +245,517 @@ pub unsafe trait SwapChainMethods: Sized {
         a1: u32,
         a2: *const core::ffi::c_void,
     ) -> windows::core::HRESULT {
+        unsafe { real::SetHDRMetaData(self.inner(), a0, a1, a2) }
+    }
+}
+
+/// Each method called on the real (wrapped) object: the trait's defaults, and overrides that still want the
+/// real behaviour.
+pub mod real {
+    use core::ffi::c_void;
+
+    /// `SetPrivateData` on the real object.
+    pub unsafe fn SetPrivateData(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: u32,
+        a2: *const core::ffi::c_void,
+    ) -> windows::core::HRESULT {
         unsafe {
-            ((*(*(self.inner() as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
-                .SetHDRMetaData)(self.inner(), a0, a1, a2)
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .SetPrivateData)(inner, a0, a1, a2)
+        }
+    }
+    /// `SetPrivateDataInterface` on the real object.
+    pub unsafe fn SetPrivateDataInterface(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .SetPrivateDataInterface)(inner, a0, a1)
+        }
+    }
+    /// `GetPrivateData` on the real object.
+    pub unsafe fn GetPrivateData(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut u32,
+        a2: *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetPrivateData)(inner, a0, a1, a2)
+        }
+    }
+    /// `GetParent` on the real object.
+    pub unsafe fn GetParent(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetParent)(inner, a0, a1)
+        }
+    }
+    /// `GetDevice` on the real object.
+    pub unsafe fn GetDevice(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetDevice)(inner, a0, a1)
+        }
+    }
+    /// `Present` on the real object.
+    pub unsafe fn Present(
+        inner: *mut c_void,
+        a0: u32,
+        a1: windows::Win32::Graphics::Dxgi::DXGI_PRESENT,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .Present)(inner, a0, a1)
+        }
+    }
+    /// `GetBuffer` on the real object.
+    pub unsafe fn GetBuffer(
+        inner: *mut c_void,
+        a0: u32,
+        a1: *const windows::core::GUID,
+        a2: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetBuffer)(inner, a0, a1, a2)
+        }
+    }
+    /// `SetFullscreenState` on the real object.
+    pub unsafe fn SetFullscreenState(
+        inner: *mut c_void,
+        a0: windows::core::BOOL,
+        a1: *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .SetFullscreenState)(inner, a0, a1)
+        }
+    }
+    /// `GetFullscreenState` on the real object.
+    pub unsafe fn GetFullscreenState(
+        inner: *mut c_void,
+        a0: *mut windows::core::BOOL,
+        a1: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetFullscreenState)(inner, a0, a1)
+        }
+    }
+    /// `GetDesc` on the real object.
+    pub unsafe fn GetDesc(
+        inner: *mut c_void,
+        a0: *mut windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetDesc)(inner, a0)
+        }
+    }
+    /// `ResizeBuffers` on the real object.
+    pub unsafe fn ResizeBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: u32,
+        a3: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        a4: u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .ResizeBuffers)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `ResizeTarget` on the real object.
+    pub unsafe fn ResizeTarget(
+        inner: *mut c_void,
+        a0: *const windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_DESC,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .ResizeTarget)(inner, a0)
+        }
+    }
+    /// `GetContainingOutput` on the real object.
+    pub unsafe fn GetContainingOutput(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetContainingOutput)(inner, a0)
+        }
+    }
+    /// `GetFrameStatistics` on the real object.
+    pub unsafe fn GetFrameStatistics(
+        inner: *mut c_void,
+        a0: *mut windows::Win32::Graphics::Dxgi::DXGI_FRAME_STATISTICS,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetFrameStatistics)(inner, a0)
+        }
+    }
+    /// `GetLastPresentCount` on the real object.
+    pub unsafe fn GetLastPresentCount(inner: *mut c_void, a0: *mut u32) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetLastPresentCount)(inner, a0)
+        }
+    }
+    /// `GetDesc1` on the real object.
+    pub unsafe fn GetDesc1(
+        inner: *mut c_void,
+        a0: *mut windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_DESC1,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .GetDesc1)(inner, a0)
+        }
+    }
+    /// `GetFullscreenDesc` on the real object.
+    pub unsafe fn GetFullscreenDesc(
+        inner: *mut c_void,
+        a0: *mut windows::Win32::Graphics::Dxgi::DXGI_SWAP_CHAIN_FULLSCREEN_DESC,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .GetFullscreenDesc)(inner, a0)
+        }
+    }
+    /// `GetHwnd` on the real object.
+    pub unsafe fn GetHwnd(
+        inner: *mut c_void,
+        a0: *mut windows::Win32::Foundation::HWND,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .GetHwnd)(inner, a0)
+        }
+    }
+    /// `GetCoreWindow` on the real object.
+    pub unsafe fn GetCoreWindow(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .GetCoreWindow)(inner, a0, a1)
+        }
+    }
+    /// `Present1` on the real object.
+    pub unsafe fn Present1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: windows::Win32::Graphics::Dxgi::DXGI_PRESENT,
+        a2: *const windows::Win32::Graphics::Dxgi::DXGI_PRESENT_PARAMETERS,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .Present1)(inner, a0, a1, a2)
+        }
+    }
+    /// `IsTemporaryMonoSupported` on the real object.
+    pub unsafe fn IsTemporaryMonoSupported(inner: *mut c_void) -> windows::core::BOOL {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .IsTemporaryMonoSupported)(inner)
+        }
+    }
+    /// `GetRestrictToOutput` on the real object.
+    pub unsafe fn GetRestrictToOutput(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .GetRestrictToOutput)(inner, a0)
+        }
+    }
+    /// `SetBackgroundColor` on the real object.
+    pub unsafe fn SetBackgroundColor(
+        inner: *mut c_void,
+        a0: *const windows::Win32::Graphics::Dxgi::DXGI_RGBA,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .SetBackgroundColor)(inner, a0)
+        }
+    }
+    /// `GetBackgroundColor` on the real object.
+    pub unsafe fn GetBackgroundColor(
+        inner: *mut c_void,
+        a0: *mut windows::Win32::Graphics::Dxgi::DXGI_RGBA,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .GetBackgroundColor)(inner, a0)
+        }
+    }
+    /// `SetRotation` on the real object.
+    pub unsafe fn SetRotation(
+        inner: *mut c_void,
+        a0: windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .SetRotation)(inner, a0)
+        }
+    }
+    /// `GetRotation` on the real object.
+    pub unsafe fn GetRotation(
+        inner: *mut c_void,
+        a0: *mut windows::Win32::Graphics::Dxgi::Common::DXGI_MODE_ROTATION,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .GetRotation)(inner, a0)
+        }
+    }
+    /// `SetSourceSize` on the real object.
+    pub unsafe fn SetSourceSize(inner: *mut c_void, a0: u32, a1: u32) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .SetSourceSize)(inner, a0, a1)
+        }
+    }
+    /// `GetSourceSize` on the real object.
+    pub unsafe fn GetSourceSize(inner: *mut c_void, a0: *mut u32, a1: *mut u32) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .GetSourceSize)(inner, a0, a1)
+        }
+    }
+    /// `SetMaximumFrameLatency` on the real object.
+    pub unsafe fn SetMaximumFrameLatency(inner: *mut c_void, a0: u32) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .SetMaximumFrameLatency)(inner, a0)
+        }
+    }
+    /// `GetMaximumFrameLatency` on the real object.
+    pub unsafe fn GetMaximumFrameLatency(inner: *mut c_void, a0: *mut u32) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .GetMaximumFrameLatency)(inner, a0)
+        }
+    }
+    /// `GetFrameLatencyWaitableObject` on the real object.
+    pub unsafe fn GetFrameLatencyWaitableObject(inner: *mut c_void) -> windows::Win32::Foundation::HANDLE {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .GetFrameLatencyWaitableObject)(inner)
+        }
+    }
+    /// `SetMatrixTransform` on the real object.
+    pub unsafe fn SetMatrixTransform(
+        inner: *mut c_void,
+        a0: *const windows::Win32::Graphics::Dxgi::DXGI_MATRIX_3X2_F,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .SetMatrixTransform)(inner, a0)
+        }
+    }
+    /// `GetMatrixTransform` on the real object.
+    pub unsafe fn GetMatrixTransform(
+        inner: *mut c_void,
+        a0: *mut windows::Win32::Graphics::Dxgi::DXGI_MATRIX_3X2_F,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .base__
+                .GetMatrixTransform)(inner, a0)
+        }
+    }
+    /// `GetCurrentBackBufferIndex` on the real object.
+    pub unsafe fn GetCurrentBackBufferIndex(inner: *mut c_void) -> u32 {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .GetCurrentBackBufferIndex)(inner)
+        }
+    }
+    /// `CheckColorSpaceSupport` on the real object.
+    pub unsafe fn CheckColorSpaceSupport(
+        inner: *mut c_void,
+        a0: windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_TYPE,
+        a1: *mut u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .CheckColorSpaceSupport)(inner, a0, a1)
+        }
+    }
+    /// `SetColorSpace1` on the real object.
+    pub unsafe fn SetColorSpace1(
+        inner: *mut c_void,
+        a0: windows::Win32::Graphics::Dxgi::Common::DXGI_COLOR_SPACE_TYPE,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .SetColorSpace1)(inner, a0)
+        }
+    }
+    /// `ResizeBuffers1` on the real object.
+    pub unsafe fn ResizeBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: u32,
+        a3: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        a4: u32,
+        a5: *const u32,
+        a6: *const *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .base__
+                .ResizeBuffers1)(inner, a0, a1, a2, a3, a4, a5, a6)
+        }
+    }
+    /// `SetHDRMetaData` on the real object.
+    pub unsafe fn SetHDRMetaData(
+        inner: *mut c_void,
+        a0: windows::Win32::Graphics::Dxgi::DXGI_HDR_METADATA_TYPE,
+        a1: u32,
+        a2: *const core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Dxgi::IDXGISwapChain4_Vtbl)))
+                .SetHDRMetaData)(inner, a0, a1, a2)
         }
     }
 }

@@ -11,3 +11,6 @@ publish = false
 [lib]
 name = "dxgi"
 crate-type = ["cdylib"]
+
+[build-dependencies]
+find-msvc-tools = "0.1"

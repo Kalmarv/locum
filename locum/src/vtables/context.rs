@@ -25,16 +25,7 @@ pub unsafe trait ContextMethods: Sized {
     unsafe fn AddRef(&self) -> u32;
     unsafe fn Release(&self) -> u32;
     unsafe fn GetDevice(&self, a0: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetDevice)(self.inner(), a0)
-        }
+        unsafe { real::GetDevice(self.inner(), a0) }
     }
     unsafe fn GetPrivateData(
         &self,
@@ -42,16 +33,7 @@ pub unsafe trait ContextMethods: Sized {
         a1: *mut u32,
         a2: *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetPrivateData)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GetPrivateData(self.inner(), a0, a1, a2) }
     }
     unsafe fn SetPrivateData(
         &self,
@@ -59,109 +41,35 @@ pub unsafe trait ContextMethods: Sized {
         a1: u32,
         a2: *const core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .SetPrivateData)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::SetPrivateData(self.inner(), a0, a1, a2) }
     }
     unsafe fn SetPrivateDataInterface(
         &self,
         a0: *const windows::core::GUID,
         a1: *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .base__
-                .SetPrivateDataInterface)(self.inner(), a0, a1)
-        }
+        unsafe { real::SetPrivateDataInterface(self.inner(), a0, a1) }
     }
     unsafe fn VSSetConstantBuffers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .VSSetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::VSSetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn PSSetShaderResources(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .PSSetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::PSSetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn PSSetShader(&self, a0: *mut core::ffi::c_void, a1: *const *mut core::ffi::c_void, a2: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .PSSetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::PSSetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn PSSetSamplers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .PSSetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::PSSetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn VSSetShader(&self, a0: *mut core::ffi::c_void, a1: *const *mut core::ffi::c_void, a2: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .VSSetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::VSSetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn DrawIndexed(&self, a0: u32, a1: u32, a2: i32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DrawIndexed)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::DrawIndexed(self.inner(), a0, a1, a2) }
     }
     unsafe fn Draw(&self, a0: u32, a1: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .Draw)(self.inner(), a0, a1)
-        }
+        unsafe { real::Draw(self.inner(), a0, a1) }
     }
     unsafe fn Map(
         &self,
@@ -171,48 +79,16 @@ pub unsafe trait ContextMethods: Sized {
         a3: u32,
         a4: *mut windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .Map)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::Map(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn Unmap(&self, a0: *mut core::ffi::c_void, a1: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .Unmap)(self.inner(), a0, a1)
-        }
+        unsafe { real::Unmap(self.inner(), a0, a1) }
     }
     unsafe fn PSSetConstantBuffers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .PSSetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::PSSetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn IASetInputLayout(&self, a0: *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .IASetInputLayout)(self.inner(), a0)
-        }
+        unsafe { real::IASetInputLayout(self.inner(), a0) }
     }
     unsafe fn IASetVertexBuffers(
         &self,
@@ -222,15 +98,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *const u32,
         a4: *const u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .IASetVertexBuffers)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::IASetVertexBuffers(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn IASetIndexBuffer(
         &self,
@@ -238,114 +106,34 @@ pub unsafe trait ContextMethods: Sized {
         a1: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
         a2: u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .IASetIndexBuffer)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::IASetIndexBuffer(self.inner(), a0, a1, a2) }
     }
     unsafe fn DrawIndexedInstanced(&self, a0: u32, a1: u32, a2: u32, a3: i32, a4: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DrawIndexedInstanced)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::DrawIndexedInstanced(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn DrawInstanced(&self, a0: u32, a1: u32, a2: u32, a3: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DrawInstanced)(self.inner(), a0, a1, a2, a3)
-        }
+        unsafe { real::DrawInstanced(self.inner(), a0, a1, a2, a3) }
     }
     unsafe fn GSSetConstantBuffers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GSSetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GSSetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn GSSetShader(&self, a0: *mut core::ffi::c_void, a1: *const *mut core::ffi::c_void, a2: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GSSetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GSSetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn IASetPrimitiveTopology(&self, a0: windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .IASetPrimitiveTopology)(self.inner(), a0)
-        }
+        unsafe { real::IASetPrimitiveTopology(self.inner(), a0) }
     }
     unsafe fn VSSetShaderResources(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .VSSetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::VSSetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn VSSetSamplers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .VSSetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::VSSetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn Begin(&self, a0: *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .Begin)(self.inner(), a0)
-        }
+        unsafe { real::Begin(self.inner(), a0) }
     }
     unsafe fn End(&self, a0: *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .End)(self.inner(), a0)
-        }
+        unsafe { real::End(self.inner(), a0) }
     }
     unsafe fn GetData(
         &self,
@@ -354,48 +142,16 @@ pub unsafe trait ContextMethods: Sized {
         a2: u32,
         a3: u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetData)(self.inner(), a0, a1, a2, a3)
-        }
+        unsafe { real::GetData(self.inner(), a0, a1, a2, a3) }
     }
     unsafe fn SetPredication(&self, a0: *mut core::ffi::c_void, a1: windows::core::BOOL) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .SetPredication)(self.inner(), a0, a1)
-        }
+        unsafe { real::SetPredication(self.inner(), a0, a1) }
     }
     unsafe fn GSSetShaderResources(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GSSetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GSSetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn GSSetSamplers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GSSetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GSSetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn OMSetRenderTargets(
         &self,
@@ -403,15 +159,7 @@ pub unsafe trait ContextMethods: Sized {
         a1: *const *mut core::ffi::c_void,
         a2: *mut core::ffi::c_void,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .OMSetRenderTargets)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::OMSetRenderTargets(self.inner(), a0, a1, a2) }
     }
     unsafe fn OMSetRenderTargetsAndUnorderedAccessViews(
         &self,
@@ -423,142 +171,44 @@ pub unsafe trait ContextMethods: Sized {
         a5: *const *mut core::ffi::c_void,
         a6: *const u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .OMSetRenderTargetsAndUnorderedAccessViews)(
-                self.inner(), a0, a1, a2, a3, a4, a5, a6
-            )
-        }
+        unsafe { real::OMSetRenderTargetsAndUnorderedAccessViews(self.inner(), a0, a1, a2, a3, a4, a5, a6) }
     }
     unsafe fn OMSetBlendState(&self, a0: *mut core::ffi::c_void, a1: *const f32, a2: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .OMSetBlendState)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::OMSetBlendState(self.inner(), a0, a1, a2) }
     }
     unsafe fn OMSetDepthStencilState(&self, a0: *mut core::ffi::c_void, a1: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .OMSetDepthStencilState)(self.inner(), a0, a1)
-        }
+        unsafe { real::OMSetDepthStencilState(self.inner(), a0, a1) }
     }
     unsafe fn SOSetTargets(&self, a0: u32, a1: *const *mut core::ffi::c_void, a2: *const u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .SOSetTargets)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::SOSetTargets(self.inner(), a0, a1, a2) }
     }
     unsafe fn DrawAuto(&self) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DrawAuto)(self.inner())
-        }
+        unsafe { real::DrawAuto(self.inner()) }
     }
     unsafe fn DrawIndexedInstancedIndirect(&self, a0: *mut core::ffi::c_void, a1: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DrawIndexedInstancedIndirect)(self.inner(), a0, a1)
-        }
+        unsafe { real::DrawIndexedInstancedIndirect(self.inner(), a0, a1) }
     }
     unsafe fn DrawInstancedIndirect(&self, a0: *mut core::ffi::c_void, a1: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DrawInstancedIndirect)(self.inner(), a0, a1)
-        }
+        unsafe { real::DrawInstancedIndirect(self.inner(), a0, a1) }
     }
     unsafe fn Dispatch(&self, a0: u32, a1: u32, a2: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .Dispatch)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::Dispatch(self.inner(), a0, a1, a2) }
     }
     unsafe fn DispatchIndirect(&self, a0: *mut core::ffi::c_void, a1: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DispatchIndirect)(self.inner(), a0, a1)
-        }
+        unsafe { real::DispatchIndirect(self.inner(), a0, a1) }
     }
     unsafe fn RSSetState(&self, a0: *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .RSSetState)(self.inner(), a0)
-        }
+        unsafe { real::RSSetState(self.inner(), a0) }
     }
     unsafe fn RSSetViewports(
         &self,
         a0: u32,
         a1: *const windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .RSSetViewports)(self.inner(), a0, a1)
-        }
+        unsafe { real::RSSetViewports(self.inner(), a0, a1) }
     }
     unsafe fn RSSetScissorRects(&self, a0: u32, a1: *const windows::Win32::Foundation::RECT) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .RSSetScissorRects)(self.inner(), a0, a1)
-        }
+        unsafe { real::RSSetScissorRects(self.inner(), a0, a1) }
     }
     unsafe fn CopySubresourceRegion(
         &self,
@@ -571,26 +221,10 @@ pub unsafe trait ContextMethods: Sized {
         a6: u32,
         a7: *const windows::Win32::Graphics::Direct3D11::D3D11_BOX,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CopySubresourceRegion)(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7)
-        }
+        unsafe { real::CopySubresourceRegion(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7) }
     }
     unsafe fn CopyResource(&self, a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CopyResource)(self.inner(), a0, a1)
-        }
+        unsafe { real::CopyResource(self.inner(), a0, a1) }
     }
     unsafe fn UpdateSubresource(
         &self,
@@ -601,103 +235,31 @@ pub unsafe trait ContextMethods: Sized {
         a4: u32,
         a5: u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .UpdateSubresource)(self.inner(), a0, a1, a2, a3, a4, a5)
-        }
+        unsafe { real::UpdateSubresource(self.inner(), a0, a1, a2, a3, a4, a5) }
     }
     unsafe fn CopyStructureCount(&self, a0: *mut core::ffi::c_void, a1: u32, a2: *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CopyStructureCount)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CopyStructureCount(self.inner(), a0, a1, a2) }
     }
     unsafe fn ClearRenderTargetView(&self, a0: *mut core::ffi::c_void, a1: *const f32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .ClearRenderTargetView)(self.inner(), a0, a1)
-        }
+        unsafe { real::ClearRenderTargetView(self.inner(), a0, a1) }
     }
     unsafe fn ClearUnorderedAccessViewUint(&self, a0: *mut core::ffi::c_void, a1: *const u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .ClearUnorderedAccessViewUint)(self.inner(), a0, a1)
-        }
+        unsafe { real::ClearUnorderedAccessViewUint(self.inner(), a0, a1) }
     }
     unsafe fn ClearUnorderedAccessViewFloat(&self, a0: *mut core::ffi::c_void, a1: *const f32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .ClearUnorderedAccessViewFloat)(self.inner(), a0, a1)
-        }
+        unsafe { real::ClearUnorderedAccessViewFloat(self.inner(), a0, a1) }
     }
     unsafe fn ClearDepthStencilView(&self, a0: *mut core::ffi::c_void, a1: u32, a2: f32, a3: u8) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .ClearDepthStencilView)(self.inner(), a0, a1, a2, a3)
-        }
+        unsafe { real::ClearDepthStencilView(self.inner(), a0, a1, a2, a3) }
     }
     unsafe fn GenerateMips(&self, a0: *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GenerateMips)(self.inner(), a0)
-        }
+        unsafe { real::GenerateMips(self.inner(), a0) }
     }
     unsafe fn SetResourceMinLOD(&self, a0: *mut core::ffi::c_void, a1: f32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .SetResourceMinLOD)(self.inner(), a0, a1)
-        }
+        unsafe { real::SetResourceMinLOD(self.inner(), a0, a1) }
     }
     unsafe fn GetResourceMinLOD(&self, a0: *mut core::ffi::c_void) -> f32 {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetResourceMinLOD)(self.inner(), a0)
-        }
+        unsafe { real::GetResourceMinLOD(self.inner(), a0) }
     }
     unsafe fn ResolveSubresource(
         &self,
@@ -707,125 +269,37 @@ pub unsafe trait ContextMethods: Sized {
         a3: u32,
         a4: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .ResolveSubresource)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::ResolveSubresource(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn ExecuteCommandList(&self, a0: *mut core::ffi::c_void, a1: windows::core::BOOL) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .ExecuteCommandList)(self.inner(), a0, a1)
-        }
+        unsafe { real::ExecuteCommandList(self.inner(), a0, a1) }
     }
     unsafe fn HSSetShaderResources(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .HSSetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::HSSetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn HSSetShader(&self, a0: *mut core::ffi::c_void, a1: *const *mut core::ffi::c_void, a2: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .HSSetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::HSSetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn HSSetSamplers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .HSSetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::HSSetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn HSSetConstantBuffers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .HSSetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::HSSetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn DSSetShaderResources(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DSSetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::DSSetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn DSSetShader(&self, a0: *mut core::ffi::c_void, a1: *const *mut core::ffi::c_void, a2: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DSSetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::DSSetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn DSSetSamplers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DSSetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::DSSetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn DSSetConstantBuffers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DSSetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::DSSetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn CSSetShaderResources(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CSSetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CSSetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn CSSetUnorderedAccessViews(
         &self,
@@ -834,70 +308,22 @@ pub unsafe trait ContextMethods: Sized {
         a2: *const *mut core::ffi::c_void,
         a3: *const u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CSSetUnorderedAccessViews)(self.inner(), a0, a1, a2, a3)
-        }
+        unsafe { real::CSSetUnorderedAccessViews(self.inner(), a0, a1, a2, a3) }
     }
     unsafe fn CSSetShader(&self, a0: *mut core::ffi::c_void, a1: *const *mut core::ffi::c_void, a2: u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CSSetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CSSetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn CSSetSamplers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CSSetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CSSetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn CSSetConstantBuffers(&self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CSSetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CSSetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn VSGetConstantBuffers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .VSGetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::VSGetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn PSGetShaderResources(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .PSGetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::PSGetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn PSGetShader(
         &self,
@@ -905,26 +331,10 @@ pub unsafe trait ContextMethods: Sized {
         a1: *mut *mut core::ffi::c_void,
         a2: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .PSGetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::PSGetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn PSGetSamplers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .PSGetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::PSGetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn VSGetShader(
         &self,
@@ -932,37 +342,13 @@ pub unsafe trait ContextMethods: Sized {
         a1: *mut *mut core::ffi::c_void,
         a2: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .VSGetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::VSGetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn PSGetConstantBuffers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .PSGetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::PSGetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn IAGetInputLayout(&self, a0: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .IAGetInputLayout)(self.inner(), a0)
-        }
+        unsafe { real::IAGetInputLayout(self.inner(), a0) }
     }
     unsafe fn IAGetVertexBuffers(
         &self,
@@ -972,15 +358,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *mut u32,
         a4: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .IAGetVertexBuffers)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::IAGetVertexBuffers(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn IAGetIndexBuffer(
         &self,
@@ -988,26 +366,10 @@ pub unsafe trait ContextMethods: Sized {
         a1: *mut windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
         a2: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .IAGetIndexBuffer)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::IAGetIndexBuffer(self.inner(), a0, a1, a2) }
     }
     unsafe fn GSGetConstantBuffers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GSGetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GSGetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn GSGetShader(
         &self,
@@ -1015,84 +377,28 @@ pub unsafe trait ContextMethods: Sized {
         a1: *mut *mut core::ffi::c_void,
         a2: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GSGetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GSGetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn IAGetPrimitiveTopology(
         &self,
         a0: *mut windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .IAGetPrimitiveTopology)(self.inner(), a0)
-        }
+        unsafe { real::IAGetPrimitiveTopology(self.inner(), a0) }
     }
     unsafe fn VSGetShaderResources(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .VSGetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::VSGetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn VSGetSamplers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .VSGetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::VSGetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn GetPredication(&self, a0: *mut *mut core::ffi::c_void, a1: *mut windows::core::BOOL) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetPredication)(self.inner(), a0, a1)
-        }
+        unsafe { real::GetPredication(self.inner(), a0, a1) }
     }
     unsafe fn GSGetShaderResources(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GSGetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GSGetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn GSGetSamplers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GSGetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::GSGetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn OMGetRenderTargets(
         &self,
@@ -1100,15 +406,7 @@ pub unsafe trait ContextMethods: Sized {
         a1: *mut *mut core::ffi::c_void,
         a2: *mut *mut core::ffi::c_void,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .OMGetRenderTargets)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::OMGetRenderTargets(self.inner(), a0, a1, a2) }
     }
     unsafe fn OMGetRenderTargetsAndUnorderedAccessViews(
         &self,
@@ -1119,96 +417,32 @@ pub unsafe trait ContextMethods: Sized {
         a4: u32,
         a5: *mut *mut core::ffi::c_void,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .OMGetRenderTargetsAndUnorderedAccessViews)(self.inner(), a0, a1, a2, a3, a4, a5)
-        }
+        unsafe { real::OMGetRenderTargetsAndUnorderedAccessViews(self.inner(), a0, a1, a2, a3, a4, a5) }
     }
     unsafe fn OMGetBlendState(&self, a0: *mut *mut core::ffi::c_void, a1: *mut f32, a2: *mut u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .OMGetBlendState)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::OMGetBlendState(self.inner(), a0, a1, a2) }
     }
     unsafe fn OMGetDepthStencilState(&self, a0: *mut *mut core::ffi::c_void, a1: *mut u32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .OMGetDepthStencilState)(self.inner(), a0, a1)
-        }
+        unsafe { real::OMGetDepthStencilState(self.inner(), a0, a1) }
     }
     unsafe fn SOGetTargets(&self, a0: u32, a1: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .SOGetTargets)(self.inner(), a0, a1)
-        }
+        unsafe { real::SOGetTargets(self.inner(), a0, a1) }
     }
     unsafe fn RSGetState(&self, a0: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .RSGetState)(self.inner(), a0)
-        }
+        unsafe { real::RSGetState(self.inner(), a0) }
     }
     unsafe fn RSGetViewports(
         &self,
         a0: *mut u32,
         a1: *mut windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .RSGetViewports)(self.inner(), a0, a1)
-        }
+        unsafe { real::RSGetViewports(self.inner(), a0, a1) }
     }
     unsafe fn RSGetScissorRects(&self, a0: *mut u32, a1: *mut windows::Win32::Foundation::RECT) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .RSGetScissorRects)(self.inner(), a0, a1)
-        }
+        unsafe { real::RSGetScissorRects(self.inner(), a0, a1) }
     }
     unsafe fn HSGetShaderResources(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .HSGetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::HSGetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn HSGetShader(
         &self,
@@ -1216,48 +450,16 @@ pub unsafe trait ContextMethods: Sized {
         a1: *mut *mut core::ffi::c_void,
         a2: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .HSGetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::HSGetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn HSGetSamplers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .HSGetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::HSGetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn HSGetConstantBuffers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .HSGetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::HSGetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn DSGetShaderResources(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DSGetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::DSGetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn DSGetShader(
         &self,
@@ -1265,59 +467,19 @@ pub unsafe trait ContextMethods: Sized {
         a1: *mut *mut core::ffi::c_void,
         a2: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DSGetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::DSGetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn DSGetSamplers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DSGetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::DSGetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn DSGetConstantBuffers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .DSGetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::DSGetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn CSGetShaderResources(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CSGetShaderResources)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CSGetShaderResources(self.inner(), a0, a1, a2) }
     }
     unsafe fn CSGetUnorderedAccessViews(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CSGetUnorderedAccessViews)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CSGetUnorderedAccessViews(self.inner(), a0, a1, a2) }
     }
     unsafe fn CSGetShader(
         &self,
@@ -1325,96 +487,32 @@ pub unsafe trait ContextMethods: Sized {
         a1: *mut *mut core::ffi::c_void,
         a2: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CSGetShader)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CSGetShader(self.inner(), a0, a1, a2) }
     }
     unsafe fn CSGetSamplers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CSGetSamplers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CSGetSamplers(self.inner(), a0, a1, a2) }
     }
     unsafe fn CSGetConstantBuffers(&self, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .CSGetConstantBuffers)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::CSGetConstantBuffers(self.inner(), a0, a1, a2) }
     }
     unsafe fn ClearState(&self) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .ClearState)(self.inner())
-        }
+        unsafe { real::ClearState(self.inner()) }
     }
     unsafe fn Flush(&self) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .Flush)(self.inner())
-        }
+        unsafe { real::Flush(self.inner()) }
     }
     unsafe fn GetType(&self) -> windows::Win32::Graphics::Direct3D11::D3D11_DEVICE_CONTEXT_TYPE {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetType)(self.inner())
-        }
+        unsafe { real::GetType(self.inner()) }
     }
     unsafe fn GetContextFlags(&self) -> u32 {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .GetContextFlags)(self.inner())
-        }
+        unsafe { real::GetContextFlags(self.inner()) }
     }
     unsafe fn FinishCommandList(
         &self,
         a0: windows::core::BOOL,
         a1: *mut *mut core::ffi::c_void,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .base__
-                .FinishCommandList)(self.inner(), a0, a1)
-        }
+        unsafe { real::FinishCommandList(self.inner(), a0, a1) }
     }
     unsafe fn CopySubresourceRegion1(
         &self,
@@ -1428,14 +526,7 @@ pub unsafe trait ContextMethods: Sized {
         a7: *const windows::Win32::Graphics::Direct3D11::D3D11_BOX,
         a8: u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .CopySubresourceRegion1)(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7, a8)
-        }
+        unsafe { real::CopySubresourceRegion1(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7, a8) }
     }
     unsafe fn UpdateSubresource1(
         &self,
@@ -1447,34 +538,13 @@ pub unsafe trait ContextMethods: Sized {
         a5: u32,
         a6: u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .UpdateSubresource1)(self.inner(), a0, a1, a2, a3, a4, a5, a6)
-        }
+        unsafe { real::UpdateSubresource1(self.inner(), a0, a1, a2, a3, a4, a5, a6) }
     }
     unsafe fn DiscardResource(&self, a0: *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .DiscardResource)(self.inner(), a0)
-        }
+        unsafe { real::DiscardResource(self.inner(), a0) }
     }
     unsafe fn DiscardView(&self, a0: *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .DiscardView)(self.inner(), a0)
-        }
+        unsafe { real::DiscardView(self.inner(), a0) }
     }
     unsafe fn VSSetConstantBuffers1(
         &self,
@@ -1484,14 +554,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *const u32,
         a4: *const u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .VSSetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::VSSetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn HSSetConstantBuffers1(
         &self,
@@ -1501,14 +564,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *const u32,
         a4: *const u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .HSSetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::HSSetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn DSSetConstantBuffers1(
         &self,
@@ -1518,14 +574,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *const u32,
         a4: *const u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .DSSetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::DSSetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn GSSetConstantBuffers1(
         &self,
@@ -1535,14 +584,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *const u32,
         a4: *const u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .GSSetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::GSSetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn PSSetConstantBuffers1(
         &self,
@@ -1552,14 +594,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *const u32,
         a4: *const u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .PSSetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::PSSetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn CSSetConstantBuffers1(
         &self,
@@ -1569,14 +604,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *const u32,
         a4: *const u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .CSSetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::CSSetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn VSGetConstantBuffers1(
         &self,
@@ -1586,14 +614,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *mut u32,
         a4: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .VSGetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::VSGetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn HSGetConstantBuffers1(
         &self,
@@ -1603,14 +624,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *mut u32,
         a4: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .HSGetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::HSGetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn DSGetConstantBuffers1(
         &self,
@@ -1620,14 +634,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *mut u32,
         a4: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .DSGetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::DSGetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn GSGetConstantBuffers1(
         &self,
@@ -1637,14 +644,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *mut u32,
         a4: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .GSGetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::GSGetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn PSGetConstantBuffers1(
         &self,
@@ -1654,14 +654,7 @@ pub unsafe trait ContextMethods: Sized {
         a3: *mut u32,
         a4: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .PSGetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::PSGetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn CSGetConstantBuffers1(
         &self,
@@ -1671,24 +664,10 @@ pub unsafe trait ContextMethods: Sized {
         a3: *mut u32,
         a4: *mut u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .CSGetConstantBuffers1)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::CSGetConstantBuffers1(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn SwapDeviceContextState(&self, a0: *mut core::ffi::c_void, a1: *mut *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .SwapDeviceContextState)(self.inner(), a0, a1)
-        }
+        unsafe { real::SwapDeviceContextState(self.inner(), a0, a1) }
     }
     unsafe fn ClearView(
         &self,
@@ -1697,14 +676,7 @@ pub unsafe trait ContextMethods: Sized {
         a2: *const windows::Win32::Foundation::RECT,
         a3: u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .ClearView)(self.inner(), a0, a1, a2, a3)
-        }
+        unsafe { real::ClearView(self.inner(), a0, a1, a2, a3) }
     }
     unsafe fn DiscardView1(
         &self,
@@ -1712,14 +684,7 @@ pub unsafe trait ContextMethods: Sized {
         a1: *const windows::Win32::Foundation::RECT,
         a2: u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .base__
-                .DiscardView1)(self.inner(), a0, a1, a2)
-        }
+        unsafe { real::DiscardView1(self.inner(), a0, a1, a2) }
     }
     unsafe fn UpdateTileMappings(
         &self,
@@ -1734,13 +699,7 @@ pub unsafe trait ContextMethods: Sized {
         a8: *const u32,
         a9: u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .UpdateTileMappings)(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)
-        }
+        unsafe { real::UpdateTileMappings(self.inner(), a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) }
     }
     unsafe fn CopyTileMappings(
         &self,
@@ -1751,13 +710,7 @@ pub unsafe trait ContextMethods: Sized {
         a4: *const windows::Win32::Graphics::Direct3D11::D3D11_TILE_REGION_SIZE,
         a5: u32,
     ) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .CopyTileMappings)(self.inner(), a0, a1, a2, a3, a4, a5)
-        }
+        unsafe { real::CopyTileMappings(self.inner(), a0, a1, a2, a3, a4, a5) }
     }
     unsafe fn CopyTiles(
         &self,
@@ -1768,13 +721,7 @@ pub unsafe trait ContextMethods: Sized {
         a4: u64,
         a5: u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .CopyTiles)(self.inner(), a0, a1, a2, a3, a4, a5)
-        }
+        unsafe { real::CopyTiles(self.inner(), a0, a1, a2, a3, a4, a5) }
     }
     unsafe fn UpdateTiles(
         &self,
@@ -1784,108 +731,2129 @@ pub unsafe trait ContextMethods: Sized {
         a3: *const core::ffi::c_void,
         a4: u32,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .UpdateTiles)(self.inner(), a0, a1, a2, a3, a4)
-        }
+        unsafe { real::UpdateTiles(self.inner(), a0, a1, a2, a3, a4) }
     }
     unsafe fn ResizeTilePool(&self, a0: *mut core::ffi::c_void, a1: u64) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .ResizeTilePool)(self.inner(), a0, a1)
-        }
+        unsafe { real::ResizeTilePool(self.inner(), a0, a1) }
     }
     unsafe fn TiledResourceBarrier(&self, a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .TiledResourceBarrier)(self.inner(), a0, a1)
-        }
+        unsafe { real::TiledResourceBarrier(self.inner(), a0, a1) }
     }
     unsafe fn IsAnnotationEnabled(&self) -> windows::core::BOOL {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .IsAnnotationEnabled)(self.inner())
-        }
+        unsafe { real::IsAnnotationEnabled(self.inner()) }
     }
     unsafe fn SetMarkerInt(&self, a0: windows::core::PCWSTR, a1: i32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .SetMarkerInt)(self.inner(), a0, a1)
-        }
+        unsafe { real::SetMarkerInt(self.inner(), a0, a1) }
     }
     unsafe fn BeginEventInt(&self, a0: windows::core::PCWSTR, a1: i32) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .BeginEventInt)(self.inner(), a0, a1)
-        }
+        unsafe { real::BeginEventInt(self.inner(), a0, a1) }
     }
     unsafe fn EndEvent(&self) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .base__
-                .EndEvent)(self.inner())
-        }
+        unsafe { real::EndEvent(self.inner()) }
     }
     unsafe fn Flush1(
         &self,
         a0: windows::Win32::Graphics::Direct3D11::D3D11_CONTEXT_TYPE,
         a1: windows::Win32::Foundation::HANDLE,
     ) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .Flush1)(self.inner(), a0, a1)
-        }
+        unsafe { real::Flush1(self.inner(), a0, a1) }
     }
     unsafe fn SetHardwareProtectionState(&self, a0: windows::core::BOOL) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .SetHardwareProtectionState)(self.inner(), a0)
-        }
+        unsafe { real::SetHardwareProtectionState(self.inner(), a0) }
     }
     unsafe fn GetHardwareProtectionState(&self, a0: *mut windows::core::BOOL) {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .base__
-                .GetHardwareProtectionState)(self.inner(), a0)
-        }
+        unsafe { real::GetHardwareProtectionState(self.inner(), a0) }
     }
     unsafe fn Signal(&self, a0: *mut core::ffi::c_void, a1: u64) -> windows::core::HRESULT {
-        unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .Signal)(self.inner(), a0, a1)
-        }
+        unsafe { real::Signal(self.inner(), a0, a1) }
     }
     unsafe fn Wait(&self, a0: *mut core::ffi::c_void, a1: u64) -> windows::core::HRESULT {
+        unsafe { real::Wait(self.inner(), a0, a1) }
+    }
+}
+
+/// Each method called on the real (wrapped) object: the trait's defaults, and overrides that still want the
+/// real behaviour.
+pub mod real {
+    use core::ffi::c_void;
+
+    /// `GetDevice` on the real object.
+    pub unsafe fn GetDevice(inner: *mut c_void, a0: *mut *mut core::ffi::c_void) {
         unsafe {
-            ((*(*(self.inner()
-                as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
-                .Wait)(self.inner(), a0, a1)
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetDevice)(inner, a0)
+        }
+    }
+    /// `GetPrivateData` on the real object.
+    pub unsafe fn GetPrivateData(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut u32,
+        a2: *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetPrivateData)(inner, a0, a1, a2)
+        }
+    }
+    /// `SetPrivateData` on the real object.
+    pub unsafe fn SetPrivateData(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: u32,
+        a2: *const core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .SetPrivateData)(inner, a0, a1, a2)
+        }
+    }
+    /// `SetPrivateDataInterface` on the real object.
+    pub unsafe fn SetPrivateDataInterface(
+        inner: *mut c_void,
+        a0: *const windows::core::GUID,
+        a1: *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .base__
+                .SetPrivateDataInterface)(inner, a0, a1)
+        }
+    }
+    /// `VSSetConstantBuffers` on the real object.
+    pub unsafe fn VSSetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .VSSetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `PSSetShaderResources` on the real object.
+    pub unsafe fn PSSetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .PSSetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `PSSetShader` on the real object.
+    pub unsafe fn PSSetShader(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const *mut core::ffi::c_void,
+        a2: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .PSSetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `PSSetSamplers` on the real object.
+    pub unsafe fn PSSetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .PSSetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `VSSetShader` on the real object.
+    pub unsafe fn VSSetShader(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const *mut core::ffi::c_void,
+        a2: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .VSSetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `DrawIndexed` on the real object.
+    pub unsafe fn DrawIndexed(inner: *mut c_void, a0: u32, a1: u32, a2: i32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DrawIndexed)(inner, a0, a1, a2)
+        }
+    }
+    /// `Draw` on the real object.
+    pub unsafe fn Draw(inner: *mut c_void, a0: u32, a1: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .Draw)(inner, a0, a1)
+        }
+    }
+    /// `Map` on the real object.
+    pub unsafe fn Map(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: u32,
+        a2: windows::Win32::Graphics::Direct3D11::D3D11_MAP,
+        a3: u32,
+        a4: *mut windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .Map)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `Unmap` on the real object.
+    pub unsafe fn Unmap(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .Unmap)(inner, a0, a1)
+        }
+    }
+    /// `PSSetConstantBuffers` on the real object.
+    pub unsafe fn PSSetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .PSSetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `IASetInputLayout` on the real object.
+    pub unsafe fn IASetInputLayout(inner: *mut c_void, a0: *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .IASetInputLayout)(inner, a0)
+        }
+    }
+    /// `IASetVertexBuffers` on the real object.
+    pub unsafe fn IASetVertexBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+        a3: *const u32,
+        a4: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .IASetVertexBuffers)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `IASetIndexBuffer` on the real object.
+    pub unsafe fn IASetIndexBuffer(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        a2: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .IASetIndexBuffer)(inner, a0, a1, a2)
+        }
+    }
+    /// `DrawIndexedInstanced` on the real object.
+    pub unsafe fn DrawIndexedInstanced(inner: *mut c_void, a0: u32, a1: u32, a2: u32, a3: i32, a4: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DrawIndexedInstanced)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `DrawInstanced` on the real object.
+    pub unsafe fn DrawInstanced(inner: *mut c_void, a0: u32, a1: u32, a2: u32, a3: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DrawInstanced)(inner, a0, a1, a2, a3)
+        }
+    }
+    /// `GSSetConstantBuffers` on the real object.
+    pub unsafe fn GSSetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GSSetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `GSSetShader` on the real object.
+    pub unsafe fn GSSetShader(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const *mut core::ffi::c_void,
+        a2: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GSSetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `IASetPrimitiveTopology` on the real object.
+    pub unsafe fn IASetPrimitiveTopology(
+        inner: *mut c_void,
+        a0: windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .IASetPrimitiveTopology)(inner, a0)
+        }
+    }
+    /// `VSSetShaderResources` on the real object.
+    pub unsafe fn VSSetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .VSSetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `VSSetSamplers` on the real object.
+    pub unsafe fn VSSetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .VSSetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `Begin` on the real object.
+    pub unsafe fn Begin(inner: *mut c_void, a0: *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .Begin)(inner, a0)
+        }
+    }
+    /// `End` on the real object.
+    pub unsafe fn End(inner: *mut c_void, a0: *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .End)(inner, a0)
+        }
+    }
+    /// `GetData` on the real object.
+    pub unsafe fn GetData(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *mut core::ffi::c_void,
+        a2: u32,
+        a3: u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetData)(inner, a0, a1, a2, a3)
+        }
+    }
+    /// `SetPredication` on the real object.
+    pub unsafe fn SetPredication(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: windows::core::BOOL) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .SetPredication)(inner, a0, a1)
+        }
+    }
+    /// `GSSetShaderResources` on the real object.
+    pub unsafe fn GSSetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GSSetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `GSSetSamplers` on the real object.
+    pub unsafe fn GSSetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GSSetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `OMSetRenderTargets` on the real object.
+    pub unsafe fn OMSetRenderTargets(
+        inner: *mut c_void,
+        a0: u32,
+        a1: *const *mut core::ffi::c_void,
+        a2: *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .OMSetRenderTargets)(inner, a0, a1, a2)
+        }
+    }
+    /// `OMSetRenderTargetsAndUnorderedAccessViews` on the real object.
+    pub unsafe fn OMSetRenderTargetsAndUnorderedAccessViews(
+        inner: *mut c_void,
+        a0: u32,
+        a1: *const *mut core::ffi::c_void,
+        a2: *mut core::ffi::c_void,
+        a3: u32,
+        a4: u32,
+        a5: *const *mut core::ffi::c_void,
+        a6: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .OMSetRenderTargetsAndUnorderedAccessViews)(inner, a0, a1, a2, a3, a4, a5, a6)
+        }
+    }
+    /// `OMSetBlendState` on the real object.
+    pub unsafe fn OMSetBlendState(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: *const f32, a2: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .OMSetBlendState)(inner, a0, a1, a2)
+        }
+    }
+    /// `OMSetDepthStencilState` on the real object.
+    pub unsafe fn OMSetDepthStencilState(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .OMSetDepthStencilState)(inner, a0, a1)
+        }
+    }
+    /// `SOSetTargets` on the real object.
+    pub unsafe fn SOSetTargets(
+        inner: *mut c_void,
+        a0: u32,
+        a1: *const *mut core::ffi::c_void,
+        a2: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .SOSetTargets)(inner, a0, a1, a2)
+        }
+    }
+    /// `DrawAuto` on the real object.
+    pub unsafe fn DrawAuto(inner: *mut c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DrawAuto)(inner)
+        }
+    }
+    /// `DrawIndexedInstancedIndirect` on the real object.
+    pub unsafe fn DrawIndexedInstancedIndirect(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DrawIndexedInstancedIndirect)(inner, a0, a1)
+        }
+    }
+    /// `DrawInstancedIndirect` on the real object.
+    pub unsafe fn DrawInstancedIndirect(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DrawInstancedIndirect)(inner, a0, a1)
+        }
+    }
+    /// `Dispatch` on the real object.
+    pub unsafe fn Dispatch(inner: *mut c_void, a0: u32, a1: u32, a2: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .Dispatch)(inner, a0, a1, a2)
+        }
+    }
+    /// `DispatchIndirect` on the real object.
+    pub unsafe fn DispatchIndirect(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DispatchIndirect)(inner, a0, a1)
+        }
+    }
+    /// `RSSetState` on the real object.
+    pub unsafe fn RSSetState(inner: *mut c_void, a0: *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .RSSetState)(inner, a0)
+        }
+    }
+    /// `RSSetViewports` on the real object.
+    pub unsafe fn RSSetViewports(
+        inner: *mut c_void,
+        a0: u32,
+        a1: *const windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .RSSetViewports)(inner, a0, a1)
+        }
+    }
+    /// `RSSetScissorRects` on the real object.
+    pub unsafe fn RSSetScissorRects(
+        inner: *mut c_void,
+        a0: u32,
+        a1: *const windows::Win32::Foundation::RECT,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .RSSetScissorRects)(inner, a0, a1)
+        }
+    }
+    /// `CopySubresourceRegion` on the real object.
+    pub unsafe fn CopySubresourceRegion(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: u32,
+        a2: u32,
+        a3: u32,
+        a4: u32,
+        a5: *mut core::ffi::c_void,
+        a6: u32,
+        a7: *const windows::Win32::Graphics::Direct3D11::D3D11_BOX,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CopySubresourceRegion)(inner, a0, a1, a2, a3, a4, a5, a6, a7)
+        }
+    }
+    /// `CopyResource` on the real object.
+    pub unsafe fn CopyResource(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CopyResource)(inner, a0, a1)
+        }
+    }
+    /// `UpdateSubresource` on the real object.
+    pub unsafe fn UpdateSubresource(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: u32,
+        a2: *const windows::Win32::Graphics::Direct3D11::D3D11_BOX,
+        a3: *const core::ffi::c_void,
+        a4: u32,
+        a5: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .UpdateSubresource)(inner, a0, a1, a2, a3, a4, a5)
+        }
+    }
+    /// `CopyStructureCount` on the real object.
+    pub unsafe fn CopyStructureCount(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: u32,
+        a2: *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CopyStructureCount)(inner, a0, a1, a2)
+        }
+    }
+    /// `ClearRenderTargetView` on the real object.
+    pub unsafe fn ClearRenderTargetView(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: *const f32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .ClearRenderTargetView)(inner, a0, a1)
+        }
+    }
+    /// `ClearUnorderedAccessViewUint` on the real object.
+    pub unsafe fn ClearUnorderedAccessViewUint(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .ClearUnorderedAccessViewUint)(inner, a0, a1)
+        }
+    }
+    /// `ClearUnorderedAccessViewFloat` on the real object.
+    pub unsafe fn ClearUnorderedAccessViewFloat(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const f32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .ClearUnorderedAccessViewFloat)(inner, a0, a1)
+        }
+    }
+    /// `ClearDepthStencilView` on the real object.
+    pub unsafe fn ClearDepthStencilView(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: u32,
+        a2: f32,
+        a3: u8,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .ClearDepthStencilView)(inner, a0, a1, a2, a3)
+        }
+    }
+    /// `GenerateMips` on the real object.
+    pub unsafe fn GenerateMips(inner: *mut c_void, a0: *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GenerateMips)(inner, a0)
+        }
+    }
+    /// `SetResourceMinLOD` on the real object.
+    pub unsafe fn SetResourceMinLOD(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: f32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .SetResourceMinLOD)(inner, a0, a1)
+        }
+    }
+    /// `GetResourceMinLOD` on the real object.
+    pub unsafe fn GetResourceMinLOD(inner: *mut c_void, a0: *mut core::ffi::c_void) -> f32 {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetResourceMinLOD)(inner, a0)
+        }
+    }
+    /// `ResolveSubresource` on the real object.
+    pub unsafe fn ResolveSubresource(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: u32,
+        a2: *mut core::ffi::c_void,
+        a3: u32,
+        a4: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .ResolveSubresource)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `ExecuteCommandList` on the real object.
+    pub unsafe fn ExecuteCommandList(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: windows::core::BOOL,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .ExecuteCommandList)(inner, a0, a1)
+        }
+    }
+    /// `HSSetShaderResources` on the real object.
+    pub unsafe fn HSSetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .HSSetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `HSSetShader` on the real object.
+    pub unsafe fn HSSetShader(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const *mut core::ffi::c_void,
+        a2: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .HSSetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `HSSetSamplers` on the real object.
+    pub unsafe fn HSSetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .HSSetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `HSSetConstantBuffers` on the real object.
+    pub unsafe fn HSSetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .HSSetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `DSSetShaderResources` on the real object.
+    pub unsafe fn DSSetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DSSetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `DSSetShader` on the real object.
+    pub unsafe fn DSSetShader(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const *mut core::ffi::c_void,
+        a2: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DSSetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `DSSetSamplers` on the real object.
+    pub unsafe fn DSSetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DSSetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `DSSetConstantBuffers` on the real object.
+    pub unsafe fn DSSetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DSSetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `CSSetShaderResources` on the real object.
+    pub unsafe fn CSSetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CSSetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `CSSetUnorderedAccessViews` on the real object.
+    pub unsafe fn CSSetUnorderedAccessViews(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+        a3: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CSSetUnorderedAccessViews)(inner, a0, a1, a2, a3)
+        }
+    }
+    /// `CSSetShader` on the real object.
+    pub unsafe fn CSSetShader(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const *mut core::ffi::c_void,
+        a2: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CSSetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `CSSetSamplers` on the real object.
+    pub unsafe fn CSSetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CSSetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `CSSetConstantBuffers` on the real object.
+    pub unsafe fn CSSetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CSSetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `VSGetConstantBuffers` on the real object.
+    pub unsafe fn VSGetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .VSGetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `PSGetShaderResources` on the real object.
+    pub unsafe fn PSGetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .PSGetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `PSGetShader` on the real object.
+    pub unsafe fn PSGetShader(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+        a1: *mut *mut core::ffi::c_void,
+        a2: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .PSGetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `PSGetSamplers` on the real object.
+    pub unsafe fn PSGetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .PSGetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `VSGetShader` on the real object.
+    pub unsafe fn VSGetShader(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+        a1: *mut *mut core::ffi::c_void,
+        a2: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .VSGetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `PSGetConstantBuffers` on the real object.
+    pub unsafe fn PSGetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .PSGetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `IAGetInputLayout` on the real object.
+    pub unsafe fn IAGetInputLayout(inner: *mut c_void, a0: *mut *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .IAGetInputLayout)(inner, a0)
+        }
+    }
+    /// `IAGetVertexBuffers` on the real object.
+    pub unsafe fn IAGetVertexBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+        a3: *mut u32,
+        a4: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .IAGetVertexBuffers)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `IAGetIndexBuffer` on the real object.
+    pub unsafe fn IAGetIndexBuffer(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+        a1: *mut windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        a2: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .IAGetIndexBuffer)(inner, a0, a1, a2)
+        }
+    }
+    /// `GSGetConstantBuffers` on the real object.
+    pub unsafe fn GSGetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GSGetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `GSGetShader` on the real object.
+    pub unsafe fn GSGetShader(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+        a1: *mut *mut core::ffi::c_void,
+        a2: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GSGetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `IAGetPrimitiveTopology` on the real object.
+    pub unsafe fn IAGetPrimitiveTopology(
+        inner: *mut c_void,
+        a0: *mut windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .IAGetPrimitiveTopology)(inner, a0)
+        }
+    }
+    /// `VSGetShaderResources` on the real object.
+    pub unsafe fn VSGetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .VSGetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `VSGetSamplers` on the real object.
+    pub unsafe fn VSGetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .VSGetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `GetPredication` on the real object.
+    pub unsafe fn GetPredication(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+        a1: *mut windows::core::BOOL,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetPredication)(inner, a0, a1)
+        }
+    }
+    /// `GSGetShaderResources` on the real object.
+    pub unsafe fn GSGetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GSGetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `GSGetSamplers` on the real object.
+    pub unsafe fn GSGetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GSGetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `OMGetRenderTargets` on the real object.
+    pub unsafe fn OMGetRenderTargets(
+        inner: *mut c_void,
+        a0: u32,
+        a1: *mut *mut core::ffi::c_void,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .OMGetRenderTargets)(inner, a0, a1, a2)
+        }
+    }
+    /// `OMGetRenderTargetsAndUnorderedAccessViews` on the real object.
+    pub unsafe fn OMGetRenderTargetsAndUnorderedAccessViews(
+        inner: *mut c_void,
+        a0: u32,
+        a1: *mut *mut core::ffi::c_void,
+        a2: *mut *mut core::ffi::c_void,
+        a3: u32,
+        a4: u32,
+        a5: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .OMGetRenderTargetsAndUnorderedAccessViews)(inner, a0, a1, a2, a3, a4, a5)
+        }
+    }
+    /// `OMGetBlendState` on the real object.
+    pub unsafe fn OMGetBlendState(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+        a1: *mut f32,
+        a2: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .OMGetBlendState)(inner, a0, a1, a2)
+        }
+    }
+    /// `OMGetDepthStencilState` on the real object.
+    pub unsafe fn OMGetDepthStencilState(inner: *mut c_void, a0: *mut *mut core::ffi::c_void, a1: *mut u32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .OMGetDepthStencilState)(inner, a0, a1)
+        }
+    }
+    /// `SOGetTargets` on the real object.
+    pub unsafe fn SOGetTargets(inner: *mut c_void, a0: u32, a1: *mut *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .SOGetTargets)(inner, a0, a1)
+        }
+    }
+    /// `RSGetState` on the real object.
+    pub unsafe fn RSGetState(inner: *mut c_void, a0: *mut *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .RSGetState)(inner, a0)
+        }
+    }
+    /// `RSGetViewports` on the real object.
+    pub unsafe fn RSGetViewports(
+        inner: *mut c_void,
+        a0: *mut u32,
+        a1: *mut windows::Win32::Graphics::Direct3D11::D3D11_VIEWPORT,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .RSGetViewports)(inner, a0, a1)
+        }
+    }
+    /// `RSGetScissorRects` on the real object.
+    pub unsafe fn RSGetScissorRects(
+        inner: *mut c_void,
+        a0: *mut u32,
+        a1: *mut windows::Win32::Foundation::RECT,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .RSGetScissorRects)(inner, a0, a1)
+        }
+    }
+    /// `HSGetShaderResources` on the real object.
+    pub unsafe fn HSGetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .HSGetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `HSGetShader` on the real object.
+    pub unsafe fn HSGetShader(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+        a1: *mut *mut core::ffi::c_void,
+        a2: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .HSGetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `HSGetSamplers` on the real object.
+    pub unsafe fn HSGetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .HSGetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `HSGetConstantBuffers` on the real object.
+    pub unsafe fn HSGetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .HSGetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `DSGetShaderResources` on the real object.
+    pub unsafe fn DSGetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DSGetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `DSGetShader` on the real object.
+    pub unsafe fn DSGetShader(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+        a1: *mut *mut core::ffi::c_void,
+        a2: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DSGetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `DSGetSamplers` on the real object.
+    pub unsafe fn DSGetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DSGetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `DSGetConstantBuffers` on the real object.
+    pub unsafe fn DSGetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .DSGetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `CSGetShaderResources` on the real object.
+    pub unsafe fn CSGetShaderResources(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CSGetShaderResources)(inner, a0, a1, a2)
+        }
+    }
+    /// `CSGetUnorderedAccessViews` on the real object.
+    pub unsafe fn CSGetUnorderedAccessViews(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CSGetUnorderedAccessViews)(inner, a0, a1, a2)
+        }
+    }
+    /// `CSGetShader` on the real object.
+    pub unsafe fn CSGetShader(
+        inner: *mut c_void,
+        a0: *mut *mut core::ffi::c_void,
+        a1: *mut *mut core::ffi::c_void,
+        a2: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CSGetShader)(inner, a0, a1, a2)
+        }
+    }
+    /// `CSGetSamplers` on the real object.
+    pub unsafe fn CSGetSamplers(inner: *mut c_void, a0: u32, a1: u32, a2: *mut *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CSGetSamplers)(inner, a0, a1, a2)
+        }
+    }
+    /// `CSGetConstantBuffers` on the real object.
+    pub unsafe fn CSGetConstantBuffers(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .CSGetConstantBuffers)(inner, a0, a1, a2)
+        }
+    }
+    /// `ClearState` on the real object.
+    pub unsafe fn ClearState(inner: *mut c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .ClearState)(inner)
+        }
+    }
+    /// `Flush` on the real object.
+    pub unsafe fn Flush(inner: *mut c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .Flush)(inner)
+        }
+    }
+    /// `GetType` on the real object.
+    pub unsafe fn GetType(
+        inner: *mut c_void,
+    ) -> windows::Win32::Graphics::Direct3D11::D3D11_DEVICE_CONTEXT_TYPE {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetType)(inner)
+        }
+    }
+    /// `GetContextFlags` on the real object.
+    pub unsafe fn GetContextFlags(inner: *mut c_void) -> u32 {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .GetContextFlags)(inner)
+        }
+    }
+    /// `FinishCommandList` on the real object.
+    pub unsafe fn FinishCommandList(
+        inner: *mut c_void,
+        a0: windows::core::BOOL,
+        a1: *mut *mut core::ffi::c_void,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .base__
+                .FinishCommandList)(inner, a0, a1)
+        }
+    }
+    /// `CopySubresourceRegion1` on the real object.
+    pub unsafe fn CopySubresourceRegion1(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: u32,
+        a2: u32,
+        a3: u32,
+        a4: u32,
+        a5: *mut core::ffi::c_void,
+        a6: u32,
+        a7: *const windows::Win32::Graphics::Direct3D11::D3D11_BOX,
+        a8: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .CopySubresourceRegion1)(inner, a0, a1, a2, a3, a4, a5, a6, a7, a8)
+        }
+    }
+    /// `UpdateSubresource1` on the real object.
+    pub unsafe fn UpdateSubresource1(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: u32,
+        a2: *const windows::Win32::Graphics::Direct3D11::D3D11_BOX,
+        a3: *const core::ffi::c_void,
+        a4: u32,
+        a5: u32,
+        a6: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .UpdateSubresource1)(inner, a0, a1, a2, a3, a4, a5, a6)
+        }
+    }
+    /// `DiscardResource` on the real object.
+    pub unsafe fn DiscardResource(inner: *mut c_void, a0: *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .DiscardResource)(inner, a0)
+        }
+    }
+    /// `DiscardView` on the real object.
+    pub unsafe fn DiscardView(inner: *mut c_void, a0: *mut core::ffi::c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .DiscardView)(inner, a0)
+        }
+    }
+    /// `VSSetConstantBuffers1` on the real object.
+    pub unsafe fn VSSetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+        a3: *const u32,
+        a4: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .VSSetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `HSSetConstantBuffers1` on the real object.
+    pub unsafe fn HSSetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+        a3: *const u32,
+        a4: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .HSSetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `DSSetConstantBuffers1` on the real object.
+    pub unsafe fn DSSetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+        a3: *const u32,
+        a4: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .DSSetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `GSSetConstantBuffers1` on the real object.
+    pub unsafe fn GSSetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+        a3: *const u32,
+        a4: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .GSSetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `PSSetConstantBuffers1` on the real object.
+    pub unsafe fn PSSetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+        a3: *const u32,
+        a4: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .PSSetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `CSSetConstantBuffers1` on the real object.
+    pub unsafe fn CSSetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *const *mut core::ffi::c_void,
+        a3: *const u32,
+        a4: *const u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .CSSetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `VSGetConstantBuffers1` on the real object.
+    pub unsafe fn VSGetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+        a3: *mut u32,
+        a4: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .VSGetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `HSGetConstantBuffers1` on the real object.
+    pub unsafe fn HSGetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+        a3: *mut u32,
+        a4: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .HSGetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `DSGetConstantBuffers1` on the real object.
+    pub unsafe fn DSGetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+        a3: *mut u32,
+        a4: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .DSGetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `GSGetConstantBuffers1` on the real object.
+    pub unsafe fn GSGetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+        a3: *mut u32,
+        a4: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .GSGetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `PSGetConstantBuffers1` on the real object.
+    pub unsafe fn PSGetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+        a3: *mut u32,
+        a4: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .PSGetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `CSGetConstantBuffers1` on the real object.
+    pub unsafe fn CSGetConstantBuffers1(
+        inner: *mut c_void,
+        a0: u32,
+        a1: u32,
+        a2: *mut *mut core::ffi::c_void,
+        a3: *mut u32,
+        a4: *mut u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .CSGetConstantBuffers1)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `SwapDeviceContextState` on the real object.
+    pub unsafe fn SwapDeviceContextState(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *mut *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .SwapDeviceContextState)(inner, a0, a1)
+        }
+    }
+    /// `ClearView` on the real object.
+    pub unsafe fn ClearView(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const f32,
+        a2: *const windows::Win32::Foundation::RECT,
+        a3: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .ClearView)(inner, a0, a1, a2, a3)
+        }
+    }
+    /// `DiscardView1` on the real object.
+    pub unsafe fn DiscardView1(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const windows::Win32::Foundation::RECT,
+        a2: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .base__
+                .DiscardView1)(inner, a0, a1, a2)
+        }
+    }
+    /// `UpdateTileMappings` on the real object.
+    pub unsafe fn UpdateTileMappings(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: u32,
+        a2: *const windows::Win32::Graphics::Direct3D11::D3D11_TILED_RESOURCE_COORDINATE,
+        a3: *const windows::Win32::Graphics::Direct3D11::D3D11_TILE_REGION_SIZE,
+        a4: *mut core::ffi::c_void,
+        a5: u32,
+        a6: *const u32,
+        a7: *const u32,
+        a8: *const u32,
+        a9: u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .UpdateTileMappings)(inner, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9)
+        }
+    }
+    /// `CopyTileMappings` on the real object.
+    pub unsafe fn CopyTileMappings(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const windows::Win32::Graphics::Direct3D11::D3D11_TILED_RESOURCE_COORDINATE,
+        a2: *mut core::ffi::c_void,
+        a3: *const windows::Win32::Graphics::Direct3D11::D3D11_TILED_RESOURCE_COORDINATE,
+        a4: *const windows::Win32::Graphics::Direct3D11::D3D11_TILE_REGION_SIZE,
+        a5: u32,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .CopyTileMappings)(inner, a0, a1, a2, a3, a4, a5)
+        }
+    }
+    /// `CopyTiles` on the real object.
+    pub unsafe fn CopyTiles(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const windows::Win32::Graphics::Direct3D11::D3D11_TILED_RESOURCE_COORDINATE,
+        a2: *const windows::Win32::Graphics::Direct3D11::D3D11_TILE_REGION_SIZE,
+        a3: *mut core::ffi::c_void,
+        a4: u64,
+        a5: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .CopyTiles)(inner, a0, a1, a2, a3, a4, a5)
+        }
+    }
+    /// `UpdateTiles` on the real object.
+    pub unsafe fn UpdateTiles(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *const windows::Win32::Graphics::Direct3D11::D3D11_TILED_RESOURCE_COORDINATE,
+        a2: *const windows::Win32::Graphics::Direct3D11::D3D11_TILE_REGION_SIZE,
+        a3: *const core::ffi::c_void,
+        a4: u32,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .UpdateTiles)(inner, a0, a1, a2, a3, a4)
+        }
+    }
+    /// `ResizeTilePool` on the real object.
+    pub unsafe fn ResizeTilePool(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: u64,
+    ) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .ResizeTilePool)(inner, a0, a1)
+        }
+    }
+    /// `TiledResourceBarrier` on the real object.
+    pub unsafe fn TiledResourceBarrier(
+        inner: *mut c_void,
+        a0: *mut core::ffi::c_void,
+        a1: *mut core::ffi::c_void,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .TiledResourceBarrier)(inner, a0, a1)
+        }
+    }
+    /// `IsAnnotationEnabled` on the real object.
+    pub unsafe fn IsAnnotationEnabled(inner: *mut c_void) -> windows::core::BOOL {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .IsAnnotationEnabled)(inner)
+        }
+    }
+    /// `SetMarkerInt` on the real object.
+    pub unsafe fn SetMarkerInt(inner: *mut c_void, a0: windows::core::PCWSTR, a1: i32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .SetMarkerInt)(inner, a0, a1)
+        }
+    }
+    /// `BeginEventInt` on the real object.
+    pub unsafe fn BeginEventInt(inner: *mut c_void, a0: windows::core::PCWSTR, a1: i32) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .BeginEventInt)(inner, a0, a1)
+        }
+    }
+    /// `EndEvent` on the real object.
+    pub unsafe fn EndEvent(inner: *mut c_void) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .base__
+                .EndEvent)(inner)
+        }
+    }
+    /// `Flush1` on the real object.
+    pub unsafe fn Flush1(
+        inner: *mut c_void,
+        a0: windows::Win32::Graphics::Direct3D11::D3D11_CONTEXT_TYPE,
+        a1: windows::Win32::Foundation::HANDLE,
+    ) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .Flush1)(inner, a0, a1)
+        }
+    }
+    /// `SetHardwareProtectionState` on the real object.
+    pub unsafe fn SetHardwareProtectionState(inner: *mut c_void, a0: windows::core::BOOL) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .SetHardwareProtectionState)(inner, a0)
+        }
+    }
+    /// `GetHardwareProtectionState` on the real object.
+    pub unsafe fn GetHardwareProtectionState(inner: *mut c_void, a0: *mut windows::core::BOOL) {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .base__
+                .GetHardwareProtectionState)(inner, a0)
+        }
+    }
+    /// `Signal` on the real object.
+    pub unsafe fn Signal(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: u64) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .Signal)(inner, a0, a1)
+        }
+    }
+    /// `Wait` on the real object.
+    pub unsafe fn Wait(inner: *mut c_void, a0: *mut core::ffi::c_void, a1: u64) -> windows::core::HRESULT {
+        unsafe {
+            ((*(*(inner as *const *const windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext4_Vtbl)))
+                .Wait)(inner, a0, a1)
         }
     }
 }
