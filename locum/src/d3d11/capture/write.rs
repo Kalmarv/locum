@@ -58,6 +58,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     let tracked: BTreeMap<u64, Tracked> = std::mem::take(&mut s.resources);
     let in_flight = std::mem::take(&mut s.in_flight);
     let mut read = std::mem::take(&mut s.contents);
+    let counters = std::mem::take(&mut s.counter_copies);
     let views = std::mem::take(&mut s.views);
     let states = std::mem::take(&mut s.states);
     let staging = std::mem::take(&mut s.staging);
@@ -143,6 +144,16 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
 
     // Number draws, read targets, collect stacks.
     let mut capture = Capture::default();
+    for (view, copy) in counters {
+        match copy.and_then(|buffer| super::counters::read(immediate, &buffer)) {
+            Ok(count) => capture.uav_counters.push((view, count)),
+            Err(e) => {
+                *gaps
+                    .entry(("counters".into(), format!("view #{view}: {e}")))
+                    .or_insert(0) += 1;
+            }
+        }
+    }
     let mut interner = Interner::default();
     let mut cb_seen: HashMap<String, ()> = HashMap::new();
     let mut shader_hashes: BTreeSet<(String, &'static str)> = BTreeSet::new();
@@ -202,11 +213,15 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                 cbs_repeated += 1;
                 continue;
             }
-            let data = cb.copy.and_then(|(chunk, offset, bytes)| {
-                chunks
-                    .get(chunk as usize)?
-                    .get(offset as usize..(offset + bytes) as usize)
-            });
+            let data = if cb.empty {
+                Some(&[][..])
+            } else {
+                cb.copy.and_then(|(chunk, offset, bytes)| {
+                    chunks
+                        .get(chunk as usize)?
+                        .get(offset as usize..(offset + bytes) as usize)
+                })
+            };
             if let Some(bytes) = data {
                 let key = hash::key(bytes);
                 if cb_seen.insert(key.clone(), ()).is_none() {

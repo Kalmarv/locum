@@ -26,6 +26,7 @@
 //! effect change on the GPU's timeline; its targets are read back there (see [`targets`]).
 
 pub mod contents;
+mod counters;
 pub mod ids;
 pub mod ops;
 mod snapshot;
@@ -125,6 +126,8 @@ pub(super) struct CbCopy {
     source: Option<ID3D11Buffer>,
     first: u32,
     count: u32,
+    /// The bound window intersects no constants in the buffer.
+    empty: bool,
     /// Staging chunk, offset, bytes.
     copy: Option<(u32, u32, u32)>,
 }
@@ -176,6 +179,8 @@ pub(super) struct Event {
     draw: Option<Box<Draw>>,
     reads: Vec<u64>,
     writes: Vec<u64>,
+    /// Views whose hidden counters this event uses or resets.
+    counters: Vec<u64>,
     /// The number of the command list execution it came in with (set when spliced).
     list: Option<u64>,
 }
@@ -225,6 +230,8 @@ struct State {
     in_flight_bytes: u64,
     /// Contents read so far (key and subresource keys), or why there are none.
     contents: BTreeMap<u64, contents::Read>,
+    counter_views: BTreeMap<u64, ID3D11UnorderedAccessView>,
+    counter_copies: BTreeMap<u64, Result<ID3D11Buffer, String>>,
     gaps: BTreeMap<(String, String), u64>,
 }
 
@@ -257,6 +264,8 @@ static STATE: Mutex<State> = Mutex::new(State {
     in_flight: Vec::new(),
     in_flight_bytes: 0,
     contents: BTreeMap::new(),
+    counter_views: BTreeMap::new(),
+    counter_copies: BTreeMap::new(),
     gaps: BTreeMap::new(),
 });
 
@@ -294,6 +303,8 @@ impl State {
         self.in_flight.clear();
         self.in_flight_bytes = 0;
         self.contents.clear();
+        self.counter_views.clear();
+        self.counter_copies.clear();
         self.gaps.clear();
     }
 }
@@ -405,6 +416,7 @@ fn first_touch(immediate: &ID3D11DeviceContext4, event: &Event) {
         }
         todo
     };
+    counters::touch(immediate, &event.counters);
     if todo.is_empty() {
         return;
     }
@@ -469,6 +481,14 @@ pub(super) fn touch_only(c: &ID3D11DeviceContext4, event: &Event) {
 }
 
 fn new_event(kind: &'static str, call: &'static str, context: u32, deferred: bool, args: Value) -> Event {
+    let mut counters: Vec<_> = args["view"].as_u64().into_iter().collect();
+    counters.extend(
+        args["set"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s["view"].as_u64()),
+    );
     Event {
         kind,
         call,
@@ -480,6 +500,7 @@ fn new_event(kind: &'static str, call: &'static str, context: u32, deferred: boo
         draw: None,
         reads: Vec::new(),
         writes: Vec::new(),
+        counters,
         list: None,
     }
 }
@@ -531,6 +552,12 @@ fn draw_event(
     event.reads = touches.reads;
     event.reads.extend_from_slice(extra_reads);
     event.writes = touches.writes;
+    event.counters.extend(
+        draw.bindings
+            .iter()
+            .filter(|b| b.kind == "uav")
+            .filter_map(|b| b.view),
+    );
     event.draw = Some(draw);
     record(context, event);
 }
@@ -743,6 +770,7 @@ pub fn on_execute_list(
                 for le in &l.events {
                     e.reads.extend_from_slice(&le.reads);
                     e.writes.extend_from_slice(&le.writes);
+                    e.counters.extend_from_slice(&le.counters);
                 }
             }
             e

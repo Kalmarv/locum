@@ -213,6 +213,9 @@ enum Command {
         /// Run on WARP, the software rasterizer, instead of the GPU.
         #[arg(long)]
         warp: bool,
+        /// Enable D3D11 validation; errors make verification fail.
+        #[arg(long)]
+        debug: bool,
         #[arg(short, long, default_value = "replay")]
         out: PathBuf,
         #[arg(long, default_value = "auto")]
@@ -223,6 +226,9 @@ enum Command {
         capture: String,
         #[arg(long)]
         warp: bool,
+        /// Enable D3D11 validation; errors make verification fail.
+        #[arg(long)]
+        debug: bool,
         /// Compare at most this many targets.
         #[arg(long)]
         limit: Option<i64>,
@@ -471,6 +477,7 @@ fn run(cli: Cli) -> Result<(), String> {
             rules,
             mode,
             warp,
+            debug,
             out,
             range: r,
         } => {
@@ -486,12 +493,18 @@ fn run(cli: Cli) -> Result<(), String> {
                     rules: rule,
                     rules_file: rules,
                     warp,
+                    debug,
                     out,
                     range: range(&r)?,
                 },
             )
         }
-        Command::Verify { capture, warp, limit } => replay::verify(&open(&capture)?, warp, limit),
+        Command::Verify {
+            capture,
+            warp,
+            debug,
+            limit,
+        } => replay::verify(&open(&capture)?, warp, debug, limit),
         Command::Dump { pid, out, signal } => memory::dump(pid, &out, signal.as_deref()),
         Command::Memfind {
             target,

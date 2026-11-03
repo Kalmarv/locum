@@ -678,14 +678,16 @@ pub fn uav_counters(
         return;
     }
     let mut set = Vec::new();
+    let mut written = Vec::new();
     for i in 0..n as usize {
         let count = unsafe { *counts.add(i) };
         if count == u32::MAX {
             continue;
         }
         let raw = unsafe { *views.add(i) };
-        if let Some((v, _)) = view_target(raw) {
+        if let Some((v, resource)) = view_target(raw) {
             set.push(json!({"slot": start + i as u32, "view": v, "count": count}));
+            written.push(resource);
         }
     }
     if !set.is_empty() {
@@ -699,7 +701,7 @@ pub fn uav_counters(
             call,
             json!({"set": set}),
             &[],
-            &[],
+            &written,
         );
     }
 }

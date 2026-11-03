@@ -14,6 +14,8 @@
 //!   frame before (as engines that build the next frame while the GPU draws this one do) gives both draws, in order,
 //!   with their shaders' hashes and the constant-buffer contents each draw saw.
 
+mod replay_rows;
+
 use std::process::ExitCode;
 
 use windows::Win32::Foundation::{HMODULE, HWND};
@@ -212,6 +214,10 @@ fn run(checks: &mut Checks) -> Result<()> {
     adversarial_capture(checks, &device, &immediate, &deferred, &swapchain)?;
     unsafe { immediate.ClearState() };
     ordered_capture(checks, &device, &immediate, &swapchain)?;
+    replay_rows::row16(checks, &device, &immediate, &deferred, &swapchain)?;
+    replay_rows::row17(checks, &device, &immediate, &swapchain)?;
+    replay_rows::row18(checks, &device, &immediate, &swapchain)?;
+    replay_rows::row21(checks, &device, &immediate, &deferred, &swapchain)?;
     drop((swapchain, deferred));
     unsafe { DestroyWindow(hwnd) }?;
     Ok(())

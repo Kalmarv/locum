@@ -93,7 +93,7 @@ fn main() {
         .to_path_buf();
     match args.first().map(String::as_str) {
         Some("gen") => generate_all(&root),
-        Some("smoke") => smoke(&root),
+        Some("smoke") => smoke(&root, args.iter().any(|a| a == "--debug")),
         _ => {
             eprintln!("usage: cargo xtask gen | smoke");
             std::process::exit(2);
@@ -103,7 +103,7 @@ fn main() {
 
 /// Builds the release DLLs and the smoke program, puts them in `target/smoke/` and runs it there, with locum's log
 /// in `target/smoke/log/`.
-fn smoke(root: &Path) {
+fn smoke(root: &Path, debug: bool) {
     let status = Command::new(env!("CARGO"))
         .current_dir(root)
         .args([
@@ -175,6 +175,7 @@ fn smoke(root: &Path) {
         &log_dir,
         "adversarial",
         false,
+        debug,
         "adversarial rows6/7: all recorded checkpoints match replay",
     );
     // The ordered capture's dispatch writes its records in whatever order the GPU runs its threads; WARP runs them
@@ -187,6 +188,7 @@ fn smoke(root: &Path) {
             &log_dir,
             "ordered",
             warp,
+            debug,
             &format!(
                 "ordered: replayed on {device}, the draw after an order-dependent dispatch is the game's"
             ),
@@ -209,16 +211,62 @@ fn smoke(root: &Path) {
         );
         ordered_ok &= ok && settled;
     }
-    if !status.success() || !late.success() || !cli_ok || !adversarial_ok || !ordered_ok {
+    let mut rows_ok = verified(&cli, &log_dir, "row16", false, debug, "row16: bit-exact replay").0;
+    if log_dir.join("captures/row17/capture.db").exists() {
+        for warp in [false, true] {
+            rows_ok &= verified(&cli, &log_dir, "row17", warp, debug, "row17: bit-exact replay").0;
+        }
+    }
+    for warp in [false, true] {
+        rows_ok &= verified(&cli, &log_dir, "row18", warp, debug, "row18: bit-exact replay").0;
+    }
+    for warp in [false, true] {
+        rows_ok &= verified(&cli, &log_dir, "row21", warp, debug, "row21: bit-exact replay").0;
+        let mut command = Command::new(&cli);
+        command
+            .arg("replay")
+            .arg(log_dir.join("captures/row21"))
+            .args(["last", "--mode", "slice", "--out"])
+            .arg(log_dir.join(if warp {
+                "row21-slice-warp"
+            } else {
+                "row21-slice-gpu"
+            }));
+        if warp {
+            command.arg("--warp");
+        }
+        if debug {
+            command.arg("--debug");
+        }
+        let output = command
+            .env("LOCUM_DIR", &log_dir)
+            .output()
+            .expect("replay counter slice");
+        let text =
+            String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        let ok = output.status.success()
+            && text.contains("against the game's: identical")
+            && !text.contains("warning:");
+        println!("--- row21 slice replay (WARP={warp})\n{text}");
+        println!(
+            "{} row21: slice retains counter resets",
+            if ok { "ok  " } else { "FAIL" }
+        );
+        rows_ok &= ok;
+    }
+    if !status.success() || !late.success() || !cli_ok || !adversarial_ok || !ordered_ok || !rows_ok {
         std::process::exit(1);
     }
 }
 
 /// Runs `locum-cli verify` on the smoke test's capture `label` (on WARP if `warp`): whether it passed, with every
 /// target compared identical and at least one compared, and what it said.
-fn verified(cli: &Path, log_dir: &Path, label: &str, warp: bool, what: &str) -> (bool, String) {
+fn verified(cli: &Path, log_dir: &Path, label: &str, warp: bool, debug: bool, what: &str) -> (bool, String) {
     let mut command = Command::new(cli);
     command.arg("verify").arg(log_dir.join("captures").join(label));
+    if debug {
+        command.arg("--debug");
+    }
     if warp {
         command.arg("--warp");
     }
@@ -259,11 +307,7 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
             .output()
             .expect("run locum-cli");
         let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-        println!(
-            "--- locum-cli {}
-{text}",
-            args.join(" ")
-        );
+        println!("--- locum-cli {}\n{text}", args.join(" "));
         text
     };
     let checks = [

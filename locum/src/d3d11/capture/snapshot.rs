@@ -83,6 +83,7 @@ pub(super) unsafe fn snapshot(c: &ID3D11DeviceContext4, compute: bool, draw: &mu
                 source: Some(buffer),
                 first: b.first,
                 count: b.count,
+                empty: false,
                 copy: None,
             });
             draw.bindings.push(row);
@@ -273,13 +274,10 @@ pub(super) unsafe fn copy_cb(c: &ID3D11DeviceContext4, cb: &mut CbCopy) -> Optio
     let mut desc = D3D11_BUFFER_DESC::default();
     unsafe { source.GetDesc(&mut desc) };
     let start = cb.first.saturating_mul(16).min(desc.ByteWidth);
-    let wanted = if cb.count == 0 {
-        desc.ByteWidth
-    } else {
-        cb.count.saturating_mul(16)
-    };
+    let wanted = cb.count.saturating_mul(16);
     let bytes = wanted.min(desc.ByteWidth - start).min(MAX_CB_COPY);
     if bytes == 0 {
+        cb.empty = true;
         return None;
     }
     let (chunk, offset, staging) = {

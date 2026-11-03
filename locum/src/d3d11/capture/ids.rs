@@ -73,6 +73,9 @@ pub(super) fn view_ids(view: &ID3D11View) -> (u64, u64) {
     let (id, known) = number(&child, capture);
     if !known {
         let row = describe_view(id, resource_id, view);
+        if let Ok(uav) = view.cast::<ID3D11UnorderedAccessView>() {
+            super::counters::track(id, &uav);
+        }
         state().views.push(row);
     }
     (id, resource_id)

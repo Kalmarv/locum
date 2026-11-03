@@ -323,9 +323,10 @@ fn execute(
     plan: &Plan,
     rules: &[Rule],
     warp: bool,
+    debug: bool,
     outs: &[Output],
 ) -> Result<(Vec<Vec<u8>>, Vec<String>), String> {
-    let mut b = backend(c, warp)?;
+    let mut b = backend(c, warp, debug)?;
     let mut missing = 0;
     for &id in &plan.resources {
         let key: Option<String> = c
@@ -457,9 +458,9 @@ fn same_records(a: &[u8], b: &[u8], stride: usize) -> bool {
     x == y
 }
 
-fn backend(c: &Capture, warp: bool) -> Result<Box<dyn Backend>, String> {
+fn backend(c: &Capture, warp: bool, debug: bool) -> Result<Box<dyn Backend>, String> {
     match c.meta("api").as_deref() {
-        Some("d3d11") => Ok(Box::new(d3d11::D3d11::new(warp)?)),
+        Some("d3d11") => Ok(Box::new(d3d11::D3d11::new(warp, debug)?)),
         other => Err(format!("no replay for API {other:?}")),
     }
 }
@@ -481,6 +482,7 @@ pub struct Options {
     pub rules: Vec<String>,
     pub rules_file: Option<PathBuf>,
     pub warp: bool,
+    pub debug: bool,
     pub out: PathBuf,
     pub range: Range,
 }
@@ -541,7 +543,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     }
     std::fs::create_dir_all(&o.out).map_err(|e| format!("{}: {e}", o.out.display()))?;
     let t = std::time::Instant::now();
-    let (base, warnings) = execute(c, &plan, &[], o.warp, &outs)?;
+    let (base, warnings) = execute(c, &plan, &[], o.warp, o.debug, &outs)?;
     out!("  replayed in {:.2} s", t.elapsed().as_secs_f64());
     for w in &warnings {
         out!("  warning: {w}");
@@ -549,7 +551,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     let edited = if parsed.is_empty() {
         None
     } else {
-        let (after, _) = execute(c, &plan, &parsed, o.warp, &outs)?;
+        let (after, _) = execute(c, &plan, &parsed, o.warp, o.debug, &outs)?;
         Some(after)
     };
     // Captured targets after this draw, to compare the replay against.
@@ -616,7 +618,7 @@ const CHECKS: &str = "'evidence', 'targets', 'memory'";
 
 /// Replays the whole frame and compares every target the capture read back with the replay's at the same point. Fails
 /// unless every target compared is identical and nothing kept the capture or the replay from being complete.
-pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String> {
+pub fn verify(c: &Capture, warp: bool, debug: bool, limit: Option<i64>) -> Result<(), String> {
     let last: i64 = c
         .row("SELECT max(seq) FROM events", [], |r| r.get::<_, Option<i64>>(0))
         .flatten()
@@ -652,7 +654,7 @@ pub fn verify(c: &Capture, warp: bool, limit: Option<i64>) -> Result<(), String>
         checks.len()
     );
     let started = std::time::Instant::now();
-    let mut b = backend(c, warp)?;
+    let mut b = backend(c, warp, debug)?;
     for &id in &plan.resources {
         let key: Option<String> = c
             .row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))

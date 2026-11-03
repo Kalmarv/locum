@@ -46,6 +46,8 @@ CREATE TABLE subresources(
 );
 CREATE TABLE views(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, resource INTEGER, format INTEGER, dimension INTEGER,
   desc BLOB, json TEXT);
+-- Hidden UAV counters immediately before each view's first use on the GPU timeline.
+CREATE TABLE uav_counters(view INTEGER PRIMARY KEY, count INTEGER NOT NULL);
 -- Pipeline state objects: rasterizer, blend, depth_stencil, sampler, input_layout (signature: key of the bytecode it
 -- was created against).
 CREATE TABLE states(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, desc BLOB, json TEXT, signature TEXT);
@@ -284,6 +286,7 @@ pub struct Capture {
     pub resources: Vec<Resource>,
     pub subresources: Vec<Subresource>,
     pub views: Vec<View>,
+    pub uav_counters: Vec<(u64, u32)>,
     pub states: Vec<State>,
     pub shaders: Vec<Shader>,
     pub events: Vec<Event>,
@@ -407,6 +410,10 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
                 v.desc,
                 v.json
             ])?;
+        }
+        let mut s = tx.prepare("INSERT INTO uav_counters VALUES(?1,?2)")?;
+        for &(view, count) in &capture.uav_counters {
+            s.execute(params![view as i64, count])?;
         }
         let mut s = tx.prepare("INSERT INTO states VALUES(?1,?2,?3,?4,?5)")?;
         for v in &capture.states {

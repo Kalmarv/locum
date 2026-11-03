@@ -51,10 +51,11 @@ pub struct D3d11 {
     shaders: HashMap<(String, usize), Option<ID3D11DeviceChild>>,
     replaced: HashMap<String, Option<ID3D11DeviceChild>>,
     warnings: BTreeSet<String>,
+    debug: Option<ID3D11InfoQueue>,
 }
 
 impl D3d11 {
-    pub fn new(warp: bool) -> Result<D3d11, String> {
+    pub fn new(warp: bool, debug: bool) -> Result<D3d11, String> {
         let (mut device, mut ctx) = (None, None);
         let levels = [D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0];
         unsafe {
@@ -66,7 +67,12 @@ impl D3d11 {
                     D3D_DRIVER_TYPE_HARDWARE
                 },
                 HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT
+                    | if debug {
+                        D3D11_CREATE_DEVICE_DEBUG
+                    } else {
+                        D3D11_CREATE_DEVICE_FLAG(0)
+                    },
                 Some(&levels),
                 D3D11_SDK_VERSION,
                 Some(&mut device),
@@ -83,6 +89,15 @@ impl D3d11 {
             .ok_or("no context")?
             .cast()
             .map_err(|e| format!("ID3D11DeviceContext1: {e}"))?;
+        let debug = if debug {
+            Some(
+                device
+                    .cast::<ID3D11InfoQueue>()
+                    .map_err(|e| format!("ID3D11InfoQueue: {e}"))?,
+            )
+        } else {
+            None
+        };
         Ok(D3d11 {
             device,
             ctx,
@@ -93,6 +108,7 @@ impl D3d11 {
             shaders: HashMap::new(),
             replaced: HashMap::new(),
             warnings: BTreeSet::new(),
+            debug,
         })
     }
 
@@ -144,6 +160,9 @@ impl D3d11 {
                     None
                 }
             };
+            if let Some(View::Uav(view)) = &made {
+                self.initial_counter(c, id, view);
+            }
             self.views.insert(id, made);
         }
         Ok(self.views[&id].as_ref())
@@ -177,6 +196,38 @@ impl D3d11 {
                     Ok(View::Uav(v.unwrap()))
                 }
             }
+        }
+    }
+
+    /// Restore a view's counter once, before any event can use it, including CopyStructureCount.
+    fn initial_counter(&mut self, c: &Capture, id: i64, view: &ID3D11UnorderedAccessView) {
+        let mut desc = D3D11_UNORDERED_ACCESS_VIEW_DESC::default();
+        unsafe { view.GetDesc(&mut desc) };
+        if desc.ViewDimension != D3D11_UAV_DIMENSION_BUFFER
+            || unsafe { desc.Anonymous.Buffer.Flags }
+                & (D3D11_BUFFER_UAV_FLAG_APPEND.0 | D3D11_BUFFER_UAV_FLAG_COUNTER.0) as u32
+                == 0
+        {
+            return;
+        }
+        let count: Option<u32> = c.row("SELECT count FROM uav_counters WHERE view = ?1", [id], |r| {
+            r.get(0)
+        });
+        let Some(count) = count else {
+            self.warn(format!("view #{id}: initial UAV counter was not captured"));
+            return;
+        };
+        if count == u32::MAX {
+            self.warn(format!(
+                "view #{id}: initial UAV counter UINT_MAX cannot be set by a binding"
+            ));
+            return;
+        }
+        // Every draw rebuilds its bindings; this temporary bind also initializes views used only by copies.
+        unsafe {
+            self.ctx
+                .CSSetUnorderedAccessViews(0, 1, Some(&Some(view.clone())), Some(&count));
+            self.ctx.CSSetUnorderedAccessViews(0, 1, Some(&None), None);
         }
     }
 
@@ -568,10 +619,13 @@ impl D3d11 {
                                     |r| r.get(0),
                                 )
                                 .flatten();
+                            if size == Some(0) {
+                                continue;
+                            }
                             let all = self.read(r)?;
                             let start = (offset.unwrap_or(0) as usize).min(all.len());
                             let end = match size {
-                                Some(s) if s > 0 => (start + s as usize).min(all.len()),
+                                Some(s) if s >= 0 => (start + s as usize).min(all.len()),
                                 _ => all.len().min(start + 65536),
                             };
                             all[start..end].to_vec()
@@ -583,6 +637,10 @@ impl D3d11 {
                             continue;
                         }
                     };
+                    // An empty window reads zeros at every register, like an unbound buffer.
+                    if bytes.is_empty() {
+                        continue;
+                    }
                     for r in &applying {
                         if let Action::Constant { slot: s, index, bits } = r.action
                             && r.stage == st
@@ -1302,6 +1360,40 @@ impl Backend for D3d11 {
     }
 
     fn warnings(&self) -> Vec<String> {
-        self.warnings.iter().cloned().collect()
+        let mut warnings = self.warnings.clone();
+        if let Some(queue) = &self.debug {
+            unsafe {
+                if queue.GetNumMessagesDiscardedByMessageCountLimit() != 0 {
+                    warnings.insert("D3D11 validation messages were lost to the queue limit".into());
+                }
+                for i in 0..queue.GetNumStoredMessagesAllowedByRetrievalFilter() {
+                    let mut size = 0;
+                    if let Err(e) = queue.GetMessage(i, None, &mut size) {
+                        warnings.insert(format!("D3D11 validation message {i}: {e}"));
+                        continue;
+                    }
+                    // The queue writes a D3D11_MESSAGE followed by its text; keep the header aligned.
+                    let mut storage = vec![0usize; size.div_ceil(size_of::<usize>())];
+                    let message = storage.as_mut_ptr().cast::<D3D11_MESSAGE>();
+                    if let Err(e) = queue.GetMessage(i, Some(message), &mut size) {
+                        warnings.insert(format!("D3D11 validation message {i}: {e}"));
+                        continue;
+                    }
+                    let message = &*message;
+                    if matches!(
+                        message.Severity,
+                        D3D11_MESSAGE_SEVERITY_ERROR | D3D11_MESSAGE_SEVERITY_CORRUPTION
+                    ) {
+                        let text =
+                            std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength);
+                        warnings.insert(format!(
+                            "D3D11 validation: {}",
+                            String::from_utf8_lossy(text).trim_end_matches('\0')
+                        ));
+                    }
+                }
+            }
+        }
+        warnings.into_iter().collect()
     }
 }
