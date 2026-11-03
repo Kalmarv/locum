@@ -68,6 +68,18 @@ impl Context {
         }
     }
 
+    /// The end of a pass on this context, if a capture is running (see [`capture::end_pass`]).
+    pub fn end_pass(&self) {
+        if capture::armed() {
+            capture::end_pass(&self.inner, self.id, self.deferred);
+        }
+    }
+
+    /// The real context.
+    pub fn real(&self) -> &ID3D11DeviceContext4 {
+        &self.inner
+    }
+
     /// Records an indirect draw or dispatch if a capture is running: its arguments are the buffer's id and offset.
     unsafe fn draw_indirect(&self, call: &'static str, buffer: *mut c_void, offset: u32) {
         if capture::armed() {
@@ -134,9 +146,8 @@ impl Device {
         core::ptr::eq(vtbl, &DEVICE_VTBL).then(|| unsafe { &*(object as *const Device) })
     }
 
-    /// The real immediate context.
-    pub fn real_immediate(&self) -> &ID3D11DeviceContext4 {
-        &self.immediate.inner
+    pub fn immediate(&self) -> &Context {
+        &self.immediate
     }
 
     pub fn immediate_raw(&self) -> *mut c_void {
@@ -441,7 +452,36 @@ unsafe impl ContextMethods for Context {
         }
     }
 
+    unsafe fn OMSetRenderTargets(&self, a0: u32, a1: *const *mut c_void, a2: *mut c_void) {
+        self.end_pass();
+        unsafe { real_context::OMSetRenderTargets(self.inner(), a0, a1, a2) }
+    }
+
+    unsafe fn OMSetRenderTargetsAndUnorderedAccessViews(
+        &self,
+        a0: u32,
+        a1: *const *mut c_void,
+        a2: *mut c_void,
+        a3: u32,
+        a4: u32,
+        a5: *const *mut c_void,
+        a6: *const u32,
+    ) {
+        if a0 != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL {
+            self.end_pass();
+        }
+        unsafe {
+            real_context::OMSetRenderTargetsAndUnorderedAccessViews(self.inner(), a0, a1, a2, a3, a4, a5, a6)
+        }
+    }
+
+    unsafe fn ClearState(&self) {
+        self.end_pass();
+        unsafe { real_context::ClearState(self.inner()) }
+    }
+
     unsafe fn FinishCommandList(&self, a0: BOOL, a1: *mut *mut c_void) -> HRESULT {
+        self.end_pass();
         let hr = unsafe { real_context::FinishCommandList(self.inner(), a0, a1) };
         if capture::armed() && hr.is_ok() && !a1.is_null() {
             capture::on_finish_list(self.id, unsafe { *a1 });
@@ -450,6 +490,7 @@ unsafe impl ContextMethods for Context {
     }
 
     unsafe fn ExecuteCommandList(&self, a0: *mut c_void, a1: BOOL) {
+        self.end_pass();
         if capture::armed() {
             capture::on_execute_list(self.id, self.deferred, a0);
         }

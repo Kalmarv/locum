@@ -321,7 +321,12 @@ fn capture(
         c.PSSetConstantBuffers(3, Some(&[Some(buffer.clone())]));
     };
 
-    std::fs::write(dir.join("capture"), b"").expect("write the capture request");
+    std::fs::write(
+        dir.join("capture"),
+        b"targets
+",
+    )
+    .expect("write the capture request");
     let mut next_list: Option<ID3D11CommandList> = None;
     for frame in 1..=CAPTURED + 2 {
         unsafe {
@@ -423,6 +428,24 @@ fn capture(
         checks.check(
             d["rtvs"].as_array().map(Vec::len) == Some(1),
             &format!("draw {i}: one render target"),
+        );
+
+        // Each draw is the last of its pass, so the target is read back after it: the whole target (the triangle
+        // covers it) holds the draw's colour, value / 2000 in every channel.
+        let targets = dir
+            .join("captures")
+            .join(format!("frame-{CAPTURED}"))
+            .join("targets");
+        let file = d["after"][0]["file"].as_str().map(|f| targets.join(f));
+        let pixel = file
+            .and_then(|f| std::fs::read(f).ok())
+            .and_then(|b| b.get(148..152).map(<[u8]>::to_vec));
+        let expected = (value / 2000.0 * 255.0).round() as u8;
+        println!("draw {i}: after it {}, first pixel {pixel:?}", d["after"]);
+        checks.check(
+            d["after"][0]["target"] == "rt0"
+                && pixel.is_some_and(|p| p.iter().all(|&c| c.abs_diff(expected) <= 1)),
+            &format!("draw {i}: its render target, read back after it, holds {expected} in every channel"),
         );
     }
     Ok(())

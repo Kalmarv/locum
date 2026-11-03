@@ -5,7 +5,8 @@ locum's; every call it makes arrives at locum first, which passes it on to the r
 DLLs is patched, and the game keeps rendering on its own driver.
 
 Status: early. The wrappers forward everything, shaders are hashed and dumped, and one frame can be captured with
-each draw's state and constant-buffer contents. Texture readback and overrides are being built.
+each draw's state, its constant-buffer contents and the render targets at the end of each pass. Overrides are being
+built.
 
 ## What it is for
 
@@ -34,17 +35,26 @@ Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` beside the game's executable. locum
   passes to the real object unwrapped.
 - `shaders/<hash>.<stage>.dxbc`: the bytecode of every shader the game creates, once per distinct shader. The hash
   is FNV-1a 64 of the bytecode.
-- `captures/frame-<n>/draws.jsonl`: a captured frame. Create an empty file named `capture` in the folder to request
-  one; locum removes it, records the next frames and writes the capture.
+- `captures/frame-<n>/draws.jsonl`: a captured frame. Create a file named `capture` in the folder to request one;
+  locum removes it, records the next frames and writes the capture. Each line of the file is an option:
+  - `targets`: also read back the render and depth targets at the end of each pass, to
+    `captures/frame-<n>/targets/<draw>-<target>.dds` (the pass's last draw; `rt0` to `rt7` or `depth`);
+  - `max_mb N`: the most memory the target copies may use (default 1024); targets past it are skipped and counted.
 
 A capture is one JSON object per line: a `frame` line (draw count, command lists spliced in, copy failures), a
 `resource`, `view` or `state` line for each object the frame used (with a number the draws refer to), a `cb` line for
 each distinct constant-buffer content (hex), and a `draw` line for each draw and dispatch in the order the GPU runs
 them: the call and its arguments, each stage's shader hash, constant buffers (slot, buffer, range, content), shader
-resource views, render targets, depth target, input assembly and the blend, raster and depth-stencil states.
+resource views, render targets, depth target, input assembly and the blend, raster and depth-stencil states, and with
+`targets` the files read back after it.
 
-Draws recorded on deferred contexts are placed where their command list is executed. Constant-buffer contents are
-copied by the GPU at the draw, on the draw's own context, so each draw's constants are the ones it ran with.
+Target files are DDS in the format the pass drew in; depth is written as the colour format of the same bits (D24S8 as
+R24_UNORM_X8, D32 as R32_FLOAT) and typeless formats as their plain typed format. Multisampled colour targets are
+resolved first.
+
+Draws recorded on deferred contexts are placed where their command list is executed. Constant buffers and targets
+are copied by the GPU on the draw's own context, so each draw's constants and each pass's targets are the ones the
+GPU saw at that point of the frame.
 
 ## Building
 

@@ -39,6 +39,15 @@ pub enum Stage {
 }
 
 impl Stage {
+    /// The stages a draw runs, in pipeline order.
+    pub const GRAPHICS: [Stage; 5] = [
+        Stage::Vertex,
+        Stage::Hull,
+        Stage::Domain,
+        Stage::Geometry,
+        Stage::Pixel,
+    ];
+
     pub fn short(self) -> &'static str {
         match self {
             Stage::Vertex => "vs",

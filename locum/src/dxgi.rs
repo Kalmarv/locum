@@ -312,9 +312,11 @@ impl SwapChain {
             return real();
         }
         count_frame();
+        let immediate = unsafe { (*self.device).immediate() };
+        immediate.end_pass();
         let finished = capture::before_present();
         let hr = real();
-        capture::after_present(finished, unsafe { (*self.device).real_immediate() });
+        capture::after_present(finished, immediate.real());
         hr
     }
 }
