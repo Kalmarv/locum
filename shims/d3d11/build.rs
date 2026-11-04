@@ -1,4 +1,8 @@
-//! Forward d3d11.dll's exports to locum.dll, with the system DLL's ordinals (the list DXVK exports).
+//! Forward d3d11.dll's exports to locum.dll: every name the system DLL exports, with the ordinals of Windows 11's
+//! (build 26200). Ordinals differ between Windows builds, so callers find these by name. The process finds ours for
+//! whatever it asks of d3d11.dll, as ours is loaded under that name: an export left out is one nothing can find (the
+//! Direct3D 11 debug layer imports D3D11CoreRegisterLayers and its kin). Those locum does not intercept pass through
+//! (`locum/src/passthrough.rs`).
 
 include!("../forward.rs");
 
@@ -6,10 +10,57 @@ fn main() {
     forward(
         "d3d11",
         &[
+            ("D3D11CreateDeviceForD3D12", 1),
+            ("D3DKMTCloseAdapter", 2),
+            ("D3DKMTDestroyAllocation", 3),
+            ("D3DKMTDestroyContext", 4),
+            ("D3DKMTDestroyDevice", 5),
+            ("D3DKMTDestroySynchronizationObject", 6),
+            ("D3DKMTPresent", 7),
+            ("D3DKMTQueryAdapterInfo", 8),
+            ("D3DKMTSetDisplayPrivateDriverFormat", 9),
+            ("D3DKMTSignalSynchronizationObject", 10),
+            ("D3DKMTUnlock", 11),
+            ("D3DKMTWaitForSynchronizationObject", 12),
+            ("EnableFeatureLevelUpgrade", 13),
+            ("OpenAdapter10", 14),
+            ("OpenAdapter10_2", 15),
+            ("CreateDirect3D11DeviceFromDXGIDevice", 16),
+            ("CreateDirect3D11SurfaceFromDXGISurface", 17),
             ("D3D11CoreCreateDevice", 18),
+            ("D3D11CoreCreateLayeredDevice", 19),
+            ("D3D11CoreGetLayeredDeviceSize", 20),
+            ("D3D11CoreRegisterLayers", 21),
             ("D3D11CreateDevice", 22),
             ("D3D11CreateDeviceAndSwapChain", 23),
             ("D3D11On12CreateDevice", 24),
+            ("D3DKMTCreateAllocation", 25),
+            ("D3DKMTCreateContext", 26),
+            ("D3DKMTCreateDevice", 27),
+            ("D3DKMTCreateSynchronizationObject", 28),
+            ("D3DKMTEscape", 29),
+            ("D3DKMTGetContextSchedulingPriority", 30),
+            ("D3DKMTGetDeviceState", 31),
+            ("D3DKMTGetDisplayModeList", 32),
+            ("D3DKMTGetMultisampleMethodList", 33),
+            ("D3DKMTGetRuntimeData", 34),
+            ("D3DKMTGetSharedPrimaryHandle", 35),
+            ("D3DKMTLock", 36),
+            ("D3DKMTOpenAdapterFromHdc", 37),
+            ("D3DKMTOpenResource", 38),
+            ("D3DKMTQueryAllocationResidency", 39),
+            ("D3DKMTQueryResourceInfo", 40),
+            ("D3DKMTRender", 41),
+            ("D3DKMTSetAllocationPriority", 42),
+            ("D3DKMTSetContextSchedulingPriority", 43),
+            ("D3DKMTSetDisplayMode", 44),
+            ("D3DKMTSetGammaRamp", 45),
+            ("D3DKMTSetVidPnSourceOwner", 46),
+            ("D3DKMTWaitForVerticalBlankEvent", 47),
+            ("D3DPerformance_BeginEvent", 48),
+            ("D3DPerformance_EndEvent", 49),
+            ("D3DPerformance_GetStatus", 50),
+            ("D3DPerformance_SetMarker", 51),
         ],
     );
 }

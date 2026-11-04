@@ -5,8 +5,11 @@ How locum works, the files it writes and reads, what a capture holds, and every 
 
 ## How it works
 
-- `d3d11.dll` and `dxgi.dll` contain no code: each export forwards to `locum.dll` (the same names and ordinals as the
-  system DLLs, the list DXVK exports).
+- `d3d11.dll` and `dxgi.dll` contain no code: each export forwards to `locum.dll`. They export every name the system
+  DLL exports, with Windows 11's ordinals. Whatever the process asks of `d3d11.dll` or `dxgi.dll` by name finds
+  locum's, so a name left out is one nothing can find. The Direct3D 11 debug layer imports `D3D11CoreRegisterLayers`
+  and its kin, and without them no debug device can be made (DXGI_ERROR_SDK_COMPONENT_MISSING). What locum does not
+  intercept passes through to the system DLL untouched.
 - `locum.dll` loads its own two DLLs, then the real `d3d11.dll` and `dxgi.dll` from the system folder, and wraps the
   device, its contexts, the DXGI factory and the swap chains in objects of its own. Loading its own first keeps a
   game that loads `d3d11.dll` late, by name, on locum's.

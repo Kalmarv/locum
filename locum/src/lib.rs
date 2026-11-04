@@ -16,6 +16,7 @@ mod d3d12;
 mod dump;
 mod dxgi;
 mod log;
+mod passthrough;
 mod settings;
 mod system;
 mod vtables;
@@ -355,69 +356,4 @@ pub unsafe extern "system" fn DXGIGetDebugInterface1(
         Some(real) => unsafe { real(flags, iid, out) },
         None => E_NOTIMPL,
     }
-}
-
-// D3D11CoreCreateDevice and D3D11On12CreateDevice pass through untouched: a naked stub saves the argument registers,
-// asks the resolver for the real function and jumps to it with the caller's stack and registers as they were, so the
-// exact signature does not matter. The devices they make are not wrapped (logged when used).
-
-/// Returned when the real DLL lacks the export: ignores its arguments and fails.
-extern "system" fn not_implemented() -> HRESULT {
-    E_NOTIMPL
-}
-
-extern "system" fn resolve_core_create_device() -> usize {
-    hello();
-    log!("D3D11CoreCreateDevice: passed through, device not wrapped");
-    type F = unsafe extern "system" fn() -> HRESULT;
-    unsafe { export::<F>(system().d3d11, c"D3D11CoreCreateDevice") }
-        .map_or(not_implemented as *const () as usize, |f| f as usize)
-}
-
-extern "system" fn resolve_on12_create_device() -> usize {
-    hello();
-    log!("D3D11On12CreateDevice: passed through, device not wrapped");
-    type F = unsafe extern "system" fn() -> HRESULT;
-    unsafe { export::<F>(system().d3d11, c"D3D11On12CreateDevice") }
-        .map_or(not_implemented as *const () as usize, |f| f as usize)
-}
-
-#[unsafe(no_mangle)]
-#[unsafe(naked)]
-pub unsafe extern "system" fn D3D11CoreCreateDevice() {
-    core::arch::naked_asm!(
-        "push rcx",
-        "push rdx",
-        "push r8",
-        "push r9",
-        "sub rsp, 40",
-        "call {resolve}",
-        "add rsp, 40",
-        "pop r9",
-        "pop r8",
-        "pop rdx",
-        "pop rcx",
-        "jmp rax",
-        resolve = sym resolve_core_create_device,
-    )
-}
-
-#[unsafe(no_mangle)]
-#[unsafe(naked)]
-pub unsafe extern "system" fn D3D11On12CreateDevice() {
-    core::arch::naked_asm!(
-        "push rcx",
-        "push rdx",
-        "push r8",
-        "push r9",
-        "sub rsp, 40",
-        "call {resolve}",
-        "add rsp, 40",
-        "pop r9",
-        "pop r8",
-        "pop rdx",
-        "pop rcx",
-        "jmp rax",
-        resolve = sym resolve_on12_create_device,
-    )
 }

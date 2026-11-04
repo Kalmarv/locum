@@ -468,6 +468,54 @@ impl D3d11 {
         self.replaced[&rule.text].clone()
     }
 
+    /// Writes `bytes` at byte `offset` of buffer `r`. A constant buffer takes no UpdateSubresource of part of it (and
+    /// UpdateSubresource1 only of 16-byte-aligned ranges, where the driver allows): its bytes go into a buffer of
+    /// their own and are copied in.
+    fn write_range(&self, r: &ID3D11Resource, offset: u32, bytes: &[u8]) -> Result<(), String> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let buffer: ID3D11Buffer = r
+            .cast()
+            .map_err(|e| format!("a range write to a non-buffer: {e}"))?;
+        let mut desc = D3D11_BUFFER_DESC::default();
+        unsafe { buffer.GetDesc(&mut desc) };
+        let len = bytes.len() as u32;
+        let range = |left| D3D11_BOX {
+            left,
+            top: 0,
+            front: 0,
+            right: left + len,
+            bottom: 1,
+            back: 1,
+        };
+        if desc.BindFlags & D3D11_BIND_CONSTANT_BUFFER.0 as u32 == 0 {
+            unsafe {
+                self.ctx
+                    .UpdateSubresource(r, 0, Some(&range(offset)), bytes.as_ptr().cast(), 0, 0)
+            };
+            return Ok(());
+        }
+        let staged = D3D11_BUFFER_DESC {
+            ByteWidth: len,
+            Usage: D3D11_USAGE_DEFAULT,
+            ..Default::default()
+        };
+        let init = D3D11_SUBRESOURCE_DATA {
+            pSysMem: bytes.as_ptr().cast(),
+            ..Default::default()
+        };
+        let mut b = None;
+        unsafe { self.device.CreateBuffer(&staged, Some(&init), Some(&mut b)) }
+            .map_err(|e| format!("a buffer of {len} bytes for a constant buffer's range: {e}"))?;
+        let b = b.ok_or("no buffer for a constant buffer's range")?;
+        unsafe {
+            self.ctx
+                .CopySubresourceRegion(r, 0, offset, 0, 0, &b, 0, Some(&range(0)))
+        };
+        Ok(())
+    }
+
     fn constant_buffer(&self, bytes: &[u8]) -> Result<ID3D11Buffer, String> {
         let size = bytes.len().max(16).div_ceil(16) * 16;
         let mut data = bytes.to_vec();
@@ -1088,16 +1136,22 @@ impl Backend for D3d11 {
                     (None, _) => (whole.row_bytes, whole.row_bytes * whole.rows),
                 };
                 let r = self.resource(dst)?.clone();
-                unsafe {
-                    ctx.UpdateSubresource(
-                        &r,
-                        sub,
-                        region.as_ref().map(|b| b as *const _),
-                        bytes.as_ptr().cast(),
-                        row,
-                        depth,
-                    )
-                };
+                match &region {
+                    Some(b) if s.kind == "buffer" => {
+                        let len = (b.right.saturating_sub(b.left) as usize).min(bytes.len());
+                        self.write_range(&r, b.left, &bytes[..len])?;
+                    }
+                    _ => unsafe {
+                        ctx.UpdateSubresource(
+                            &r,
+                            sub,
+                            region.as_ref().map(|b| b as *const _),
+                            bytes.as_ptr().cast(),
+                            row,
+                            depth,
+                        )
+                    },
+                }
             }
             "map" => {
                 let Some(key) = data else { return Ok(()) };
@@ -1151,18 +1205,8 @@ impl Backend for D3d11 {
                             range[0].as_u64().unwrap_or(0) as u32,
                             range[1].as_u64().unwrap_or(0) as usize,
                         );
-                        let b = D3D11_BOX {
-                            left: offset,
-                            top: 0,
-                            front: 0,
-                            right: offset + len as u32,
-                            bottom: 1,
-                            back: 1,
-                        };
                         if at + len <= bytes.len() {
-                            unsafe {
-                                ctx.UpdateSubresource(&r, 0, Some(&b), bytes[at..].as_ptr().cast(), 0, 0)
-                            };
+                            self.write_range(&r, offset, &bytes[at..at + len])?;
                         }
                         at += len;
                     }
