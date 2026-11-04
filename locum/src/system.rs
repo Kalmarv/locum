@@ -10,7 +10,7 @@ use windows::Win32::Foundation::HMODULE;
 use windows::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
 use windows::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW,
-    GetModuleHandleExW, GetProcAddress, LOAD_LIBRARY_FLAGS, LoadLibraryExW,
+    GetModuleHandleExW, GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_FLAGS, LoadLibraryExW,
 };
 use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::core::{PCSTR, PCWSTR};
@@ -52,12 +52,45 @@ pub fn system() -> &'static System {
 }
 
 /// The real `d3d12.dll`, loaded from the system folder the first time a D3D12 export is called (a D3D11 game never
-/// gets it).
+/// gets it). NVAPI is hidden first (see [`hide_nvapi`]).
 pub fn system_d3d12() -> HMODULE {
     static D3D12: OnceLock<usize> = OnceLock::new();
-    HMODULE(
-        *D3D12.get_or_init(|| load(&system().folder, "d3d12.dll").map_or(0, |h| h.0 as usize)) as *mut c_void,
-    )
+    HMODULE(*D3D12.get_or_init(|| {
+        hide_nvapi();
+        load(&system().folder, "d3d12.dll").map_or(0, |h| h.0 as usize)
+    }) as *mut c_void)
+}
+
+/// Puts in locum's `nvapi64.dll`, which exports nothing, before the game loads NVAPI by name, so the game and NVIDIA
+/// Aftermath find no NVAPI: its Direct3D 12 functions take the driver's own objects, and given locum's wrappers the
+/// driver crashes reading their internals.
+fn hide_nvapi() {
+    let own = module_of(system as *const c_void)
+        .map(module_path)
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    if let Ok(loaded) = unsafe { GetModuleHandleW(windows::core::w!("nvapi64.dll")) } {
+        let path = module_path(loaded);
+        if own
+            .as_deref()
+            .is_none_or(|own| path.parent().is_none_or(|p| !same_folder(p, own)))
+        {
+            log!(
+                "NVAPI was loaded before Direct3D 12 ({}): its D3D12 functions get locum's wrappers",
+                path.display()
+            );
+        }
+        return;
+    }
+    match own {
+        Some(own) if own.join("nvapi64.dll").is_file() => {
+            if load(&own, "nvapi64.dll").is_some() {
+                log!("NVAPI hidden: locum's nvapi64.dll stands in for it");
+            }
+        }
+        _ => log!(
+            "no nvapi64.dll beside locum.dll: a game using NVAPI's Direct3D 12 functions gets locum's wrappers"
+        ),
+    }
 }
 
 /// Whether two folders are the same (Windows paths compare without case).

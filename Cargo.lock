@@ -505,6 +505,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "locum-shim-nvapi64"
+version = "0.1.0"
+
+[[package]]
 name = "locum-smoke"
 version = "0.1.0"
 dependencies = [

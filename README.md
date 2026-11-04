@@ -19,7 +19,8 @@ cargo build --release
 ```
 
 1. Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` from `target/release/` next to the game's `.exe` (for Unreal games,
-   the one under `Binaries/Win64`).
+   the one under `Binaries/Win64`). For a Direct3D 12 game, copy `locum.dll`, `d3d12.dll`, `dxgi.dll` and
+   `nvapi64.dll`.
 2. Run the game. To capture a frame, create an empty file named `capture` in `%LOCALAPPDATA%\locum`. A few seconds
    later the frame is in `captures/frame-<n>/`.
 3. Open it:

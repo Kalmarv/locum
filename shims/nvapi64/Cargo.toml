@@ -1,0 +1,13 @@
+[package]
+name = "locum-shim-nvapi64"
+description = "nvapi64.dll for locum's Direct3D 12 games: exports nothing, so the game finds no NVAPI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "nvapi64"
+crate-type = ["cdylib"]

@@ -194,6 +194,8 @@ pub fn smoke(root: &std::path::Path) {
             "-p",
             "locum-shim-d3d12",
             "-p",
+            "locum-shim-nvapi64",
+            "-p",
             "locum-smoke-d3d12",
         ])
         .status()
@@ -201,7 +203,13 @@ pub fn smoke(root: &std::path::Path) {
     assert!(status.success(), "D3D12 smoke build failed");
     let stage = root.join("target/smoke-d3d12");
     std::fs::create_dir_all(&stage).unwrap();
-    for file in ["locum.dll", "dxgi.dll", "d3d12.dll", "locum-smoke-d3d12.exe"] {
+    for file in [
+        "locum.dll",
+        "dxgi.dll",
+        "d3d12.dll",
+        "nvapi64.dll",
+        "locum-smoke-d3d12.exe",
+    ] {
         std::fs::copy(root.join("target/release").join(file), stage.join(file)).unwrap();
     }
     let log = stage.join("log");

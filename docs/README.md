@@ -317,7 +317,12 @@ A third DLL, `d3d12.dll`, passes every Direct3D 12 call through to the system's,
 it keeps the system DLL's exports by name and ordinal (Elden Ring imports `D3D12CreateDevice` by ordinal 101). Devices,
 queues, command lists and every other object a game gets are wrapped, up to `ID3D12Device14` and
 `ID3D12GraphicsCommandList10`, with the debug, DRED, SDK-configuration and device-factory interfaces. An interface
-locum does not wrap is logged as `D3D12 interface escape {IID}`. Every command-list method is recorded with its
+locum does not wrap is logged as `D3D12 interface escape {IID}`. NVAPI's Direct3D 12 functions (NVIDIA Aftermath
+uses them) take the driver's own device and lists, and given locum's wrappers the driver crashes reading their
+internals: Motor Town's Unreal Engine did at startup. So the first D3D12 export call loads locum's `nvapi64.dll`
+from beside `locum.dll`, a DLL that exports nothing; Windows gives any later load of NVAPI by name, even one that
+searches only System32, the module already loaded under the name, and the game finds no NVAPI, as on another
+vendor's GPU. The log says `NVAPI hidden`, or that NVAPI was loaded before Direct3D 12. Every command-list method is recorded with its
 arguments; `cargo xtask gen` fails for a method that has no capture entry. The log records the first use of each interface
 and method, with periodic counts and journal timings. Object identities remain in memory and in captures.
 

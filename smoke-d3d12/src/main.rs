@@ -102,6 +102,17 @@ unsafe fn run() {
             d.EnableDebugLayer();
         }
         println!("debug layer enabled: {debug_enabled}");
+        // A D3D12 export's first call puts in locum's NVAPI stand-in: loading NVAPI by name finds no entry point.
+        let nvapi = LoadLibraryW(w!("nvapi64.dll")).unwrap();
+        assert!(GetProcAddress(nvapi, s!("nvapi_QueryInterface")).is_none());
+        assert!(GetProcAddress(nvapi, s!("nvapi_Direct_GetMethod")).is_none());
+        // Even a load that searches only System32 is given the module already loaded under the name.
+        let system_only = LoadLibraryExW(w!("nvapi64.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32).unwrap();
+        assert_eq!(
+            system_only.0, nvapi.0,
+            "a System32-only load found the real NVAPI"
+        );
+        println!("NVAPI hidden behind locum's nvapi64.dll verified");
         type Create = unsafe extern "system" fn(
             *mut c_void,
             D3D_FEATURE_LEVEL,
