@@ -348,54 +348,15 @@ pub unsafe fn submit(queue: &Data, sequence: u64, count: u32, pointers: *const *
     s.cpu_seq += 1;
     s.next_submission += 1;
     let (cpu_seq, id) = (s.cpu_seq, s.next_submission);
-    let uploads = if s.capture.is_some() {
-        s.uploads
-            .iter()
-            .map(|(&resource, u)| {
-                let start = Instant::now();
-                // Snapshot only an armed submission. Re-map an unmapped CPU-visible
-                // resource through its real interface; no disarmed copies, hashes or disk writes.
-                let content = if u.pointer != 0 {
-                    unsafe { super::pipelines::bytes(u.pointer as *const c_void, u.bytes) }
-                } else {
-                    match super::real(resource).and_then(|r| r.cast::<ID3D12Resource>().ok()) {
-                        Some(r) => {
-                            let mut p = std::ptr::null_mut();
-                            match unsafe {
-                                r.Map(
-                                    0,
-                                    Some(&D3D12_RANGE {
-                                        Begin: 0,
-                                        End: u.bytes,
-                                    }),
-                                    Some(&mut p),
-                                )
-                            } {
-                                Ok(()) => {
-                                    let content = unsafe { super::pipelines::bytes(p, u.bytes) };
-                                    unsafe { r.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
-                                    content
-                                }
-                                Err(e) => json!({"diagnostic":format!("upload snapshot Map: {e}")}),
-                            }
-                        }
-                        None => json!({"diagnostic":"upload resource identity expired before submission"}),
-                    }
-                };
-                UPLOAD_COST.add(start, u.bytes as u64);
-                (resource, content)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let descriptors = if s.capture.is_some() {
+    let armed = s.capture.is_some();
+    let descriptors = if armed {
         super::slots::snapshot()
     } else {
         Vec::new()
     };
-    if let Some((_, frame)) = s.capture.as_mut() {
-        let mut lists = Vec::new();
+    let mut lists = Vec::new();
+    let mut diagnostics = Vec::new();
+    if armed {
         for (ordinal, pointer) in unsafe { slice(pointers, count as usize) }.iter().enumerate() {
             if let Some(data) = super::data(*pointer) {
                 lists.push(data.snapshot().unwrap_or_else(|| {
@@ -405,12 +366,21 @@ pub unsafe fn submit(queue: &Data, sequence: u64, count: u32, pointers: *const *
                     })
                 }));
             } else {
-                frame.diagnostics.push(format!(
+                diagnostics.push(format!(
                     "submission {id} queue {}: list {ordinal} of {count} has no registered identity",
                     queue.id
                 ));
             }
         }
+    }
+    let uploads = match s.capture.as_ref() {
+        Some((_, frame)) => unsafe {
+            upload_contents(&s.uploads, frame.submissions.is_empty(), &lists, &descriptors)
+        },
+        None => Vec::new(),
+    };
+    if let Some((_, frame)) = s.capture.as_mut() {
+        frame.diagnostics.extend(diagnostics);
         frame.submissions.push(model::Submission {
             id,
             queue: queue.id,
@@ -422,6 +392,131 @@ pub unsafe fn submit(queue: &Data, sequence: u64, count: u32, pointers: *const *
         });
     }
     SUBMISSION_COST.add(start, 0);
+}
+
+/// D3D12's largest constant buffer view: 4096 constants of 16 bytes.
+const CONSTANT_BUFFER_BYTES: u64 = 65536;
+
+/// The upload bytes an armed submission's work reads: every upload buffer whole at the frame's first submission
+/// (marked `whole`, the contents its resources began the frame with), then at each submission only the
+/// constant-buffer ranges its lists' root CBVs and the descriptor heaps' CBVs name, merged into runs per buffer.
+/// Copying every upload buffer whole at every submission cost seconds per submission on Elden Ring's persistent
+/// 323 MB ring, so the armed frame never reached its closing Present.
+///
+/// # Safety
+/// Mapped pointers in `uploads` are the application's live persistent maps.
+unsafe fn upload_contents(
+    uploads: &BTreeMap<u64, Upload>,
+    first: bool,
+    lists: &[Arc<model::List>],
+    descriptors: &[model::Descriptor],
+) -> Vec<(u64, Value)> {
+    let mut out = Vec::new();
+    if first {
+        for (&resource, u) in uploads {
+            let mut content = unsafe { upload_range(resource, u, 0, u.bytes) };
+            if let Some(o) = content.as_object_mut() {
+                o.insert("whole".into(), json!(true));
+            }
+            out.push((resource, content));
+        }
+    }
+    let mut ranges = Vec::new();
+    for list in lists {
+        constant_ranges(list, uploads, &mut ranges);
+    }
+    for d in descriptors {
+        if d.kind == "cb"
+            && uploads.contains_key(&d.resource)
+            && let (Some(offset), Some(bytes)) = (
+                d.description["buffer"]["offset"].as_u64(),
+                d.description["bytes"].as_u64(),
+            )
+        {
+            ranges.push((d.resource, offset, offset.saturating_add(bytes)));
+        }
+    }
+    for (resource, begin, end) in runs(ranges) {
+        let u = &uploads[&resource];
+        let end = end.min(u.bytes as u64);
+        if begin < end {
+            out.push((resource, unsafe {
+                upload_range(resource, u, begin as usize, (end - begin) as usize)
+            }));
+        }
+    }
+    out
+}
+
+/// Root constant-buffer views on upload buffers, in this list and the bundles it executes, as (resource, begin, end)
+/// at the largest size a constant buffer can have: the bytes a shader reads are not known until reflection.
+fn constant_ranges(list: &model::List, uploads: &BTreeMap<u64, Upload>, ranges: &mut Vec<(u64, u64, u64)>) {
+    for c in &list.commands {
+        if let Some(bundle) = &c.bundle {
+            constant_ranges(bundle, uploads, ranges);
+        }
+        if matches!(
+            c.call,
+            "SetGraphicsRootConstantBufferView" | "SetComputeRootConstantBufferView"
+        ) {
+            let at = &c.args[1];
+            if let (Some(resource), Some(offset)) = (at["resource"].as_u64(), at["offset"].as_u64())
+                && uploads.contains_key(&resource)
+            {
+                ranges.push((resource, offset, offset.saturating_add(CONSTANT_BUFFER_BYTES)));
+            }
+        }
+    }
+}
+
+/// Overlapping or touching ranges of the same resource, merged.
+fn runs(mut ranges: Vec<(u64, u64, u64)>) -> Vec<(u64, u64, u64)> {
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64, u64)> = Vec::new();
+    for (resource, begin, end) in ranges {
+        match merged.last_mut() {
+            Some(last) if last.0 == resource && begin <= last.2 => last.2 = last.2.max(end),
+            _ => merged.push((resource, begin, end)),
+        }
+    }
+    merged
+}
+
+/// `len` bytes at `offset` of an upload buffer, through the application's persistent map or a map of our own.
+///
+/// # Safety
+/// A non-zero `u.pointer` is the application's live map of the resource.
+unsafe fn upload_range(resource: u64, u: &Upload, offset: usize, len: usize) -> Value {
+    let start = Instant::now();
+    let mut content = if u.pointer != 0 {
+        unsafe { super::pipelines::bytes((u.pointer + offset) as *const c_void, len) }
+    } else {
+        // Re-map an unmapped CPU-visible resource through its real interface, reading only the range.
+        match super::real(resource).and_then(|r| r.cast::<ID3D12Resource>().ok()) {
+            Some(r) => {
+                let mut p = std::ptr::null_mut();
+                let range = D3D12_RANGE {
+                    Begin: offset,
+                    End: offset + len,
+                };
+                match unsafe { r.Map(0, Some(&range), Some(&mut p)) } {
+                    Ok(()) => {
+                        let content =
+                            unsafe { super::pipelines::bytes(p.cast::<u8>().add(offset).cast(), len) };
+                        unsafe { r.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
+                        content
+                    }
+                    Err(e) => json!({"diagnostic":format!("upload snapshot Map: {e}")}),
+                }
+            }
+            None => json!({"diagnostic":"upload resource identity expired before submission"}),
+        }
+    };
+    if let Some(o) = content.as_object_mut() {
+        o.insert("offset".into(), json!(offset));
+    }
+    UPLOAD_COST.add(start, len as u64);
+    content
 }
 
 pub fn sync(queue: &Data, sequence: u64, kind: &'static str, fence: *mut c_void, value: u64, hr: HRESULT) {

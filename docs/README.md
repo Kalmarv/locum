@@ -314,8 +314,10 @@ and method, with periodic counts and journal timings. Object identities remain i
 
 The inspection foundation records command lists continuously, so lists and bundles recorded before a capture request
 retain their original generations. A request arms at the next non-test Present and closes at the following Present.
-Captures use schema 2 with `api=d3d12`: queue submissions, list executions, fence values, descriptor versions, root
-signatures, root arguments and PSO inputs are authoritative records. The CLI and viewer project these into their
+Captures use schema 3 with `api=d3d12`: queue submissions, list executions, fence values, descriptor versions, root
+signatures, root arguments and PSO inputs are authoritative records. Upload buffers are copied whole once, at the
+frame's first submission; each later submission keeps only the constant-buffer ranges its root and descriptor CBVs
+name. The CLI and viewer project these into their
 draw, resource, binding and pipeline views. Display order across queues is not a GPU execution order; queue order
 and fence operations are retained separately. CPU-consumed descriptor definitions are frozen when recorded, while
 GPU descriptor tables use the versions present at submission.

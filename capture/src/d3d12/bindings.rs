@@ -113,16 +113,18 @@ pub(super) fn project(
             let value = &arg["value"];
             let resource = value["resource"].as_u64();
             let offset = value["offset"].as_u64().unwrap_or(0);
-            let size = resource
-                .and_then(|r| objects.get(&r))
-                .and_then(|r| r["width"].as_u64())
-                .and_then(|w| w.checked_sub(offset));
             let kind = match parameter["type"].as_u64() {
                 Some(2) => "cb",
                 Some(3) => "srv",
                 Some(4) => "uav",
                 _ => continue,
             };
+            // A root CBV has no size of its own: at most the largest constant buffer view, within its buffer.
+            let size = resource
+                .and_then(|r| objects.get(&r))
+                .and_then(|r| r["width"].as_u64())
+                .and_then(|w| w.checked_sub(offset))
+                .map(|rest| if kind == "cb" { rest.min(65536) } else { rest });
             for stage in &stages {
                 c.bindings.push(db::Binding {
                     draw,

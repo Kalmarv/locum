@@ -698,6 +698,12 @@ unsafe fn journal_capture(
                 "SELECT count(*) FROM bindings WHERE kind='cb' AND content IS NOT NULL",
                 9,
             ),
+            // Each dispatch reads its own submission's bytes: the root CBV sees 0x11 then the host's 0x22, the
+            // descriptor CBV the copied-in buffer's 0x33 after CopyDescriptors.
+            (
+                "SELECT count(*) FROM bindings b JOIN cb_data d ON d.hash=b.content WHERE b.kind='cb' AND                  hex(substr(d.bytes,1,1))=CASE WHEN b.draw=1 THEN '11' WHEN b.slot=5 THEN '22' ELSE '33' END AND                  b.slot IN (3,5)",
+                6,
+            ),
             (
                 "SELECT count(*) FROM d12_draw_state WHERE pso!=0 AND compute_root!=0",
                 3,
@@ -722,10 +728,11 @@ unsafe fn journal_capture(
                 r.get::<_, String>(0)
             })
             .unwrap(),
-            "2"
+            locum_capture::db::D3D12_SCHEMA_VERSION.to_string()
         );
         let blobs = locum_capture::blobs::Blobs::new(dir.join("blobs"));
         let mut versions = std::collections::BTreeMap::<i64, Vec<u8>>::new();
+        let mut wholes = std::collections::BTreeMap::<i64, u32>::new();
         let mut statement = db
             .prepare("SELECT resource,content_json FROM d12_upload_versions ORDER BY submission")
             .unwrap();
@@ -736,11 +743,21 @@ unsafe fn journal_capture(
             let (resource, text) = row.unwrap();
             let content: serde_json::Value = serde_json::from_str(&text).unwrap();
             let bytes = blobs.get(content["blob"].as_str().unwrap()).unwrap();
-            versions.entry(resource).or_default().push(bytes[0]);
+            if content["whole"] == true {
+                // The frame-start copy, once per upload buffer.
+                assert_eq!(bytes.len() as u64, content["size"].as_u64().unwrap());
+                *wholes.entry(resource).or_default() += 1;
+            } else {
+                versions.entry(resource).or_default().push(bytes[0]);
+            }
         }
         assert!(
             versions.values().any(|v| v == &[0x11, 0x22, 0x22]),
             "persistent upload writes must be distinct per submission: {versions:?}"
+        );
+        assert!(
+            wholes.values().all(|&n| n == 1) && versions.keys().all(|r| wholes.contains_key(r)),
+            "each upload buffer is copied whole once, at the first captured submission: {wholes:?}"
         );
         let mut statement = db.prepare("SELECT hash,blob FROM shaders").unwrap();
         for row in statement

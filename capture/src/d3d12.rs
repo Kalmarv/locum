@@ -134,11 +134,26 @@ pub struct Prepared {
 impl Prepared {
     /// Populate CPU upload contents and per-draw constant bytes after queued blobs are durable.
     pub fn contents(&self, capture: &mut db::Capture, blobs: &crate::blobs::Blobs) {
-        let uploads: BTreeMap<_, _> = self
+        // Per submission, runs of upload bytes keyed by where they begin; and each upload buffer whole as the frame
+        // began.
+        let runs: BTreeMap<_, _> = self
             .frame
             .submissions
             .iter()
-            .flat_map(|s| s.uploads.iter().map(move |(r, v)| ((s.id, *r), v)))
+            .flat_map(|s| {
+                s.uploads
+                    .iter()
+                    .map(move |(r, v)| ((s.id, *r, v["offset"].as_u64().unwrap_or(0)), v))
+            })
+            .filter(|(_, v)| v["whole"] != true)
+            .collect();
+        let whole: BTreeMap<_, _> = self
+            .frame
+            .submissions
+            .iter()
+            .flat_map(|s| s.uploads.iter())
+            .filter(|(_, v)| v["whole"] == true)
+            .map(|(r, v)| (*r, v))
             .collect();
         let draws: BTreeMap<_, _> = self
             .projection
@@ -157,7 +172,14 @@ impl Prepared {
             let Some(submission) = draws.get(&binding.draw) else {
                 continue;
             };
-            let Some(content) = uploads.get(&(*submission, resource)) else {
+            let offset = binding.offset.unwrap_or(0);
+            // The run beginning at or before the binding's offset; merged runs never overlap, so it is the only one
+            // that can cover it.
+            let Some((&(_, _, begin), content)) = runs
+                .range((*submission, resource, 0)..=(*submission, resource, offset))
+                .next_back()
+                .filter(|((_, _, begin), v)| offset < begin + v["size"].as_u64().unwrap_or(0))
+            else {
                 continue;
             };
             let Some(key) = content["blob"].as_str() else {
@@ -165,11 +187,11 @@ impl Prepared {
             };
             match blobs.get(key) {
                 Ok(bytes) => {
-                    let start = binding.offset.unwrap_or(0) as usize;
+                    let start = (offset - begin) as usize;
                     let end = binding
                         .size
                         .and_then(|s| (s as usize).checked_add(start))
-                        .unwrap_or(bytes.len());
+                        .map_or(bytes.len(), |end| end.min(bytes.len()));
                     if let Some(bytes) = bytes.get(start..end) {
                         let key = crate::hash::key(bytes);
                         capture.cb_data.push((key.clone(), bytes.to_vec()));
@@ -188,7 +210,7 @@ impl Prepared {
             }
         }
         for resource in &mut capture.resources {
-            if let Some((_, content)) = uploads.iter().find(|((_, id), _)| *id == resource.id)
+            if let Some(content) = whole.get(&resource.id)
                 && let Some(key) = content["blob"].as_str()
                 && blobs.has(key)
             {
@@ -580,8 +602,14 @@ impl Frame {
         for s in &self.submissions {
             for (resource, content) in &s.uploads {
                 tx.execute(
-                    "INSERT INTO d12_upload_versions VALUES(?1,?2,?3)",
-                    params![integer(s.id)?, integer(*resource)?, content.to_string()],
+                    "INSERT INTO d12_upload_versions VALUES(?1,?2,?3,?4,?5)",
+                    params![
+                        integer(s.id)?,
+                        integer(*resource)?,
+                        content["whole"] == true,
+                        integer(content["offset"].as_u64().unwrap_or(0))?,
+                        content.to_string()
+                    ],
                 )?;
             }
         }
@@ -806,8 +834,8 @@ CREATE TABLE d12_draw_state(draw INTEGER PRIMARY KEY,pso INTEGER,graphics_root I
 CREATE TABLE d12_descriptor_versions(id INTEGER PRIMARY KEY,heap INTEGER NOT NULL,slot INTEGER NOT NULL,
  kind TEXT NOT NULL,resource INTEGER NOT NULL,counter_resource INTEGER NOT NULL,description TEXT NOT NULL);
 CREATE TABLE d12_submission_descriptors(submission INTEGER NOT NULL,version INTEGER NOT NULL,PRIMARY KEY(submission,version));
-CREATE TABLE d12_upload_versions(submission INTEGER NOT NULL,resource INTEGER NOT NULL,content_json TEXT NOT NULL,
- PRIMARY KEY(submission,resource));
+CREATE TABLE d12_upload_versions(submission INTEGER NOT NULL,resource INTEGER NOT NULL,whole INTEGER NOT NULL,
+ offset INTEGER NOT NULL,content_json TEXT NOT NULL,PRIMARY KEY(submission,resource,whole,offset));
 "#;
 
 fn integer(value: u64) -> rusqlite::Result<i64> {
