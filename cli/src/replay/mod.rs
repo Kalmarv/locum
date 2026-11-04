@@ -794,7 +794,25 @@ pub fn verify(
     let last: i64 = c
         .row("SELECT max(seq) FROM events", [], |r| r.get::<_, Option<i64>>(0))
         .flatten()
-        .ok_or("the capture has no events")?;
+        .ok_or_else(|| {
+            let gaps: Vec<String> = c.rows(
+                "SELECT what, coalesce(detail, ''), count FROM gaps ORDER BY what, detail",
+                [],
+                |r| {
+                    Ok(format!(
+                        "capture gap: {} {} ({}x)",
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?
+                    ))
+                },
+            );
+            if gaps.is_empty() {
+                "the capture has no events".to_string()
+            } else {
+                format!("the capture has no events; {}", gaps.join("; "))
+            }
+        })?;
     let started = std::time::Instant::now();
     let plan = plan(c, last, Mode::Frame);
     let planned = started.elapsed();

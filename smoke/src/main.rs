@@ -18,6 +18,7 @@ mod device_writes;
 mod layers;
 mod live_capture;
 mod partial_lists;
+mod recorder_bench;
 mod replay_rows;
 mod tiles;
 
@@ -1342,15 +1343,13 @@ fn adversarial_capture(
             )
             .ok();
         let expected: Option<Vec<u8>> =
-            (execution == 1).then(|| colors[execution].iter().flat_map(|v| v.to_le_bytes()).collect());
+            Some(colors[execution].iter().flat_map(|v| v.to_le_bytes()).collect());
         println!(
             "adversarial row6 execution {execution}: captured CB bytes={bytes:02x?}, expected={expected:02x?}"
         );
         checks.check(
             bytes == expected,
-            &format!(
-                "adversarial row6 execution {execution}: constants kept only when they are this execution's"
-            ),
+            &format!("adversarial row6 execution {execution}: constants match this execution"),
         );
         let key: Option<String> = db
             .query_row(
@@ -1366,12 +1365,10 @@ fn adversarial_capture(
             "adversarial row6 execution {execution}: captured target BGRA={pixel:?}, GPU={:?}",
             pixels[execution]
         );
-        let expected = (execution == 1).then(|| pixels[execution].to_vec());
+        let expected = Some(pixels[execution].to_vec());
         checks.check(
             pixel == expected,
-            &format!(
-                "adversarial row6 execution {execution}: pass target kept only when it is this execution's"
-            ),
+            &format!("adversarial row6 execution {execution}: pass target matches this execution"),
         );
     }
     // The pass's targets were read after the clear that followed its draw: the row says so, and holds blue.
@@ -1686,7 +1683,12 @@ fn ordered_capture(
 
 fn main() -> ExitCode {
     let mut checks = Checks { failed: 0 };
-    if let Err(e) = run(&mut checks) {
+    let result = if std::env::args().any(|a| a == "--record-bench") {
+        recorder_bench::run()
+    } else {
+        run(&mut checks)
+    };
+    if let Err(e) = result {
         println!("FAIL error: {e}");
         checks.failed += 1;
     }

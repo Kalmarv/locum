@@ -935,3 +935,20 @@ pub(super) fn touched(timeline: &[Event]) -> (BTreeSet<u64>, BTreeSet<u64>) {
     }
     (used, written)
 }
+
+/// A retained list could not be reconstructed; the application executes its original list.
+pub fn recorder_gap(reason: String) {
+    *state()
+        .gaps
+        .entry(("deferred_recorder".into(), reason))
+        .or_default() += 1;
+}
+pub fn discard_pending(context: u32) {
+    state().pending.remove(&context);
+}
+
+pub fn list_recorded_before(list: *mut c_void, before: bool) {
+    if let Some(list) = state().lists.get_mut(&(list as usize)) {
+        list.before = before;
+    }
+}

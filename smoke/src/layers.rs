@@ -324,8 +324,8 @@ fn deferred_clears(
         )
         .unwrap();
     checks.check(
-        counts == (5, 3),
-        "layers-deferred: clears from a repeated list retain only the last execution's copies",
+        counts == (5, 5),
+        "layers-deferred: each repeated-list clear retains its own copy",
     );
     Ok(())
 }

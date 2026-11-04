@@ -27,4 +27,5 @@ pub mod d12_state;
 pub mod device;
 pub mod dxgi_device;
 pub mod factory;
+pub mod recorded_context;
 pub mod swapchain;

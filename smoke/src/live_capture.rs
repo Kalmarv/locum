@@ -65,7 +65,7 @@ pub(super) fn run(
         let db = rusqlite::Connection::open(dir.join(format!("captures/{label}/capture.db"))).unwrap();
         let gaps: u32 = db
             .query_row(
-                "SELECT count(*) FROM gaps WHERE what='overrides' AND detail LIKE '%event 0%'",
+                "SELECT count(*) FROM gaps WHERE (what='overrides' AND detail LIKE '%event 0%') OR (what='deferred_recorder' AND detail LIKE '%live override%')",
                 [],
                 |r| r.get(0),
             )

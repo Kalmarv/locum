@@ -143,15 +143,39 @@ refused rather than replayed as ordinary resources.
 A pass ends where the targets in effect change on the GPU's timeline: an `OMSetRenderTargets` that binds other
 targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame. Its
 targets are read there, and the capture records the event they were read after (the pass's last draw, or a clear, copy
-or dispatch after it), which is where verify compares them. A command list executed more than once makes its copies
-into the same places each time, so only its last execution's constants and targets are kept.
+or dispatch after it), which is where verify compares them. Each captured execution of a retained command list gets
+fresh constant-buffer, target and output copies. Updating or mapping its resources between executions therefore
+produces a separate checkpoint for each execution.
 
-A command list that the game began recording before the capture was armed, or during an earlier capture, holds GPU
-commands locum never saw. Executing such a list adds a `partial_list` gap, even when the part locum did record
-reproduces every target. The next list the game records on that context is whole again, whether or not a capture is
-running, and a partial list that is never executed doesn't affect the capture. Binding state doesn't make a list
-partial, because each recorded draw reads all the state bound when it runs. While no capture is armed, this costs one
-counter per context and no GPU copies.
+Deferred contexts retain command arguments, referenced D3D11 objects, and CPU upload/map bytes from the start of each
+list, including before capture arming. No GPU copies are issued by this recorder while idle. Metadata belongs to the
+finished command list and is released with it. During capture, locum constructs an instrumented list for each
+execution, keeping the original Finish/Execute boundaries. A list begun before arming or during an older capture can
+therefore be captured in full. A list that never executes contributes no events or gaps.
+
+Deferred write maps use a reusable write-watch allocation per resource/subresource in the current list. Unmap
+examines only dirty pages and retains their changed byte ranges, with pitch padding removed. NO_OVERWRITE compares
+those pages against their last retained values so appending on a page does not rewrite earlier GPU-referenced bytes.
+MEM_COMMIT charges commit for the whole subresource, even though untouched pages consume no physical RAM.
+DISCARD starts a new logical allocation without clearing untouched bytes; those bytes remain undefined. The first
+written page can therefore retain stale pre-DISCARD bytes outside the application's writes in the recorded upload. Finished
+lists own the sparse uploads, while map shadows are released at FinishCommandList. If write-watch observation fails,
+the original list is retained with a reconstruction gap.
+
+If exact reconstruction is unavailable, locum executes the original list and emits a `deferred_recorder` gap.
+This includes applied live overrides, unobservable inherited stream-output cursors, nested lists (whose instrumented
+readbacks hung on the tested hardware runtime), unknown upload layouts, context-state swaps, hardware protection and
+fence calls. Successful deferred tile-mapping calls retain their separate `tiled` gap until execution-time seeding is
+verified. The D3D11 specification permits deferred mapping; the installed hardware and WARP runtimes rejected the
+probed mapping calls with `E_INVALIDARG`, so this is an observed runtime limitation, not an API-wide prohibition.
+
+`locum-smoke --record-bench` measures the real unarmed recorder: 100 retained lists, each with 500 draws and 500 CPU
+uploads, six trials, with elapsed time and process-private memory. Run the same executable beside baseline/new DLLs
+(and with `--warp`) to compare recorder cost without submitting any of those lists to the GPU.
+Add `--maps` for four trials of 4/16 MiB dynamic buffers: one DISCARD followed by 255 small NO_OVERWRITE writes,
+both within pages and across pages, plus repeated 16 MiB DISCARD maps with 64-byte writes. It reports us/map,
+FinishCommandList time, and private-memory deltas before and after Finish. The old full-shadow implementation can
+retain roughly 4 GiB in the 16 MiB ring case; run comparisons sequentially when the machine is free.
 
 Draws recorded on deferred contexts are placed where their command list is executed. Constant buffers and targets
 are copied by the GPU on the draw's own context, so each draw's constants and each pass's targets are the ones the

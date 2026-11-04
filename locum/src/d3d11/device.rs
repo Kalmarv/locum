@@ -24,8 +24,8 @@ use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface};
 use crate::com::answer_query;
 use crate::d3d11::capture::{self, ops, tiled};
 use crate::d3d11::overrides;
-use crate::d3d11::registry;
 use crate::d3d11::shaders::{self, Stage};
+use crate::d3d11::{recorder, registry};
 use crate::dxgi::Adapter;
 use crate::log::log;
 use crate::vtables::adapter::AdapterMethods;
@@ -63,6 +63,9 @@ pub struct Context {
     /// locum's number for the context, in captures.
     id: u32,
     coverage: capture::coverage::Coverage,
+    recorder: Option<recorder::Recorder>,
+    reconstructed: bool,
+    rebuild_error: std::sync::Mutex<Option<windows::core::Error>>,
 }
 
 static DEVICE_VTBL: ID3D11Device5_Vtbl = crate::vtables::device::vtable::<Device>();
@@ -99,15 +102,61 @@ const CONTEXT_IIDS: [GUID; 7] = [
 ];
 
 impl Context {
+    fn capturing(&self) -> bool {
+        capture::armed() && self.recorder.is_none()
+    }
+
+    unsafe fn rebuild(&self, plan: &recorder::Plan) -> windows::core::Result<ID3D11CommandList> {
+        let device = unsafe { &*self.device };
+        let mut inner = None;
+        unsafe { device.inner.CreateDeferredContext3(0, Some(&mut inner)) }?;
+        let inner = inner.unwrap().cast::<ID3D11DeviceContext4>()?;
+        unsafe { device.AddRef() };
+        let wrapper = Box::into_raw(Box::new(Context {
+            vtbl: &CONTEXT_VTBL,
+            refs: AtomicU32::new(1),
+            inner,
+            device: self.device,
+            deferred: true,
+            id: capture::next_context_id(),
+            coverage: Default::default(),
+            recorder: None,
+            reconstructed: true,
+            rebuild_error: Default::default(),
+        }));
+        let context = unsafe { ID3D11DeviceContext4::from_raw(wrapper.cast()) };
+        if let Err(e) = unsafe { plan.replay(context.as_raw()) } {
+            capture::discard_pending(unsafe { (*wrapper).id });
+            return Err(e);
+        }
+        if let Some(e) = unsafe { &*wrapper }
+            .rebuild_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            capture::discard_pending(unsafe { (*wrapper).id });
+            return Err(e);
+        }
+        let mut list = None;
+        unsafe { context.FinishCommandList(false, Some(&mut list)) }?;
+        let list = list.unwrap();
+        capture::list_recorded_before(list.as_raw(), plan.frame < crate::dxgi::frame());
+        Ok(list)
+    }
+
     /// Runs the real draw or dispatch, with the overrides that hold for it if any are loaded.
     fn run(&self, compute: bool, real: impl FnOnce()) {
-        if overrides::active() {
+        if !self.reconstructed && overrides::active() {
             unsafe {
                 overrides::around(
                     &self.inner,
                     compute,
                     |rule| {
-                        if capture::armed() {
+                        if let Some(r) = &self.recorder {
+                            r.gap("live override changed the recorded command list");
+                        }
+                        if self.capturing() {
                             capture::rule_applied(self.ctx(), rule);
                         }
                     },
@@ -117,21 +166,21 @@ impl Context {
         } else {
             real()
         }
-        if capture::armed() {
+        if self.capturing() {
             capture::after_draw(self.ctx());
         }
     }
 
     /// Records a draw or dispatch if a capture is running.
     fn draw(&self, call: &'static str, args: &[i64]) {
-        if capture::armed() {
+        if self.capturing() {
             capture::on_draw(self.ctx(), call, args);
         }
     }
 
     /// Targets about to be bound on this context, if a capture is running (see [`capture::targets_changing`]).
     unsafe fn targets_changing(&self, count: u32, rtvs: *const *mut c_void, dsv: *mut c_void) {
-        if capture::armed() {
+        if self.capturing() {
             let rtvs = if rtvs.is_null() || count == 0 {
                 &[][..]
             } else {
@@ -182,7 +231,10 @@ impl Context {
                 data = data.wrapping_byte_add(offset);
             }
         }
-        if capture::armed() {
+        if let Some(r) = &self.recorder {
+            unsafe { r.update(dst, sub, region, data, row, depth, flags) };
+        }
+        if self.capturing() {
             unsafe { ops::update(self.ctx(), call, dst, sub, region, data, row, depth, flags) };
         } else if let Some(r) = unsafe { ID3D11Resource::from_raw_borrowed(&dst) } {
             let region = if region.is_null() {
@@ -210,7 +262,7 @@ impl Context {
 
     /// Records an indirect draw or dispatch if a capture is running: its arguments are the buffer's id and offset.
     unsafe fn draw_indirect(&self, call: &'static str, buffer: *mut c_void, offset: u32) {
-        if capture::armed() {
+        if self.capturing() {
             unsafe { capture::on_indirect(self.ctx(), call, buffer, offset) };
         }
     }
@@ -257,6 +309,9 @@ impl Device {
                 deferred: false,
                 id: capture::next_context_id(),
                 coverage: Default::default(),
+                recorder: None,
+                reconstructed: false,
+                rebuild_error: Default::default(),
             },
         }));
         unsafe {
@@ -344,6 +399,9 @@ impl Device {
                     deferred: true,
                     id: capture::next_context_id(),
                     coverage: Default::default(),
+                    recorder: Some(Default::default()),
+                    reconstructed: false,
+                    rebuild_error: Default::default(),
                 }));
                 unsafe { *out = wrapper.cast() };
             }
@@ -679,6 +737,9 @@ unsafe impl DxgiDeviceMethods for DxgiDevice {
 }
 
 unsafe impl ContextMethods for Context {
+    fn recorder(&self) -> Option<&recorder::Recorder> {
+        self.recorder.as_ref()
+    }
     fn before_command(&self) {
         if self.deferred {
             self.coverage.command();
@@ -806,15 +867,30 @@ unsafe impl ContextMethods for Context {
         a3: u32,
         a4: *mut D3D11_MAPPED_SUBRESOURCE,
     ) -> HRESULT {
-        unsafe {
-            ops::map(self.ctx(), a0, a1, a2, a4, || {
-                real_context::Map(self.inner(), a0, a1, a2, a3, a4)
-            })
+        if let Some(r) = &self.recorder {
+            let hr = unsafe { real_context::Map(self.inner(), a0, a1, a2, a3, a4) };
+            if hr.is_ok() {
+                unsafe { r.mapped(a0, a1, a2, a3, a4) };
+            }
+            hr
+        } else {
+            unsafe {
+                ops::map(self.ctx(), a0, a1, a2, a4, || {
+                    real_context::Map(self.inner(), a0, a1, a2, a3, a4)
+                })
+            }
         }
     }
 
     unsafe fn Unmap(&self, a0: *mut c_void, a1: u32) {
-        unsafe { ops::unmap(&self.inner, a0, a1, || real_context::Unmap(self.inner(), a0, a1)) }
+        if let Some(r) = &self.recorder {
+            unsafe {
+                r.unmap(a0, a1);
+                real_context::Unmap(self.inner(), a0, a1)
+            };
+        } else {
+            unsafe { ops::unmap(&self.inner, a0, a1, || real_context::Unmap(self.inner(), a0, a1)) };
+        }
     }
 
     unsafe fn UpdateSubresource(
@@ -849,7 +925,7 @@ unsafe impl ContextMethods for Context {
     }
 
     unsafe fn CopyResource(&self, a0: *mut c_void, a1: *mut c_void) {
-        if capture::armed() {
+        if self.capturing() {
             ops::copy_resource(self.ctx(), a0, a1);
         }
         unsafe { real_context::CopyResource(self.inner(), a0, a1) }
@@ -866,7 +942,7 @@ unsafe impl ContextMethods for Context {
         a6: u32,
         a7: *const D3D11_BOX,
     ) {
-        if capture::armed() {
+        if self.capturing() {
             let call = "CopySubresourceRegion";
             ops::copy_region(self.ctx(), call, a0, a1, [a2, a3, a4], a5, a6, a7, 0);
         }
@@ -885,7 +961,7 @@ unsafe impl ContextMethods for Context {
         a7: *const D3D11_BOX,
         a8: u32,
     ) {
-        if capture::armed() {
+        if self.capturing() {
             let call = "CopySubresourceRegion1";
             ops::copy_region(self.ctx(), call, a0, a1, [a2, a3, a4], a5, a6, a7, a8);
         }
@@ -893,27 +969,27 @@ unsafe impl ContextMethods for Context {
     }
 
     unsafe fn ClearRenderTargetView(&self, a0: *mut c_void, a1: *const f32) {
-        if capture::armed() {
+        if self.capturing() {
             ops::clear_rtv(self.ctx(), a0, a1);
         }
         unsafe { real_context::ClearRenderTargetView(self.inner(), a0, a1) }
-        if capture::armed() {
+        if self.capturing() {
             capture::after_clear(self.ctx());
         }
     }
 
     unsafe fn ClearDepthStencilView(&self, a0: *mut c_void, a1: u32, a2: f32, a3: u8) {
-        if capture::armed() {
+        if self.capturing() {
             ops::clear_dsv(self.ctx(), a0, a1, a2, a3);
         }
         unsafe { real_context::ClearDepthStencilView(self.inner(), a0, a1, a2, a3) }
-        if capture::armed() {
+        if self.capturing() {
             capture::after_clear(self.ctx());
         }
     }
 
     unsafe fn ClearUnorderedAccessViewUint(&self, a0: *mut c_void, a1: *const u32) {
-        if capture::armed() {
+        if self.capturing() {
             let values = if a1.is_null() {
                 [0u32; 4]
             } else {
@@ -923,13 +999,13 @@ unsafe impl ContextMethods for Context {
             ops::clear_uav(self.ctx(), call, a0, values.to_vec().into());
         }
         unsafe { real_context::ClearUnorderedAccessViewUint(self.inner(), a0, a1) }
-        if capture::armed() {
+        if self.capturing() {
             capture::after_clear(self.ctx());
         }
     }
 
     unsafe fn ClearUnorderedAccessViewFloat(&self, a0: *mut c_void, a1: *const f32) {
-        if capture::armed() {
+        if self.capturing() {
             let values = if a1.is_null() {
                 [0f32; 4]
             } else {
@@ -939,65 +1015,65 @@ unsafe impl ContextMethods for Context {
             ops::clear_uav(self.ctx(), call, a0, values.to_vec().into());
         }
         unsafe { real_context::ClearUnorderedAccessViewFloat(self.inner(), a0, a1) }
-        if capture::armed() {
+        if self.capturing() {
             capture::after_clear(self.ctx());
         }
     }
 
     unsafe fn ClearView(&self, a0: *mut c_void, a1: *const f32, a2: *const RECT, a3: u32) {
-        if capture::armed() {
+        if self.capturing() {
             ops::clear_view(self.ctx(), a0, a1, a2, a3);
         }
         unsafe { real_context::ClearView(self.inner(), a0, a1, a2, a3) }
-        if capture::armed() {
+        if self.capturing() {
             capture::after_clear(self.ctx());
         }
     }
 
     unsafe fn ResolveSubresource(&self, a0: *mut c_void, a1: u32, a2: *mut c_void, a3: u32, a4: DXGI_FORMAT) {
-        if capture::armed() {
+        if self.capturing() {
             ops::resolve(self.ctx(), a0, a1, a2, a3, a4.0);
         }
         unsafe { real_context::ResolveSubresource(self.inner(), a0, a1, a2, a3, a4) }
     }
 
     unsafe fn GenerateMips(&self, a0: *mut c_void) {
-        if capture::armed() {
+        if self.capturing() {
             ops::generate_mips(self.ctx(), a0);
         }
         unsafe { real_context::GenerateMips(self.inner(), a0) }
     }
 
     unsafe fn CopyStructureCount(&self, a0: *mut c_void, a1: u32, a2: *mut c_void) {
-        if capture::armed() {
+        if self.capturing() {
             ops::copy_structure_count(self.ctx(), a0, a1, a2);
         }
         unsafe { real_context::CopyStructureCount(self.inner(), a0, a1, a2) }
     }
 
     unsafe fn DiscardResource(&self, a0: *mut c_void) {
-        if capture::armed() {
+        if self.capturing() {
             ops::discard(self.ctx(), "DiscardResource", a0);
         }
         unsafe { real_context::DiscardResource(self.inner(), a0) }
     }
 
     unsafe fn DiscardView(&self, a0: *mut c_void) {
-        if capture::armed() {
+        if self.capturing() {
             ops::discard(self.ctx(), "DiscardView", a0);
         }
         unsafe { real_context::DiscardView(self.inner(), a0) }
     }
 
     unsafe fn DiscardView1(&self, a0: *mut c_void, a1: *const RECT, a2: u32) {
-        if capture::armed() {
+        if self.capturing() {
             ops::discard(self.ctx(), "DiscardView1", a0);
         }
         unsafe { real_context::DiscardView1(self.inner(), a0, a1, a2) }
     }
 
     unsafe fn CSSetUnorderedAccessViews(&self, a0: u32, a1: u32, a2: *const *mut c_void, a3: *const u32) {
-        if capture::armed() {
+        if self.capturing() {
             let call = "CSSetUnorderedAccessViews";
             ops::uav_counters(self.ctx(), call, a0, a2, a3, a1);
         }
@@ -1022,7 +1098,7 @@ unsafe impl ContextMethods for Context {
         if a0 != D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL {
             unsafe { self.targets_changing(a0, a1, a2) };
         }
-        if capture::armed() && a4 != D3D11_KEEP_UNORDERED_ACCESS_VIEWS {
+        if self.capturing() && a4 != D3D11_KEEP_UNORDERED_ACCESS_VIEWS {
             let call = "OMSetRenderTargetsAndUnorderedAccessViews";
             ops::uav_counters(self.ctx(), call, a3, a5, a6, a4);
         }
@@ -1063,15 +1139,17 @@ unsafe impl ContextMethods for Context {
                     "range_flags": tiled::array(a6, a5, number), "offsets": tiled::array(a7, a5, number),
                     "counts": tiled::array(a8, a5, number), "flags": a9,
                 });
-                tiled::event(
-                    self.ctx(),
-                    "tile_map",
-                    "UpdateTileMappings",
-                    args.clone(),
-                    &[pool],
-                    &[dst],
-                    None,
-                );
+                if self.capturing() {
+                    tiled::event(
+                        self.ctx(),
+                        "tile_map",
+                        "UpdateTileMappings",
+                        args.clone(),
+                        &[pool],
+                        &[dst],
+                        None,
+                    );
+                }
                 tiled::changed(self.ctx(), "tile_map", args, a0, a4);
             }
         }
@@ -1096,15 +1174,17 @@ unsafe impl ContextMethods for Context {
                     "dst": dst, "dst_at": tiled::coord(a1), "src": src, "src_at": tiled::coord(a3),
                     "size": tiled::region(a4), "flags": a5,
                 });
-                tiled::event(
-                    self.ctx(),
-                    "tile_copy_map",
-                    "CopyTileMappings",
-                    args.clone(),
-                    &[src],
-                    &[dst],
-                    None,
-                );
+                if self.capturing() {
+                    tiled::event(
+                        self.ctx(),
+                        "tile_copy_map",
+                        "CopyTileMappings",
+                        args.clone(),
+                        &[src],
+                        &[dst],
+                        None,
+                    );
+                }
                 tiled::changed(self.ctx(), "tile_copy_map", args, a0, a2);
             }
         }
@@ -1119,7 +1199,7 @@ unsafe impl ContextMethods for Context {
         a4: u64,
         a5: u32,
     ) {
-        if capture::armed() {
+        if self.capturing() {
             unsafe {
                 let resource = tiled::id(a0);
                 let buffer = tiled::id(a3);
@@ -1153,7 +1233,10 @@ unsafe impl ContextMethods for Context {
         a3: *const c_void,
         a4: u32,
     ) {
-        if capture::armed() {
+        if let Some(r) = &self.recorder {
+            unsafe { r.tiles(a0, a1, a2, a3, a4) };
+        }
+        if self.capturing() {
             unsafe {
                 let dst = tiled::id(a0);
                 tiled::event(
@@ -1167,12 +1250,54 @@ unsafe impl ContextMethods for Context {
                 );
             }
         }
-        unsafe { real_context::UpdateTiles(self.inner(), a0, a1, a2, a3, a4) };
+        if self.reconstructed {
+            // This runtime retains a deferred UpdateTiles CPU pointer beyond ExecuteCommandList.
+            // A GPU buffer instead gives the command stream ownership of its source data.
+            let result = (|| -> windows::core::Result<()> {
+                let data = unsafe { tiled::data(a3, a2) }
+                    .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG))?;
+                let bytes = u32::try_from(data.len())
+                    .map_err(|_| windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG))?;
+                let mut buffer = None;
+                let device = unsafe { self.inner.GetDevice() }?;
+                unsafe {
+                    device.CreateBuffer(
+                        &D3D11_BUFFER_DESC {
+                            ByteWidth: bytes,
+                            Usage: D3D11_USAGE_DEFAULT,
+                            ..Default::default()
+                        },
+                        Some(&D3D11_SUBRESOURCE_DATA {
+                            pSysMem: data.as_ptr().cast(),
+                            ..Default::default()
+                        }),
+                        Some(&mut buffer),
+                    )
+                }?;
+                unsafe {
+                    real_context::CopyTiles(
+                        self.inner(),
+                        a0,
+                        a1,
+                        a2,
+                        buffer.as_ref().unwrap().as_raw(),
+                        0,
+                        a4 | D3D11_TILE_COPY_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE.0 as u32,
+                    )
+                };
+                Ok(())
+            })();
+            if let Err(e) = result {
+                *self.rebuild_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+            }
+        } else {
+            unsafe { real_context::UpdateTiles(self.inner(), a0, a1, a2, a3, a4) };
+        }
     }
     unsafe fn ResizeTilePool(&self, a0: *mut c_void, a1: u64) -> HRESULT {
         tiled::before(self.ctx(), &[a0]);
         let hr = unsafe { real_context::ResizeTilePool(self.inner(), a0, a1) };
-        if capture::armed() && hr.is_ok() {
+        if self.capturing() && hr.is_ok() {
             let pool = tiled::id(a0);
             tiled::event(
                 self.ctx(),
@@ -1190,7 +1315,7 @@ unsafe impl ContextMethods for Context {
         hr
     }
     unsafe fn TiledResourceBarrier(&self, a0: *mut c_void, a1: *mut c_void) {
-        if capture::armed() {
+        if self.capturing() {
             let before = tiled::id(a0);
             let after = tiled::id(a1);
             tiled::event(
@@ -1210,8 +1335,16 @@ unsafe impl ContextMethods for Context {
         let hr = unsafe { real_context::FinishCommandList(self.inner(), a0, a1) };
         if hr.is_ok() {
             let complete = self.coverage.finish();
+            if let Some(r) = &self.recorder {
+                unsafe {
+                    r.finish(
+                        if a1.is_null() { core::ptr::null_mut() } else { *a1 },
+                        a0.as_bool(),
+                    )
+                };
+            }
             unsafe { tiled::finish(self.id, if a1.is_null() { core::ptr::null_mut() } else { *a1 }) };
-            if capture::armed() && !a1.is_null() {
+            if self.capturing() && !a1.is_null() {
                 capture::on_finish_list(self.id, unsafe { *a1 }, complete);
             }
         }
@@ -1219,11 +1352,36 @@ unsafe impl ContextMethods for Context {
     }
 
     unsafe fn ExecuteCommandList(&self, a0: *mut c_void, a1: BOOL) {
-        if capture::armed() {
-            capture::on_execute_list(self.ctx(), a0);
+        let replacement = if self.capturing() {
+            if let Some(plan) = unsafe { recorder::plan(a0) } {
+                if plan.gaps.is_empty() {
+                    match unsafe { self.rebuild(&plan) } {
+                        Ok(list) => Some(list),
+                        Err(error) => {
+                            capture::recorder_gap(format!("command list reconstruction failed: {error}"));
+                            None
+                        }
+                    }
+                } else {
+                    for reason in &plan.gaps {
+                        capture::recorder_gap((*reason).into());
+                    }
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let list = replacement.as_ref().map_or(a0, Interface::as_raw);
+        if self.capturing() {
+            capture::on_execute_list(self.ctx(), list);
         }
-        unsafe { tiled::execute(self.ctx(), a0) };
-        unsafe { real_context::ExecuteCommandList(self.inner(), a0, a1) }
+        unsafe {
+            tiled::execute(self.ctx(), list);
+            real_context::ExecuteCommandList(self.inner(), list, a1)
+        };
     }
 
     unsafe fn GetDevice(&self, a0: *mut *mut c_void) {

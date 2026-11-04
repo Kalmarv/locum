@@ -10,6 +10,7 @@
 //!
 //! Regenerate after changing the `windows` version. The generated files are checked in.
 
+mod d3d11;
 mod d3d12;
 
 use std::collections::{BTreeSet, HashMap};
@@ -481,26 +482,28 @@ fn smoke(root: &Path, debug: bool) {
         "list-unexecuted",
         "list-armed",
         "list-generation",
+        "list-inherited",
+        "list-reuse-update",
+        "list-reuse-map",
+        "list-owned-update",
+        "list-owned-map",
+        "list-sparse-maps",
+        "list-nested",
     ] {
         for warp in [false, true] {
-            if matches!(label, "list-prefix" | "list-generation") {
+            if label == "list-nested" {
                 let mut cmd = Command::new(&cli);
                 cmd.arg("verify").arg(log_dir.join(format!("captures/{label}")));
                 if warp {
                     cmd.arg("--warp");
                 }
-                let output = cmd.output().expect("verify partial list");
-                let text = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                let ok = !output.status.success()
-                    && text.contains("partial_list")
-                    && text.contains("1 of 1 targets identical");
-                println!("--- verify {label} WARP={warp}\n{text}");
+                let output = cmd.output().expect("verify nested fallback");
+                let text = String::from_utf8_lossy(&output.stdout).into_owned()
+                    + &String::from_utf8_lossy(&output.stderr);
+                let ok =
+                    !output.status.success() && text.contains("deferred_recorder") && text.contains("nested");
                 println!(
-                    "{} {label}: matching pixels cannot hide a partial command list",
+                    "{} list-nested: explicit fallback gap WARP={warp}\n{text}",
                     if ok { "ok  " } else { "FAIL" }
                 );
                 rows_ok &= ok;
@@ -511,7 +514,7 @@ fn smoke(root: &Path, debug: bool) {
                     label,
                     warp,
                     debug,
-                    &format!("{label}: complete list verifies"),
+                    &format!("{label}: complete retained list verifies"),
                 )
                 .0;
             }
@@ -647,6 +650,8 @@ fn smoke(root: &Path, debug: bool) {
             println!("--- {label} (WARP={warp})\n{text}");
             let ok = if matches!(label, "live-unmatched" | "live-unexecuted") {
                 passed
+            } else if label == "live-deferred" {
+                !passed && text.contains("capture gap: deferred_recorder") && text.contains("live override")
             } else {
                 !passed
                     && text.contains("capture gap: overrides")
@@ -682,7 +687,7 @@ fn layer_checks(cli: &Path, log_dir: &Path, debug: bool) -> bool {
             ("layers-legacy", "4 of 4 targets identical"),
             (
                 "layers-deferred",
-                "clear outputs: 3 identical to the game's, 0 different",
+                "clear outputs: 5 identical to the game's, 0 different",
             ),
             ("layers-budget-array", "1 of 1 targets identical"),
             ("layers-budget-volume", "1 of 1 targets identical"),
@@ -1015,6 +1020,10 @@ fn generate_all(root: &Path) {
         rustfmt(&path);
         writeln!(mods, "pub mod {};", class.module).unwrap();
     }
+    let recorded = out.join("recorded_context.rs");
+    std::fs::write(&recorded, d3d11::commands(&vtbls)).unwrap();
+    rustfmt(&recorded);
+    mods.push_str("pub mod recorded_context;\n");
     let d12 = out.join("d12_registry.rs");
     std::fs::write(&d12, d3d12::registry(CLASSES, &vtbls)).unwrap();
     rustfmt(&d12);
@@ -1251,7 +1260,7 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
     writeln!(out, "    /// The wrapped object, an `{}`.", class.interface).unwrap();
     out.push_str("    fn inner(&self) -> *mut c_void;\n");
     if class.trait_name == "ContextMethods" {
-        out.push_str("    /// Called before commands that perform work, including calls with a manual override.\n    fn before_command(&self) {}\n");
+        out.push_str("    /// Called before commands that perform work, including calls with a manual override.\n    fn before_command(&self) {}\n    fn recorder(&self) -> Option<&crate::d3d11::recorder::Recorder> { None }\n");
     }
     out.push_str("    unsafe fn QueryInterface(&self, iid: *const windows::core::GUID, out: *mut *mut c_void) -> windows::core::HRESULT;\n");
     out.push_str("    unsafe fn AddRef(&self) -> u32;\n");
@@ -1324,16 +1333,52 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
             } else {
                 ""
             };
-            writeln!(
-                thunks,
-                "unsafe extern \"system\" fn {name}<T: {t}>(this: *mut c_void{comma}{params}){ret} {{\n{observe}    unsafe {{ (*(this as *const T)).{name}({args}) }}\n}}",
-                name = e.name,
-                t = class.trait_name,
-                comma = if params.is_empty() { "" } else { ", " },
-                params = params.join(", "),
-                args = args.join(", "),
-            )
-            .unwrap();
+            let owning = class.trait_name == "ContextMethods" && d3d11::recorded(&e.name);
+            let special = class.trait_name == "ContextMethods"
+                && matches!(
+                    e.name.as_str(),
+                    "Map" | "UpdateSubresource" | "UpdateSubresource1" | "UpdateTiles"
+                );
+            let unsupported = class.trait_name == "ContextMethods"
+                && matches!(
+                    e.name.as_str(),
+                    "SwapDeviceContextState"
+                        | "SetHardwareProtectionState"
+                        | "Signal"
+                        | "Wait"
+                        | "SetResourceMinLOD"
+                );
+            let mut before = observe.to_string();
+            if owning || special || unsupported {
+                before.push_str("    let object = unsafe { &*(this as *const T) };\n    let recorder = object.recorder();\n    if let Some(r) = recorder { unsafe { r.begin(object.inner()) }; }\n");
+            }
+            if owning {
+                writeln!(before, "    let command = recorder.map(|_| unsafe {{ crate::vtables::recorded_context::Command::capture_{}({}) }});", e.name, args.join(", ")).unwrap();
+            }
+            let condition = if e.ret.is_some() { "result.is_ok() && " } else { "" };
+            let mut after = String::new();
+            if unsupported {
+                writeln!(after,"    if {condition}let Some(r) = recorder {{ r.gap(\"{} cannot be reconstructed exactly\"); }}",e.name).unwrap();
+            }
+            if owning {
+                writeln!(after,"    if {condition}let (Some(r), Some(command)) = (recorder, command) {{ r.push(command); }}").unwrap();
+            }
+            let call = format!(
+                "unsafe {{ (*(this as *const T)).{}({}) }}",
+                e.name,
+                args.join(", ")
+            );
+            let body = if after.is_empty() {
+                format!("{before}    {call}")
+            } else if e.ret.is_none() {
+                format!("{before}    {call};\n{after}")
+            } else {
+                format!("{before}    let result = {call};\n{after}    result")
+            };
+            writeln!(thunks,
+                "unsafe extern \"system\" fn {name}<T: {t}>(this: *mut c_void{comma}{params}){ret} {{\n{body}\n}}",
+                name=e.name, t=class.trait_name, comma=if params.is_empty(){""}else{", "},
+                params=params.join(", ")).unwrap();
         }
     }
     out.push_str("}\n\n");
