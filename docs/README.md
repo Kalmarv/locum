@@ -389,8 +389,11 @@ layout), or what the list's own barriers left it in, to COPY_SOURCE and back, wi
 are read after the list's first execution in the frame completes, into `targets` rows on the last draw that had the
 target bound. Lists recorded before the request, a list executed again in the frame, multisampled targets,
 attachments a render pass discards or suspends into another list, and copies past the 3 GiB checkpoint budget are
-`d3d12-targets` gaps. ExecuteIndirect counts as a draw or a dispatch by its command signature's last argument. Each
-submission records the descriptor definitions that changed
+`d3d12-targets` gaps. The budget is spent as the copies are recorded, in the order the game records its lists, not
+in pass order, so the passes past it are not only the frame's last; `passes` marks each pass whose targets were not
+read back after its draws, and says where they were (with the later pass a continued pass ends in) or why not.
+ExecuteIndirect counts as a draw or a dispatch by its command signature's last argument. Each submission records the
+descriptor definitions that changed
 since the previous one (all of them at the first; `empty` marks a slot emptied), so `d12_submission_descriptors`
 holds changes, not whole heaps. The CLI and viewer project these into their
 draw, resource, binding and pipeline views. Display order across queues is not a GPU execution order; queue order

@@ -178,6 +178,18 @@ pub fn info(c: &Capture) -> Result<(), String> {
     for (what, detail, count) in gaps {
         missing.push(format!("{what}: {} ({count})", detail.unwrap_or_default()));
     }
+    // No valid root signature binds a register twice; a locum before 2026-11-04 let a D3D12 table range reach
+    // descriptors of another type.
+    let doubled = c.count(
+        "SELECT count(*) FROM (SELECT 1 FROM bindings GROUP BY draw, stage, kind, slot, space HAVING count(*) > 1)",
+        [],
+    );
+    if doubled > 0 {
+        missing.push(format!(
+            "bindings: {doubled} registers of draws are bound to more than one descriptor: an older locum projected \
+             them, and only one of each is what the program read (`draw` says which draws; a new capture binds one)"
+        ));
+    }
     let unread: Vec<(String, i64)> = c.rows(
         "SELECT coalesce(content_note, 'not read'), count(*) FROM resources WHERE used = 1 AND content IS NULL \
          GROUP BY content_note",

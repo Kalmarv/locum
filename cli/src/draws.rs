@@ -260,6 +260,16 @@ pub fn find(c: &Capture, target: f64, tolerance: f64, int: bool) -> Result<(), S
     Ok(())
 }
 
+/// One pass as `passes` lists it: its draws, where it was recorded, and its targets (name and shape, and resources).
+struct Pass {
+    n: i64,
+    first: i64,
+    last: i64,
+    place: String,
+    targets: Vec<String>,
+    resources: Vec<i64>,
+}
+
 pub fn passes(c: &Capture) -> Result<(), String> {
     let rows: Vec<(i64, i64, i64, bool, Option<i64>)> = c.rows(
         "SELECT p.n, p.first_draw, p.last_draw, e.deferred, e.list FROM passes p JOIN draws d ON d.n = p.first_draw \
@@ -267,6 +277,37 @@ pub fn passes(c: &Capture) -> Result<(), String> {
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     );
+    let list: Vec<Pass> = rows
+        .into_iter()
+        .map(|(n, first, last, deferred, list)| {
+            let bound: Vec<(String, i64, Option<i64>)> = c.rows(
+                "SELECT kind, slot, resource FROM bindings WHERE draw = ?1 AND kind IN ('rtv', 'dsv') ORDER BY kind DESC, slot",
+                [first],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            );
+            let targets = bound
+                .iter()
+                .map(|(kind, slot, res)| {
+                    let name = if kind == "dsv" { "depth".to_string() } else { format!("rt{slot}") };
+                    let s = res.and_then(|r| shape(c, r)).map_or("?".into(), |s| s.to_string());
+                    format!("{name} {s}")
+                })
+                .collect();
+            let place = match (deferred, list) {
+                (true, Some(l)) => format!("list {l}"),
+                (true, None) => "list".into(),
+                _ => "imm".into(),
+            };
+            Pass {
+                n,
+                first,
+                last,
+                place,
+                targets,
+                resources: bound.iter().filter_map(|b| b.2).collect(),
+            }
+        })
+        .collect();
     out!(
         "{:>4} {:>11} {:>5} {:<9} targets",
         "pass",
@@ -274,59 +315,106 @@ pub fn passes(c: &Capture) -> Result<(), String> {
         "count",
         "list"
     );
-    let mut previous: Option<Vec<String>> = None;
     let missing = c.has_table("missing_targets");
-    for (n, first, last, deferred, list) in rows {
-        let targets: Vec<String> = c
-            .rows(
-                "SELECT kind, slot, resource FROM bindings WHERE draw = ?1 AND kind IN ('rtv', 'dsv') ORDER BY kind DESC, slot",
-                [first],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?)),
-            )
-            .into_iter()
-            .map(|(kind, slot, res)| {
-                let name = if kind == "dsv" { "depth".to_string() } else { format!("rt{slot}") };
-                let s = res.and_then(|r| shape(c, r)).map_or("?".into(), |s| s.to_string());
-                format!("{name} {s}")
-            })
-            .collect();
-        let count = c.count("SELECT count(*) FROM draws WHERE pass = ?1", [n]);
+    // A capture that reads back no target says so once (`info` too), not once a pass.
+    let none = c.count("SELECT count(*) FROM targets", []) == 0;
+    if none {
+        out!("(no target was read back in this capture)");
+    }
+    // Why a capture from before the per-pass reasons read back fewer targets: its gaps, which count them.
+    let gaps: Vec<String> = if missing {
+        Vec::new()
+    } else {
+        c.rows(
+            "SELECT detail FROM gaps WHERE what LIKE '%targets%' AND detail IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+    };
+    for (i, p) in list.iter().enumerate() {
+        let count = c.count("SELECT count(*) FROM draws WHERE pass = ?1", [p.n]);
         // Games that record one pass on several lists (Elden Ring's G-buffer) split it where each list ends.
-        let shown = if previous.as_ref() == Some(&targets) && !targets.is_empty() {
+        let shown = if i > 0 && list[i - 1].targets == p.targets && !p.targets.is_empty() {
             "the same targets as the pass before".to_string()
         } else {
-            targets.join(", ")
-        };
-        let place = match (deferred, list) {
-            (true, Some(l)) => format!("list {l}"),
-            (true, None) => "list".into(),
-            _ => "imm".into(),
+            p.targets.join(", ")
         };
         out!(
-            "{n:>4} {:>11} {count:>5} {place:<9} {shown}",
-            format!("{first}-{last}")
+            "{:>4} {:>11} {count:>5} {:<9} {shown}",
+            p.n,
+            format!("{}-{}", p.first, p.last),
+            p.place
         );
         // Targets of this pass not read back where it ended, by reason.
         let lost: Vec<(String, String)> = if missing {
             c.rows(
                 "SELECT why, group_concat(DISTINCT target) FROM missing_targets WHERE draw BETWEEN ?1 AND ?2 \
                  GROUP BY why",
-                [first, last],
+                [p.first, p.last],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
         } else {
             Vec::new()
         };
-        for (why, targets) in lost {
-            out!(
-                "{:>4} {:>11} {:>5} {:<9} not read back: {targets}: {why}",
-                "",
-                "",
-                "",
-                ""
-            );
+        let note = |text: &str| out!("{:>4} {:>11} {:>5} {:<9} {text}", "", "", "", "");
+        for (why, targets) in &lost {
+            note(&format!("not read back: {targets}: {why}"));
         }
-        previous = Some(targets);
+        if lost.is_empty()
+            && !none
+            && let Some(text) = readback(c, &list, i, &gaps)
+        {
+            note(&text);
+        }
     }
     Ok(())
+}
+
+/// Where the targets of pass `i` were read back when none was after its own draws: with a later pass its targets go
+/// on into (a pass recorded on several lists is read where the last ends), or not at all, with the capture's reason
+/// when it gives one for the whole capture (`gaps`) rather than per pass.
+fn readback(c: &Capture, passes: &[Pass], i: usize, gaps: &[String]) -> Option<String> {
+    let p = &passes[i];
+    let read = c.count(
+        "SELECT count(*) FROM targets WHERE draw BETWEEN ?1 AND ?2",
+        [p.first, p.last],
+    );
+    if p.resources.is_empty() || read > 0 {
+        return None;
+    }
+    let ids = p
+        .resources
+        .iter()
+        .map(i64::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let next: Option<(i64, i64)> = c.row(
+        &format!(
+            "SELECT t.draw, d.pass FROM targets t JOIN draws d ON d.n = t.draw WHERE t.draw > ?1 \
+             AND t.resource IN ({ids}) ORDER BY t.draw LIMIT 1"
+        ),
+        [p.last],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    );
+    let why = if gaps.is_empty() {
+        String::new()
+    } else {
+        format!(" ({}; the capture does not say which passes)", gaps.join("; "))
+    };
+    Some(match next {
+        Some((draw, pass))
+            if passes
+                .iter()
+                .filter(|q| q.n > p.n && q.n <= pass)
+                .all(|q| q.targets == p.targets) =>
+        {
+            format!("read back with pass {pass}, after draw {draw}: the same targets go on to there")
+        }
+        Some((draw, pass)) => {
+            format!(
+                "not read back where it ends{why}; its targets are next read back after draw {draw}, pass {pass}"
+            )
+        }
+        None => format!("not read back{why}"),
+    })
 }

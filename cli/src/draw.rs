@@ -1,7 +1,7 @@
 //! `draw` and `cb`: one draw or dispatch, everything it had bound and its constants by name, as text or as JSON
 //! (`--json`; with `all`, one object per line for every draw, so a census over a frame is one process).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use locum_capture::format;
 use serde::Serialize;
@@ -106,6 +106,9 @@ pub struct Draw {
     /// Bound registers left out because the shaders' reflection does not list them (`--all` keeps them): a D3D12
     /// root table binds every descriptor of its ranges, whatever the program reads.
     pub unused: usize,
+    /// Registers bound to more than one descriptor, which no valid root signature does: captures whose D3D12 bindings
+    /// a locum before 2026-11-04 projected let a table range reach descriptors of another type.
+    pub doubled: usize,
     pub constants: Vec<Constants>,
     /// Targets read back after it (the last draw of a pass).
     pub targets: Vec<Target>,
@@ -514,6 +517,13 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
         bindings.retain(|b| b.used != Some(false));
     }
     let unused = before - bindings.len();
+    let mut registers: HashMap<(&str, &str, u32, u32), usize> = HashMap::new();
+    for b in &rows {
+        *registers
+            .entry((b.stage.as_str(), b.kind.as_str(), b.slot, b.space))
+            .or_default() += 1;
+    }
+    let doubled = registers.values().filter(|&&n| n > 1).count();
     let targets = c.rows(
         "SELECT target, blob, width, height, format FROM targets WHERE draw = ?1",
         [n],
@@ -563,6 +573,7 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
         scissors,
         bindings,
         unused,
+        doubled,
         constants,
         targets,
     })
@@ -933,6 +944,15 @@ fn print_bound(d: &Draw) {
             if d.unused == 1 { "it" } else { "them" }
         );
     }
+    if d.doubled > 0 {
+        out!(
+            "  ({} register{} bound to more than one descriptor: an older locum projected this capture's bindings and let \
+             a table range reach descriptors of another type, so only one of each is what the program read; a new \
+             capture binds one)",
+            d.doubled,
+            if d.doubled == 1 { "" } else { "s" }
+        );
+    }
 }
 
 fn json<T: Serialize>(v: &T) -> Result<(), String> {
@@ -991,11 +1011,11 @@ pub fn cb(
     as_json: bool,
     only: &Only,
 ) -> Result<(), String> {
-    let (mut here, elsewhere): (Vec<_>, Vec<_>) = rows(c, draw)
+    let (here, elsewhere): (Vec<_>, Vec<_>) = rows(c, draw)
         .into_iter()
         .filter(|b| b.kind == "cb" && b.stage == stage && b.slot == slot)
         .partition(|b| b.space == space);
-    let Some(b) = here.pop() else {
+    if here.is_empty() {
         let spaces: Vec<String> = elsewhere.iter().map(|b| b.space.to_string()).collect();
         return Err(if spaces.is_empty() {
             format!("draw {draw} has no {stage} b{slot}")
@@ -1005,7 +1025,38 @@ pub fn cb(
                 spaces.join(" or ")
             )
         });
-    };
+    }
+    // A register bound to several descriptors (`Draw::doubled`): each is shown, since the capture cannot say which
+    // the program read.
+    let several = here.len() > 1;
+    if several {
+        let message = format!(
+            "{stage} b{slot} is bound to {} descriptors: an older locum projected this capture's bindings, and only \
+             one is what the program read",
+            here.len()
+        );
+        if as_json {
+            eprintln!("{message}; the JSON is the first");
+        } else {
+            out!("({message})");
+        }
+    }
+    for (i, b) in here.into_iter().enumerate() {
+        if several && i > 0 && as_json {
+            break;
+        }
+        if several && !as_json {
+            let at = b.offset.map_or(String::new(), |o| format!(" offset {o}"));
+            let buffer = b.resource.map_or("no buffer".to_string(), |r| format!("#{r}"));
+            out!("descriptor {}: {buffer}{at}", i + 1);
+        }
+        constants_at(c, draw, b, raw, as_json, only)?;
+    }
+    Ok(())
+}
+
+/// One constant-buffer binding of `cb`: its registers, or with `raw` its bytes.
+fn constants_at(c: &Capture, draw: i64, b: Row, raw: bool, as_json: bool, only: &Only) -> Result<(), String> {
     if raw {
         let key = b.content.ok_or("contents not captured")?;
         let bytes: Vec<u8> = c
