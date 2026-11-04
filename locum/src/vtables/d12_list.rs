@@ -2850,6 +2850,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     unsafe fn Close(&self) -> windows::core::HRESULT {
         unsafe {
             self.called("Close");
+            self.data.closing(self.real());
             let result = real::Close(self.real());
             self.data.close(result);
             result
@@ -2859,13 +2860,13 @@ unsafe impl List12Methods for crate::d3d12::Object {
         unsafe {
             self.called("Reset");
             let result = real::Reset(self.real(), crate::d3d12::unwrap(a0), crate::d3d12::unwrap(a1));
-            self.data.reset(result, a0, a1);
+            self.data.reset(self.real(), result, a0, a1);
             result
         }
     }
     unsafe fn ClearState(&self, a0: *mut core::ffi::c_void) {
         unsafe {
-            self.data.record("ClearState", || {
+            self.data.record(self.real(), "ClearState", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0)])
@@ -2876,7 +2877,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     unsafe fn DrawInstanced(&self, a0: u32, a1: u32, a2: u32, a3: u32) {
         unsafe {
             self.called("DrawInstanced");
-            self.data.record("DrawInstanced", || {
+            self.data.record(self.real(), "DrawInstanced", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, a1, a2, a3])
@@ -2887,7 +2888,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     unsafe fn DrawIndexedInstanced(&self, a0: u32, a1: u32, a2: u32, a3: i32, a4: u32) {
         unsafe {
             self.called("DrawIndexedInstanced");
-            self.data.record("DrawIndexedInstanced", || {
+            self.data.record(self.real(), "DrawIndexedInstanced", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, a1, a2, a3, a4])
@@ -2898,7 +2899,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     unsafe fn Dispatch(&self, a0: u32, a1: u32, a2: u32) {
         unsafe {
             self.called("Dispatch");
-            self.data.record("Dispatch", || {
+            self.data.record(self.real(), "Dispatch", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, a1, a2])
@@ -2915,7 +2916,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a4: u64,
     ) {
         unsafe {
-            self.data.record("CopyBufferRegion", || {
+            self.data.record(self.real(), "CopyBufferRegion", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), a1, id(a2), a3, a4])
@@ -2942,7 +2943,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         unsafe {
             let mapped0 = crate::d3d12::inputs::texture_copy(a0);
             let mapped4 = crate::d3d12::inputs::texture_copy(a4);
-            self.data.record("CopyTextureRegion", || {
+            self.data.record(self.real(), "CopyTextureRegion", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([texture_copy(a0), a1, a2, a3, texture_copy(a4), box_value(a5)])
@@ -2952,7 +2953,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn CopyResource(&self, a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) {
         unsafe {
-            self.data.record("CopyResource", || {
+            self.data.record(self.real(), "CopyResource", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), id(a1)])
@@ -2970,7 +2971,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a5: windows::Win32::Graphics::Direct3D12::D3D12_TILE_COPY_FLAGS,
     ) {
         unsafe {
-            self.data.record("CopyTiles", || {
+            self.data.record(self.real(), "CopyTiles", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), tile_coordinate(a1), tile_region(a2), id(a3), a4, a5.0])
@@ -2995,7 +2996,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a4: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     ) {
         unsafe {
-            self.data.record("ResolveSubresource", || {
+            self.data.record(self.real(), "ResolveSubresource", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), a1, id(a2), a3, a4.0])
@@ -3012,7 +3013,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn IASetPrimitiveTopology(&self, a0: windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY) {
         unsafe {
-            self.data.record("IASetPrimitiveTopology", || {
+            self.data.record(self.real(), "IASetPrimitiveTopology", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0.0])
@@ -3026,7 +3027,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a1: *const windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT,
     ) {
         unsafe {
-            self.data.record("RSSetViewports", || {
+            self.data.record(self.real(), "RSSetViewports", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([viewports(a1, a0)])
@@ -3036,7 +3037,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn RSSetScissorRects(&self, a0: u32, a1: *const windows::Win32::Foundation::RECT) {
         unsafe {
-            self.data.record("RSSetScissorRects", || {
+            self.data.record(self.real(), "RSSetScissorRects", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([rects(a1, a0)])
@@ -3046,7 +3047,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn OMSetBlendFactor(&self, a0: *const f32) {
         unsafe {
-            self.data.record("OMSetBlendFactor", || {
+            self.data.record(self.real(), "OMSetBlendFactor", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([slice(a0, 4)])
@@ -3056,7 +3057,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn OMSetStencilRef(&self, a0: u32) {
         unsafe {
-            self.data.record("OMSetStencilRef", || {
+            self.data.record(self.real(), "OMSetStencilRef", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0])
@@ -3066,7 +3067,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn SetPipelineState(&self, a0: *mut core::ffi::c_void) {
         unsafe {
-            self.data.record("SetPipelineState", || {
+            self.data.record(self.real(), "SetPipelineState", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0)])
@@ -3081,7 +3082,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     ) {
         unsafe {
             let mapped1 = crate::d3d12::inputs::barriers(a1, a0);
-            self.data.record("ResourceBarrier", || {
+            self.data.record(self.real(), "ResourceBarrier", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([barriers(a1, a0)])
@@ -3091,14 +3092,14 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn ExecuteBundle(&self, a0: *mut core::ffi::c_void) {
         unsafe {
-            self.data.bundle(a0);
+            self.data.bundle(self.real(), a0);
             real::ExecuteBundle(self.real(), crate::d3d12::unwrap(a0));
         }
     }
     unsafe fn SetDescriptorHeaps(&self, a0: u32, a1: *const *mut core::ffi::c_void) {
         unsafe {
             let mapped1 = crate::d3d12::inputs::objects(a1, a0);
-            self.data.record("SetDescriptorHeaps", || {
+            self.data.record(self.real(), "SetDescriptorHeaps", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([slice(a1, a0 as usize).iter().map(|p| id(*p)).collect::<Vec<_>>()])
@@ -3108,7 +3109,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn SetComputeRootSignature(&self, a0: *mut core::ffi::c_void) {
         unsafe {
-            self.data.record("SetComputeRootSignature", || {
+            self.data.record(self.real(), "SetComputeRootSignature", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0)])
@@ -3118,7 +3119,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn SetGraphicsRootSignature(&self, a0: *mut core::ffi::c_void) {
         unsafe {
-            self.data.record("SetGraphicsRootSignature", || {
+            self.data.record(self.real(), "SetGraphicsRootSignature", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0)])
@@ -3132,11 +3133,12 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a1: windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
     ) {
         unsafe {
-            self.data.record("SetComputeRootDescriptorTable", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([a0, descriptor(a1.ptr, true)])
-            });
+            self.data
+                .record(self.real(), "SetComputeRootDescriptorTable", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([a0, descriptor(a1.ptr, true)])
+                });
             real::SetComputeRootDescriptorTable(self.real(), a0, a1);
         }
     }
@@ -3146,17 +3148,18 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a1: windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
     ) {
         unsafe {
-            self.data.record("SetGraphicsRootDescriptorTable", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([a0, descriptor(a1.ptr, true)])
-            });
+            self.data
+                .record(self.real(), "SetGraphicsRootDescriptorTable", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([a0, descriptor(a1.ptr, true)])
+                });
             real::SetGraphicsRootDescriptorTable(self.real(), a0, a1);
         }
     }
     unsafe fn SetComputeRoot32BitConstant(&self, a0: u32, a1: u32, a2: u32) {
         unsafe {
-            self.data.record("SetComputeRoot32BitConstant", || {
+            self.data.record(self.real(), "SetComputeRoot32BitConstant", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, a1, a2])
@@ -3166,7 +3169,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn SetGraphicsRoot32BitConstant(&self, a0: u32, a1: u32, a2: u32) {
         unsafe {
-            self.data.record("SetGraphicsRoot32BitConstant", || {
+            self.data.record(self.real(), "SetGraphicsRoot32BitConstant", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, a1, a2])
@@ -3176,7 +3179,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn SetComputeRoot32BitConstants(&self, a0: u32, a1: u32, a2: *const core::ffi::c_void, a3: u32) {
         unsafe {
-            self.data.record("SetComputeRoot32BitConstants", || {
+            self.data.record(self.real(), "SetComputeRoot32BitConstants", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, slice(a2.cast::<u32>(), a1 as usize), a3])
@@ -3186,71 +3189,78 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn SetGraphicsRoot32BitConstants(&self, a0: u32, a1: u32, a2: *const core::ffi::c_void, a3: u32) {
         unsafe {
-            self.data.record("SetGraphicsRoot32BitConstants", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([a0, slice(a2.cast::<u32>(), a1 as usize), a3])
-            });
+            self.data
+                .record(self.real(), "SetGraphicsRoot32BitConstants", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([a0, slice(a2.cast::<u32>(), a1 as usize), a3])
+                });
             real::SetGraphicsRoot32BitConstants(self.real(), a0, a1, a2, a3);
         }
     }
     unsafe fn SetComputeRootConstantBufferView(&self, a0: u32, a1: u64) {
         unsafe {
-            self.data.record("SetComputeRootConstantBufferView", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([a0, address(a1)])
-            });
+            self.data
+                .record(self.real(), "SetComputeRootConstantBufferView", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([a0, address(a1)])
+                });
             real::SetComputeRootConstantBufferView(self.real(), a0, a1);
         }
     }
     unsafe fn SetGraphicsRootConstantBufferView(&self, a0: u32, a1: u64) {
         unsafe {
-            self.data.record("SetGraphicsRootConstantBufferView", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([a0, address(a1)])
-            });
+            self.data
+                .record(self.real(), "SetGraphicsRootConstantBufferView", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([a0, address(a1)])
+                });
             real::SetGraphicsRootConstantBufferView(self.real(), a0, a1);
         }
     }
     unsafe fn SetComputeRootShaderResourceView(&self, a0: u32, a1: u64) {
         unsafe {
-            self.data.record("SetComputeRootShaderResourceView", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([a0, address(a1)])
-            });
+            self.data
+                .record(self.real(), "SetComputeRootShaderResourceView", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([a0, address(a1)])
+                });
             real::SetComputeRootShaderResourceView(self.real(), a0, a1);
         }
     }
     unsafe fn SetGraphicsRootShaderResourceView(&self, a0: u32, a1: u64) {
         unsafe {
-            self.data.record("SetGraphicsRootShaderResourceView", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([a0, address(a1)])
-            });
+            self.data
+                .record(self.real(), "SetGraphicsRootShaderResourceView", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([a0, address(a1)])
+                });
             real::SetGraphicsRootShaderResourceView(self.real(), a0, a1);
         }
     }
     unsafe fn SetComputeRootUnorderedAccessView(&self, a0: u32, a1: u64) {
         unsafe {
-            self.data.record("SetComputeRootUnorderedAccessView", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([a0, address(a1)])
-            });
+            self.data
+                .record(self.real(), "SetComputeRootUnorderedAccessView", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([a0, address(a1)])
+                });
             real::SetComputeRootUnorderedAccessView(self.real(), a0, a1);
         }
     }
     unsafe fn SetGraphicsRootUnorderedAccessView(&self, a0: u32, a1: u64) {
         unsafe {
-            self.data.record("SetGraphicsRootUnorderedAccessView", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([a0, address(a1)])
-            });
+            self.data
+                .record(self.real(), "SetGraphicsRootUnorderedAccessView", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([a0, address(a1)])
+                });
             real::SetGraphicsRootUnorderedAccessView(self.real(), a0, a1);
         }
     }
@@ -3259,7 +3269,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a0: *const windows::Win32::Graphics::Direct3D12::D3D12_INDEX_BUFFER_VIEW,
     ) {
         unsafe {
-            self.data.record("IASetIndexBuffer", || {
+            self.data.record(self.real(), "IASetIndexBuffer", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([index_buffer(a0)])
@@ -3274,7 +3284,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: *const windows::Win32::Graphics::Direct3D12::D3D12_VERTEX_BUFFER_VIEW,
     ) {
         unsafe {
-            self.data.record("IASetVertexBuffers", || {
+            self.data.record(self.real(), "IASetVertexBuffers", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, vertex_buffers(a2, a1)])
@@ -3289,7 +3299,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: *const windows::Win32::Graphics::Direct3D12::D3D12_STREAM_OUTPUT_BUFFER_VIEW,
     ) {
         unsafe {
-            self.data.record("SOSetTargets", || {
+            self.data.record(self.real(), "SOSetTargets", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, stream_outputs(a2, a1)])
@@ -3305,7 +3315,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a3: *const windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
     ) {
         unsafe {
-            self.data.record("OMSetRenderTargets", || {
+            self.data.record(self.real(), "OMSetRenderTargets", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([
@@ -3326,7 +3336,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a5: *const windows::Win32::Foundation::RECT,
     ) {
         unsafe {
-            self.data.record("ClearDepthStencilView", || {
+            self.data.record(self.real(), "ClearDepthStencilView", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([descriptor(a0.ptr as u64, false), a1.0, a2, a3, rects(a5, a4)])
@@ -3342,7 +3352,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a3: *const windows::Win32::Foundation::RECT,
     ) {
         unsafe {
-            self.data.record("ClearRenderTargetView", || {
+            self.data.record(self.real(), "ClearRenderTargetView", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([descriptor(a0.ptr as u64, false), slice(a1, 4), rects(a3, a2)])
@@ -3360,7 +3370,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a5: *const windows::Win32::Foundation::RECT,
     ) {
         unsafe {
-            self.data.record("ClearUnorderedAccessViewUint", || {
+            self.data.record(self.real(), "ClearUnorderedAccessViewUint", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([
@@ -3384,17 +3394,18 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a5: *const windows::Win32::Foundation::RECT,
     ) {
         unsafe {
-            self.data.record("ClearUnorderedAccessViewFloat", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([
-                    descriptor(a0.ptr, true),
-                    descriptor(a1.ptr as u64, false),
-                    id(a2),
-                    slice(a3, 4),
-                    rects(a5, a4)
-                ])
-            });
+            self.data
+                .record(self.real(), "ClearUnorderedAccessViewFloat", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([
+                        descriptor(a0.ptr, true),
+                        descriptor(a1.ptr as u64, false),
+                        id(a2),
+                        slice(a3, 4),
+                        rects(a5, a4)
+                    ])
+                });
             real::ClearUnorderedAccessViewFloat(self.real(), a0, a1, crate::d3d12::unwrap(a2), a3, a4, a5);
         }
     }
@@ -3404,7 +3415,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a1: *const windows::Win32::Graphics::Direct3D12::D3D12_DISCARD_REGION,
     ) {
         unsafe {
-            self.data.record("DiscardResource", || {
+            self.data.record(self.real(), "DiscardResource", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), discard_region(a1)])
@@ -3419,7 +3430,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: u32,
     ) {
         unsafe {
-            self.data.record("BeginQuery", || {
+            self.data.record(self.real(), "BeginQuery", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), a1.0, a2])
@@ -3434,7 +3445,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: u32,
     ) {
         unsafe {
-            self.data.record("EndQuery", || {
+            self.data.record(self.real(), "EndQuery", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), a1.0, a2])
@@ -3452,7 +3463,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a5: u64,
     ) {
         unsafe {
-            self.data.record("ResolveQueryData", || {
+            self.data.record(self.real(), "ResolveQueryData", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), a1.0, a2, a3, id(a4), a5])
@@ -3475,7 +3486,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: windows::Win32::Graphics::Direct3D12::D3D12_PREDICATION_OP,
     ) {
         unsafe {
-            self.data.record("SetPredication", || {
+            self.data.record(self.real(), "SetPredication", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), a1, a2.0])
@@ -3485,7 +3496,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn SetMarker(&self, a0: u32, a1: *const core::ffi::c_void, a2: u32) {
         unsafe {
-            self.data.record("SetMarker", || {
+            self.data.record(self.real(), "SetMarker", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, slice(a1.cast::<u8>(), a2 as usize)])
@@ -3495,7 +3506,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn BeginEvent(&self, a0: u32, a1: *const core::ffi::c_void, a2: u32) {
         unsafe {
-            self.data.record("BeginEvent", || {
+            self.data.record(self.real(), "BeginEvent", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, slice(a1.cast::<u8>(), a2 as usize)])
@@ -3505,7 +3516,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn EndEvent(&self) {
         unsafe {
-            self.data.record("EndEvent", || {
+            self.data.record(self.real(), "EndEvent", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([])
@@ -3524,7 +3535,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     ) {
         unsafe {
             self.called("ExecuteIndirect");
-            self.data.record("ExecuteIndirect", || {
+            self.data.record(self.real(), "ExecuteIndirect", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), a1, id(a2), a3, id(a4), a5])
@@ -3552,7 +3563,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     ) {
         unsafe {
             let mapped5 = crate::d3d12::inputs::objects(a5, a4);
-            self.data.record("AtomicCopyBufferUINT", || {
+            self.data.record(self.real(), "AtomicCopyBufferUINT", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), a1, id(a2), a3, dependent_resources(a5, a6, a4)])
@@ -3581,7 +3592,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     ) {
         unsafe {
             let mapped5 = crate::d3d12::inputs::objects(a5, a4);
-            self.data.record("AtomicCopyBufferUINT64", || {
+            self.data.record(self.real(), "AtomicCopyBufferUINT64", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), a1, id(a2), a3, dependent_resources(a5, a6, a4)])
@@ -3600,7 +3611,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn OMSetDepthBounds(&self, a0: f32, a1: f32) {
         unsafe {
-            self.data.record("OMSetDepthBounds", || {
+            self.data.record(self.real(), "OMSetDepthBounds", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, a1])
@@ -3615,7 +3626,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: *const windows::Win32::Graphics::Direct3D12::D3D12_SAMPLE_POSITION,
     ) {
         unsafe {
-            self.data.record("SetSamplePositions", || {
+            self.data.record(self.real(), "SetSamplePositions", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, a1, sample_positions(a2, a0, a1)])
@@ -3636,7 +3647,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a8: windows::Win32::Graphics::Direct3D12::D3D12_RESOLVE_MODE,
     ) {
         unsafe {
-            self.data.record("ResolveSubresourceRegion", || {
+            self.data.record(self.real(), "ResolveSubresourceRegion", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([
@@ -3667,7 +3678,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn SetViewInstanceMask(&self, a0: u32) {
         unsafe {
-            self.data.record("SetViewInstanceMask", || {
+            self.data.record(self.real(), "SetViewInstanceMask", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0])
@@ -3682,7 +3693,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: *const windows::Win32::Graphics::Direct3D12::D3D12_WRITEBUFFERIMMEDIATE_MODE,
     ) {
         unsafe {
-            self.data.record("WriteBufferImmediate", || {
+            self.data.record(self.real(), "WriteBufferImmediate", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([write_immediate(a1, a2, a0)])
@@ -3692,7 +3703,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn SetProtectedResourceSession(&self, a0: *mut core::ffi::c_void) {
         unsafe {
-            self.data.record("SetProtectedResourceSession", || {
+            self.data.record(self.real(), "SetProtectedResourceSession", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0)])
@@ -3710,7 +3721,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         unsafe {
             let mapped1 = crate::d3d12::inputs::render_targets(a1, a0);
             let mapped2 = crate::d3d12::inputs::depth_stencil(a2);
-            self.data.record("BeginRenderPass", || {
+            self.data.record(self.real(), "BeginRenderPass", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([render_pass_targets(a1, a0), render_pass_depth(a2), a3.0])
@@ -3720,7 +3731,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn EndRenderPass(&self) {
         unsafe {
-            self.data.record("EndRenderPass", || {
+            self.data.record(self.real(), "EndRenderPass", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([])
@@ -3735,7 +3746,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: usize,
     ) {
         unsafe {
-            self.data.record("InitializeMetaCommand", || {
+            self.data.record(self.real(), "InitializeMetaCommand", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), slice(a1.cast::<u8>(), a2)])
@@ -3745,7 +3756,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn ExecuteMetaCommand(&self, a0: *mut core::ffi::c_void, a1: *const core::ffi::c_void, a2: usize) {
         unsafe {
-            self.data.record("ExecuteMetaCommand", || {
+            self.data.record(self.real(), "ExecuteMetaCommand", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0), slice(a1.cast::<u8>(), a2)])
@@ -3760,11 +3771,12 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: * const windows :: Win32 :: Graphics :: Direct3D12 :: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC,
     ) {
         unsafe {
-            self.data.record("BuildRaytracingAccelerationStructure", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([acceleration_structure_build(a0), postbuild_info(a2, a1)])
-            });
+            self.data
+                .record(self.real(), "BuildRaytracingAccelerationStructure", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([acceleration_structure_build(a0), postbuild_info(a2, a1)])
+                });
             real::BuildRaytracingAccelerationStructure(self.real(), a0, a1, a2);
         }
     }
@@ -3775,12 +3787,15 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: *const u64,
     ) {
         unsafe {
-            self.data
-                .record("EmitRaytracingAccelerationStructurePostbuildInfo", || {
+            self.data.record(
+                self.real(),
+                "EmitRaytracingAccelerationStructurePostbuildInfo",
+                || {
                     #[allow(unused_imports)]
                     use crate::d3d12::values::*;
                     serde_json::json!([postbuild_info(a0, 1), addresses(a2, a1)])
-                });
+                },
+            );
             real::EmitRaytracingAccelerationStructurePostbuildInfo(self.real(), a0, a1, a2);
         }
     }
@@ -3791,17 +3806,18 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: windows::Win32::Graphics::Direct3D12::D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE,
     ) {
         unsafe {
-            self.data.record("CopyRaytracingAccelerationStructure", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([address(a0), address(a1), a2.0])
-            });
+            self.data
+                .record(self.real(), "CopyRaytracingAccelerationStructure", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([address(a0), address(a1), a2.0])
+                });
             real::CopyRaytracingAccelerationStructure(self.real(), a0, a1, a2);
         }
     }
     unsafe fn SetPipelineState1(&self, a0: *mut core::ffi::c_void) {
         unsafe {
-            self.data.record("SetPipelineState1", || {
+            self.data.record(self.real(), "SetPipelineState1", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0)])
@@ -3812,7 +3828,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     unsafe fn DispatchRays(&self, a0: *const windows::Win32::Graphics::Direct3D12::D3D12_DISPATCH_RAYS_DESC) {
         unsafe {
             self.called("DispatchRays");
-            self.data.record("DispatchRays", || {
+            self.data.record(self.real(), "DispatchRays", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([dispatch_rays(a0)])
@@ -3826,7 +3842,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a1: *const windows::Win32::Graphics::Direct3D12::D3D12_SHADING_RATE_COMBINER,
     ) {
         unsafe {
-            self.data.record("RSSetShadingRate", || {
+            self.data.record(self.real(), "RSSetShadingRate", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0.0, slice(a1, 2).iter().map(|c| c.0).collect::<Vec<_>>()])
@@ -3836,7 +3852,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn RSSetShadingRateImage(&self, a0: *mut core::ffi::c_void) {
         unsafe {
-            self.data.record("RSSetShadingRateImage", || {
+            self.data.record(self.real(), "RSSetShadingRateImage", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([id(a0)])
@@ -3846,7 +3862,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn DispatchMesh(&self, a0: u32, a1: u32, a2: u32) {
         unsafe {
-            self.data.record("DispatchMesh", || {
+            self.data.record(self.real(), "DispatchMesh", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, a1, a2])
@@ -3857,7 +3873,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     unsafe fn Barrier(&self, a0: u32, a1: *const windows::Win32::Graphics::Direct3D12::D3D12_BARRIER_GROUP) {
         unsafe {
             let mapped1 = crate::d3d12::inputs::barrier_groups(a1, a0);
-            self.data.record("Barrier", || {
+            self.data.record(self.real(), "Barrier", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([barrier_groups(a1, a0)])
@@ -3867,7 +3883,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn OMSetFrontAndBackStencilRef(&self, a0: u32, a1: u32) {
         unsafe {
-            self.data.record("OMSetFrontAndBackStencilRef", || {
+            self.data.record(self.real(), "OMSetFrontAndBackStencilRef", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, a1])
@@ -3877,7 +3893,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn RSSetDepthBias(&self, a0: f32, a1: f32, a2: f32) {
         unsafe {
-            self.data.record("RSSetDepthBias", || {
+            self.data.record(self.real(), "RSSetDepthBias", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([a0, a1, a2])
@@ -3890,17 +3906,18 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a0: windows::Win32::Graphics::Direct3D12::D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     ) {
         unsafe {
-            self.data.record("IASetIndexBufferStripCutValue", || {
-                #[allow(unused_imports)]
-                use crate::d3d12::values::*;
-                serde_json::json!([a0.0])
-            });
+            self.data
+                .record(self.real(), "IASetIndexBufferStripCutValue", || {
+                    #[allow(unused_imports)]
+                    use crate::d3d12::values::*;
+                    serde_json::json!([a0.0])
+                });
             real::IASetIndexBufferStripCutValue(self.real(), a0);
         }
     }
     unsafe fn SetProgram(&self, a0: *const windows::Win32::Graphics::Direct3D12::D3D12_SET_PROGRAM_DESC) {
         unsafe {
-            self.data.record("SetProgram", || {
+            self.data.record(self.real(), "SetProgram", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([set_program(a0)])
@@ -3913,7 +3930,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a0: *const windows::Win32::Graphics::Direct3D12::D3D12_DISPATCH_GRAPH_DESC,
     ) {
         unsafe {
-            self.data.record("DispatchGraph", || {
+            self.data.record(self.real(), "DispatchGraph", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
                 serde_json::json!([dispatch_graph(a0)])

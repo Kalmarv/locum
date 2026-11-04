@@ -131,9 +131,12 @@ pub fn before(c: &Class, e: &Entry) -> String {
     {
         let mut s = "let mut queue_order = self.data.queue_seq.lock().unwrap_or_else(|e|e.into_inner());\n*queue_order += 1;\n".to_string();
         if n == "ExecuteCommandLists" {
-            s.push_str("crate::d3d12::journal::submit(&self.data,self.real(),*queue_order,a0,a1);\n");
+            s.push_str("let submission = crate::d3d12::journal::submit(&self.data,self.real(),*queue_order,a0,a1);\n");
         }
         return s;
+    }
+    if c.module == "d12_list" && n == "Close" {
+        return "self.data.closing(self.real());\n".into();
     }
     if c.module != "d12_list"
         || matches!(
@@ -151,7 +154,7 @@ pub fn before(c: &Class, e: &Entry) -> String {
         return String::new();
     }
     if n == "ExecuteBundle" {
-        return "self.data.bundle(a0);\n".into();
+        return "self.data.bundle(self.real(),a0);\n".into();
     }
     let expr = match n {
         "DrawInstanced" => "[a0,a1,a2,a3]",
@@ -232,7 +235,7 @@ pub fn before(c: &Class, e: &Entry) -> String {
         _ => panic!("no capture entry for command list method {n}"),
     };
     format!(
-        "self.data.record(\"{n}\", || {{ #[allow(unused_imports)] use crate::d3d12::values::*; serde_json::json!({expr}) }});\n"
+        "self.data.record(self.real(),\"{n}\", || {{ #[allow(unused_imports)] use crate::d3d12::values::*; serde_json::json!({expr}) }});\n"
     )
 }
 
@@ -292,7 +295,10 @@ pub fn after(c: &Class, e: &Entry) -> String {
             "crate::log::log!(\"D3D12 Serialize: library={} capacity={}\",self.data.id,a1);"
         }
         ("d12_list", "Close") => "self.data.close(result);",
-        ("d12_list", "Reset") => "self.data.reset(result,a0,a1);",
+        ("d12_list", "Reset") => "self.data.reset(self.real(),result,a0,a1);",
+        ("d12_queue", "ExecuteCommandLists") => {
+            "crate::d3d12::journal::submitted(&self.data,self.real(),submission);"
+        }
         ("d12_queue", "Signal" | "Wait") => {
             return format!("crate::d3d12::journal::sync(&self.data,*queue_order,\"{n}\",a0,a1,result);\n");
         }
@@ -304,6 +310,9 @@ pub fn after(c: &Class, e: &Entry) -> String {
         }
         ("d12_device", "CreateCommandQueue") => {
             "if result.is_ok() { crate::d3d12::values::created_queue(self.data.id,a2,a0); }"
+        }
+        ("d12_device", "CreateCommandSignature") => {
+            "if result.is_ok() { crate::d3d12::values::created_command_signature(self.data.id,a3,a0,a1); }"
         }
         ("d12_device", "CreateDescriptorHeap") => {
             "if result.is_ok() { crate::d3d12::values::created_descriptor_heap(self.data.id,a2); }"

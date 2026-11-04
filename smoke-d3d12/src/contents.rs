@@ -5,7 +5,7 @@ use super::*;
 
 const RGBA8: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 
-fn desc(
+pub(super) fn desc(
     dimension: D3D12_RESOURCE_DIMENSION,
     format: DXGI_FORMAT,
     (width, height): (u64, u32),
@@ -33,7 +33,7 @@ fn desc(
     }
 }
 
-unsafe fn committed(
+pub(super) unsafe fn committed(
     device: &ID3D12Device,
     heap: D3D12_HEAP_TYPE,
     d: &D3D12_RESOURCE_DESC,
@@ -57,7 +57,7 @@ unsafe fn committed(
     r.unwrap()
 }
 
-fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
+pub(super) fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
     desc(
         D3D12_RESOURCE_DIMENSION_BUFFER,
         DXGI_FORMAT_UNKNOWN,
@@ -146,7 +146,7 @@ unsafe fn fill(
 }
 
 /// The application's own read of a texture's subresource 0: a copy into `readback` at `offset`.
-unsafe fn read(
+pub(super) unsafe fn read(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
@@ -174,7 +174,7 @@ unsafe fn read(
     }
 }
 
-unsafe fn layout_barrier(
+pub(super) unsafe fn layout_barrier(
     list: &ID3D12GraphicsCommandList7,
     texture: &ID3D12Resource,
     sync: [D3D12_BARRIER_SYNC; 2],

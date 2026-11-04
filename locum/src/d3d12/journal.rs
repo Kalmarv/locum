@@ -31,6 +31,8 @@ pub struct Data {
     pub recording: Mutex<Option<model::Recording>>,
     /// Held through the real queue operation so the recorded order is its actual CPU call order.
     pub queue_seq: Mutex<u64>,
+    /// A direct list's passes while it is recorded with a capture armed (see [`super::passes`]).
+    pub pass: Mutex<Option<super::passes::Pass>>,
 }
 
 impl Data {
@@ -39,9 +41,12 @@ impl Data {
             id,
             recording: Mutex::new(None),
             queue_seq: Mutex::new(0),
+            pass: Mutex::new(None),
         }
     }
-    pub fn record(&self, call: &'static str, build: impl FnOnce() -> Value) {
+    /// Records a command before it is forwarded to the real list `real`; an instrumented list first records the
+    /// copies of a pass the command ends.
+    pub fn record(&self, real: *mut c_void, call: &'static str, build: impl FnOnce() -> Value) {
         if !enabled() {
             return;
         }
@@ -49,6 +54,9 @@ impl Data {
         let args = build();
         let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(recording) = recording.as_mut() {
+            self.checkpoints(recording, |pass, at| unsafe {
+                pass.before(real, call, &args, at)
+            });
             recording.record(model::Command {
                 call,
                 args,
@@ -58,13 +66,16 @@ impl Data {
         }
         RECORDING_COST.add(start, 0);
     }
-    pub fn bundle(&self, pointer: *mut c_void) {
+    pub fn bundle(&self, real: *mut c_void, pointer: *mut c_void) {
         if !enabled() {
             return;
         }
         let bundle = super::data(pointer).and_then(|d| d.snapshot());
         let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(recording) = recording.as_mut() {
+            self.checkpoints(recording, |pass, at| unsafe {
+                pass.before(real, "ExecuteBundle", &Value::Null, at)
+            });
             let diagnostic = bundle
                 .is_none()
                 .then(|| "bundle has no recorded generation".into());
@@ -83,6 +94,33 @@ impl Data {
             .as_ref()
             .map(|r| r.snapshot())
     }
+    /// The checkpoints `make` records into an instrumented list, at its next command.
+    fn checkpoints(
+        &self,
+        recording: &mut model::Recording,
+        make: impl FnOnce(&mut super::passes::Pass, usize) -> Vec<model::Checkpoint>,
+    ) {
+        let mut pass = self.pass.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pass) = pass.as_mut() else {
+            return;
+        };
+        let checkpoints = make(pass, recording.len());
+        super::passes::belong(self.id, &checkpoints);
+        for c in checkpoints {
+            recording.checkpoint(c);
+        }
+    }
+    /// Before Close is forwarded to the real list `real`: a pass still open ends.
+    pub fn closing(&self, real: *mut c_void) {
+        if !enabled() {
+            return;
+        }
+        let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(recording) = recording.as_mut() {
+            self.checkpoints(recording, |pass, at| unsafe { pass.closing(real, at) });
+        }
+        *self.pass.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
     pub fn close(&self, hr: HRESULT) {
         if hr.is_ok()
             && let Some(r) = self.recording.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
@@ -90,15 +128,31 @@ impl Data {
             r.close();
         }
     }
-    pub fn reset(&self, hr: HRESULT, allocator: *mut c_void, pso: *mut c_void) {
+    /// After Reset of the real list `real`: the previous generation's copies are retired, and the new one is
+    /// instrumented while a capture is armed.
+    pub fn reset(&self, real: *mut c_void, hr: HRESULT, allocator: *mut c_void, pso: *mut c_void) {
         let start = Instant::now();
         let (allocator, pso) = (super::id(allocator), super::id(pso));
+        super::passes::retire(self.id);
         if hr.is_ok()
             && let Some(r) = self.recording.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
         {
             r.reset(allocator, pso);
+            self.instrument(r, real);
         }
         RESET_COST.add(start, 0);
+    }
+    /// Instruments a generation opened with a capture armed, if the list is a direct one.
+    fn instrument(&self, recording: &mut model::Recording, real: *mut c_void) {
+        let pass = if super::passes::ARMED.load(std::sync::atomic::Ordering::Acquire) {
+            unsafe { super::passes::Pass::new(real) }
+        } else {
+            None
+        };
+        if pass.is_some() {
+            recording.instrument();
+        }
+        *self.pass.lock().unwrap_or_else(|e| e.into_inner()) = pass;
     }
 }
 
@@ -131,6 +185,8 @@ struct Live {
     results: super::readback::Results,
     /// The resources a submission of the frame has used: their first-use copies are made, or given up.
     used: HashSet<u64>,
+    /// The list generations executed in the frame: a generation's first execution has its checkpoints' bytes.
+    executed: HashSet<(u64, u64)>,
 }
 #[derive(Default)]
 struct Upload {
@@ -188,6 +244,7 @@ pub fn owner_device(id: u64) -> u64 {
 }
 pub fn destroy(id: u64) {
     let start = Instant::now();
+    super::passes::destroyed(id);
     {
         let mut s = state();
         s.objects.remove(&id);
@@ -350,8 +407,11 @@ pub unsafe fn created_list(
     }
     if let Some(data) = super::data(unsafe { *out }) {
         let (allocator, pso) = (super::id(allocator), super::id(pso));
-        *data.recording.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(model::Recording::new(data.id, kind, allocator, pso, closed));
+        let mut recording = model::Recording::new(data.id, kind, allocator, pso, closed);
+        if !closed && let Some(real) = super::real(data.id) {
+            data.instrument(&mut recording, windows::core::Interface::as_raw(&real));
+        }
+        *data.recording.lock().unwrap_or_else(|e| e.into_inner()) = Some(recording);
         describe(
             data.id,
             device,
@@ -361,15 +421,16 @@ pub unsafe fn created_list(
 }
 
 /// Called while the queue lock is held, immediately before forwarding ExecuteCommandLists to `real`, the real queue.
+/// Returns the checkpoints its instrumented lists copy, for [`submitted`].
 pub unsafe fn submit(
     queue: &Data,
     real: *mut c_void,
     sequence: u64,
     count: u32,
     pointers: *const *mut c_void,
-) {
+) -> super::passes::Submitted {
     if !enabled() {
-        return;
+        return Default::default();
     }
     let start = Instant::now();
     let mut s = state();
@@ -456,7 +517,31 @@ pub unsafe fn submit(
     }
     // The copies run before these lists, which change states for the next submission.
     states.execute(&lists, queue_type);
+    let mut submitted = super::passes::Submitted {
+        submission: id,
+        ..Default::default()
+    };
+    for list in lists.iter().filter(|l| l.instrumented) {
+        let copied = list.checkpoints.iter().filter(|c| c.gap.is_none()).map(|c| c.id);
+        submitted.all.extend(copied.clone());
+        if let Some(live) = capture.as_mut()
+            && live.executed.insert((list.id, list.generation))
+        {
+            submitted.read.extend(copied);
+        }
+    }
+    if let Some(live) = capture.as_ref()
+        && !submitted.read.is_empty()
+    {
+        submitted.results = Some(live.results.clone());
+    }
     SUBMISSION_COST.add(start, 0);
+    submitted
+}
+
+/// Called while the queue lock is held, immediately after forwarding ExecuteCommandLists to `real`, the real queue.
+pub unsafe fn submitted(queue: &Data, real: *mut c_void, submission: super::passes::Submitted) {
+    unsafe { super::passes::submitted(queue.id, real, submission) };
 }
 
 /// The first wait this queue has been told of that no submitted Signal and no completed fence value is known to
@@ -753,7 +838,11 @@ pub fn present(frame_number: u64) {
     let Some(root) = folder() else {
         return;
     };
+    super::passes::sweep();
     let finished = state().capture.take();
+    if finished.is_some() {
+        super::passes::ARMED.store(false, std::sync::atomic::Ordering::Release);
+    }
     if let Some(Live {
         path,
         frame,
@@ -779,12 +868,12 @@ pub fn present(frame_number: u64) {
         capture.meta("capture_status", "incomplete");
         capture.meta(
             "verification_scope",
-            "command history and first-use contents; pass-end checkpoints not yet implemented",
+            "command history, first-use contents and pass-end targets",
         );
         let mut prepared = frame.finish(&mut capture, projection);
         capture.gap(
             "d3d12-capture-development",
-            "GPU pass-end checkpoints and full pipeline inspection are in development",
+            "replay and per-dispatch UAV results are in development",
             1,
         );
         let t = std::time::Instant::now();
@@ -797,6 +886,9 @@ pub fn present(frame_number: u64) {
                     prepared.add_uploads(batch.submission, batch.uploads);
                     for (resource, first) in batch.contents {
                         prepared.set_first_use(resource, first);
+                    }
+                    for (id, content) in batch.checkpoints {
+                        prepared.set_checkpoint(id, content);
                     }
                 }
                 prepared.contents(&mut capture, &crate::settings::settings().blobs);
@@ -854,7 +946,9 @@ pub fn present(frame_number: u64) {
             capture: db::Capture::default(),
             results: Default::default(),
             used: HashSet::new(),
+            executed: HashSet::new(),
         });
+        super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
         log!("D3D12 capture armed at Present {frame_number}; cached list history retained");
     }
 }

@@ -9,6 +9,7 @@ use windows::core::*;
 mod contents;
 mod graphics;
 mod modern;
+mod passes;
 
 fn identity<T: Interface, U: Interface>(a: &T, b: &U) {
     assert_eq!(
@@ -458,6 +459,8 @@ unsafe fn run() {
         finish(&queue, &fence, 13);
         contents::capture(&device, &queue, &fence, &chain);
         finish(&queue, &fence, 16);
+        passes::capture(&device, &queue, &fence, &chain);
+        finish(&queue, &fence, 18);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

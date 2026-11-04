@@ -7,6 +7,7 @@ pub mod descriptors;
 mod exports;
 pub mod inputs;
 pub mod journal;
+pub mod passes;
 pub mod pipelines;
 mod portable;
 mod ranges;

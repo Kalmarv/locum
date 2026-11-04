@@ -31,6 +31,34 @@ pub struct List {
     pub initial_pso: u64,
     pub closed: bool,
     pub commands: Vec<Command>,
+    /// Whether this generation was recorded while a capture was armed, so its pass ends were copied.
+    #[serde(skip)]
+    pub instrumented: bool,
+    /// The targets copied inside this generation where its passes ended.
+    #[serde(skip)]
+    pub checkpoints: Vec<Checkpoint>,
+}
+
+/// A render or depth target copied inside a list where a pass ended, before the command at `at` (after all the
+/// commands before it). Its bytes are read once the GPU has run the list.
+#[derive(Clone, Debug, Default)]
+pub struct Checkpoint {
+    pub id: u64,
+    pub at: usize,
+    /// `rt0` to `rt7`, or `depth`.
+    pub target: String,
+    pub resource: u64,
+    /// The view's descriptor version.
+    pub view: u64,
+    pub width: u32,
+    pub height: u32,
+    /// The view's format.
+    pub format: u32,
+    pub sub: u32,
+    /// Depth slice of a volume target.
+    pub z: u32,
+    /// Why no copy was made.
+    pub gap: Option<String>,
 }
 
 /// Kept beside each live list, rather than under the process-wide identity lock.
@@ -66,6 +94,23 @@ impl Recording {
 
     pub fn close(&mut self) {
         Arc::make_mut(&mut self.current).closed = true;
+    }
+
+    pub fn instrument(&mut self) {
+        Arc::make_mut(&mut self.current).instrumented = true;
+    }
+
+    pub fn checkpoint(&mut self, checkpoint: Checkpoint) {
+        Arc::make_mut(&mut self.current).checkpoints.push(checkpoint);
+    }
+
+    /// Commands recorded so far.
+    pub fn len(&self) -> usize {
+        self.current.commands.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.current.commands.is_empty()
     }
 
     pub fn record(&mut self, command: Command) {
@@ -132,6 +177,8 @@ pub struct Prepared {
     frame: Frame,
     projection: Projection,
     first_use: BTreeMap<u64, FirstUse>,
+    /// Checkpoint copies read back: the key of each target's bytes, or why there are none.
+    checkpoints: BTreeMap<u64, Result<String, String>>,
 }
 
 /// A resource's contents as its first use in the frame found them, copied on the GPU just before the submission that
@@ -147,6 +194,10 @@ pub struct FirstUse {
 }
 
 impl Prepared {
+    /// A checkpoint's bytes, read back after the GPU ran its list.
+    pub fn set_checkpoint(&mut self, id: u64, content: Result<String, String>) {
+        self.checkpoints.insert(id, content);
+    }
     /// A resource's contents before its first use.
     pub fn set_first_use(&mut self, resource: u64, first_use: FirstUse) {
         self.first_use.insert(resource, first_use);
@@ -285,6 +336,20 @@ impl Prepared {
             }
         }
         capture.subresources.extend(subresources);
+        let mut uncopied = BTreeMap::<String, u64>::new();
+        for (id, target) in &self.projection.targets {
+            match self.checkpoints.get(id) {
+                Some(Ok(key)) => capture.targets.push(db::Target {
+                    blob: Some(key.clone()),
+                    ..target.clone()
+                }),
+                Some(Err(why)) => *uncopied.entry(why.clone()).or_default() += 1,
+                None => *uncopied.entry("copy not read back".into()).or_default() += 1,
+            }
+        }
+        for (why, count) in self.projection.uncopied.iter().chain(&uncopied) {
+            capture.gap("d3d12-targets", why, *count);
+        }
         for gap in gaps {
             capture.gap("d3d12-upload-content", gap, 1);
         }
@@ -316,6 +381,18 @@ struct Execution {
 }
 
 /// The frame's command history projected into the common tables, one submission at a time.
+/// What an ExecuteIndirect with command signature `signature` is: its last argument draws or dispatches.
+fn indirect(signature: Option<&Value>) -> &'static str {
+    let last = signature.and_then(|s| s["arguments"].as_array()?.last()?["type"].as_i64());
+    match last {
+        // DRAW, DRAW_INDEXED, DISPATCH_MESH.
+        Some(0 | 1 | 10) => "draw",
+        // DISPATCH, DISPATCH_RAYS.
+        Some(2 | 9) => "dispatch",
+        _ => "indirect",
+    }
+}
+
 pub struct Projection {
     next_execution: u64,
     executions: Vec<Execution>,
@@ -324,6 +401,14 @@ pub struct Projection {
     draw_states: Vec<(u64, u64, Pipeline)>,
     /// Each descriptor slot's definition as of the submission being projected, by (heap, slot).
     descriptors: BTreeMap<(u64, u32), Descriptor>,
+    /// List generations executed so far: only a generation's first execution has its checkpoints' bytes.
+    executed: std::collections::HashSet<(u64, u64)>,
+    /// The targets the frame's checkpoints copied, by checkpoint, each on its pass's last draw.
+    targets: Vec<(u64, db::Target)>,
+    /// Pass ends no copy was made for, by reason.
+    uncopied: BTreeMap<String, u64>,
+    /// The last draw of the list execution being projected that each (target, view) was bound to.
+    drawn: BTreeMap<(String, u64), u64>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -491,6 +576,7 @@ impl Frame {
             frame: self,
             projection,
             first_use: BTreeMap::new(),
+            checkpoints: BTreeMap::new(),
         }
     }
 
@@ -669,6 +755,51 @@ impl Projection {
             objects: objects.iter().map(|o| (o.id, o.description.clone())).collect(),
             draw_states: Vec::new(),
             descriptors: BTreeMap::new(),
+            executed: std::collections::HashSet::new(),
+            targets: Vec::new(),
+            uncopied: BTreeMap::new(),
+            drawn: BTreeMap::new(),
+        }
+    }
+
+    /// The checkpoints a list made before its command `at`, each as its target after the last draw of this
+    /// execution that had it bound. A generation executed again has the same copies, which hold its first
+    /// execution's bytes.
+    fn checkpoints(&mut self, capture: &db::Capture, list: &List, at: usize, first: bool) {
+        for c in list.checkpoints.iter().filter(|c| c.at == at) {
+            // A copy after no draw that had its target bound (an indirect dispatch, a bundle without draws) holds
+            // no draw's output.
+            let Some(draw) = self.drawn.get(&(c.target.clone(), c.view)).copied() else {
+                continue;
+            };
+            let why = if first {
+                c.gap.clone()
+            } else {
+                Some(
+                    "the list was executed again in the frame: its copies hold the first execution's targets"
+                        .into(),
+                )
+            };
+            if let Some(why) = why {
+                *self.uncopied.entry(why).or_default() += 1;
+                continue;
+            }
+            self.targets.push((
+                c.id,
+                db::Target {
+                    draw,
+                    target: c.target.clone(),
+                    view: c.view,
+                    resource: c.resource,
+                    width: c.width,
+                    height: c.height,
+                    format: c.format,
+                    sub: c.sub,
+                    blob: None,
+                    event: capture.events.len() as u64,
+                    z: c.z,
+                },
+            ));
         }
     }
 
@@ -715,6 +846,7 @@ impl Projection {
             .collect()
     }
 
+    /// Projects one execution of a list (or a bundle it executes); returns its last graphics draw.
     fn execute(
         &mut self,
         capture: &mut db::Capture,
@@ -722,7 +854,7 @@ impl Projection {
         list: &Arc<List>,
         location: (usize, Option<u64>, usize),
         pipeline: &mut Pipeline,
-    ) {
+    ) -> Option<u64> {
         let (ordinal, parent, depth) = location;
         if depth > 32 {
             capture.gap(
@@ -730,8 +862,13 @@ impl Projection {
                 format!("list {} generation {}", list.id, list.generation),
                 1,
             );
-            return;
+            return None;
         }
+        let first = self.executed.insert((list.id, list.generation));
+        if depth == 0 {
+            self.drawn.clear();
+        }
+        let mut last_draw = None;
         let execution = self.next_execution;
         self.next_execution += 1;
         self.executions.push(Execution {
@@ -756,6 +893,7 @@ impl Projection {
             pipeline.graphics.begin_bundle();
         }
         for (index, command) in list.commands.iter().enumerate() {
+            self.checkpoints(capture, list, index, first);
             pipeline.apply(command);
             let seq = capture.events.len() as u64 + 1;
             // The event kinds D3D11 captures use, so both APIs browse alike.
@@ -763,7 +901,7 @@ impl Projection {
                 "DrawInstanced" | "DrawIndexedInstanced" | "DispatchMesh" => "draw",
                 // Ray and graph dispatches bind through the compute root signature, as a dispatch does.
                 "Dispatch" | "DispatchRays" | "DispatchGraph" => "dispatch",
-                "ExecuteIndirect" => "indirect",
+                "ExecuteIndirect" => indirect(self.objects.get(&command.args[0].as_u64().unwrap_or(0))),
                 "CopyBufferRegion"
                 | "CopyTextureRegion"
                 | "CopyResource"
@@ -812,6 +950,9 @@ impl Projection {
                     );
                 }
                 capture.draws.push(draw);
+                if kind == "draw" {
+                    last_draw = Some(n);
+                }
                 bindings::project(
                     capture,
                     n,
@@ -820,6 +961,16 @@ impl Projection {
                     &self.objects,
                     &self.descriptors,
                 );
+                for b in capture.bindings[bound..].iter().filter(|b| b.stage == "om") {
+                    if let Some(view) = b.view {
+                        let target = if b.kind == "dsv" {
+                            "depth".to_string()
+                        } else {
+                            format!("rt{}", b.slot)
+                        };
+                        self.drawn.insert((target, view), n);
+                    }
+                }
                 self.draw_states.push((n, submission.id, pipeline.clone()));
                 Some(n)
             } else {
@@ -861,15 +1012,25 @@ impl Projection {
                 );
             }
             if let Some(bundle) = &command.bundle {
-                self.execute(
-                    capture,
-                    submission,
-                    bundle,
-                    (index, Some(execution), depth + 1),
-                    pipeline,
-                );
+                last_draw = self
+                    .execute(
+                        capture,
+                        submission,
+                        bundle,
+                        (index, Some(execution), depth + 1),
+                        pipeline,
+                    )
+                    .or(last_draw);
             }
         }
+        self.checkpoints(capture, list, list.commands.len(), first);
+        if depth == 0 && list.kind == 0 && !list.instrumented && last_draw.is_some() {
+            *self
+                .uncopied
+                .entry("list recorded before the capture was armed: its pass ends were not copied".into())
+                .or_default() += 1;
+        }
+        last_draw
     }
 }
 

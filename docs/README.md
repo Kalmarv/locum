@@ -327,7 +327,19 @@ makes all these copies, on the submitting queue just before the game's lists, in
 thread reads (at most 1 GiB waits at once): the CPU reads upload heaps at a few MB/s. A texture is transitioned to
 COPY_SOURCE and back from the state locum tracks for it, from its creation and every submitted barrier; the log's
 `D3D12 states` line counts barriers whose before-state differed from the tracked one. Multisampled and reserved
-resources, and a submission on a queue waiting for a fence nothing has signalled yet, are recorded gaps. Each
+resources, and a submission on a queue waiting for a fence nothing has signalled yet, are recorded gaps.
+
+Lists reset or created while a capture is armed are instrumented: where a pass ends, locum records copies of its
+render and depth targets into the game's own list, so they run on the GPU right after the pass's last draw. A pass
+ends for a target when a barrier moves it out of its state, its views are rebound or cleared from the state, a clear
+or discard is about to overwrite it, a native render pass ends (after EndRenderPass, its ending accesses done), or the
+list closes. Each copy transitions the target from the state the game's own barrier names, the state binding it
+requires (RENDER_TARGET, DEPTH_WRITE or DEPTH_READ per plane, or the layouts of those names for a resource made in a
+layout), or what the list's own barriers left it in, to COPY_SOURCE and back, with predication suspended. Its bytes
+are read after the list's first execution in the frame completes, into `targets` rows on the last draw that had the
+target bound. Lists recorded before the request, a list executed again in the frame, multisampled targets,
+attachments a render pass discards or suspends into another list, and copies past the 3 GiB checkpoint budget are
+`d3d12-targets` gaps. ExecuteIndirect counts as a draw or a dispatch by its command signature's last argument. Each
 submission records the descriptor definitions that changed
 since the previous one (all of them at the first; `empty` marks a slot emptied), so `d12_submission_descriptors`
 holds changes, not whole heaps. The CLI and viewer project these into their
@@ -335,7 +347,7 @@ draw, resource, binding and pipeline views. Display order across queues is not a
 and fence operations are retained separately. CPU-consumed descriptor definitions are frozen when recorded, while
 GPU descriptor tables use the versions present at submission.
 
-This milestone remains explicitly incomplete: pass-end/output checkpoints and D3D12 replay are subsequent work.
+This milestone remains explicitly incomplete: per-dispatch UAV results and D3D12 replay are subsequent work.
 Upload copies assume the application's host writes obey D3D12 synchronization. Captures retain the original
 shader bytes regardless of whether reflection succeeds. Resource reachability comes from API state and root
 signatures, not a single shader parser's conclusions.

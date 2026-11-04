@@ -29,6 +29,55 @@ pub unsafe fn created_queue(device: u64, out: *mut *mut c_void, desc: *const D3D
     }
 }
 
+/// A command signature: its stride, root signature and arguments (type, and each type's parameters), which say
+/// whether ExecuteIndirect draws or dispatches with it.
+pub unsafe fn created_command_signature(
+    device: u64,
+    out: *mut *mut c_void,
+    desc: *const D3D12_COMMAND_SIGNATURE_DESC,
+    root: *mut c_void,
+) {
+    let (Some(d), false) = (unsafe { desc.as_ref() }, out.is_null()) else {
+        return;
+    };
+    let arguments: Vec<Value> = unsafe { slice(d.pArgumentDescs, d.NumArgumentDescs as usize) }
+        .iter()
+        .map(|a| {
+            let mut v = json!({"type":a.Type.0});
+            unsafe {
+                match a.Type {
+                    D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW => {
+                        v["slot"] = json!(a.Anonymous.VertexBuffer.Slot);
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT
+                    | D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT => {
+                        let c = a.Anonymous.Constant;
+                        v["root_parameter"] = json!(c.RootParameterIndex);
+                        v["offset"] = json!(c.DestOffsetIn32BitValues);
+                        v["count"] = json!(c.Num32BitValuesToSet);
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW => {
+                        v["root_parameter"] = json!(a.Anonymous.ConstantBufferView.RootParameterIndex);
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW => {
+                        v["root_parameter"] = json!(a.Anonymous.ShaderResourceView.RootParameterIndex);
+                    }
+                    D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW => {
+                        v["root_parameter"] = json!(a.Anonymous.UnorderedAccessView.RootParameterIndex);
+                    }
+                    _ => {}
+                }
+            }
+            v
+        })
+        .collect();
+    super::journal::describe(
+        id(unsafe { *out }),
+        device,
+        json!({"stride":d.ByteStride,"node_mask":d.NodeMask,"root_signature":id(root),"arguments":arguments}),
+    );
+}
+
 /// How a resource begins: in a legacy resource state, or (created through the enhanced-barrier creators) in a layout.
 pub enum Initial {
     State(i32),
@@ -57,6 +106,7 @@ pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, initial: Init
         }
         Initial::Layout(l) => {
             description["initial_layout"] = json!(l);
+            super::passes::created_in_layout(id);
             super::states::Access::Layout(l)
         }
     };

@@ -1,7 +1,7 @@
 //! Two attachments consumed during recording, a cached bundle, and actual GPU output.
 use super::*;
 
-unsafe fn compile(source: &[u8], target: PCSTR) -> ID3DBlob {
+pub(super) unsafe fn compile(source: &[u8], target: PCSTR) -> ID3DBlob {
     let mut code = None;
     let mut errors = None;
     unsafe {

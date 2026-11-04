@@ -55,6 +55,8 @@ pub struct Batch {
     pub submission: u64,
     pub uploads: Vec<(u64, Value)>,
     pub contents: Vec<(u64, FirstUse)>,
+    /// Pass-end checkpoints read back (see [`super::passes`]).
+    pub checkpoints: Vec<(u64, Result<String, String>)>,
 }
 
 /// A capture's batches, filled by the collector.
@@ -235,7 +237,7 @@ pub fn then(f: impl FnOnce() + Send + 'static) {
 
 type Job = Box<dyn FnOnce() + Send>;
 
-fn collector(job: Job) {
+pub(super) fn collector(job: Job) {
     static QUEUE: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
     QUEUE
         .get_or_init(|| {
@@ -612,18 +614,28 @@ fn collect(pending: Pending) -> Batch {
             Item::Contents {
                 snapshot, footprints, ..
             } => {
-                let content = unsafe { canonical(&snapshot, &footprints, data, p.bytes) }.map(|bytes| {
-                    let subs = snapshot
-                        .layout
-                        .iter()
-                        .map(|s| {
-                            locum_capture::hash::key(&bytes[s.offset as usize..(s.offset + s.size) as usize])
-                        })
-                        .collect();
-                    let key = locum_capture::hash::key(&bytes);
-                    locum_capture::writer::blob(&crate::settings::settings().blobs, key.clone(), bytes, true);
-                    (key, subs)
-                });
+                let content =
+                    unsafe { canonical(&snapshot.layout, snapshot.joined, &footprints, data, p.bytes) }.map(
+                        |bytes| {
+                            let subs = snapshot
+                                .layout
+                                .iter()
+                                .map(|s| {
+                                    locum_capture::hash::key(
+                                        &bytes[s.offset as usize..(s.offset + s.size) as usize],
+                                    )
+                                })
+                                .collect();
+                            let key = locum_capture::hash::key(&bytes);
+                            locum_capture::writer::blob(
+                                &crate::settings::settings().blobs,
+                                key.clone(),
+                                bytes,
+                                true,
+                            );
+                            (key, subs)
+                        },
+                    );
                 batch.contents.push(first_use(submission, &snapshot, content));
             }
         }
@@ -632,14 +644,17 @@ fn collect(pending: Pending) -> Batch {
     batch
 }
 
-/// A snapshot's bytes in the canonical layout, from the footprints the GPU copied them into at `data`.
-unsafe fn canonical(
-    snapshot: &Snapshot,
+/// Subresources' bytes in the canonical layout `layout`, from the footprints the GPU copied them into at `data`
+/// (every subresource of plane 0, then every one of plane 1 for a depth-stencil format `joined` into one texel of
+/// that many bytes); no footprints for a buffer.
+pub(super) unsafe fn canonical(
+    layout: &[Sub],
+    joined: Option<u32>,
     footprints: &[(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)],
     data: *const u8,
     bytes: u64,
 ) -> Result<Vec<u8>, String> {
-    let total = locum_capture::layout::total(&snapshot.layout);
+    let total = locum_capture::layout::total(layout);
     if footprints.is_empty() {
         // A buffer: its bytes as they are.
         return Ok(unsafe { core::slice::from_raw_parts(data, total.min(bytes) as usize) }.to_vec());
@@ -662,11 +677,10 @@ unsafe fn canonical(
         Ok((out, *row_bytes))
     };
     let mut out = Vec::with_capacity(total as usize);
-    let per_plane = snapshot.layout.len();
-    for sub in &snapshot.layout {
-        let i = sub.index as usize;
+    let per_plane = layout.len();
+    for (i, sub) in layout.iter().enumerate() {
         let (first, row_bytes) = plane(i)?;
-        match snapshot.joined {
+        match joined {
             Some(texel) => {
                 let (stencil, _) = plane(i + per_plane)?;
                 locum_capture::layout::join_depth_stencil(texel, &first, &stencil, &mut out);
@@ -779,8 +793,16 @@ mod tests {
             layout: locum_capture::layout::texture(28, 2, 2, 1, 1, 1).unwrap(),
             joined: None,
         };
-        let out =
-            unsafe { canonical(&snapshot, &[(footprint(0, 2, 2, 256), 2, 8)], data.as_ptr(), 512) }.unwrap();
+        let out = unsafe {
+            canonical(
+                &snapshot.layout,
+                snapshot.joined,
+                &[(footprint(0, 2, 2, 256), 2, 8)],
+                data.as_ptr(),
+                512,
+            )
+        }
+        .unwrap();
         assert_eq!(out, [[1u8; 8], [2u8; 8]].concat());
         // A 1x1 D24S8 texture: depth plane then stencil plane.
         let mut data = vec![0u8; 1024];
@@ -794,7 +816,8 @@ mod tests {
             joined: Some(4),
         };
         let planes = [(footprint(0, 1, 1, 256), 1, 4), (footprint(512, 1, 1, 256), 1, 1)];
-        let out = unsafe { canonical(&snapshot, &planes, data.as_ptr(), 1024) }.unwrap();
+        let out =
+            unsafe { canonical(&snapshot.layout, snapshot.joined, &planes, data.as_ptr(), 1024) }.unwrap();
         assert_eq!(out, [0x11, 0x22, 0x33, 0x7F]);
     }
 }

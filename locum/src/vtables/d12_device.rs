@@ -3877,6 +3877,9 @@ unsafe impl Device12Methods for crate::d3d12::Object {
         unsafe {
             let result = real::CreateCommandSignature(self.real(), a0, crate::d3d12::unwrap(a1), a2, a3);
             crate::d3d12::wrap_output(result, a2, a3);
+            if result.is_ok() {
+                crate::d3d12::values::created_command_signature(self.data.id, a3, a0, a1);
+            }
             result
         }
     }
