@@ -462,7 +462,8 @@ enum Command {
         out: PathBuf,
         inputs: Vec<PathBuf>,
         /// A list of buffer keys to add, one `key<TAB>bytes<TAB>name` a line, as a game's reader writes them for
-        /// what is inside its archives (fromsoft-formats' `flver_keys` example: FLVER vertex and index bytes).
+        /// what is inside its archives (fromsoft-formats' `flver_keys` example: FLVER vertex and index bytes;
+        /// unity-formats' `mesh_keys`: a Unity player's Mesh vertex streams and index buffers).
         #[arg(long)]
         keys: Vec<PathBuf>,
     },

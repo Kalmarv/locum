@@ -262,7 +262,8 @@ impl Names {
 
 /// Adds every DDS file under each of `inputs` (or the file itself) to the index at `out`, named by its path from the
 /// input, and the buffers each of `keys` lists: lines of `key<TAB>bytes<TAB>name`, as a game's reader writes them for
-/// what is inside its archives (fromsoft-formats' `flver_keys` for FLVER vertex and index bytes).
+/// what is inside its archives (fromsoft-formats' `flver_keys` for FLVER vertex and index bytes, unity-formats'
+/// `mesh_keys` for a Unity player's Mesh vertex streams and index buffers).
 pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), String> {
     let mut index = Index::create(out)?;
     let (mut added, mut refused) = (0usize, Vec::new());

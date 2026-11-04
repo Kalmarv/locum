@@ -350,7 +350,8 @@ indices needs some of its bytes bound as vertices too (a data block holding both
 from the same file (the part of a key-list name before `#`). `LOCUM_INDEX` (paths
 separated by `;`) stands in for `--index`. A game's own extractor can add what it reads from its archives through
 `locum_capture::index`, or list keys for `--keys`: fromsoft-formats' `flver_keys` example lists every FLVER's data
-block, vertex buffers and face sets in Sekiro's or Elden Ring's archives.
+block, vertex buffers and face sets in Sekiro's or Elden Ring's archives, and unity-formats' `mesh_keys` example every
+Mesh's vertex streams and index buffer in a Unity player (a SkateBIRD capture has 183 of its 209 buffers named so).
 
 Constants are named from each shader's reflection (its `RDEF` part as `dxbc-reader` reads it, Shader Model 4.0 to 5.1,
 register spaces included), as `cbuffer.variable[index].component`. PNGs of depth and other one-channel images are
