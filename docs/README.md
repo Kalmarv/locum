@@ -248,6 +248,8 @@ locum-cli resources last --used --format BC7_UNORM
 locum-cli resource last 812                # where it was made (call stack), hashes, views, draws, events
 locum-cli events last --kind copy          # the timeline; --resource N for what touched one resource
 locum-cli shaders last --stage ps --name Gbuf --bindings  # programs by name, each with the registers it declares
+                                           # and its code key (the code part alone: programs that differ only in
+                                           # names or reflection share it; `shader` and `shader --json` give it)
 locum-cli shader last 9f2c -d              # constant buffers, textures and samplers by register, and disassembly
 locum-cli trace last 120 rt1.z            # what target 1's blue lane is made of: each texture channel, constant (by
                                            # name, with the draw's value) and vertex attribute (through every

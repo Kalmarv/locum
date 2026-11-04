@@ -1,6 +1,17 @@
 //! Instruction-level detection of potentially order-dependent atomics: SM4/5 programs over dx's `dxbc-reader`
 //! decoding, DXIL programs over its `dxil-reader`.
 
+/// The key (XXH3-128, as blob keys are) of a program's code alone: its `SHEX`/`SHDR` part, or its `DXIL` part. Two
+/// programs built from the same source under other names, or whose reflection or debug parts differ, have the same
+/// code key where their blob keys differ. None for bytes that are not a shader container with code.
+pub fn code_key(container: &[u8]) -> Option<String> {
+    let parts = dxbc_reader::parts(container).ok()?;
+    let code = parts
+        .iter()
+        .find(|p| matches!(&p.kind, b"DXIL" | b"SHEX" | b"SHDR"))?;
+    Some(format!("{:032x}", xxhash_rust::xxh3::xxh3_128(code.data)))
+}
+
 /// One kind of atomic instruction, counted statically (not by executions).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AtomicOp {
@@ -271,5 +282,21 @@ mod tests {
             assert!(order_dependent(&valid[..end]).is_err(), "cut at {end}");
         }
         assert!(order_dependent(&container(b"DXIL", 0x5_0050, &[])).is_err());
+    }
+
+    #[test]
+    fn the_code_key_follows_the_code_alone() {
+        let program = include_bytes!("testdata/dxbc-stripped.cso");
+        let key = code_key(program).expect("a container with code");
+        // The container's checksum (bytes 4..20) is not code: changed, the key stays.
+        let mut other = program.to_vec();
+        other[4] ^= 0xff;
+        assert_eq!(code_key(&other).as_deref(), Some(key.as_str()));
+        // The last byte is in the code part (SHEX ends the container fxc writes when stripped).
+        let mut changed = program.to_vec();
+        *changed.last_mut().unwrap() ^= 1;
+        let changed = code_key(&changed).expect("still a container");
+        assert_ne!(changed, key);
+        assert_eq!(code_key(b"not a program"), None);
     }
 }

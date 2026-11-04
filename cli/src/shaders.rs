@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DDisassemble};
 use windows::Win32::Graphics::Direct3D::{ID3DBlob, ID3DInclude};
 use windows::core::PCSTR;
 
+use crate::describe::short;
 use crate::open::Capture;
 use crate::out;
 
@@ -34,11 +35,12 @@ pub fn shaders(c: &Capture, stage: Option<&str>, name: Option<&str>, bindings: b
     );
     let mut reflection = crate::describe::Reflection::default();
     out!(
-        "{:<5} {:<16} {:>7} {:>6}  name",
+        "{:<5} {:<16} {:>7} {:>6}  {:<12}  name",
         "stage",
         "hash",
         "bytes",
-        "draws"
+        "draws",
+        "code"
     );
     let mut shown = 0;
     for (h, stage_of, size) in rows {
@@ -53,10 +55,20 @@ pub fn shaders(c: &Capture, stage: Option<&str>, name: Option<&str>, bindings: b
             continue;
         }
         shown += 1;
+        // The code alone: programs differing only in their names or reflection share it.
+        let code = c
+            .row(
+                "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
+                [&h],
+                |r| r.get::<_, String>(0),
+            )
+            .and_then(|key| c.blob(&key).ok())
+            .and_then(|bytes| locum_capture::dxbc::code_key(&bytes));
         out!(
-            "{stage_of:<5} {h:<16} {:>7} {:>6}  {}",
+            "{stage_of:<5} {h:<16} {:>7} {:>6}  {:<12}  {}",
             size.map_or("-".into(), |s| s.to_string()),
             uses.get(&h).copied().unwrap_or(0),
+            code.as_deref().map_or("-", short),
             named.as_deref().unwrap_or("-")
         );
         if bindings {
@@ -104,6 +116,9 @@ struct Shader {
     stage: String,
     bytes: usize,
     blob: String,
+    /// The key of its code alone (`locum_capture::dxbc::code_key`): equal for programs that differ only in names,
+    /// reflection or debug parts.
+    code: Option<String>,
     /// Every resource it binds, constant buffers included; null without reflection.
     bindings: Option<Vec<Binding>>,
     constant_buffers: Option<Vec<Buffer>>,
@@ -204,6 +219,7 @@ pub fn shader(
             stage,
             bytes: code.len(),
             blob: key,
+            code: locum_capture::dxbc::code_key(&code),
             bindings: rdef::bindings(&code).map(|bs| {
                 bs.into_iter()
                     .map(|b| Binding {
@@ -251,7 +267,11 @@ pub fn shader(
         out!("{}", serde_json::to_string(&s).map_err(|e| e.to_string())?);
         return Ok(());
     }
-    out!("{stage} {h}: {} bytes, blob {key}", code.len());
+    out!(
+        "{stage} {h}: {} bytes, blob {key}, code {}",
+        code.len(),
+        locum_capture::dxbc::code_key(&code).as_deref().unwrap_or("-")
+    );
     show(
         &code,
         &format!("{}:shader/{h}", c.path.display()),
