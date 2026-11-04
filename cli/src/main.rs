@@ -52,8 +52,8 @@ struct PictureArgs {
     /// tone-mapped, the rest clamped), clamp, tonemap or LO:HI.
     #[arg(long, default_value = "auto")]
     range: String,
-    /// PNG: one channel as grey (r, g, b or a); the mapping used is printed.
-    #[arg(long, value_parser = ["r", "g", "b", "a"])]
+    /// PNG: one channel as grey (r, g, b or a, or a depth-stencil format's stencil); the mapping used is printed.
+    #[arg(long, value_parser = ["r", "g", "b", "a", "stencil"])]
     channel: Option<String>,
     /// PNG: only the texels from X,Y, W wide and H high.
     #[arg(long, value_name = "X,Y,W,H", conflicts_with = "crop")]
@@ -79,7 +79,10 @@ impl PictureArgs {
             .transpose()?;
         Ok(export::Picture {
             range: range(&self.range)?,
-            channel: self.channel.as_deref().map(|c| "rgba".find(c).unwrap_or(0)),
+            channel: self.channel.as_deref().map(|c| match c {
+                "stencil" => export::STENCIL,
+                c => "rgba".find(c).unwrap_or(0),
+            }),
             rect,
             crop: self.crop,
             alpha: self.alpha,

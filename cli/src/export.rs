@@ -85,10 +85,13 @@ macro_rules! told {
     }};
 }
 
+/// `Picture::channel` for a depth-stencil format's stencil.
+pub const STENCIL: usize = 4;
+
 /// How a PNG is drawn: the value mapping, one channel as grey, and a part of the image.
 pub struct Picture {
     pub range: Range,
-    /// 0 to 3: r, g, b, a.
+    /// 0 to 3: r, g, b, a; `STENCIL`: the stencil.
     pub channel: Option<usize>,
     /// x, y, width, height.
     pub rect: Option<[u32; 4]>,
@@ -103,6 +106,20 @@ impl Picture {
     fn apply(&self, image: texels::Image) -> Result<(texels::Image, String), String> {
         let mut note = Vec::new();
         let mut image = match self.channel {
+            Some(STENCIL) => {
+                let stencil = image.stencil.as_ref().ok_or(
+                    "--channel stencil: the format has no stencil (D24_UNORM_S8_UINT, D32_FLOAT_S8X24_UINT)",
+                )?;
+                note.push("the stencil as grey".to_string());
+                texels::Image {
+                    width: image.width,
+                    height: image.height,
+                    channels: 1,
+                    float: false,
+                    texels: stencil.iter().map(|&s| [f32::from(s), 0.0, 0.0, 1.0]).collect(),
+                    stencil: None,
+                }
+            }
             Some(c) if c >= usize::from(image.channels.max(1)) => {
                 return Err(format!(
                     "the format has {} channel(s): no channel {}",
@@ -396,7 +413,13 @@ pub fn target(c: &Capture, draw: i64, name: &str, out_path: &Path, picture: &Pic
             };
             write(out_path, &dds::file(&t, &bytes))?;
         }
-        Kind::Raw => write(out_path, &bytes)?,
+        Kind::Raw => {
+            write(out_path, &bytes)?;
+            // What the bytes are, for a depth format: where the depth and the stencil are in a texel.
+            if let Some(t) = format::texel(f) {
+                note = format!(", rows tightly packed; {t}");
+            }
+        }
     }
     told!(
         out_path,

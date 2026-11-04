@@ -273,6 +273,8 @@ locum-cli target last presented -o frame.png # the presented picture: the last r
                                              # frame presented (`info` names it); captures before 2026-11-04 do
                                              # not record it
 locum-cli target last last rt0 -o rt0.png   # the frame's last readback of rt0, whatever it was bound to
+locum-cli target last 120 depth -o s.png --channel stencil  # a depth-stencil target's stencil as grey; raw
+                                           # (-o -) says where depth and stencil are in a texel
 locum-cli target last 120 rt3 -o a.png --channel a   # one channel as grey; the mapping used is printed. PNGs are
                                            # opaque unless --alpha; --rect X,Y,W,H or --crop (to the texels not
                                            # zero, for a sparse atlas) draw a part (export takes them too)
