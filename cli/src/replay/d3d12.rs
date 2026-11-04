@@ -2323,6 +2323,10 @@ impl Backend for D3d12 {
     fn validation(&self) -> Vec<String> {
         self.messages()
     }
+
+    fn notes(&self) -> Vec<String> {
+        self.queries.notes()
+    }
 }
 
 impl D3d12 {

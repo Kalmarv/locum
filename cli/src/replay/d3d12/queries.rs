@@ -145,30 +145,71 @@ pub(super) struct Queries {
     /// Replay's queries in the open list, and the game's queries each goes to.
     pending: Vec<(Counted, Vec<Query>)>,
     own: Option<Own>,
-    timestamps: usize,
+    /// Timestamps resolved, which hold the replay's GPU clock.
+    clock: Resolved,
     /// Results resolved of queries that ended before the frame.
-    before: usize,
+    before: Resolved,
     unsupported: BTreeSet<u64>,
 }
 
+/// Results resolved otherwise than the game's: into a readback buffer, which the GPU only copies into and nothing it
+/// runs reads, so no output of the frame depends on them; or anywhere else.
+#[derive(Default)]
+struct Resolved {
+    read: usize,
+    unread: usize,
+}
+
+impl Resolved {
+    fn count(&mut self, readback: bool) {
+        if readback {
+            self.unread += 1;
+        } else {
+            self.read += 1;
+        }
+    }
+}
+
+const CLOCK: &str = "timestamp results hold the replay's GPU clock, not the game's";
+const BEFORE: &str = "query results the frame resolved are of queries that ended before it: the buffers keep their \
+                      bytes from the frame's start there";
+
 impl Queries {
+    /// What the frame's outputs may depend on.
     pub(super) fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.timestamps > 0 {
+        if self.clock.read > 0 {
             out.push(format!(
-                "{} timestamp queries hold the replay's GPU clock, not the game's",
-                self.timestamps
+                "{} {CLOCK}, resolved where the GPU can read them",
+                self.clock.read
             ));
         }
-        if self.before > 0 {
+        if self.before.read > 0 {
             out.push(format!(
-                "{} query results the frame resolved are of queries that ended before it: the buffers keep their bytes \
-                 from the frame's start there",
-                self.before
+                "{} {BEFORE}, where the GPU can read them",
+                self.before.read
             ));
         }
         for kind in &self.unsupported {
             out.push(format!("queries of type {kind} are not replayed"));
+        }
+        out
+    }
+
+    /// What none of them can: results resolved into readback buffers only.
+    pub(super) fn notes(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.clock.unread > 0 {
+            out.push(format!(
+                "{} {CLOCK}, in readback buffers the GPU does not read",
+                self.clock.unread
+            ));
+        }
+        if self.before.unread > 0 {
+            out.push(format!(
+                "{} {BEFORE}, in readback buffers the GPU does not read",
+                self.before.unread
+            ));
         }
         out
     }
@@ -268,7 +309,6 @@ impl D3d12 {
             self.queries
                 .pending
                 .push((Counted::Timestamp, vec![(heap, index)]));
-            self.queries.timestamps += 1;
         } else if let Some(open) = self.queries.open.remove(&(heap, index)) {
             self.queries.ended.insert((heap, index), open.counts);
         }
@@ -417,12 +457,16 @@ impl D3d12 {
         } else {
             8
         };
+        let readback = matches!(self.made(dst)?.heap, super::Heap::Readback);
         // Runs of results known, written as they end: an unknown one keeps the buffer's bytes there.
         let mut runs: Vec<(u64, Vec<u8>)> = Vec::new();
         let mut run: Option<(u64, Vec<u8>)> = None;
         for i in 0..count {
             match self.queries.ended.get(&(heap, start + i)) {
                 Some(values) => {
+                    if kind == TIMESTAMP {
+                        self.queries.clock.count(readback);
+                    }
                     let (_, bytes) = run.get_or_insert_with(|| (i, Vec::new()));
                     for (k, &v) in values.iter().enumerate() {
                         let v = if kind == BINARY_OCCLUSION && k == 0 {
@@ -434,7 +478,7 @@ impl D3d12 {
                     }
                 }
                 None => {
-                    self.queries.before += 1;
+                    self.queries.before.count(readback);
                     runs.extend(run.take());
                 }
             }

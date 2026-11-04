@@ -342,7 +342,8 @@ locum-cli replay last 812 --rules mine.txt --mode frame
 ```
 
 `verify` exits with success only when every target and every draw, dispatch or clear output compared is identical and
-nothing the replay needs is missing (contents, command lists, constants); checks the capture could not make (targets
+nothing the replay needs is missing (contents, command lists, constants; a Direct3D 12 readback buffer's contents are
+not needed, since the GPU only copies into it); checks the capture could not make (targets
 or outputs skipped, a repeated list's earlier executions, the memory dump) are listed as not compared. With
 `--out <dir>` it writes the replay's and the game's bytes of everything that differs there
 (`event-<seq>-<resource>.{replay,game}.bin`, `draw-<n>-<target>.{replay,game}.bin`), and for a target in a format it
@@ -412,9 +413,10 @@ begun in runs with a query of replay's own around it, and their counts are added
 statistics counter summed, a binary occlusion query's result 1 where any draw passed a sample. ResolveQueryData writes
 those results where the game resolved them, to a buffer the CPU maps or, through a copy, to one it does not. A query
 pulls the draws it counted into a plan, as a written resource would. Timestamps are taken from the replay's own GPU
-clock, which verify says, since the game's are of another run. A result the frame resolves of a query that did not
-end in it keeps the buffer's bytes from the frame's start, and other query types (stream output, video) are not
-replayed; verify lists both.
+clock, since the game's are of another run, and a result the frame resolves of a query that did not end in it keeps
+the buffer's bytes from the frame's start. Resolved into a readback buffer, which the GPU only copies into and nothing
+it runs reads, neither can change an output, and verify notes them; resolved anywhere else, they make the capture
+incomplete. Other query types (stream output, video) are not replayed, and verify lists them.
 
 `verify --debug` replays a Direct3D 12 frame twice. The first time is under GPU-based validation, which checks
 descriptors, resource states and bounds as the shaders use them; only its errors count. It patches the shaders to do

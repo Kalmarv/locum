@@ -9,7 +9,7 @@
 mod d3d11;
 mod d3d12;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use locum_capture::format;
@@ -35,6 +35,11 @@ pub trait Backend {
     fn warnings(&self) -> Vec<String>;
     /// The errors the API's validation reported so far (none without it).
     fn validation(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// What it did otherwise than recorded that nothing the GPU ran can depend on (results only the CPU reads), so
+    /// no compared output does; said, but the capture is not incomplete for it.
+    fn notes(&self) -> Vec<String> {
         Vec::new()
     }
     /// Brings what the API holds outside events up to just before event `seq` (a Direct3D 12 queue's changes to
@@ -521,6 +526,7 @@ pub fn run(
     }
     end(b.as_mut())?;
     let mut warnings = b.warnings();
+    warnings.extend(b.notes());
     warnings.extend(b.validation());
     if missing > 0 {
         warnings.push(format!(
@@ -544,6 +550,7 @@ fn made(
     validation: Validation,
 ) -> Result<(Box<dyn Backend>, usize), String> {
     let mut b = backend(c, warp, validation)?;
+    let lacking = lacking(c);
     let mut missing = 0;
     for &id in &plan.resources {
         let key: Option<String> = c
@@ -552,16 +559,7 @@ fn made(
         let contents = match key {
             Some(k) => Some(c.blob(&k)?),
             None => {
-                let tiled: bool = c
-                    .row(
-                        "SELECT coalesce(content_source, '') = 'tile-events' FROM resources WHERE id = ?1",
-                        [id],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(false);
-                if !tiled {
-                    missing += 1;
-                }
+                missing += usize::from(lacking.contains(&id));
                 None
             }
         };
@@ -569,6 +567,28 @@ fn made(
             .map_err(|e| format!("resource #{id}: {e}"))?;
     }
     Ok((b, missing))
+}
+
+/// The resources whose contents as the frame began matter but the capture does not hold. Not those made of the
+/// frame's tile events (a D3D11 tiled resource's pages), nor those on a Direct3D 12 readback heap: the GPU only
+/// copies into them, and nothing it runs reads them.
+fn lacking(c: &Capture) -> HashSet<i64> {
+    let readback = if c.has_table("d12_objects") {
+        "AND id NOT IN (SELECT id FROM d12_objects WHERE kind LIKE 'ID3D12Resource%' \
+         AND json_extract(description, '$.heap_properties.type') = 3)"
+    } else {
+        ""
+    };
+    c.rows(
+        &format!(
+            "SELECT id FROM resources WHERE content IS NULL AND coalesce(content_source, '') != 'tile-events' \
+             {readback}"
+        ),
+        [],
+        |r| r.get(0),
+    )
+    .into_iter()
+    .collect()
 }
 
 /// A resource checkpoint after a draw/dispatch UAV write or a clear.
@@ -1376,12 +1396,14 @@ pub fn verify(
             ))
         },
     );
-    let missing: Vec<i64> = c.rows(
-        "SELECT id FROM resources WHERE used = 1 AND content IS NULL AND coalesce(content_source, '') != 'tile-events' \
-         ORDER BY id",
-        [],
-        |r| r.get(0),
-    );
+    let lacking = lacking(c);
+    let missing: Vec<i64> = c
+        .rows("SELECT id FROM resources WHERE used = 1 ORDER BY id", [], |r| {
+            r.get(0)
+        })
+        .into_iter()
+        .filter(|id| lacking.contains(id))
+        .collect();
     if !missing.is_empty() {
         let named: Vec<String> = missing.iter().take(12).map(|id| format!("#{id}")).collect();
         incomplete.push(format!(
@@ -1392,6 +1414,9 @@ pub fn verify(
         ));
     }
     incomplete.extend(b.warnings().into_iter().map(|w| format!("replay: {w}")));
+    for note in b.notes() {
+        out!("note: replay: {note}");
+    }
     validated.extend(b.validation());
     incomplete.extend(validated.into_iter().map(|w| format!("replay: {w}")));
     for i in &incomplete {
