@@ -933,8 +933,21 @@ fn asks(stages: &[Stage], specs: &[String]) -> Result<Vec<(usize, Ask)>, String>
                     format!("{}: {}", s.name, names.join(", "))
                 })
                 .collect();
+            // A tessellated pipeline's position: the hull program passes control points on, and the domain (or a
+            // geometry) program writes SV_Position.
+            let position = spec
+                .split('.')
+                .next()
+                .is_some_and(|n| n.eq_ignore_ascii_case("sv_position"));
+            let later = stages.iter().any(|s| matches!(s.name, "ds" | "gs"));
+            let note = if position && !later && stages.iter().any(|s| matches!(s.name, "vs" | "hs")) {
+                "; in a draw with hull and domain programs the domain (or a geometry) program writes SV_Position: \
+                 `trace DRAW SV_Position` follows the draw's stages back to the vertex attributes"
+            } else {
+                ""
+            };
             return Err(format!(
-                "no output lane {spec:?}; the outputs are {}",
+                "no output lane {spec:?}; the outputs are {}{note}",
                 outputs.join("; ")
             ));
         };
@@ -977,29 +990,31 @@ pub fn draw(c: &Capture, which: &str, specs: &[String], as_json: bool) -> Result
             "draw {n} is a dispatch: a compute program has no output lanes (what it writes to UAVs is not traced)"
         ));
     }
+    // Every program of the pipeline in order, each stage's inputs followed into the outputs of the one before by
+    // their names: a domain program's control-point inputs into the hull program's control-point outputs, and those
+    // into the vertex program's. A program that cannot be read ends the chain there: the stages after it are traced.
     let mut stages = Vec::new();
     let mut notes = Vec::new();
-    let between: Vec<&str> = [("hs", &hs), ("ds", &ds), ("gs", &gs)]
-        .iter()
-        .filter(|(_, h)| h.is_some())
-        .map(|(s, _)| *s)
-        .collect();
-    match (&vs, between.is_empty(), &ps) {
-        (Some(vs), true, _) => match Stage::read(c, vs, "vs") {
+    let pipeline = [("vs", &vs), ("hs", &hs), ("ds", &ds), ("gs", &gs), ("ps", &ps)];
+    for (name, hash) in pipeline {
+        let Some(hash) = hash else { continue };
+        match Stage::read(c, hash, name) {
             Ok(s) => stages.push(s),
-            Err(e) if ps.is_some() => {
-                notes.push(format!("pixel inputs not followed into the vertex program: {e}"))
+            Err(e) if name != "ps" && ps.is_some() => {
+                notes.push(format!(
+                    "{e}: the inputs of the stage after it are not followed further"
+                ));
+                stages.clear();
             }
             Err(e) => return Err(e),
-        },
-        (_, false, _) => notes.push(format!(
-            "the draw has a {} program: pixel inputs are not followed past it",
-            between.join(" and ")
-        )),
-        (None, true, _) => {}
+        }
     }
-    if let Some(ps) = &ps {
-        stages.push(Stage::read(c, ps, "ps")?);
+    if hs.is_some() && stages.iter().any(|s| s.name == "ds") {
+        notes.push(
+            "a domain program's patch constants (tessellation factors and the rest the hull program's patch \
+             function writes) are shown as supplied, not followed into the hull program"
+                .into(),
+        );
     }
     if stages.is_empty() {
         return Err(format!("draw {n} has no program locum can trace"));

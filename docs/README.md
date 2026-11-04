@@ -248,10 +248,12 @@ locum-cli events last --kind copy          # the timeline; --resource N for what
 locum-cli shaders last --stage ps --name Gbuf --bindings  # programs by name, each with the registers it declares
 locum-cli shader last 9f2c -d              # constant buffers, textures and samplers by register, and disassembly
 locum-cli trace last 120 rt1.z            # what target 1's blue lane is made of: each texture channel, constant (by
-                                           # name, with the draw's value) and vertex attribute (through the vertex
-                                           # program, with its input-layout element), as its value, only as an
-                                           # address (a coordinate, an index) or only through a condition. Lanes:
-                                           # SV_Target1.z, rt1, o1.z, depth, SV_Position.z, discard; none: all
+                                           # name, with the draw's value) and vertex attribute (through every
+                                           # program of the pipeline, hull, domain and geometry ones too, to the
+                                           # input-layout element), as its value, only as an address (a coordinate,
+                                           # an index) or only through a condition. Lanes: SV_Target1.z, rt1, o1.z,
+                                           # depth, SV_Position.z (a domain program's, where it writes it), discard;
+                                           # none: all
 locum-cli shader last 9f2c --trace o1.z   # the same for one program, to its own inputs
 locum-cli vertices last 120 --limit 8      # what the draw fed its vertex shader: each vertex in the order it reads
                                            # them (index, vertex, then every input-layout element decoded from its
