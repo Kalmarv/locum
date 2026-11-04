@@ -10,3 +10,4 @@ publish = false
 syn = { version = "2", default-features = false, features = ["full", "parsing", "printing", "clone-impls"] }
 quote = "1"
 proc-macro2 = "1"
+rusqlite = { version = "0.41", features = ["bundled"] }

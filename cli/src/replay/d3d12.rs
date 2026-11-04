@@ -34,6 +34,7 @@ use super::Backend;
 
 mod memory;
 mod pipelines;
+mod queries;
 mod views;
 
 use views::Extent;
@@ -246,6 +247,7 @@ pub struct D3d12 {
     replaced: HashMap<String, Option<Vec<u8>>>,
     /// Heaps, and the resources made in them.
     memory: memory::Memory,
+    queries: queries::Queries,
     /// Resources the frame uses that the capture holds no description of.
     undescribed: Vec<i64>,
     warnings: BTreeSet<String>,
@@ -255,6 +257,12 @@ pub struct D3d12 {
 /// The resources each resource of a Direct3D 12 capture shares memory with (see [`memory`]).
 pub fn aliases(c: &Capture) -> HashMap<i64, BTreeSet<i64>> {
     memory::aliases(c)
+}
+
+/// For planning: the events that begin, end, count into or resolve the frame's queries, with the queries (as
+/// resources of negative id) each reads and writes.
+pub fn query_touches(c: &Capture) -> Vec<(i64, Vec<i64>, Vec<i64>)> {
+    queries::touches(c)
 }
 
 fn u(v: &Value, i: usize) -> u64 {
@@ -404,6 +412,7 @@ impl D3d12 {
                 list_state: None,
                 replaced: HashMap::new(),
                 memory: memory::Memory::default(),
+                queries: queries::Queries::default(),
                 undescribed: Vec::new(),
                 warnings: BTreeSet::new(),
                 debug,
@@ -1700,9 +1709,14 @@ impl D3d12 {
                     let (dst, src) = (self.location(&a[0])?, self.location(&a[4])?);
                     let side = |v: &Value, state| {
                         let id = v["resource"].as_i64().unwrap_or(0);
-                        v["footprint"].is_null().then(|| self.need(id, v["subresource"].as_u64().map(|s| s as u32), state))
+                        v["footprint"]
+                            .is_null()
+                            .then(|| self.need(id, v["subresource"].as_u64().map(|s| s as u32), state))
                     };
-                    let needs: Vec<Need> = [side(&a[0], 0x400), side(&a[4], 0x800)].into_iter().flatten().collect();
+                    let needs: Vec<Need> = [side(&a[0], 0x400), side(&a[4], 0x800)]
+                        .into_iter()
+                        .flatten()
+                        .collect();
                     let region = a[5].as_array().map(|b| {
                         let n = |i: usize| b[i].as_u64().unwrap_or(0) as u32;
                         D3D12_BOX {
@@ -1742,10 +1756,6 @@ impl D3d12 {
                     );
                     self.barriers(&needs, true);
                 }
-                "ResolveQueryData" => self.warn(
-                    "query results are not replayed: the buffers ResolveQueryData wrote keep their bytes from the \
-                     frame's start",
-                ),
                 other => self.warn(format!("{other} is not replayed")),
             }
         }
@@ -1900,6 +1910,37 @@ fn mirror(
     }
 }
 
+/// A resource's description as the game made it, from the capture's: its flags those replay keeps, a placed one with
+/// the alignment the game placed it with (small resources go at 4 KiB, not the 64 KiB asked of 0), and a reserved
+/// texture with the game's tile layout (64KB_UNDEFINED_SWIZZLE or a standard swizzle).
+pub(super) fn resource_desc(d: &Value) -> D3D12_RESOURCE_DESC {
+    let n = |k: &str| d[k].as_u64().unwrap_or(0);
+    let buffer = n("dimension") as i32 == D3D12_RESOURCE_DIMENSION_BUFFER.0;
+    let placement = memory::Placement::of(d);
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION(n("dimension") as i32),
+        Alignment: match placement {
+            memory::Placement::Placed { .. } => n("alignment"),
+            _ => 0,
+        },
+        Width: n("width"),
+        Height: n("height") as u32,
+        DepthOrArraySize: n("depth_or_array_size") as u16,
+        MipLevels: n("mips") as u16,
+        Format: DXGI_FORMAT(n("format") as i32),
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: n("sample_count").max(1) as u32,
+            Quality: n("sample_quality") as u32,
+        },
+        Layout: match placement {
+            memory::Placement::Reserved if !buffer => D3D12_TEXTURE_LAYOUT(n("layout") as i32),
+            _ if buffer => D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            _ => D3D12_TEXTURE_LAYOUT_UNKNOWN,
+        },
+        Flags: D3D12_RESOURCE_FLAGS(n("flags") as i32 & KEPT_FLAGS),
+    }
+}
+
 impl Backend for D3d12 {
     fn create(&mut self, c: &Capture, id: i64, contents: Option<&[u8]>) -> Result<(), String> {
         let d: Option<Value> = c
@@ -1933,33 +1974,7 @@ impl Backend for D3d12 {
         let placement = memory::Placement::of(&d);
         let format = n("format") as u32;
         let samples = n("sample_count").max(1) as u32;
-        let mut desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION(dimension),
-            Alignment: 0,
-            Width: n("width"),
-            Height: n("height") as u32,
-            DepthOrArraySize: n("depth_or_array_size") as u16,
-            MipLevels: n("mips") as u16,
-            Format: DXGI_FORMAT(format as i32),
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: samples,
-                Quality: n("sample_quality") as u32,
-            },
-            Layout: if buffer {
-                D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-            } else {
-                D3D12_TEXTURE_LAYOUT_UNKNOWN
-            },
-            Flags: D3D12_RESOURCE_FLAGS(n("flags") as i32 & KEPT_FLAGS),
-        };
-        if matches!(placement, memory::Placement::Placed { .. }) {
-            // The alignment the game placed it with: small resources go at 4 KiB, not the 64 KiB asked of 0.
-            desc.Alignment = d["alignment"].as_u64().unwrap_or(0);
-        }
-        if matches!(placement, memory::Placement::Reserved) && !buffer {
-            // A reserved texture's tiles are laid out as the game's were: 64KB_UNDEFINED_SWIZZLE or a standard swizzle.
-            desc.Layout = D3D12_TEXTURE_LAYOUT(n("layout") as i32);
-        }
+        let mut desc = resource_desc(&d);
         let (properties, state) = match heap {
             Heap::Default => (
                 D3D12_HEAP_PROPERTIES {
@@ -2130,10 +2145,12 @@ impl Backend for D3d12 {
     }
 
     fn run(&mut self, c: &Capture, seq: i64, rules: &[Rule]) -> Result<(), String> {
-        let (kind, call, args): (String, String, Option<String>) = c
-            .row("SELECT kind, call, args FROM events WHERE seq = ?1", [seq], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })
+        let (kind, call, args, list): (String, String, Option<String>, Option<i64>) = c
+            .row(
+                "SELECT kind, call, args, list FROM events WHERE seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
             .ok_or("no such event")?;
         let a: Value = args
             .as_deref()
@@ -2143,7 +2160,12 @@ impl Backend for D3d12 {
             self.enter(c, s)?;
         }
         match kind.as_str() {
-            "draw" | "dispatch" => self.draw(c, seq, &kind, &call, &a, rules)?,
+            "draw" | "dispatch" => {
+                self.count_begin(list)?;
+                self.draw(c, seq, &kind, &call, &a, rules)?;
+                self.count_end()?;
+            }
+            "copy" if call == "ResolveQueryData" => self.resolve_queries(&a)?,
             "copy" => self.copy(&call, &a)?,
             "clear" => self.clear(c, &call, &a)?,
             "update" if call == "WriteBufferImmediate" => {
@@ -2185,10 +2207,12 @@ impl Backend for D3d12 {
             // there; other barriers are replay's own.
             "barrier" if call == "ResourceBarrier" => self.aliasing(&a),
             "discard" => self.discard(&a),
+            "state" if call == "BeginQuery" => self.query_begin(&a, list),
+            "state" if call == "EndQuery" => self.query_end(&a)?,
             "state" | "barrier" | "submit" | "bundle" => {}
             other => self.warn(format!("events of kind {other} ({call}) are not replayed")),
         }
-        let ran = self.flush();
+        let ran = self.flush().and_then(|()| self.collect_queries());
         // Put back the descriptors a rule changed for this event.
         for (heap, slot) in std::mem::take(&mut self.changed) {
             if let Some(v) = self.versions.get(&(heap, slot)).and_then(|id| {
@@ -2276,6 +2300,7 @@ impl Backend for D3d12 {
     fn warnings(&self) -> Vec<String> {
         let mut warnings = self.warnings.clone();
         warnings.extend(self.memory.warnings());
+        warnings.extend(self.queries.warnings());
         if !self.undescribed.is_empty() {
             let mut ids: Vec<String> = self
                 .undescribed

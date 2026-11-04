@@ -6,8 +6,12 @@
 //! point, what the frame's own copy saw there. The game's aliasing barriers, and its discards of render and depth
 //! targets so placed (the operations that begin such a target's use), are run.
 //!
+//! A heap the capture does not describe (captures before heaps were described) is made from what the resources placed
+//! in it record: the heap properties and flags GetHeapProperties gave the game for each, and a size that holds each at
+//! its offset as this device lays it out, and each reserved tile mapped into it; replay says so.
+//!
 //! Where that cannot be done as the game did, the resource is made committed instead, and replay says why: a heap the
-//! capture does not describe (captures before heaps were described), a resource that takes more of its heap on this
+//! capture does not describe and no resource in it describes either, a resource that takes more of its heap on this
 //! device than in the game or is not aligned for it there, a reserved resource this device tiles otherwise, or one the
 //! capture holds no page table of.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -76,6 +80,8 @@ pub(super) struct Memory {
     pub(super) reserved: usize,
     /// Resources made committed instead, by why.
     committed: BTreeMap<String, usize>,
+    /// Heaps the capture does not describe, made from what their resources record.
+    inferred: usize,
     /// Changes to tile mappings run, and those of resources made committed, which are not.
     pub(super) remaps: usize,
     pub(super) not_remapped: usize,
@@ -91,6 +97,14 @@ impl Memory {
                 format!("{n} placed or reserved resources were made committed, memory the game shared not shared: {why}")
             })
             .collect();
+        if self.inferred > 0 {
+            out.push(format!(
+                "{} heaps the capture does not describe (captured before heaps were described) were made from what \
+                 the resources in them record: their heap properties and flags, and a size that holds each at its \
+                 offset on this device",
+                self.inferred
+            ));
+        }
         if self.not_remapped > 0 {
             out.push(format!(
                 "the frame's {} changes to the tile mappings of reserved resources made committed are not run",
@@ -103,6 +117,48 @@ impl Memory {
     pub(super) fn fell_back(&mut self, why: String) {
         *self.committed.entry(why).or_default() += 1;
     }
+}
+
+/// A heap's recorded properties: its type, and a custom heap's CPU page property and memory pool.
+fn heap_properties(p: &Value) -> D3D12_HEAP_PROPERTIES {
+    let n = |v: &Value| v.as_i64().unwrap_or(0) as i32;
+    D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE(n(&p["type"])),
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY(n(&p["cpu_page"])),
+        MemoryPoolPreference: D3D12_MEMORY_POOL(n(&p["memory_pool"])),
+        ..Default::default()
+    }
+}
+
+/// A heap's recorded flags, those replay keeps: the deny flags and shader atomics; sharing, display and residency
+/// flags are dropped.
+fn heap_flags(v: &Value) -> D3D12_HEAP_FLAGS {
+    const KEPT: i32 = 0x4 | 0x40 | 0x80 | 0x400;
+    D3D12_HEAP_FLAGS(v.as_i64().unwrap_or(0) as i32 & KEPT)
+}
+
+/// Every page table the capture holds of a reserved resource, as the frame found it and after each of its changes,
+/// with the resource's id. Captures from before reserved resources were followed have none.
+fn page_tables(c: &Capture) -> Vec<(i64, Pages)> {
+    let mut tables: Vec<(i64, String)> = Vec::new();
+    for table in ["d12_tile_pages", "d12_tile_mappings"] {
+        if c.has_table(table) {
+            tables.extend(c.rows(
+                &format!("SELECT resource, pages_json FROM {table} WHERE pages_json IS NOT NULL"),
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ));
+        }
+    }
+    tables
+        .into_iter()
+        .filter_map(|(id, json)| {
+            let pages = serde_json::from_str(&json)
+                .ok()
+                .and_then(|v| Pages::from_runs(&v))?;
+            Some((id, pages))
+        })
+        .collect()
 }
 
 /// A recorded tile coordinate, `[x, y, z, subresource]`.
@@ -136,13 +192,27 @@ impl D3d12 {
     /// The game's heap `id`, made from its description on first use, with its size.
     fn game_heap(&mut self, c: &Capture, id: i64) -> Result<(ID3D12Heap, u64), String> {
         if !self.memory.heaps.contains_key(&id) {
-            let made = self.make_heap(c, id);
-            self.memory.heaps.insert(id, made);
+            let made = self.heap_desc(c, id).and_then(|(desc, inferred)| {
+                let mut heap: Option<ID3D12Heap> = None;
+                unsafe { self.device.CreateHeap(&desc, &mut heap) }
+                    .map_err(|e| format!("their heap could not be made on this device: {e}"))?;
+                let heap = heap.ok_or("CreateHeap gave no heap")?;
+                super::name(&heap, format!("#{id}"));
+                Ok((heap, desc.SizeInBytes, inferred))
+            });
+            if matches!(made, Ok((_, _, true))) {
+                self.memory.inferred += 1;
+            }
+            self.memory
+                .heaps
+                .insert(id, made.map(|(heap, size, _)| (heap, size)));
         }
         self.memory.heaps[&id].clone()
     }
 
-    fn make_heap(&self, c: &Capture, id: i64) -> Result<(ID3D12Heap, u64), String> {
+    /// The description of the game's heap `id`, and whether it was inferred: the capture's, or where it has none
+    /// (captures before heaps were described), [`D3d12::inferred_heap`].
+    fn heap_desc(&self, c: &Capture, id: i64) -> Result<(D3D12_HEAP_DESC, bool), String> {
         let d: Value = c
             .row(
                 "SELECT description FROM d12_objects WHERE id = ?1 AND kind LIKE 'ID3D12Heap%'",
@@ -151,30 +221,78 @@ impl D3d12 {
             )
             .and_then(|d| serde_json::from_str(&d).ok())
             .unwrap_or(Value::Null);
-        let bytes = d["bytes"]
-            .as_u64()
-            .ok_or("the capture does not describe their heap (captured before heaps were described)")?;
-        let p = &d["heap_properties"];
-        let n = |v: &Value| v.as_i64().unwrap_or(0) as i32;
-        // The deny flags and shader atomics; sharing, display and residency flags are dropped.
-        const KEPT: i32 = 0x4 | 0x40 | 0x80 | 0x400;
-        let desc = D3D12_HEAP_DESC {
-            SizeInBytes: bytes,
-            Properties: D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE(n(&p["type"])),
-                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY(n(&p["cpu_page"])),
-                MemoryPoolPreference: D3D12_MEMORY_POOL(n(&p["memory_pool"])),
-                ..Default::default()
-            },
-            Alignment: d["alignment"].as_u64().unwrap_or(0),
-            Flags: D3D12_HEAP_FLAGS(n(&d["flags"]) & KEPT),
+        let Some(bytes) = d["bytes"].as_u64() else {
+            return self.inferred_heap(c, id).map(|desc| (desc, true));
         };
-        let mut heap: Option<ID3D12Heap> = None;
-        unsafe { self.device.CreateHeap(&desc, &mut heap) }
-            .map_err(|e| format!("their heap could not be made on this device: {e}"))?;
-        let heap = heap.ok_or("CreateHeap gave no heap")?;
-        super::name(&heap, format!("#{id}"));
-        Ok((heap, bytes))
+        let p = &d["heap_properties"];
+        Ok((
+            D3D12_HEAP_DESC {
+                SizeInBytes: bytes,
+                Properties: heap_properties(p),
+                Alignment: d["alignment"].as_u64().unwrap_or(0),
+                Flags: heap_flags(&d["flags"]),
+            },
+            false,
+        ))
+    }
+
+    /// What heap `id` must have been, from what the resources in it record: the heap properties and flags
+    /// GetHeapProperties gave the game for each placed one (which must agree), and a size that holds each placed one
+    /// at its offset as this device lays it out (or as the game did, where the capture says and it is more) and each
+    /// reserved tile mapped into it, in whole units of its alignment: 4 MiB with a multisampled resource in it, else
+    /// 64 KiB.
+    fn inferred_heap(&self, c: &Capture, id: i64) -> Result<D3D12_HEAP_DESC, String> {
+        const UNDESCRIBED: &str = "the capture does not describe their heap (captured before heaps were described), nor does any resource \
+             placed in it";
+        let placed: Vec<Value> = c
+            .rows(
+                "SELECT description FROM d12_objects WHERE kind LIKE 'ID3D12Resource%' \
+                 AND json_extract(description, '$.heap') = ?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .iter()
+            .filter_map(|d| serde_json::from_str(d).ok())
+            .collect();
+        let said: BTreeSet<String> = placed.iter().map(|d| d["heap_properties"].to_string()).collect();
+        let p = match (placed.first(), said.len()) {
+            (Some(d), 1) if d["heap_properties"].is_object() => &d["heap_properties"],
+            (_, 0 | 1) => return Err(UNDESCRIBED.into()),
+            _ => {
+                return Err(
+                    "the capture does not describe their heap, and the resources placed in it say different heap \
+                     properties"
+                        .into(),
+                )
+            }
+        };
+        let mut end = 0u64;
+        let mut multisampled = false;
+        for d in &placed {
+            let desc = super::resource_desc(d);
+            multisampled |= desc.SampleDesc.Count > 1;
+            let info = unsafe { self.device.GetResourceAllocationInfo(0, &[desc]) };
+            // One this device refuses is made committed when it is reached; it holds nothing of the heap here.
+            if info.SizeInBytes == u64::MAX {
+                continue;
+            }
+            let bytes = info.SizeInBytes.max(d["bytes"].as_u64().unwrap_or(0));
+            end = end.max(d["heap_offset"].as_u64().unwrap_or(0) + bytes);
+        }
+        for (_, pages) in page_tables(c) {
+            for &(heap, at) in pages.tiles.values() {
+                if heap as i64 == id {
+                    end = end.max((u64::from(at) + 1) * locum_capture::tiles::TILE_BYTES);
+                }
+            }
+        }
+        let alignment: u64 = if multisampled { 4 << 20 } else { 64 << 10 };
+        Ok(D3D12_HEAP_DESC {
+            SizeInBytes: end.max(1).next_multiple_of(alignment),
+            Properties: heap_properties(p),
+            Alignment: alignment,
+            Flags: heap_flags(&p["flags"]),
+        })
     }
 
     /// Makes resource `id` in the game's memory as `placement` says, from `desc` (the game's own flags), in `state`.
@@ -551,25 +669,8 @@ pub(super) fn aliases(c: &Capture) -> HashMap<i64, BTreeSet<i64>> {
         }
     }
     let tile = locum_capture::tiles::TILE_BYTES;
-    // Captures from before reserved resources were followed have no page tables.
-    let mut tables: Vec<(i64, String)> = Vec::new();
-    for table in ["d12_tile_pages", "d12_tile_mappings"] {
-        if c.has_table(table) {
-            tables.extend(c.rows(
-                &format!("SELECT resource, pages_json FROM {table} WHERE pages_json IS NOT NULL"),
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            ));
-        }
-    }
     let mut tiles: HashSet<(i64, u32, i64)> = HashSet::new();
-    for (id, json) in tables {
-        let Some(pages) = serde_json::from_str(&json)
-            .ok()
-            .and_then(|v| Pages::from_runs(&v))
-        else {
-            continue;
-        };
+    for (id, pages) in page_tables(c) {
         for &(heap, at) in pages.tiles.values() {
             tiles.insert((heap as i64, at, id));
         }

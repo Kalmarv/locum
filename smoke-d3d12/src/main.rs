@@ -14,6 +14,7 @@ mod graphics;
 mod modern;
 mod passes;
 mod planes;
+mod queries;
 mod reserved;
 mod results;
 
@@ -546,6 +547,8 @@ unsafe fn run() {
         finish(&queue, &fence, 42);
         planes::capture(&device, &queue, &fence, &chain, (256, 128));
         finish(&queue, &fence, 44);
+        queries::capture(&device, &queue, &fence, &chain);
+        finish(&queue, &fence, 47);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

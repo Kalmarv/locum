@@ -363,12 +363,19 @@ is where the replay and the game part. `replay` with rules puts back only order-
 effect on a dispatch stays.
 
 An order-dependent draw or dispatch's output is compared the same way, and described: identical; the same records in
-another order (a structured buffer's structures, otherwise 4-byte words); or different in more than order, as when
-the shader writes what its atomics returned (Sekiro's light tiles each hold the offset into the light list their
-group was given). Then it puts the game's bytes in place and goes on from them, so everything after follows the
-game's order and can be compared exactly. Neither is a failure. Outputs that differ in
-more than order are listed as not compared: what verify proves is that every target is the game's given what those
-events wrote in the game. Rules do not change what such an event writes.
+another order (a structured buffer's structures, otherwise 4-byte words); the game's slices of another of its outputs
+at other offsets; or different in more than order. Slices are what a shader writes when it allocates room in a list
+from an atomic counter: Elden Ring's tiled light culling gives each tile a record of where its lights start in a
+shared light list and how many there are, so where each tile's lights land depends on the order the GPU ran the
+tiles. Such an output is taken as slices when the list is the game's records in another order, one word of each
+record differs from the game's (the start; or two, the start and the end), every other word is the game's, and each
+record's slice of the list holds the game's records in the game's order. A buffer without a structure is tried as
+records of 8 to 64 bytes, with any bytes past the last whole one the game's (Elden Ring's are 12: start, light count
+and spot count, then a 64-byte tail). Then verify puts the game's bytes in place and goes on from them, so everything
+after follows the game's order and can be compared exactly. None of these is a failure. Outputs that differ in more
+than that are listed as not compared, as when the shader writes what its atomics returned some other way: what
+verify proves is that every target is the game's given what those events wrote in the game. Rules do not change
+what such an event writes.
 
 A draw is replayed with what it depends on: walking back from it, each earlier event that wrote a resource it (or an
 event already taken) reads or writes is taken too, and every resource starts with its contents as the frame began.
@@ -381,9 +388,13 @@ type it was recorded on. Memory the game shared is shared again: its heaps are m
 resource at its offset in its heap, a reserved one reserved with its tiles mapped as the frame found them, and the
 frame's changes to tile mappings run where the CPU made them among the submissions. Such a resource's first-use
 contents are written when replay reaches the submission they were copied at, so memory two resources share holds what
-the frame saw there at each point; the game's aliasing barriers and discards of placed targets are run. Where that
-cannot be done as the game did (a capture from before heaps were described, a resource that takes more of its heap on
-the replay's device or is aligned otherwise there, a reserved one tiled otherwise or with no page table), it is made
+the frame saw there at each point; the game's aliasing barriers and discards of placed targets are run. A capture
+from before heaps were described still records, for each placed resource, the heap properties and flags its heap was
+made with; its heaps are made from those, sized to hold each resource at its offset as the replay's device lays it
+out and each reserved tile mapped into them (in units of 64 KiB, 4 MiB with a multisampled resource), and verify says
+the heaps were inferred. Where sharing cannot be done as the game did (a heap neither the capture nor any resource in
+it describes, or whose resources say different properties; a resource that takes more of its heap on the replay's
+device or is aligned otherwise there; a reserved one tiled otherwise or with no page table), the resource is made
 committed and verify says why. Upload buffers hold, at each submission, the bytes that submission saw. The
 game's shader-visible descriptor heaps are mirrored and their slots rewritten with each submission's changes, so a
 root table points where it pointed in the game. Each event runs in a command list of its own: buffers and most
@@ -392,7 +403,17 @@ draw needs, so the game's own barriers are not replayed. Pipelines are rebuilt f
 root signatures from their bytes; root constants, root views and tables are set as each draw had them. Rules work
 as on Direct3D 11: a shader or solid rule compiles to DXIL (`ps_6_0`, with the SDK's dxcompiler) for a DXIL
 pipeline, and a constant rule rewrites a root constant, or a copy of the constant buffer a root view or table points
-at. Query resolves are not replayed.
+at.
+
+Queries are replayed. An occlusion or pipeline-statistics query must begin and end in one command list, and each
+event replays in a list of its own, so while a game's query is open, each draw and dispatch of the game's list it was
+begun in runs with a query of replay's own around it, and their counts are added up: occlusion samples and each
+statistics counter summed, a binary occlusion query's result 1 where any draw passed a sample. ResolveQueryData writes
+those results where the game resolved them, to a buffer the CPU maps or, through a copy, to one it does not. A query
+pulls the draws it counted into a plan, as a written resource would. Timestamps are taken from the replay's own GPU
+clock, which verify says, since the game's are of another run. A result the frame resolves of a query that did not
+end in it keeps the buffer's bytes from the frame's start, and other query types (stream output, video) are not
+replayed; verify lists both.
 
 `verify --debug` replays a Direct3D 12 frame twice. The first time is under GPU-based validation, which checks
 descriptors, resource states and bounds as the shaders use them; only its errors count. It patches the shaders to do

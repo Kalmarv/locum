@@ -359,6 +359,7 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
         "results",
         "reserved",
         "planes",
+        "queries",
     ] {
         let (_, text) = run(&["verify", "--warp", &capture(name)]);
         assert!(
@@ -551,5 +552,124 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
     println!(
         "ok   D3D12 reserved and placed: tiles per mip, contents as first used, the frame's remaps run, and memory \
          two placed buffers share"
+    );
+    // The same capture as one from before heaps were described has it: the heaps' descriptions empty and no placed
+    // resource's size. Replay makes the heaps from what the placed buffers record and still shares their memory.
+    let old = log.join("captures").join(format!("undescribed-{pid}"));
+    std::fs::create_dir_all(&old).unwrap();
+    let db = old.join("capture.db");
+    std::fs::copy(
+        log.join("captures")
+            .join(format!("reserved-{pid}"))
+            .join("capture.db"),
+        &db,
+    )
+    .expect("copy the reserved capture");
+    let blanked = rusqlite::Connection::open(&db)
+        .and_then(|db| {
+            let heaps = db.execute(
+                "UPDATE d12_objects SET description = '{}' WHERE kind LIKE 'ID3D12Heap%'",
+                [],
+            )?;
+            db.execute(
+                "UPDATE d12_objects SET description = json_remove(description, '$.bytes') \
+                 WHERE kind LIKE 'ID3D12Resource%' AND json_extract(description, '$.heap') != 0",
+                [],
+            )?;
+            Ok(heaps)
+        })
+        .expect("blank the copy's heap descriptions");
+    assert!(blanked > 0, "the reserved capture has heaps");
+    let raw = log.join("undescribed.raw");
+    let (ok, text) = run(&[
+        "export",
+        &old.display().to_string(),
+        &aliased,
+        "--at",
+        &events(&aliased).1.to_string(),
+        "--warp",
+        "-o",
+        &raw.display().to_string(),
+    ]);
+    assert!(ok, "export from the undescribed copy");
+    assert!(
+        text.contains("heaps the capture does not describe") && !text.contains("made committed"),
+        "replay infers the heaps the copy does not describe and places the buffers in them: {text}"
+    );
+    let bytes = std::fs::read(&raw).unwrap();
+    assert!(
+        bytes.len() == 65536 && bytes.iter().enumerate().all(|(i, &b)| b == (i * 7 + 3) as u8),
+        "export: in an inferred heap, a placed buffer reads what the frame wrote through another at its offset"
+    );
+    println!(
+        "ok   D3D12 heaps a capture does not describe: made from their placed resources, their memory shared"
+    );
+    // Queries: what replay resolves is what the GPU gave the fixture (queries.rs), but for the timestamps, which are
+    // the replay's clock. Through `export --at`, so the plan must take the draws the queries counted.
+    let expected = std::fs::read(log.join("queries-expected.bin")).expect("queries-expected.bin");
+    let dst = |filter: &str| {
+        sql(
+            "queries",
+            &format!(
+                "SELECT json_extract(args, '$[4]') FROM events WHERE call = 'ResolveQueryData' AND {filter}"
+            ),
+        )
+    };
+    let readback = dst("json_extract(args, '$[1]') = 2");
+    let resolved = dst(&format!("json_extract(args, '$[4]') <> {readback}"));
+    let last: i64 = sql(
+        "queries",
+        "SELECT max(seq) FROM events WHERE call = 'ResolveQueryData'",
+    )
+    .parse()
+    .expect("the last resolve");
+    let export = |id: &str, name: &str| -> Vec<u8> {
+        let raw = log.join(name);
+        let (ok, text) = run(&[
+            "export",
+            &capture("queries"),
+            id,
+            "--at",
+            &(last + 1).to_string(),
+            "--warp",
+            "-o",
+            &raw.display().to_string(),
+        ]);
+        assert!(ok, "export #{id} after the resolves");
+        assert!(
+            !text.contains("are not replayed"),
+            "queries: replay runs them all: {text}"
+        );
+        std::fs::read(&raw).unwrap()
+    };
+    let replayed = export(&readback, "queries-readback.raw");
+    let word = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+    assert_eq!(
+        (word(&replayed, 0), word(&replayed, 8), word(&replayed, 16)),
+        (word(&expected, 0), word(&expected, 8), word(&expected, 16)),
+        "queries: occlusion and binary occlusion as the GPU counted them in the fixture"
+    );
+    assert_eq!(
+        replayed[64..152],
+        expected[64..152],
+        "queries: pipeline statistics as the GPU counted them in the fixture"
+    );
+    let (t0, t1) = (word(&replayed, 160), word(&replayed, 168));
+    assert!(
+        t0 > 0 && t1 >= t0,
+        "queries: the replay's timestamps, in order: {t0} {t1}"
+    );
+    let other = export(&resolved, "queries-resolved.raw");
+    assert_eq!(
+        word(&other, 0),
+        word(&expected, 0),
+        "queries: the occlusion result resolved into a default-heap buffer"
+    );
+    println!(
+        "ok   D3D12 queries: occlusion {}, binary {} and {}, pipeline statistics as the GPU counted them, timestamps \
+         the replay's own",
+        word(&replayed, 0),
+        word(&replayed, 8),
+        word(&replayed, 16)
     );
 }

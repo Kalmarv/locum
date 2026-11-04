@@ -102,8 +102,13 @@ fn touches(c: &Capture) -> BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)> {
             e.0.insert(resource);
         }
     }
-    // A write to memory resources share writes each of them.
+    // A write to memory resources share writes each of them. The frame's queries are resources of their own.
     if c.meta("api").as_deref() == Some("d3d12") {
+        for (event, reads, writes) in d3d12::query_touches(c) {
+            let e = out.entry(event).or_default();
+            e.0.extend(reads);
+            e.1.extend(writes);
+        }
         let aliases = d3d12::aliases(c);
         if !aliases.is_empty() {
             for (_, written) in out.values_mut() {
@@ -221,6 +226,8 @@ fn with_bound(c: &Capture, events: Vec<i64>, mut resources: BTreeSet<i64>) -> Pl
             resources.extend(b);
         }
     }
+    // Queries are resources only to the planner (negative ids, d3d12::query_touches).
+    resources.retain(|&r| r >= 0);
     Plan {
         events,
         resources,
@@ -619,7 +626,51 @@ enum Settled {
     Reordered {
         stride: usize,
     },
+    /// Records of `stride` bytes that each name a slice of another output of the event, `list`, the same records
+    /// there as the game's but at other offsets: the slices were allocated from an atomic counter (a tiled light
+    /// list, say), so where each landed depends on the order the GPU ran its threads. The 4-byte word `start` of a
+    /// record starts its slice and `length` says how long it is; every other word is the game's.
+    Sliced {
+        stride: usize,
+        list: i64,
+        start: usize,
+        length: Length,
+    },
     Differs(String),
+}
+
+/// How a record says the length of its slice: a count of the list's records in one of its words, or the word where
+/// the slice ends.
+#[derive(Clone, Copy)]
+enum Length {
+    Count(usize),
+    End(usize),
+}
+
+impl std::fmt::Display for Settled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Settled::Sliced {
+                stride,
+                list,
+                start,
+                length,
+            } => {
+                write!(
+                    f,
+                    "{stride}-byte records naming the game's slices of #{list} at other offsets (word {start} starts \
+                     each, "
+                )?;
+                match length {
+                    Length::Count(w) => write!(f, "word {w} counts it)"),
+                    Length::End(w) => write!(f, "word {w} ends it)"),
+                }
+            }
+            Settled::Reordered { stride } => write!(f, "the game's {stride}-byte records in another order"),
+            Settled::Identical => write!(f, "identical"),
+            Settled::Differs(how) => write!(f, "{how}"),
+        }
+    }
 }
 
 /// One output of an event, compared.
@@ -639,8 +690,9 @@ fn kept(path: &Path, bytes: &[u8]) -> Result<(), String> {
 /// every output when `all`: everything after then follows the order the game's GPU took, and starts from the game's
 /// state, so a difference later is that later event's own. An order-dependent output can hold the same records in
 /// another order, or differ in more than order: a shader that writes what its atomics returned (an offset into a list
-/// it allocates from, say) writes other values when its threads run in another order. Any other output is identical
-/// or differs.
+/// it allocates from, say) writes other values when its threads run in another order. Where those values start
+/// slices of another output that holds the same records reordered, and each slice holds the game's, it is
+/// [`Settled::Sliced`]. Any other output is identical or differs.
 fn settle(
     c: &Capture,
     b: &mut dyn Backend,
@@ -652,7 +704,9 @@ fn settle(
     let Some(written) = written.get(&seq) else {
         return Ok(Vec::new());
     };
-    let mut out = Vec::new();
+    // Each output compared first; then an order-dependent one that differs is checked as slices of another that holds
+    // the same records reordered; then each kept and put back.
+    let mut each = Vec::new();
     for w in written {
         let s = shape(c, w.resource).ok_or("resource vanished")?;
         let game = c.blob(&w.key)?;
@@ -693,6 +747,36 @@ fn settle(
                 game.len().div_ceil(stride)
             ))
         };
+        // Records sliced from another output are only looked for in buffers; a structured one's are its
+        // structures, anything else's are found.
+        let records = (s.kind == "buffer").then_some((s.stride > 0).then_some(stride));
+        each.push((w, s, game, whole, mine, records, settled));
+    }
+    for i in 0..each.len() {
+        if !(each[i].0.ordered && matches!(each[i].6, Settled::Differs(_))) {
+            continue;
+        }
+        let found = each.iter().enumerate().find_map(|(j, list)| {
+            let Settled::Reordered { stride } = list.6 else {
+                return None;
+            };
+            let records = each[i].5?;
+            (j != i)
+                .then(|| sliced(&each[i].4, &each[i].2, records, &list.4, &list.2, stride))
+                .flatten()
+                .map(|(stride, start, length)| Settled::Sliced {
+                    stride,
+                    list: list.0.resource,
+                    start,
+                    length,
+                })
+        });
+        if let Some(found) = found {
+            each[i].6 = found;
+        }
+    }
+    let mut out = Vec::new();
+    for (w, s, game, whole, mine, _, settled) in each {
         if !matches!(settled, Settled::Identical) {
             if let Some(dir) = keep {
                 let part = w.sub.map_or(String::new(), |sub| format!("-sub{sub}"));
@@ -728,6 +812,90 @@ fn settle(
         });
     }
     Ok(out)
+}
+
+/// Whether the records of `mine` and `game` name the same slices of a list (`list`, `theirs`: records of
+/// `list_stride` bytes) at other offsets: some word of each starts its slice, another counts or ends it, every other
+/// word is the game's, and each slice holds the game's records in the game's order. The records are `stride` bytes,
+/// or for a buffer without a structure the first size from 8 to 64 bytes that fits, with any bytes past the last
+/// whole record the game's. Gives the record size, the start word and the length's.
+fn sliced(
+    mine: &[u8],
+    game: &[u8],
+    stride: Option<usize>,
+    list: &[u8],
+    theirs: &[u8],
+    list_stride: usize,
+) -> Option<(usize, usize, Length)> {
+    if mine.len() != game.len() || list.len() != theirs.len() {
+        return None;
+    }
+    let tried = stride
+        .map_or(8..=64, |s| s..=s)
+        .filter(|s| s % 4 == 0 && *s >= 8 && *s <= 64);
+    tried
+        .filter(|&s| game.len() >= s && mine[game.len() / s * s..] == game[game.len() / s * s..])
+        .find_map(|s| {
+            sliced_as(mine, game, s, list, theirs, list_stride).map(|(start, length)| (s, start, length))
+        })
+}
+
+/// [`sliced`] with records of `stride` bytes, the bytes past the last whole one left out.
+fn sliced_as(
+    mine: &[u8],
+    game: &[u8],
+    stride: usize,
+    list: &[u8],
+    theirs: &[u8],
+    list_stride: usize,
+) -> Option<(usize, Length)> {
+    let words = stride / 4;
+    let word = |b: &[u8], record: usize, w: usize| {
+        let at = record * stride + w * 4;
+        u32::from_le_bytes(b[at..at + 4].try_into().expect("4 bytes")) as usize
+    };
+    let records = game.len() / stride;
+    fn slice(b: &[u8], first: usize, n: usize, stride: usize) -> Option<&[u8]> {
+        b.get(first.checked_mul(stride)?..first.checked_add(n)?.checked_mul(stride)?)
+    }
+    // The words that differ somewhere: the start, and for an end, the end.
+    let moved: Vec<usize> = (0..words)
+        .filter(|&w| (0..records).any(|r| word(mine, r, w) != word(game, r, w)))
+        .collect();
+    let fits = |start: usize, length: Length| {
+        (0..records).all(|r| {
+            let rest_same = (0..words).all(|w| {
+                w == start
+                    || matches!(length, Length::End(e) if e == w)
+                    || word(mine, r, w) == word(game, r, w)
+            });
+            let (m, g) = (word(mine, r, start), word(game, r, start));
+            let n = match length {
+                Length::Count(k) => Some(word(game, r, k)),
+                Length::End(e) => {
+                    let (nm, ng) = (word(mine, r, e).checked_sub(m), word(game, r, e).checked_sub(g));
+                    (nm == ng).then_some(ng).flatten()
+                }
+            };
+            rest_same
+                && n.is_some_and(|n| {
+                    let (a, b) = (slice(list, m, n, list_stride), slice(theirs, g, n, list_stride));
+                    a.is_some() && a == b
+                })
+        })
+    };
+    match moved.as_slice() {
+        [start] => (0..words)
+            .filter(|&k| k != *start)
+            .map(Length::Count)
+            .find(|&length| fits(*start, length))
+            .map(|length| (*start, length)),
+        [a, b] => [(*a, *b), (*b, *a)]
+            .into_iter()
+            .find(|&(start, end)| fits(start, Length::End(end)))
+            .map(|(start, end)| (start, Length::End(end))),
+        _ => None,
+    }
 }
 
 /// Whether `a` and `b` hold the same `stride`-byte records, as many times each, in any order.
@@ -1083,12 +1251,9 @@ pub fn verify(
                         clears_same += 1;
                     }
                 }
-                (_, Settled::Reordered { stride }) => {
+                (_, settled @ (Settled::Reordered { .. } | Settled::Sliced { .. })) => {
                     reordered += 1;
-                    out!(
-                        "{who} #{resource}: the game's {stride}-byte records in another order; going on from the \
-                         game's order"
-                    );
+                    out!("{who} #{resource}: {settled}; going on from the game's");
                 }
                 (true, Settled::Differs(how)) => {
                     differing += 1;
@@ -1169,7 +1334,7 @@ pub fn verify(
     if settled_same + reordered + differing > 0 {
         out!(
             "order-dependent shaders' outputs: {settled_same} identical to the game's, {reordered} the same records in \
-             another order, {differing} different"
+             another order or at other offsets, {differing} different"
         );
     }
     // What keeps an identical replay from proving the frame: what the capture could not record, used resources
@@ -1261,7 +1426,7 @@ pub fn verify(
 
 #[cfg(test)]
 mod tests {
-    use super::same_records;
+    use super::{Length, same_records, sliced};
 
     #[test]
     fn records_in_another_order_are_the_same_records() {
@@ -1273,5 +1438,39 @@ mod tests {
         assert!(!same_records(&a, &c, 4));
         // As often each: a record twice is not the same as two records.
         assert!(!same_records(&[1, 1, 2, 2], &[1, 1, 1, 1], 2));
+    }
+
+    fn bytes(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn slices_at_other_offsets_are_found() {
+        // Three tiles of (start, count, other) and a tail word; the list holds their slices in another order.
+        let game = bytes(&[0, 2, 9, 2, 1, 9, 3, 0, 9, 77]);
+        let theirs = bytes(&[10, 11, 12, 0, 0]);
+        let mine = bytes(&[1, 2, 9, 0, 1, 9, 3, 0, 9, 77]);
+        let list = bytes(&[12, 10, 11, 0, 0]);
+        let found = sliced(&mine, &game, None, &list, &theirs, 4);
+        assert!(
+            matches!(found, Some((12, 0, Length::Count(1)))),
+            "{:?}",
+            found.map(|f| (f.0, f.1))
+        );
+        // A slice whose records differ is not the game's.
+        let other = bytes(&[12, 11, 10, 0, 0]);
+        assert!(sliced(&mine, &game, None, &other, &theirs, 4).is_none());
+        // Nor is a record whose other words differ, nor a different tail.
+        let mut changed = mine.clone();
+        changed[8] = 8;
+        assert!(sliced(&changed, &game, None, &list, &theirs, 4).is_none());
+        let mut tail = mine.clone();
+        tail[36] = 76;
+        assert!(sliced(&tail, &game, None, &list, &theirs, 4).is_none());
+        // Starts and ends: (start, end) records.
+        let game = bytes(&[0, 2, 2, 3]);
+        let mine = bytes(&[1, 3, 0, 1]);
+        let found = sliced(&mine, &game, Some(8), &list, &theirs, 4);
+        assert!(matches!(found, Some((8, 0, Length::End(1)))));
     }
 }
