@@ -416,7 +416,8 @@ mip by mip as it is):
 ```
 locum-cli index -o files.db DIR...         # key every DDS file and every program (a shader container: it begins
                                            # `DXBC`, whatever its extension) under each DIR
-locum-cli index -o files.db --keys k.tsv   # add buffer keys a game's reader listed (key<TAB>bytes<TAB>name lines)
+locum-cli index -o files.db --keys k.tsv   # add buffer keys a game's reader listed (key<TAB>bytes<TAB>name[<TAB>about]
+                                           # lines; - is stdin)
 extractor | locum-cli index -o files.db --tar -   # DDS files and programs from a tar stream (- is stdin)
 locum-cli --index files.db join last       # what each texture and buffer the frame used was made from
 locum-cli --index files.db draw last 120   # bound resources are shown with their file's name
@@ -433,6 +434,12 @@ separated by `;`) stands in for `--index`. A game's own extractor can add what i
 `locum_capture::index`, or list keys for `--keys`: fromsoft-formats' `flver_keys` example lists every FLVER's data
 block, vertex buffers and face sets in Sekiro's or Elden Ring's archives, and unity-formats' `mesh_keys` example every
 Mesh's vertex streams and index buffer in a Unity player (a SkateBIRD capture has 183 of its 209 buffers named so).
+A key list's optional fourth column is what the reader says of the bytes, a JSON object; the index keeps each one once,
+`draw` prints it under the binding (each field's value, an array's length, an object's field count) and `draw --json`
+and `bindings --json` carry it whole. `flver_keys` writes there the material of the mesh that draws each vertex
+buffer and face set (its name, its `mtd`, the FLVER's texture bindings) and the game's own definition of that
+material: an Elden Ring MATBIN's shader, params by name and samplers, or a Sekiro MTD's, so a draw's buffers give
+the material's authored values to set beside the constants the draw was given (`cb`, `constants`).
 Textures packed in a game's archives need not be written to disk: `--tar` reads a tar stream of DDS files and
 programs, each named by its path in the stream, and fromsoft-formats' `texture_tar` example writes one of every
 texture of the TPF packages under the archive paths given (loose, or in the binders that hold them), as

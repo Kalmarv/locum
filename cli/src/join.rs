@@ -108,6 +108,26 @@ impl Names {
         })
     }
 
+    /// The part of the file `whole` names (`file#part` in a key list) that the `len` bytes at `offset` of buffer
+    /// `id` are: a face set of the model whose data block the buffer holds. Its other files are `whole`'s, since
+    /// that is what tells the file.
+    pub fn part_of(&self, c: &Capture, id: i64, offset: u64, len: u64, whole: &Match) -> Option<Match> {
+        let bytes = self.contents_of(c, id)?;
+        let end = offset.checked_add(len)?;
+        let part = bytes.get(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)?;
+        let key = key(part);
+        let file = self
+            .indexes
+            .iter()
+            .find_map(|i| i.part(&key, file_part(&whole.file.name)))?;
+        Some(Match {
+            file,
+            how: format!("bytes {offset}..{end}"),
+            others: whole.others,
+            also: whole.also.clone(),
+        })
+    }
+
     /// What the bytes at `offset` of buffer `id`, bound as indices, were made from. Index lists alone name nothing: two
     /// triangles of a quad, or a grid's rows, are the same bytes in any engine's meshes. So the match must hold bytes the
     /// frame binds as vertices too (a FLVER's data block, indices and vertices in one), or vertex data bound with the
@@ -335,19 +355,25 @@ pub fn index(
         }
     }
     for list in keys {
-        let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
+        let text = if list.as_os_str() == "-" {
+            std::io::read_to_string(std::io::stdin().lock()).map_err(|e| format!("standard input: {e}"))?
+        } else {
+            std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?
+        };
         for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
             let at = format!("{}:{}", list.display(), n + 1);
-            let mut parts = line.splitn(3, '\t');
+            // An optional fourth column is what the reader says of the bytes, a JSON object.
+            let mut parts = line.splitn(4, '\t');
             let (Some(key), Some(bytes), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
-                refused.push(format!("{at}: not key<TAB>bytes<TAB>name"));
+                refused.push(format!("{at}: not key<TAB>bytes<TAB>name[<TAB>about]"));
                 continue;
             };
+            let about = parts.next().filter(|a| !a.trim().is_empty());
             let Ok(bytes) = bytes.parse::<u64>() else {
                 refused.push(format!("{at}: {bytes:?} is not a count of bytes"));
                 continue;
             };
-            match index.add_buffer_key(name, bytes, key) {
+            match index.add_buffer_key(name, bytes, key, about) {
                 Ok(()) => keyed += 1,
                 Err(e) => refused.push(format!("{at}: {e}")),
             }

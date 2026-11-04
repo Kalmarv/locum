@@ -178,6 +178,9 @@ pub struct Binding {
     /// cannot say.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// What the reader that listed `file` said of it (a key list's fourth column: a mesh's material, say).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub about: Option<Value>,
     pub offset: Option<i64>,
     pub size: Option<i64>,
     pub stride: Option<i64>,
@@ -405,14 +408,17 @@ pub(crate) fn range_name(
                 "DrawIndexedInstanced" => a.first().zip(a.get(2)),
                 _ => None,
             };
-            let drawn = drawn.and_then(|(&count, &start)| {
-                c.names.indices(c, r, offset + start * width, count * width, vbs)
-            });
+            let range = drawn.map(|(&count, &start)| (offset + start * width, count * width));
+            let drawn = range.and_then(|(o, n)| c.names.indices(c, r, o, n, vbs));
             let bound = c.names.indices(c, r, offset, size, vbs);
             // The one fewer files share: a face set's indices are often the same in models of one shape, the data
-            // block holding them seldom.
+            // block holding them seldom. The block tells the file; the face set of that file the draw reads is what
+            // it draws (and what the key list says of it: its mesh's material).
             match (drawn, bound) {
-                (Some(d), Some(b)) if b.others < d.others => Some(b),
+                (Some(d), b) if b.as_ref().is_none_or(|b| b.others >= d.others) => Some(d),
+                (_, Some(b)) => range
+                    .and_then(|(o, n)| c.names.part_of(c, r, o, n, &b))
+                    .or(Some(b)),
                 (d, b) => d.or(b),
             }
         }
@@ -472,17 +478,22 @@ pub(crate) fn register(
 /// The game file binding `b` of a draw (`call` with `args`, reading vertices `vbs`) was made from, when an index
 /// names it: the whole resource, or the vertex or index range the draw reads.
 pub(crate) fn file_of(c: &Capture, b: &Row, call: &str, args: &str, vbs: &[Vb]) -> Option<String> {
-    files_of(c, b, call, args, vbs).map(|(text, _)| text)
+    files_of(c, b, call, args, vbs).map(|n| n.text)
 }
 
-/// `file_of`, with the names of every file found with the same bytes (the first of them as `file_of` names it).
-pub(crate) fn files_of(
-    c: &Capture,
-    b: &Row,
-    call: &str,
-    args: &str,
-    vbs: &[Vb],
-) -> Option<(String, Vec<String>)> {
+/// The game files a binding was made from, as an index names them.
+pub(crate) struct Named {
+    /// The first file's name, with how many others have the same bytes.
+    pub text: String,
+    /// Every file found with the same bytes, the first of them first.
+    pub files: Vec<String>,
+    /// What the reader that listed the first said of it (`index::File::about`).
+    pub about: Option<Value>,
+}
+
+/// `file_of`, with the names of every file found with the same bytes (the first of them as `file_of` names it) and
+/// what the reader that listed it said of it.
+pub(crate) fn files_of(c: &Capture, b: &Row, call: &str, args: &str, vbs: &[Vb]) -> Option<Named> {
     let r = b.resource?;
     let m = c
         .names
@@ -492,9 +503,27 @@ pub(crate) fn files_of(
         0 => m.file.name.clone(),
         n => format!("{} (+{n} with the same bytes)", m.file.name),
     };
+    let about = m.file.about.as_deref().and_then(|a| serde_json::from_str(a).ok());
     let mut files = vec![m.file.name];
     files.extend(m.also);
-    Some((text, files))
+    Some(Named { text, files, about })
+}
+
+/// What a reader said of a file, in a line: each field's value, an array's length or an object's field count.
+pub(crate) fn about_line(about: &Value) -> String {
+    let Some(fields) = about.as_object() else {
+        return about.to_string();
+    };
+    fields
+        .iter()
+        .map(|(k, v)| match v {
+            Value::String(s) => format!("{k} {s}"),
+            Value::Array(a) => format!("{k} [{}]", a.len()),
+            Value::Object(o) => format!("{k} {{{}}}", o.len()),
+            v => format!("{k} {v}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Draw `n` as `draw` shows it. Without `all`, only constant registers the shader uses.
@@ -635,8 +664,7 @@ pub fn describe(
             }
         });
         // Every file with the bytes, when there is more than one.
-        let named = files_of(c, b, &call, &args, &vbs)
-            .map(|(text, files)| (text, if files.len() > 1 { files } else { Vec::new() }));
+        let named = files_of(c, b, &call, &args, &vbs);
         let mut binding = Binding {
             stage: b.stage.clone(),
             kind: b.kind.clone(),
@@ -648,8 +676,13 @@ pub fn describe(
             state: b.state.and_then(|s| state(c, s)),
             resource: b.resource,
             shape: b.resource.and_then(|r| shape(c, r)).map(|s| s.to_string()),
-            file: named.as_ref().map(|n| n.0.clone()),
-            files: named.map(|n| n.1).unwrap_or_default(),
+            file: named.as_ref().map(|n| n.text.clone()),
+            files: named
+                .as_ref()
+                .map(|n| n.files.clone())
+                .filter(|f| f.len() > 1)
+                .unwrap_or_default(),
+            about: named.and_then(|n| n.about),
             offset: b.offset,
             size: b.size,
             stride: b.stride,
@@ -1183,6 +1216,9 @@ fn print_bound(d: &Draw) {
             }
         }
         out!("{line}");
+        if let Some(about) = &b.about {
+            out!("      {}", about_line(about));
+        }
     }
     if d.unused > 0 {
         out!(

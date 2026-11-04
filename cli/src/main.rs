@@ -605,9 +605,11 @@ enum Command {
         #[arg(short, long)]
         out: PathBuf,
         inputs: Vec<PathBuf>,
-        /// A list of buffer keys to add, one `key<TAB>bytes<TAB>name` a line, as a game's reader writes them for
-        /// what is inside its archives (fromsoft-formats' `flver_keys` example: FLVER vertex and index bytes;
-        /// unity-formats' `mesh_keys`: a Unity player's Mesh vertex streams and index buffers).
+        /// A list of buffer keys to add, one `key<TAB>bytes<TAB>name[<TAB>about]` a line, as a game's reader writes
+        /// them for what is inside its archives (fromsoft-formats' `flver_keys` example: FLVER vertex and index bytes,
+        /// each with its mesh's material and material definition; unity-formats' `mesh_keys`: a Unity player's Mesh
+        /// vertex streams and index buffers). `about`, a JSON object, is what the reader says of the bytes: `draw`
+        /// shows it under the binding and `draw --json` and `bindings --json` carry it. `-` reads standard input.
         #[arg(long)]
         keys: Vec<PathBuf>,
         /// A tar stream of DDS files and programs to add (`-`: stdin), as a game's extractor writes what is inside

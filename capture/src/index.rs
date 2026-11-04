@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS subs(key TEXT NOT NULL, file INTEGER NOT NULL, sub IN
   slice INTEGER, width INTEGER, height INTEGER, bytes INTEGER NOT NULL);
 -- A program's reflection kept outside its bytecode (`rdef::Reflected`, as JSON), by the program's key.
 CREATE TABLE IF NOT EXISTS reflections(key TEXT PRIMARY KEY, json TEXT NOT NULL);
+-- What the reader that listed a file said of it (a key list's fourth column): each JSON object once, and the one of
+-- each file (many files share one: a mesh's vertex buffers and face sets, a model placed in many binders).
+CREATE TABLE IF NOT EXISTS abouts(id INTEGER PRIMARY KEY, json TEXT NOT NULL UNIQUE);
+CREATE TABLE IF NOT EXISTS file_abouts(file INTEGER PRIMARY KEY, about INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS files_key ON files(key);
 CREATE INDEX IF NOT EXISTS subs_key ON subs(key);
 ";
@@ -42,6 +46,9 @@ pub struct File {
     pub height: u32,
     pub mips: u32,
     pub array: u32,
+    /// What the reader that listed it said of it, a JSON object (a key list's fourth column: the material a mesh's
+    /// buffer is drawn with, say); None where it said nothing, or the index predates it.
+    pub about: Option<String>,
 }
 
 /// A subresource of a file in the index.
@@ -55,6 +62,8 @@ pub struct FileSub {
 
 pub struct Index {
     db: Connection,
+    /// Whether the index has the `file_abouts` table (made after it was added).
+    abouts: bool,
 }
 
 /// What a resource is, so it is matched only with files that could have made it: a buffer with buffers; a texture
@@ -132,6 +141,7 @@ fn file_from(r: &rusqlite::Row) -> rusqlite::Result<File> {
         height: r.get::<_, Option<u32>>(5)?.unwrap_or(0),
         mips: r.get::<_, Option<u32>>(6)?.unwrap_or(1),
         array: r.get::<_, Option<u32>>(7)?.unwrap_or(1),
+        about: r.get(8)?,
     })
 }
 
@@ -143,14 +153,33 @@ impl Index {
             .and_then(|()| db.execute_batch(SCHEMA))
             .and_then(|()| db.execute_batch("BEGIN"))
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Index { db })
+        Ok(Index { db, abouts: true })
     }
 
     /// Opens the index at `path` to read it.
     pub fn open(path: &Path) -> Result<Index, String> {
         let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        Ok(Index { db })
+        let abouts = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'file_abouts'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .is_ok_and(|n| n > 0);
+        Ok(Index { db, abouts })
+    }
+
+    /// The columns `file_from` reads, of files `f`.
+    fn file_columns(&self) -> String {
+        format!(
+            "{FILE_COLUMNS}, {}",
+            if self.abouts {
+                "(SELECT a.json FROM file_abouts fa JOIN abouts a ON a.id = fa.about WHERE fa.file = f.id)"
+            } else {
+                "NULL"
+            }
+        )
     }
 
     /// Writes what was added since the index was opened (or since the last call).
@@ -223,7 +252,7 @@ impl Index {
 
     /// Adds a buffer's bytes under `name`.
     pub fn add_buffer(&mut self, name: &str, bytes: &[u8]) -> Result<(), String> {
-        self.add_buffer_key(name, bytes.len() as u64, &key(bytes))
+        self.add_buffer_key(name, bytes.len() as u64, &key(bytes), None)
     }
 
     /// Adds a program's bytes (a shader container, as the game passes it to the API) under `name`.
@@ -269,13 +298,52 @@ impl Index {
     }
 
     /// Adds a buffer of `bytes` bytes whose key (`hash::key`) another tool computed, under `name`.
-    pub fn add_buffer_key(&mut self, name: &str, bytes: u64, key: &str) -> Result<(), String> {
+    /// `about`, when given, is what the reader says of the bytes: a JSON object (`File::about`).
+    pub fn add_buffer_key(
+        &mut self,
+        name: &str,
+        bytes: u64,
+        key: &str,
+        about: Option<&str>,
+    ) -> Result<(), String> {
         check_key(key)?;
+        if let Some(about) = about {
+            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(about)
+                .map_err(|e| format!("{name}: what it says of the bytes is not a JSON object: {e}"))?;
+        }
+        let e = |e: rusqlite::Error| e.to_string();
         self.db
             .prepare_cached("INSERT INTO files(name, kind, bytes, key) VALUES (?1, 'buffer', ?2, ?3)")
             .and_then(|mut s| s.execute(params![name, bytes as i64, key]))
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+            .map_err(e)?;
+        if let Some(about) = about {
+            let file = self.db.last_insert_rowid();
+            self.db
+                .prepare_cached("INSERT OR IGNORE INTO abouts(json) VALUES (?1)")
+                .and_then(|mut s| s.execute([about]))
+                .map_err(e)?;
+            self.db
+                .prepare_cached(
+                    "INSERT INTO file_abouts(file, about) SELECT ?1, id FROM abouts WHERE json = ?2",
+                )
+                .and_then(|mut s| s.execute(params![file, about]))
+                .map_err(e)?;
+        }
+        Ok(())
+    }
+
+    /// The part of file `file` (a key list's `file#part` names) whose bytes have `key`, the first by name.
+    pub fn part(&self, key: &str, file: &str) -> Option<File> {
+        let prefix = format!("{file}#");
+        self.db
+            .prepare_cached(&format!(
+                "SELECT {} FROM files f WHERE f.key = ?1 AND substr(f.name, 1, length(?2)) = ?2 \
+                 ORDER BY f.name LIMIT 1",
+                self.file_columns()
+            ))
+            .and_then(|mut s| s.query_row(params![key, prefix], file_from).optional())
+            .ok()
+            .flatten()
     }
 
     /// The files like `like` whose whole bytes have `key`, at most `limit`, and how many there are.
@@ -295,7 +363,8 @@ impl Index {
         let files = self
             .db
             .prepare_cached(&format!(
-                "SELECT {FILE_COLUMNS} FROM files f WHERE f.key = ?1 AND {filter} ORDER BY f.name LIMIT ?2"
+                "SELECT {} FROM files f WHERE f.key = ?1 AND {filter} ORDER BY f.name LIMIT ?2",
+                self.file_columns()
             ))
             .and_then(|mut s| {
                 s.query_map(params![key, limit as i64], file_from)?
@@ -324,16 +393,17 @@ impl Index {
         }
         self.db
             .prepare_cached(&format!(
-                "SELECT {FILE_COLUMNS}, s.sub, s.mip, s.slice FROM subs s JOIN files f ON f.id = s.file \
-                 WHERE s.key = ?1 AND {filter} ORDER BY f.name, s.sub LIMIT 1"
+                "SELECT {}, s.sub, s.mip, s.slice FROM subs s JOIN files f ON f.id = s.file \
+                 WHERE s.key = ?1 AND {filter} ORDER BY f.name, s.sub LIMIT 1",
+                self.file_columns()
             ))
             .and_then(|mut s| {
                 s.query_row([key], |r| {
                     Ok(FileSub {
                         file: file_from(r)?,
-                        sub: r.get(8)?,
-                        mip: r.get(9)?,
-                        slice: r.get(10)?,
+                        sub: r.get(9)?,
+                        mip: r.get(10)?,
+                        slice: r.get(11)?,
                     })
                 })
                 .optional()
@@ -448,18 +518,37 @@ mod tests {
         {
             let mut index = Index::create(&path).unwrap();
             index
-                .add_buffer_key("m.flver#vb0", bytes.len() as u64, &key(bytes))
+                .add_buffer_key(
+                    "m.flver#vb0",
+                    bytes.len() as u64,
+                    &key(bytes),
+                    Some(r#"{"material": "Wall", "mtd": "Wall.matxml"}"#),
+                )
                 .unwrap();
-            assert!(index.add_buffer_key("bad", 1, "not a key").is_err());
+            assert!(index.add_buffer_key("bad", 1, "not a key", None).is_err());
+            assert!(index.add_buffer_key("list", 1, &key(b"x"), Some("[1]")).is_err());
+            // a quad's indices, in two models: the part of each is found by its file
+            for file in ["a.flver", "b.flver"] {
+                index
+                    .add_buffer_key(&format!("{file}#faces0"), 12, &key(b"0 1 2 2 1 3"), None)
+                    .unwrap();
+            }
             assert!(
                 index
-                    .add_buffer_key("upper", 1, &key(bytes).to_uppercase())
+                    .add_buffer_key("upper", 1, &key(bytes).to_uppercase(), None)
                     .is_err()
             );
         }
         let index = Index::open(&path).unwrap();
         let (files, count) = index.whole(&key(bytes), &Like::Buffer, 10);
         assert_eq!((files[0].name.as_str(), count), ("m.flver#vb0", 1));
+        assert_eq!(
+            files[0].about.as_deref(),
+            Some(r#"{"material": "Wall", "mtd": "Wall.matxml"}"#)
+        );
+        let quad = key(b"0 1 2 2 1 3");
+        assert_eq!(index.part(&quad, "b.flver").unwrap().name, "b.flver#faces0");
+        assert!(index.part(&quad, "b.flv").is_none());
         drop(index);
         let _ = std::fs::remove_file(&path);
     }

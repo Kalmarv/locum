@@ -48,6 +48,9 @@ struct Line {
     /// Every file an index holds with the same bytes, `file`'s first, when there is more than one.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     files: Vec<String>,
+    /// What the reader that listed `file` said of it (a key list's fourth column).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    about: Option<serde_json::Value>,
     offset: Option<i64>,
     size: Option<i64>,
     stride: Option<i64>,
@@ -136,10 +139,10 @@ pub fn bindings(c: &Capture, f: &Filter, json: bool) -> Result<(), String> {
             {
                 continue;
             }
-            let (file, files) = match files_of(c, b, &call, &args, &vbs) {
-                Some((text, files)) if files.len() > 1 => (Some(text), files),
-                Some((text, _)) => (Some(text), Vec::new()),
-                None => (None, Vec::new()),
+            let (file, files, about) = match files_of(c, b, &call, &args, &vbs) {
+                Some(n) if n.files.len() > 1 => (Some(n.text), n.files, n.about),
+                Some(n) => (Some(n.text), Vec::new(), n.about),
+                None => (None, Vec::new(), None),
             };
             if file_part
                 .as_ref()
@@ -179,6 +182,7 @@ pub fn bindings(c: &Capture, f: &Filter, json: bool) -> Result<(), String> {
                 shape,
                 file,
                 files,
+                about,
                 offset: b.offset,
                 size: b.size,
                 stride: b.stride,
