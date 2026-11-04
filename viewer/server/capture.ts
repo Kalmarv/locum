@@ -9,6 +9,15 @@ import { formatName, readable, readTexel, textureSubs, type Sub, layout } from "
 
 type Row = Record<string, any>;
 
+/** The schema versions this viewer reads, by API: capture/src/db.rs `SCHEMA_VERSION` and `D3D12_SCHEMA_VERSION`. A
+ * schema bump that changes no table the viewer queries only raises the upper bound. */
+export const SCHEMAS: Record<string, [number, number]> = { d3d11: [1, 1], d3d12: [2, 5] };
+
+export function schemaReadable(api: string, version: string): boolean {
+  const range = SCHEMAS[api];
+  return !!range && /^\d+$/.test(version) && Number(version) >= range[0] && Number(version) <= range[1];
+}
+
 const STAGE_ORDER: Record<string, number> = { ia: 0, vs: 1, hs: 2, ds: 3, gs: 4, so: 5, ps: 6, cs: 7, om: 8 };
 const KIND_ORDER: Record<string, number> = { ib: 0, vb: 1, cb: 2, srv: 3, uav: 4, sampler: 5, so: 6, rtv: 7, dsv: 8 };
 
@@ -141,7 +150,7 @@ export class Capture {
       this.handle = new Database(this.path, { readonly: true });
       this.handle.exec("PRAGMA query_only = ON");
       const meta = Object.fromEntries((this.handle.query("SELECT key,value FROM meta WHERE key IN ('api','schema_version')").all() as Row[]).map(r => [r.key, r.value]));
-      if (!((meta.api === "d3d11" && meta.schema_version === "1") || (meta.api === "d3d12" && meta.schema_version === "2"))) {
+      if (!schemaReadable(String(meta.api), String(meta.schema_version))) {
         this.handle.close();
         this.handle = null;
         throw new Error(`Capture API ${meta.api}, schema ${meta.schema_version} is not readable by this viewer`);
