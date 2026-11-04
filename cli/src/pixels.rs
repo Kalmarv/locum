@@ -285,3 +285,172 @@ pub fn changes(c: &Capture, arg: &str, sub: Option<u32>, rect: Option<[u32; 4]>)
     }
     Ok(())
 }
+
+/// Texel (x, y) of the target a readback holds (`DRAW:TARGET`) after each event of the frame that wrote it up to the
+/// readback, by replaying them: which draws inside a pass wrote it, where the readbacks show only each pass's end.
+/// The replayed texel at the end is compared with the readback's.
+pub fn within(c: &Capture, arg: &str, x: u32, y: u32, sub: Option<u32>, warp: bool) -> Result<(), String> {
+    let Some((draw, name)) = arg.split_once(':') else {
+        return Err(format!(
+            "{arg}: --draws takes DRAW:TARGET, a readback whose pass is replayed"
+        ));
+    };
+    let draw: i64 = draw.parse().map_err(|_| format!("{arg}: not DRAW:TARGET"))?;
+    let s = subject(c, arg, sub)?;
+    // Captures from before the readback's event was kept: the draw's.
+    let has_event = c.count(
+        "SELECT count(*) FROM pragma_table_info('targets') WHERE name = 'event'",
+        [],
+    ) > 0;
+    let (event, readback): (i64, Option<String>) = c
+        .row(
+            &format!(
+                "SELECT {}, t.blob FROM targets t JOIN draws d ON d.n = t.draw WHERE t.draw = ?1 AND t.target = ?2",
+                if has_event { "coalesce(t.event, d.event)" } else { "d.event" }
+            ),
+            rusqlite::params![draw, name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .ok_or_else(|| format!("no {name} read back after draw {draw}"))?;
+    let shape =
+        crate::describe::shape(c, s.resource).ok_or_else(|| format!("no resource #{}", s.resource))?;
+    let subs = shape.subs();
+    let place = subs
+        .iter()
+        .find(|p| i64::from(p.index) == s.sub)
+        .ok_or_else(|| format!("#{} has no subresource {}", s.resource, s.sub))?;
+    let block = format::layout(format::readable(shape.format))
+        .filter(|l| l.block_width == 1 && l.block_height == 1)
+        .ok_or_else(|| {
+            format!(
+                "{} is block-compressed: --draws reads plain formats",
+                format::name(shape.format)
+            )
+        })?
+        .block_bytes;
+    if x >= place.width || y >= place.height {
+        return Err(format!(
+            "({x}, {y}) is outside its {}x{}",
+            place.width, place.height
+        ));
+    }
+    let at = (place.offset
+        + u64::try_from(s.z).unwrap_or(0) * place.slice_bytes()
+        + u64::from(y) * u64::from(place.row_bytes)
+        + u64::from(x) * u64::from(block)) as usize;
+    // A texel as its channels' bits, and its stencil for a depth-stencil format.
+    let texel = |bytes: &[u8]| -> Result<Vec<u32>, String> {
+        let one = bytes
+            .get(at..at + block as usize)
+            .ok_or_else(|| format!("{} bytes, the texel at {at}", bytes.len()))?;
+        let image = texels::decode(shape.format, 1, 1, one)?;
+        let (v, stencil) = value(&image, 0, 0).ok_or("no texel")?;
+        let mut words = bits(&v);
+        words.extend(stencil.map(u32::from));
+        Ok(words)
+    };
+    let stencil = matches!(shape.format, 19 | 20 | 44 | 45);
+    let shown = |words: &[u32]| -> String {
+        let (v, s) = match words.split_last() {
+            Some((s, v)) if stencil => (v, Some(s)),
+            _ => (words, None),
+        };
+        let values = v
+            .iter()
+            .map(|b| f32::from_bits(*b).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        match s {
+            Some(s) => format!("depth {values} stencil {s}"),
+            None => values,
+        }
+    };
+    let writers: std::collections::HashSet<i64> = c
+        .rows(
+            "SELECT event FROM event_resources WHERE resource = ?1 AND access = 'write' AND event <= ?2",
+            [s.resource, event],
+            |r| r.get(0),
+        )
+        .into_iter()
+        .collect();
+    let first: Option<Vec<u32>> = c
+        .row("SELECT content FROM resources WHERE id = ?1", [s.resource], |r| {
+            r.get::<_, Option<String>>(0)
+        })
+        .flatten()
+        .and_then(|k| c.blob(&k).ok())
+        .and_then(|b| texel(&b).ok());
+    let plan = crate::replay::plan_before(c, s.resource, event + 1);
+    let mut after: Vec<(i64, Result<Vec<u32>, String>)> = Vec::new();
+    let warnings = crate::replay::run(
+        c,
+        &plan,
+        &[],
+        warp,
+        false,
+        |seq, b| {
+            if writers.contains(&seq) {
+                after.push((seq, b.read(s.resource).and_then(|bytes| texel(&bytes))));
+            }
+            Ok(())
+        },
+        |_| Ok(()),
+    )?;
+    out!(
+        "#{} sub {} ({}), texel ({x}, {y}): {} events wrote it up to {name} after draw {draw}, replayed",
+        s.resource,
+        s.sub,
+        format::name(shape.format),
+        after.len()
+    );
+    out!(
+        "  as the frame began: {}",
+        first.as_deref().map_or("(no contents)".to_string(), shown)
+    );
+    out!("{:>7} {:>6} {:>5} {:<28} value", "event", "draw", "pass", "call");
+    let mut last = first.clone();
+    let mut changes = 0;
+    for (seq, v) in &after {
+        let (n, pass, call): (Option<i64>, Option<i64>, String) = c
+            .row(
+                "SELECT d.n, d.pass, e.call FROM events e LEFT JOIN draws d ON d.event = e.seq WHERE e.seq = ?1",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap_or((None, None, "?".into()));
+        let o = |v: Option<i64>| v.map_or("-".to_string(), |v| v.to_string());
+        match v {
+            Ok(words) if last.as_ref() == Some(words) => {}
+            Ok(words) => {
+                changes += 1;
+                out!("{seq:>7} {:>6} {:>5} {call:<28} {}", o(n), o(pass), shown(words));
+                last = Some(words.clone());
+            }
+            Err(e) => out!("{seq:>7} {:>6} {:>5} {call:<28} ({e})", o(n), o(pass)),
+        }
+    }
+    out!(
+        "({changes} of the {} writes changed it; the rest left it as it was)",
+        after.len()
+    );
+    let recorded = readback.and_then(|k| c.blob(&k).ok()).and_then(|bytes| {
+        let image = texels::decode(shape.format, place.width, place.height, &bytes).ok()?;
+        let (v, st) = value(&image, x, y)?;
+        let mut w = bits(&v);
+        w.extend(st.map(u32::from));
+        Some(w)
+    });
+    match (recorded, &last) {
+        (Some(r), Some(l)) if r == *l => out!("the replayed texel is the readback's"),
+        (Some(r), Some(l)) => out!(
+            "the replayed texel ({}) is not the readback's ({}): the replay is not what the game drew here",
+            shown(l),
+            shown(&r)
+        ),
+        _ => out!("(no readback texel to compare with)"),
+    }
+    for w in warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(())
+}

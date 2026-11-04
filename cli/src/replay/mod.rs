@@ -417,6 +417,38 @@ fn execute(
     debug: bool,
     outs: &[Output],
 ) -> Result<(ResourceBytes, Vec<String>), String> {
+    let mut results = HashMap::new();
+    let warnings = run(
+        c,
+        plan,
+        rules,
+        warp,
+        debug,
+        |_, _| Ok(()),
+        |b| {
+            for o in outs {
+                if let std::collections::hash_map::Entry::Vacant(e) = results.entry(o.resource) {
+                    e.insert(b.read(o.resource)?);
+                }
+            }
+            Ok(())
+        },
+    )?;
+    Ok((results, warnings))
+}
+
+/// Runs `plan`: makes its resources with their contents as the frame began, then runs its events in order, calling
+/// `after` with each event and the backend once it has run (and its order-dependent outputs are put back), and `end`
+/// at the end. Gives what the backend could not do as recorded.
+pub fn run(
+    c: &Capture,
+    plan: &Plan,
+    rules: &[Rule],
+    warp: bool,
+    debug: bool,
+    mut after: impl FnMut(i64, &mut dyn Backend) -> Result<(), String>,
+    end: impl FnOnce(&mut dyn Backend) -> Result<(), String>,
+) -> Result<Vec<String>, String> {
     let mut b = backend(c, warp, debug)?;
     let mut missing = 0;
     for &id in &plan.resources {
@@ -452,13 +484,9 @@ fn execute(
             .iter()
             .filter(|s| s.ordered)
             .count();
+        after(seq, b.as_mut())?;
     }
-    let mut results = HashMap::new();
-    for o in outs {
-        if let std::collections::hash_map::Entry::Vacant(e) = results.entry(o.resource) {
-            e.insert(b.read(o.resource)?);
-        }
-    }
+    end(b.as_mut())?;
     let mut warnings = b.warnings();
     if missing > 0 {
         warnings.push(format!(
@@ -470,7 +498,7 @@ fn execute(
             "{settled} outputs of order-dependent draws and dispatches are the game's, so rules do not change them"
         ));
     }
-    Ok((results, warnings))
+    Ok(warnings)
 }
 
 /// A resource checkpoint after a draw/dispatch UAV write or a clear.

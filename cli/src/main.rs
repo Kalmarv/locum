@@ -458,6 +458,13 @@ enum Command {
         /// Only the readbacks where the texel changed.
         #[arg(long)]
         changed: bool,
+        /// After each event that wrote it up to the readback DRAW:TARGET names, replayed: which draws inside a pass
+        /// wrote the texel.
+        #[arg(long)]
+        draws: bool,
+        /// Replay on WARP (with --draws).
+        #[arg(long)]
+        warp: bool,
     },
     /// For every readback of a target after a pass, how many texels differ from the readback before and where.
     Changes {
@@ -1008,7 +1015,18 @@ fn run(cli: Cli) -> Result<(), String> {
             y,
             sub,
             changed,
+            draws: false,
+            ..
         } => pixels::pixel(&open(&capture)?, &target, x, y, sub, changed),
+        Command::Pixel {
+            capture,
+            target,
+            x,
+            y,
+            sub,
+            warp,
+            ..
+        } => pixels::within(&open(&capture)?, &target, x, y, sub, warp),
         Command::Changes {
             capture,
             target,
