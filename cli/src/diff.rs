@@ -175,7 +175,8 @@ fn differences(ca: &Capture, a: i64, cb: &Capture, b: i64, ra: &mut Reflection) 
     // kind one draw has no state object for is the API's default.
     let state = |c: &Capture, n: i64| -> BTreeMap<String, String> {
         c.rows(
-            "SELECT s.kind, s.json FROM draws d JOIN states s ON s.id IN (d.rasterizer, d.blend, d.depth_stencil)              WHERE d.n = ?1",
+            "SELECT s.kind, s.json FROM draws d JOIN states s ON s.id IN (d.rasterizer, d.blend, d.depth_stencil) \
+             WHERE d.n = ?1",
             [n],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default())),
         )

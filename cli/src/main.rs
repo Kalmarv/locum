@@ -1,6 +1,8 @@
 //! locum-cli: reads the captures locum writes. A capture is named by its `capture.db`, the folder holding it, its
 //! name under locum's folder (`LOCUM_DIR`, or `%LOCALAPPDATA%\locum`), or `last`.
 
+mod bindings;
+mod constants;
 mod describe;
 mod diff;
 mod draw;
@@ -83,9 +85,10 @@ impl PictureArgs {
 
 #[derive(Subcommand)]
 enum Command {
-    /// The captures in locum's folder, newest first.
+    /// The captures in locum's folder, or under any folder, newest first.
     Captures {
-        /// locum's folder (default LOCUM_DIR or %LOCALAPPDATA%\locum).
+        /// locum's folder (default LOCUM_DIR or %LOCALAPPDATA%\locum), a run's folder or its `locum-log`, or a folder
+        /// of runs (each `<run>/locum-log/captures/<name>`).
         dir: Option<PathBuf>,
     },
     /// What a capture holds, and what it is missing.
@@ -124,6 +127,56 @@ enum Command {
         #[arg(long)]
         binds: Option<String>,
     },
+    /// Every register the draws had bound, one tab-separated row each (or JSON lines): the program's name for it and
+    /// whether it reads it, the resource, its shape and file, the command list, and the last write before the draw.
+    Bindings {
+        capture: String,
+        /// One draw, or draws `A..B` (both included).
+        #[arg(long, value_parser = parse_draws)]
+        draws: Option<(i64, i64)>,
+        /// Rows binding this resource.
+        #[arg(long)]
+        resource: Option<i64>,
+        /// cb, srv, uav, sampler, rtv, dsv, vb, ib or so.
+        #[arg(long)]
+        kind: Option<String>,
+        /// vs, hs, ds, gs, ps, cs (or ia, om for vertex, index and target bindings).
+        #[arg(long)]
+        stage: Option<String>,
+        /// Registers whose name in the program holds this (any case): `--name g_SSS`.
+        #[arg(long)]
+        name: Option<String>,
+        /// Rows whose file (from `--index`) holds this (any case).
+        #[arg(long)]
+        file: Option<String>,
+        /// Only registers the program (or the input layout) reads.
+        #[arg(long, conflicts_with = "unread")]
+        read: bool,
+        /// Only registers it does not read.
+        #[arg(long)]
+        unread: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Named constants across draws, and across captures: each word whose name in the program's reflection holds one
+    /// of `--name`'s parts, a tab-separated row per draw (or, with `--distinct`, each value and how many draws read it).
+    Constants {
+        /// One capture or more (a capture column is added for several).
+        #[arg(required = true)]
+        captures: Vec<String>,
+        /// Parts of the constant's full name, any case, separated by `|`: `SC_CameraPos`, `BloodAmount|TexScroll`.
+        #[arg(long)]
+        name: String,
+        /// One draw, or draws `A..B` (both included).
+        #[arg(long, value_parser = parse_draws)]
+        draws: Option<(i64, i64)>,
+        /// vs, hs, ds, gs, ps or cs.
+        #[arg(long)]
+        stage: Option<String>,
+        /// Each name's distinct values, with how many draws read each and the first and last of them.
+        #[arg(long)]
+        distinct: bool,
+    },
     /// One draw: its shaders, state, everything bound, its constants by name, and the targets read after it.
     Draw {
         capture: String,
@@ -158,7 +211,8 @@ enum Command {
         /// Only these registers: `--reg 3,26`.
         #[arg(long, value_delimiter = ',')]
         reg: Vec<u32>,
-        /// Only registers holding a variable whose name has this in it (any case): `--name SC_CameraPos`.
+        /// Only registers holding a variable whose name has this in it (any case; parts separated by `|`):
+        /// `--name SC_CameraPos`, `--name 'NormalMapScroll|waveTime'`. Across draws: `constants`.
         #[arg(long)]
         name: Option<String>,
     },
@@ -173,6 +227,12 @@ enum Command {
         /// Match 32-bit integers instead of floats.
         #[arg(long)]
         int: bool,
+        /// Only in constant buffers of this stage (vs, ps, cs, ...).
+        #[arg(long)]
+        stage: Option<String>,
+        /// Only at a variable whose name has this in it (any case): `--name Scroll`.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Passes: runs of draws with the same targets.
     Passes { capture: String },
@@ -198,6 +258,9 @@ enum Command {
         /// Contents, upload or subresource key (or its start).
         #[arg(long)]
         hash: Option<String>,
+        /// How many of each kind and format (named), instead of one line each.
+        #[arg(long)]
+        counts: bool,
     },
     /// One resource: its description, where it was made, its contents and hashes, and what the frame did with it.
     Resource { capture: String, id: i64 },
@@ -219,7 +282,18 @@ enum Command {
     /// A call stack, as module+offset.
     Stack { capture: String, id: i64 },
     /// The shaders the frame used, and how many draws used each.
-    Shaders { capture: String },
+    Shaders {
+        capture: String,
+        /// vs, hs, ds, gs, ps or cs.
+        #[arg(long)]
+        stage: Option<String>,
+        /// Programs whose name holds this (any case).
+        #[arg(long)]
+        name: Option<String>,
+        /// Each with the registers its reflection declares (`t4  g_GBuffer2Texture`).
+        #[arg(long)]
+        bindings: bool,
+    },
     /// What output lanes of a draw are made of: the texture channels, constants (by name, with the draw's values) and
     /// vertex attributes (through the vertex program, by semantic, with the input-layout element) each comes from, and
     /// how: as its value, only as an address (a texel coordinate, an index), or only through a condition.
@@ -272,8 +346,12 @@ enum Command {
     Export {
         capture: String,
         id: i64,
+        /// A .dds (all of it), a .png (one mip), anything else raw bytes; `-` writes the raw bytes to stdout.
         #[arg(short, long)]
         out: PathBuf,
+        /// Of a buffer, only bytes `A..B` (raw): the range a draw bound (`bindings` gives each one's offset and size).
+        #[arg(long, value_parser = parse_draws)]
+        bytes: Option<(i64, i64)>,
         #[arg(long)]
         sub: Option<u32>,
         #[arg(long, default_value_t = 0)]
@@ -476,6 +554,10 @@ enum Command {
         /// List those not found instead.
         #[arg(long)]
         unnamed: bool,
+        /// Only those made from a file whose name holds this (any case): `--name /map/m10`.
+        #[arg(long, conflicts_with = "unnamed")]
+        name: Option<String>,
+        /// List at most this many (the totals count them all).
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
@@ -494,6 +576,15 @@ enum Command {
 
 fn range(s: &str) -> Result<Range, String> {
     Range::parse(s).ok_or_else(|| format!("--range {s}: auto, clamp, tonemap or LO:HI"))
+}
+
+/// `N` or `A..B` (both included).
+fn parse_draws(s: &str) -> Result<(i64, i64), String> {
+    let n = |v: &str| v.trim().parse::<i64>().map_err(|e| format!("{v:?}: {e}"));
+    match s.split_once("..") {
+        Some((a, b)) => Ok((n(a)?, n(b.trim_start_matches('='))?)),
+        None => n(s).map(|v| (v, v)),
+    }
 }
 
 fn sql(c: &open::Capture, query: &str) -> Result<(), String> {
@@ -560,6 +651,41 @@ fn run(cli: Cli) -> Result<(), String> {
                 binds,
             },
         ),
+        Command::Bindings {
+            capture,
+            draws,
+            resource,
+            kind,
+            stage,
+            name,
+            file,
+            read,
+            unread,
+            json,
+        } => bindings::bindings(
+            &open(&capture)?,
+            &bindings::Filter {
+                draws,
+                resource,
+                kind,
+                stage,
+                name,
+                file,
+                read: (read || unread).then_some(read),
+            },
+            json,
+        ),
+        Command::Constants {
+            captures,
+            name,
+            draws,
+            stage,
+            distinct,
+        } => constants::constants(
+            &captures,
+            open,
+            &constants::Filter::new(&name, draws, stage, distinct),
+        ),
         Command::Draw {
             capture,
             n,
@@ -592,7 +718,16 @@ fn run(cli: Cli) -> Result<(), String> {
             value,
             tolerance,
             int,
-        } => draws::find(&open(&capture)?, value, tolerance, int),
+            stage,
+            name,
+        } => draws::find(
+            &open(&capture)?,
+            value,
+            tolerance,
+            int,
+            stage.as_deref(),
+            name.as_deref(),
+        ),
         Command::Passes { capture } => draws::passes(&open(&capture)?),
         Command::Resources {
             capture,
@@ -603,6 +738,7 @@ fn run(cli: Cli) -> Result<(), String> {
             width,
             height,
             hash,
+            counts,
         } => resources::resources(
             &open(&capture)?,
             &resources::Filter {
@@ -613,6 +749,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 hash,
                 width,
                 height,
+                counts,
             },
         ),
         Command::Resource { capture, id } => resources::resource(&open(&capture)?, id),
@@ -632,7 +769,12 @@ fn run(cli: Cli) -> Result<(), String> {
             },
         ),
         Command::Stack { capture, id } => resources::stack(&open(&capture)?, id),
-        Command::Shaders { capture } => shaders::shaders(&open(&capture)?),
+        Command::Shaders {
+            capture,
+            stage,
+            name,
+            bindings,
+        } => shaders::shaders(&open(&capture)?, stage.as_deref(), name.as_deref(), bindings),
         Command::Shader {
             capture,
             hash,
@@ -679,6 +821,7 @@ fn run(cli: Cli) -> Result<(), String> {
             upload,
             at,
             warp,
+            bytes,
             picture,
         } => export::export(
             &open(&capture)?,
@@ -692,6 +835,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 upload,
                 at,
                 warp,
+                bytes,
             },
             &picture.picture()?,
         ),
@@ -709,10 +853,12 @@ fn run(cli: Cli) -> Result<(), String> {
                     let id: i64 = c
                         .meta("presented")
                         .and_then(|v| v.parse().ok())
-                        .ok_or("the capture does not record which buffer it presented (locum before 2026-11-04 did                                 not); `last` gives the frame's last readback of a target")?;
+                        .ok_or("the capture does not record which buffer it presented (locum before 2026-11-04 did not); `last` gives the frame's last readback of a target")?;
                     let (draw, target): (i64, String) = c
                         .row(
-                            "SELECT t.draw, t.target FROM targets t JOIN bindings b ON b.draw = t.draw                              AND b.kind = 'rtv' AND 'rt' || b.slot = t.target                              WHERE b.resource = ?1 AND t.blob IS NOT NULL ORDER BY t.event DESC LIMIT 1",
+                            "SELECT t.draw, t.target FROM targets t JOIN bindings b ON b.draw = t.draw \
+                             AND b.kind = 'rtv' AND 'rt' || b.slot = t.target \
+                             WHERE b.resource = ?1 AND t.blob IS NOT NULL ORDER BY t.event DESC LIMIT 1",
                             [id],
                             |r| Ok((r.get(0)?, r.get(1)?)),
                         )
@@ -858,8 +1004,9 @@ fn run(cli: Cli) -> Result<(), String> {
             capture,
             all,
             unnamed,
+            name,
             limit,
-        } => join::join(&open(&capture)?, all, unnamed, limit),
+        } => join::join(&open(&capture)?, all, unnamed, name.as_deref(), limit),
         Command::Sql { capture, query } => sql(&open(&capture)?, &query),
         Command::Upgrade { capture, check } => upgrade::upgrade(&open(&capture)?, check),
     }

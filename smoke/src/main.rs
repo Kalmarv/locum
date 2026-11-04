@@ -983,7 +983,8 @@ fn capture(
         .unwrap_or(i64::MAX);
     checks.check(unread == 0, "contents: every resource the frame used has them");
     let dynamic = resource(
-        "SELECT r.id, r.content, r.content_source, r.upload FROM resources r JOIN bindings b ON b.resource = r.id          WHERE b.draw = 1 AND b.kind = 'vb' AND b.slot = 0",
+        "SELECT r.id, r.content, r.content_source, r.upload FROM resources r JOIN bindings b ON b.resource = r.id \
+         WHERE b.draw = 1 AND b.kind = 'vb' AND b.slot = 0",
     );
     println!("dynamic vertex buffer: {dynamic:?}");
     checks.check(

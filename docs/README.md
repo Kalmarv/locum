@@ -20,8 +20,10 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
 
 - `locum.log`: what was wrapped, the frame rate every 600 frames, and each interface the game asked for that locum
   passes to the real object unwrapped.
-- `shaders/<hash>.<stage>.dxbc`: the bytecode of every shader the game creates, once per distinct shader. The hash
-  is FNV-1a 64 of the bytecode.
+- `shaders/<hash>.<stage>.dxbc`: the bytecode of every shader the game creates, once per distinct shader. On
+  Direct3D 11 the hash is FNV-1a 64 of the bytecode from the offset basis `1469598103934665603` (the standard basis
+  with its last digit dropped, kept so hashes match earlier captures of these games), 16 hex digits; on Direct3D 12 it
+  is the bytecode's blob key (XXH3-128, 32 hex digits). `locum-cli hash FILE...` prints both for any file.
 - `captures/<name>/capture.db`: a captured frame (below). Create a file named `capture` in the folder to request one;
   locum removes it, records the next frames and writes the capture. Each line of the file is an option, and an empty
   file captures everything:
@@ -84,7 +86,11 @@ contents. locum's own copies run whatever predicate the game has set.
   key of the bytes written), resolves and mip generation, each with its context, command list and call stack;
 - `draws`, `bindings`, `viewports`, `scissors`: each draw's shaders and state, and everything bound to it by stage,
   kind (`cb`, `srv`, `uav`, `sampler`, `rtv`, `dsv`, `vb`, `ib`, `so`) and slot, constant buffers with the bytes the
-  GPU read (`cb_data`);
+  GPU read (`cb_data`). `bindings.content` is set for `cb` rows only (the key of the bytes the GPU read); any other
+  binding's contents as the frame began are its resource's (`resources.content`). `draws.args` is the call's
+  arguments in the API's order: `DrawIndexedInstanced` [index count, instances, start index, base vertex, start
+  instance], `DrawInstanced` [vertex count, instances, start vertex, start instance], `DrawIndexed` [count, start,
+  base], `Dispatch` [x, y, z] (`draw` names them). Formats everywhere are `DXGI_FORMAT` numbers, which the CLI names;
 - `passes` and `targets`: runs of draws with the same targets, and the targets read back after each one's last draw
   (in the format the pass drew in; depth as the colour format of the same bits, D24S8 as R24_UNORM_X8). Every
   array slice and 3D depth plane covered by the view has a row: `sub` identifies its subresource, `z` its depth
@@ -213,20 +219,31 @@ GPU saw at that point of the frame.
 
 ## Reading a capture
 
-`locum-cli` reads captures. A capture is named by its `capture.db`, its folder, its name under locum's folder, or
-`last`:
+`locum-cli` reads captures. A capture is named by its `capture.db`, its folder, a folder with one capture under it
+(a run's folder, holding `locum-log/captures/<name>`), `<folder>/<name>` for the capture `name` under such a folder,
+its name under locum's folder, or `last`:
 
 ```
 locum-cli captures                         # the captures in locum's folder, newest first
+locum-cli captures runs                    # those under any folder (a run, its locum-log, a folder of runs), with
+                                           # what each holds: constants, contents, targets read back, presented
 locum-cli info last                        # what it holds, and what it is missing
 locum-cli draws last --ps 9f2c --pass 3    # draws, filtered by shader, pass, --uses/--target RESOURCE, --content KEY
 locum-cli draw last 120                    # one draw: state, everything bound, constants by name, targets after it
+locum-cli bindings last --name g_SSS       # every register the draws had bound, one row each: the program's name
+                                           # for it, whether it reads it (--read), resource, shape, file, command
+                                           # list, the last write before the draw; --draws 100..200, --resource N,
+                                           # --kind, --stage, --file; --json for JSON lines
 locum-cli cb last 120 ps 3                 # a constant buffer, every register, named from the shader's reflection
+locum-cli constants m15 m16 --name SC_CameraPos --distinct  # named constants across draws and captures: a row
+                                           # per draw (or each value and how many draws read it); parts with `|`
 locum-cli find last 0.35                   # which constant holds 0.35, its name, and the draws that saw it
+                                           # (--stage ps, --name Scroll narrow it)
 locum-cli passes last
 locum-cli resources last --used --format BC7_UNORM
 locum-cli resource last 812                # where it was made (call stack), hashes, views, draws, events
 locum-cli events last --kind copy          # the timeline; --resource N for what touched one resource
+locum-cli shaders last --stage ps --name Gbuf --bindings  # programs by name, each with the registers it declares
 locum-cli shader last 9f2c -d              # constant buffers, textures and samplers by register, and disassembly
 locum-cli trace last 120 rt1.z            # what target 1's blue lane is made of: each texture channel, constant (by
                                            # name, with the draw's value) and vertex attribute (through the vertex
@@ -235,9 +252,12 @@ locum-cli trace last 120 rt1.z            # what target 1's blue lane is made of
                                            # SV_Target1.z, rt1, o1.z, depth, SV_Position.z, discard; none: all
 locum-cli shader last 9f2c --trace o1.z   # the same for one program, to its own inputs
 locum-cli draw last all --json > d.jsonl   # every draw as JSON, one per line (also: draw N --json, cb --json,
-                                           # shader --json with every constant by its full name)
+                                           # trace --json, shader --json with every constant by its full name);
+                                           # `bindings` and `constants` are the smaller routes for a census
 locum-cli export last 812 -o tex.dds       # contents as the frame began: .dds (all of it), .png (one mip), or raw
+                                           # (-o - writes the raw bytes to stdout; --bytes A..B a buffer's range)
 locum-cli export last 812 --at 3301 -o t.dds  # as event 3301 saw them, replayed with the events that wrote them
+                                           # (Direct3D 12: buffers only, rebuilt from their copies, below)
 locum-cli target last 120 rt0 -o gbuf0.png # a target read back after a pass (-o - writes the raw bytes to stdout)
 locum-cli target last presented -o frame.png # the presented picture: the last readback of the back buffer the
                                              # frame presented (`info` names it); captures before 2026-11-04 do
@@ -248,7 +268,8 @@ locum-cli target last 120 rt3 -o a.png --channel a   # one channel as grey; the 
                                            # zero, for a sparse atlas) draw a part (export takes them too)
 locum-cli pixel last 120:rt0 960 540       # that texel in every readback of the target: which passes changed it
 locum-cli changes last 120:rt0 --rect 0,0,640,360  # texels each pass changed in a region, and where
-locum-cli cb last 120 vs 8 --name ViewProj # only the registers of matching variables (--reg 3,26 by number)
+locum-cli cb last 120 vs 8 --name ViewProj # only the registers of matching variables (--reg 3,26 by number;
+                                           # --name 'Scroll|waveTime' for several)
 locum-cli draw last 120 --section bound,cb # only those parts (state, bound, cb, targets)
 locum-cli sql last "SELECT ..."            # anything else
 locum-cli upgrade last --check             # what an older locum derived, brought up to this one (see below)
@@ -256,7 +277,15 @@ locum-cli upgrade last --check             # what an older locum derived, brough
 
 `draw` leaves out what the draw does not read (`--all` keeps it, marked): registers its programs' reflection does not
 list, and vertex buffer slots no element of its input layout reads, where a game left buffers bound for an earlier draw.
-A match of only index bytes is corroborated by the vertex buffers the draw reads, not those it leaves unread.
+A match of only index bytes is corroborated by the vertex buffers the draw reads, not those it leaves unread. The
+`bindings` table keeps every row (a D3D12 root table binds every descriptor of its ranges); `locum-cli bindings`
+says which ones the program reads (`read`), so SQL is not needed for that.
+
+On Direct3D 12, `export --at` rebuilds a buffer as an event saw it without a replay: its contents as the frame began,
+with each copy into it applied in order (a copy from an upload buffer reads the bytes that buffer held when the copy's
+submission ran, which the capture keeps per submission; a copy from another buffer reads that one at the copy) and
+each `WriteBufferImmediate`. A buffer a dispatch or a query resolve wrote before the event is refused: the capture
+holds no bytes of those writes.
 
 `upgrade` rewrites what a capture derived, not what it recorded, from the capture's own authoritative records, in one
 transaction (`--check` says what it would change and writes nothing). D3D12 bindings are projected again from each

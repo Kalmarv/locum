@@ -12,7 +12,10 @@ use windows::core::PCSTR;
 use crate::open::Capture;
 use crate::out;
 
-pub fn shaders(c: &Capture) -> Result<(), String> {
+/// The frame's programs, with the draws using each and their names: of stage `stage`, and whose name holds `name`
+/// (any case), when given; with `bindings`, each with the registers its reflection declares.
+pub fn shaders(c: &Capture, stage: Option<&str>, name: Option<&str>, bindings: bool) -> Result<(), String> {
+    let wanted = name.map(str::to_lowercase);
     let mut uses: HashMap<String, i64> = HashMap::new();
     for stage in ["vs", "hs", "ds", "gs", "ps", "cs"] {
         let counts: Vec<(String, i64)> = c.rows(
@@ -37,13 +40,57 @@ pub fn shaders(c: &Capture) -> Result<(), String> {
         "bytes",
         "draws"
     );
-    for (h, stage, size) in rows {
+    let mut shown = 0;
+    for (h, stage_of, size) in rows {
+        if stage.is_some_and(|s| s != stage_of) {
+            continue;
+        }
+        let named = reflection.name(c, &h).map(str::to_string);
+        if wanted
+            .as_ref()
+            .is_some_and(|w| !named.as_ref().is_some_and(|n| n.to_lowercase().contains(w)))
+        {
+            continue;
+        }
+        shown += 1;
         out!(
-            "{stage:<5} {h:<16} {:>7} {:>6}  {}",
+            "{stage_of:<5} {h:<16} {:>7} {:>6}  {}",
             size.map_or("-".into(), |s| s.to_string()),
             uses.get(&h).copied().unwrap_or(0),
-            reflection.name(c, &h).unwrap_or("-")
+            named.as_deref().unwrap_or("-")
         );
+        if bindings {
+            let declared = c
+                .row(
+                    "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
+                    [&h],
+                    |r| r.get::<_, String>(0),
+                )
+                .and_then(|key| c.blob(&key).ok())
+                .and_then(|code| locum_capture::rdef::bindings(&code));
+            match declared {
+                Some(list) if !list.is_empty() => {
+                    for b in list {
+                        let letter = letter(b.class());
+                        let count = match b.count {
+                            0 => "[]".to_string(),
+                            1 => String::new(),
+                            n => format!("[{n}]"),
+                        };
+                        let space = match b.space {
+                            0 => String::new(),
+                            s => format!(" space{s}"),
+                        };
+                        out!("      {letter}{}{space}  {}{count}", b.slot, b.name);
+                    }
+                }
+                Some(_) => out!("      (declares no registers)"),
+                None => out!("      (no reflection)"),
+            }
+        }
+    }
+    if shown == 0 && (stage.is_some() || name.is_some()) {
+        out!("no program matches (names come from the programs' debug names)");
     }
     Ok(())
 }

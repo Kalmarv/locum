@@ -62,7 +62,8 @@ pub fn upgrade(c: &Capture, check: bool) -> Result<(), String> {
     // carries its own, which the projection above gives).
     if !d3d12 {
         plan.strides = c.rows(
-            "SELECT b.rowid, r.stride FROM bindings b JOIN resources r ON r.id = b.resource WHERE b.stride IS NULL              AND b.kind IN ('srv', 'uav') AND r.misc & 64 != 0 AND r.stride > 0",
+            "SELECT b.rowid, r.stride FROM bindings b JOIN resources r ON r.id = b.resource WHERE b.stride IS NULL \
+             AND b.kind IN ('srv', 'uav') AND r.misc & 64 != 0 AND r.stride > 0",
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         );

@@ -24,13 +24,25 @@ pub struct Capture {
     pub names: Names,
 }
 
-/// The captures under `dir/captures`, newest first.
+/// The captures under `dir`, newest first, in any of the layouts locum and the run scripts leave: `dir` is locum's
+/// folder or a run's `locum-log` (`captures/<name>/capture.db`), a `captures` folder (`<name>/capture.db`), a run
+/// (`locum-log/captures/<name>/capture.db`), or a folder of runs (`<run>/locum-log/captures/<name>/capture.db`).
 pub fn list(dir: &Path) -> Vec<PathBuf> {
-    let mut found: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir.join("captures"))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path().join("capture.db"))
+    let subdirs = |d: &Path| -> Vec<PathBuf> {
+        std::fs::read_dir(d)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect()
+    };
+    let mut folders = vec![dir.join("captures"), dir.to_path_buf(), dir.join("locum-log").join("captures")];
+    folders.extend(subdirs(dir).into_iter().map(|run| run.join("locum-log").join("captures")));
+    let mut found: Vec<(std::time::SystemTime, PathBuf)> = folders
+        .iter()
+        .flat_map(|f| subdirs(f))
+        .map(|p| p.join("capture.db"))
         .filter(|p| p.is_file())
         .map(|p| {
             (
@@ -41,19 +53,63 @@ pub fn list(dir: &Path) -> Vec<PathBuf> {
             )
         })
         .collect();
-    found.sort_by_key(|f| std::cmp::Reverse(f.0));
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    found.dedup_by(|a, b| a.1 == b.1);
     found.into_iter().map(|(_, p)| p).collect()
 }
 
-/// The capture named by `arg`: a `capture.db`, a folder holding one, a capture's name under locum's folder, or
-/// `last` for the newest there. Blobs come from `blobs`, else `LOCUM_BLOBS`, else the store the capture names, else
-/// `blobs` beside the `captures` folder.
+/// `paths` as lines for an error: at most ten, then how many more.
+fn listed(paths: &[PathBuf]) -> String {
+    let mut lines: Vec<String> = paths
+        .iter()
+        .take(10)
+        .map(|p| format!("\n  {}", p.display()))
+        .collect();
+    if paths.len() > 10 {
+        lines.push(format!(
+            "\n  ... {} more (`locum-cli captures <folder>` lists them)",
+            paths.len() - 10
+        ));
+    }
+    lines.concat()
+}
+
+/// The capture named by `arg`: a `capture.db`, a folder holding one, a folder with one capture under it in the
+/// layouts [`list`] knows (a run folder), `<folder>/<name>` for the capture `name` under such a folder, a capture's
+/// name under locum's folder, or `last` for the newest there. Blobs come from `blobs`, else `LOCUM_BLOBS`, else the
+/// store the capture names, else `blobs` beside the `captures` folder.
 pub fn open(arg: &str, blobs: Option<&Path>) -> Result<Capture, String> {
     let given = PathBuf::from(arg);
     let path = if given.is_file() {
         given
     } else if given.join("capture.db").is_file() {
         given.join("capture.db")
+    } else if given.is_dir() && !list(&given).is_empty() {
+        let found = list(&given);
+        if found.len() > 1 {
+            return Err(format!(
+                "{arg} holds {} captures; name one:{}",
+                found.len(),
+                listed(&found)
+            ));
+        }
+        found.into_iter().next().unwrap_or_default()
+    } else if let Some(found) = given
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty() && p.is_dir())
+        .zip(given.file_name())
+        .map(|(dir, name)| {
+            list(dir)
+                .into_iter()
+                .filter(|p| p.parent().and_then(Path::file_name) == Some(name))
+                .collect::<Vec<_>>()
+        })
+        .filter(|found| !found.is_empty())
+    {
+        if found.len() > 1 {
+            return Err(format!("{arg} names {} captures; give one's path:{}", found.len(), listed(&found)));
+        }
+        found.into_iter().next().unwrap_or_default()
     } else if arg == "last" {
         list(&locum_dir())
             .into_iter()
@@ -69,7 +125,8 @@ pub fn open(arg: &str, blobs: Option<&Path>) -> Result<Capture, String> {
         }
         if !named.is_file() {
             return Err(format!(
-                "{arg} is not a capture.db, a folder with one, or a capture in {}",
+                "{arg} is not a capture.db, a folder with one or with captures under it (a run folder), or a \
+                 capture in {}",
                 locum_dir().join("captures").display()
             ));
         }

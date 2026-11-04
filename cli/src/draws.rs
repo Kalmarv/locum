@@ -185,8 +185,17 @@ pub fn shader_of(c: &Capture, draw: i64, stage: &str) -> Option<String> {
     .flatten()
 }
 
-/// Draws whose bound constants hold `target` (as a float, or an integer with `int`).
-pub fn find(c: &Capture, target: f64, tolerance: f64, int: bool) -> Result<(), String> {
+/// Draws whose bound constants hold `target` (as a float, or an integer with `int`): of stage `stage` only, and
+/// only at a variable whose name holds `name` (any case), when given.
+pub fn find(
+    c: &Capture,
+    target: f64,
+    tolerance: f64,
+    int: bool,
+    stage: Option<&str>,
+    name: Option<&str>,
+) -> Result<(), String> {
+    let wanted = name.map(str::to_lowercase);
     let data: Vec<(String, Vec<u8>)> = c.rows("SELECT hash, bytes FROM cb_data", [], |r| {
         Ok((r.get(0)?, r.get(1)?))
     });
@@ -218,19 +227,34 @@ pub fn find(c: &Capture, target: f64, tolerance: f64, int: bool) -> Result<(), S
             [key],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         );
-        for (draw, stage, slot, space) in users {
+        for (draw, stage_of, slot, space) in users {
+            if stage.is_some_and(|s| s != stage_of) {
+                continue;
+            }
+            let stage = stage_of;
             let shader = shader_of(c, draw, &stage).unwrap_or_default();
             for &o in offsets {
-                let name = reflection
+                let named = reflection
                     .cb(c, &shader, slot as u32, space as u32)
-                    .and_then(|cb| cb.name_at(o))
-                    .unwrap_or_else(|| "?".into());
+                    .and_then(|cb| cb.name_at(o));
+                if wanted
+                    .as_ref()
+                    .is_some_and(|w| !named.as_ref().is_some_and(|n| n.to_lowercase().contains(w)))
+                {
+                    continue;
+                }
+                // no variable of the program's reflection covers the word (padding, or no reflection)
+                let name = named.unwrap_or_else(|| "-".into());
                 found
                     .entry((stage.clone(), slot as u32, space as u32, shader.clone(), o, name))
                     .or_default()
                     .push(draw);
             }
         }
+    }
+    if found.is_empty() {
+        out!("no bound constant holds {target} where --stage and --name allow");
+        return Ok(());
     }
     out!(
         "{:<4} {:<5} {:<6} {:<16} {:<10} {:<40} draws",

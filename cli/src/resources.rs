@@ -16,6 +16,8 @@ pub struct Filter {
     pub hash: Option<String>,
     pub width: Option<i64>,
     pub height: Option<i64>,
+    /// How many of each kind and format, instead of one line each.
+    pub counts: bool,
 }
 
 pub fn resources(c: &Capture, f: &Filter) -> Result<(), String> {
@@ -82,6 +84,22 @@ pub fn resources(c: &Capture, f: &Filter) -> Result<(), String> {
             r.get(18)?,
         ))
     });
+    if f.counts {
+        // kind, format name -> count, bytes, used
+        let mut by: std::collections::BTreeMap<(String, &str), (usize, u64, usize)> = Default::default();
+        for (s, used, ..) in &rows {
+            let e = by.entry((s.kind.clone(), format::name(s.format))).or_default();
+            e.0 += 1;
+            e.1 += s.bytes;
+            e.2 += usize::from(*used);
+        }
+        out!("kind\tformat\tresources\tused\tbytes");
+        for ((kind, name), (n, bytes, used)) in by {
+            let name = if kind == "buffer" { "-" } else { name };
+            out!("{kind}\t{name}\t{n}\t{used}\t{}", mib(bytes));
+        }
+        return Ok(());
+    }
     let mut total = 0u64;
     for (s, used, written, content, source, upload, stored, note) in &rows {
         total += s.bytes;
@@ -262,8 +280,26 @@ pub fn resource(c: &Capture, id: i64) -> Result<(), String> {
         [id],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     );
+    // Identical views once each, with their numbers: a D3D12 game can make a view of one texture per use.
+    let mut grouped: Vec<((String, String), Vec<i64>)> = Vec::new();
     for (v, kind, json) in views {
-        out!("view #{v} {kind} {}", json.unwrap_or_default());
+        let desc = (kind, json.unwrap_or_default());
+        match grouped.iter_mut().find(|g| g.0 == desc) {
+            Some(g) => g.1.push(v),
+            None => grouped.push((desc, vec![v])),
+        }
+    }
+    for ((kind, json), ids) in grouped {
+        match ids.as_slice() {
+            [v] => out!("view #{v} {kind} {json}"),
+            _ => {
+                let mut listed: Vec<String> = ids.iter().take(4).map(|v| format!("#{v}")).collect();
+                if ids.len() > 4 {
+                    listed.push(format!("... #{}", ids[ids.len() - 1]));
+                }
+                out!("{} views {kind} {json} ({})", ids.len(), listed.join(" "));
+            }
+        }
     }
     let bound: Vec<(i64, String, String, i64)> = c.rows(
         "SELECT draw, stage, kind, slot FROM bindings WHERE resource = ?1 ORDER BY draw",

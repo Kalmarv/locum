@@ -782,7 +782,9 @@ unsafe fn journal_capture(
             // Each dispatch reads its own submission's bytes: the root CBV sees 0x11 then the host's 0x22, the
             // descriptor CBV the copied-in buffer's 0x33 after CopyDescriptors.
             (
-                "SELECT count(*) FROM bindings b JOIN cb_data d ON d.hash=b.content WHERE b.kind='cb' AND                  hex(substr(d.bytes,1,1))=CASE WHEN b.draw=1 THEN '11' WHEN b.slot=5 THEN '22' ELSE '33' END AND                  b.slot IN (3,5)",
+                "SELECT count(*) FROM bindings b JOIN cb_data d ON d.hash=b.content WHERE b.kind='cb' AND \
+                 hex(substr(d.bytes,1,1))=CASE WHEN b.draw=1 THEN '11' WHEN b.slot=5 THEN '22' ELSE '33' END AND \
+                 b.slot IN (3,5)",
                 6,
             ),
             (

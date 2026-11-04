@@ -157,18 +157,28 @@ pub struct Which {
     /// The contents just before this event instead, replayed (on WARP with `warp`).
     pub at: Option<i64>,
     pub warp: bool,
+    /// Of a buffer, only bytes `a..b`.
+    pub bytes: Option<(i64, i64)>,
 }
 
 pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Picture) -> Result<(), String> {
     let s = shape(c, id).ok_or_else(|| format!("no resource #{id}"))?;
     let (bytes, key) = match which.at {
         Some(event) => {
-            let (bytes, events, warnings) = crate::replay::contents_at(c, id, event, which.warp)?;
+            let d3d12 = c.meta("api").as_deref() == Some("d3d12");
+            let (bytes, events, warnings) = if d3d12 {
+                crate::replay::d3d12_buffers::buffer_at(c, id, event)?
+            } else {
+                crate::replay::contents_at(c, id, event, which.warp)?
+            };
             for w in &warnings {
                 told!(out_path, "warning: {w}");
             }
-            let source =
-                format!("as event {event} saw it: replayed from the frame's start with {events} events");
+            let source = if d3d12 {
+                format!("as event {event} saw it: its contents as the frame began with the {events} writes before it")
+            } else {
+                format!("as event {event} saw it: replayed from the frame's start with {events} events")
+            };
             told!(out_path, "#{id} {source}");
             (bytes, source)
         }
@@ -211,7 +221,16 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
     let readable = format::readable(s.format);
     match kind {
         Kind::Raw => {
-            let (from, len) = if which.sub.is_some() || which.mip > 0 || which.slice > 0 {
+            let (from, len) = if let Some((a, b)) = which.bytes {
+                if s.kind != "buffer" {
+                    return Err("--bytes is for buffers; a texture's parts are --sub, --mip, --slice".into());
+                }
+                let (a, b) = (a.max(0) as usize, (b.max(0) as usize).min(bytes.len()));
+                if a >= b {
+                    return Err(format!("--bytes {a}..{b}: nothing of #{id}'s {} bytes", bytes.len()));
+                }
+                (a, b - a)
+            } else if which.sub.is_some() || which.mip > 0 || which.slice > 0 {
                 let sub = pick()?;
                 (sub.offset as usize, sub.size as usize)
             } else {

@@ -369,8 +369,11 @@ fn bound_ranges(c: &Capture, id: i64) -> Vec<((i64, i64), Option<Match>)> {
         .collect()
 }
 
-/// What each resource of `c` was made from: those the frame used (but its targets), or `all`.
-pub fn join(c: &Capture, all: bool, unnamed: bool, limit: usize) -> Result<(), String> {
+/// What each resource of `c` was made from: those the frame used (but its targets), or `all`; with `name`, only those
+/// a file whose name holds it (any case) made, whole or in a bound range.
+pub fn join(c: &Capture, all: bool, unnamed: bool, name: Option<&str>, limit: usize) -> Result<(), String> {
+    let wanted = name.map(str::to_lowercase);
+    let holds = |m: &Match| wanted.as_ref().is_none_or(|w| m.file.name.to_lowercase().contains(w));
     if c.names.is_empty() {
         return Err("no index: give --index INDEX.db (or set LOCUM_INDEX)".into());
     }
@@ -390,7 +393,7 @@ pub fn join(c: &Capture, all: bool, unnamed: bool, limit: usize) -> Result<(), S
     );
     // Named, not named, and not named for want of bytes (neither upload bytes nor contents recorded), by kind.
     let mut tally: HashMap<&str, (usize, usize, usize)> = HashMap::new();
-    let mut shown = 0;
+    let (mut shown, mut listable) = (0, 0);
     for (id, kind, draws) in &ids {
         let k = if kind == "buffer" { "buffer" } else { "texture" };
         let m = c.names.of(c, *id);
@@ -417,7 +420,14 @@ pub fn join(c: &Capture, all: bool, unnamed: bool, limit: usize) -> Result<(), S
                 t.2 += 1;
             }
         }
-        if named == unnamed || shown >= limit {
+        if named == unnamed
+            || (wanted.is_some()
+                && !(m.as_ref().is_some_and(holds) || ranges.iter().any(|r| r.1.as_ref().is_some_and(holds))))
+        {
+            continue;
+        }
+        listable += 1;
+        if shown >= limit {
             continue;
         }
         shown += 1;
@@ -431,7 +441,11 @@ pub fn join(c: &Capture, all: bool, unnamed: bool, limit: usize) -> Result<(), S
             Some(m) => out!("{s}{used}\n    {m}"),
             None => out!("{s}{used}"),
         }
-        let found: Vec<&Match> = ranges.iter().filter_map(|r| r.1.as_ref()).collect();
+        let found: Vec<&Match> = ranges
+            .iter()
+            .filter_map(|r| r.1.as_ref())
+            .filter(|m| holds(m))
+            .collect();
         if !ranges.is_empty() && !found.is_empty() {
             out!("    {} of {} bound ranges named:", found.len(), ranges.len());
             for m in found.iter().take(8) {
@@ -453,8 +467,11 @@ pub fn join(c: &Capture, all: bool, unnamed: bool, limit: usize) -> Result<(), S
             out!("{k}s {what}: {named} of {} named{missing}", named + not);
         }
     }
-    if shown >= limit {
-        out!("(at most {limit} listed: --limit)");
+    if let Some(name) = name {
+        out!("{listable} resources made from a file named like {name:?}");
+    }
+    if listable > shown {
+        out!("({shown} of {listable} listed: --limit)");
     }
     Ok(())
 }

@@ -7,6 +7,7 @@
 //! Resources start with their contents as the frame began.
 
 mod d3d11;
+pub mod d3d12_buffers;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -149,7 +150,8 @@ fn with_bound(c: &Capture, events: Vec<i64>, mut resources: BTreeSet<i64>) -> Pl
     // scans the bindings once per event: minutes on a game's frame).
     let mut bound: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
     for (event, resource) in c.rows(
-        "SELECT DISTINCT d.event, b.resource FROM bindings b JOIN draws d ON d.n = b.draw          WHERE b.resource IS NOT NULL AND b.kind <> 'cb'",
+        "SELECT DISTINCT d.event, b.resource FROM bindings b JOIN draws d ON d.n = b.draw \
+         WHERE b.resource IS NOT NULL AND b.kind <> 'cb'",
         [],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
     ) {

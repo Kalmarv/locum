@@ -15,22 +15,22 @@ use crate::out;
 use crate::states;
 
 /// A binding row as the capture has it.
-struct Row {
-    stage: String,
-    kind: String,
-    slot: u32,
-    space: u32,
-    view: Option<i64>,
-    resource: Option<i64>,
-    state: Option<i64>,
-    offset: Option<i64>,
-    size: Option<i64>,
-    stride: Option<i64>,
-    format: Option<i64>,
-    content: Option<String>,
+pub(crate) struct Row {
+    pub stage: String,
+    pub kind: String,
+    pub slot: u32,
+    pub space: u32,
+    pub view: Option<i64>,
+    pub resource: Option<i64>,
+    pub state: Option<i64>,
+    pub offset: Option<i64>,
+    pub size: Option<i64>,
+    pub stride: Option<i64>,
+    pub format: Option<i64>,
+    pub content: Option<String>,
 }
 
-fn rows(c: &Capture, draw: i64) -> Vec<Row> {
+pub(crate) fn rows(c: &Capture, draw: i64) -> Vec<Row> {
     c.rows(
         &format!(
             "SELECT stage, kind, slot, space, view, resource, state, offset, size, stride, format, content \
@@ -199,6 +199,8 @@ pub struct Constants {
     pub space: u32,
     /// The buffer's name in the shader's reflection.
     pub name: Option<String>,
+    /// The bytes the program declares the buffer to hold, when its reflection says: a draw can bind a larger range.
+    pub declared: Option<u32>,
     pub buffer: Option<i64>,
     /// The key of the bytes the GPU read, and their length.
     pub key: Option<String>,
@@ -223,7 +225,7 @@ pub struct Word {
     pub hex: String,
     /// The value as text shows it (at most 12 characters).
     #[serde(skip)]
-    text: String,
+    pub text: String,
 }
 
 #[derive(Serialize)]
@@ -265,7 +267,7 @@ pub fn number(bytes: [u8; 4], base: Option<u16>) -> Value {
 
 /// What a vertex or index binding's bytes were made from when no file is the whole buffer: for indices, the ones the
 /// draw reads (a FLVER face set) before the bound range (its data block); for vertices, the bound range.
-fn range_name(
+pub(crate) fn range_name(
     c: &Capture,
     r: i64,
     b: &Row,
@@ -306,6 +308,69 @@ fn range_name(
         }
         _ => None,
     }
+}
+
+/// The vertex buffer slots input layout `layout` reads; none known without a layout.
+pub(crate) fn layout_slots(c: &Capture, layout: Option<i64>) -> Option<Vec<u32>> {
+    let json: String = c
+        .row("SELECT json FROM states WHERE id = ?1", [layout?], |r| r.get(0))
+        .flatten()?;
+    let elements: Vec<Value> = serde_json::from_str(&json).ok()?;
+    elements
+        .iter()
+        .map(|e| e["slot"].as_u64().and_then(|s| u32::try_from(s).ok()))
+        .collect()
+}
+
+/// The vertex buffers a draw reads (of its bindings `rows`, those in slots its layout reads), which a match of only
+/// index bytes can be corroborated by.
+pub(crate) fn read_vertices(rows: &[Row], layout_slots: Option<&[u32]>) -> Vec<Vb> {
+    rows.iter()
+        .filter(|b| b.kind == "vb")
+        .filter(|b| layout_slots.is_none_or(|s| s.contains(&b.slot)))
+        .filter_map(|b| Some((b.resource?, b.offset, b.size)))
+        .collect()
+}
+
+/// What draw `n`'s program calls register `b`, and whether it reads it (`None`: no reflection or layout to say): a
+/// D3D12 root table binds every descriptor of its ranges, and a game can leave vertex buffers bound in slots a later
+/// draw's input layout does not read.
+pub(crate) fn register(
+    c: &Capture,
+    n: i64,
+    b: &Row,
+    layout_slots: Option<&[u32]>,
+    reflection: &mut Reflection,
+) -> (Option<String>, Option<bool>) {
+    if matches!(b.kind.as_str(), "srv" | "uav" | "sampler" | "cb")
+        && let Some(shader) = shader_of(c, n, &b.stage)
+    {
+        match reflection.slot(c, &shader, &b.kind, b.slot, b.space) {
+            describe::Slot::Named(name) => (Some(name), Some(true)),
+            describe::Slot::Unused => (None, Some(false)),
+            describe::Slot::Unknown => (None, None),
+        }
+    } else if b.kind == "vb"
+        && let Some(slots) = layout_slots
+    {
+        (None, Some(slots.contains(&b.slot)))
+    } else {
+        (None, None)
+    }
+}
+
+/// The game file binding `b` of a draw (`call` with `args`, reading vertices `vbs`) was made from, when an index
+/// names it: the whole resource, or the vertex or index range the draw reads.
+pub(crate) fn file_of(c: &Capture, b: &Row, call: &str, args: &str, vbs: &[Vb]) -> Option<String> {
+    let r = b.resource?;
+    let m = c
+        .names
+        .of(c, r)
+        .or_else(|| range_name(c, r, b, call, args, vbs))?;
+    Some(match m.others {
+        0 => m.file.name.clone(),
+        n => format!("{} (+{n} with the same bytes)", m.file.name),
+    })
 }
 
 /// Draw `n` as `draw` shows it. Without `all`, only constant registers the shader uses.
@@ -417,41 +482,11 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
     );
 
     let rows = rows(c, n);
-    // the vertex buffer slots the input layout reads; none known without a layout
-    let layout_slots: Option<Vec<u32>> = layout.and_then(|id| {
-        let json: String = c
-            .row("SELECT json FROM states WHERE id = ?1", [id], |r| r.get(0))
-            .flatten()?;
-        let elements: Vec<Value> = serde_json::from_str(&json).ok()?;
-        elements
-            .iter()
-            .map(|e| e["slot"].as_u64().and_then(|s| u32::try_from(s).ok()))
-            .collect()
-    });
-    // the vertex buffers the draw reads, which a match of only index bytes can be corroborated by
-    let vbs: Vec<Vb> = rows
-        .iter()
-        .filter(|b| b.kind == "vb")
-        .filter(|b| layout_slots.as_ref().is_none_or(|s| s.contains(&b.slot)))
-        .filter_map(|b| Some((b.resource?, b.offset, b.size)))
-        .collect();
+    let layout_slots = layout_slots(c, layout);
+    let vbs = read_vertices(&rows, layout_slots.as_deref());
     let mut bindings = Vec::with_capacity(rows.len());
     for b in &rows {
-        let (name, used) = if matches!(b.kind.as_str(), "srv" | "uav" | "sampler" | "cb")
-            && let Some(shader) = shader_of(c, n, &b.stage)
-        {
-            match reflection.slot(c, &shader, &b.kind, b.slot, b.space) {
-                describe::Slot::Named(name) => (Some(name), Some(true)),
-                describe::Slot::Unused => (None, Some(false)),
-                describe::Slot::Unknown => (None, None),
-            }
-        } else if b.kind == "vb"
-            && let Some(slots) = &layout_slots
-        {
-            (None, Some(slots.contains(&b.slot)))
-        } else {
-            (None, None)
-        };
+        let (name, used) = register(c, n, b, layout_slots.as_deref(), reflection);
         let view = b.view.map(|id| {
             let j: Value = c
                 .row("SELECT json FROM views WHERE id = ?1", [id], |r| {
@@ -480,17 +515,7 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
             state: b.state.and_then(|s| state(c, s)),
             resource: b.resource,
             shape: b.resource.and_then(|r| shape(c, r)).map(|s| s.to_string()),
-            file: b
-                .resource
-                .and_then(|r| {
-                    c.names
-                        .of(c, r)
-                        .or_else(|| range_name(c, r, b, &call, &args, &vbs))
-                })
-                .map(|m| match m.others {
-                    0 => m.file.name.clone(),
-                    n => format!("{} (+{n} with the same bytes)", m.file.name),
-                }),
+            file: file_of(c, b, &call, &args, &vbs),
             offset: b.offset,
             size: b.size,
             stride: b.stride,
@@ -622,7 +647,7 @@ fn uncaptured(c: &Capture) -> String {
 
 /// A bound constant buffer word by word, named from the shader's reflection. Without `all`, only the registers
 /// holding variables the shader uses.
-fn constants_of(
+pub(crate) fn constants_of(
     c: &Capture,
     reflection: &mut Reflection,
     draw: i64,
@@ -634,6 +659,7 @@ fn constants_of(
         slot: b.slot,
         space: b.space,
         name: None,
+        declared: None,
         buffer: b.resource,
         key: b.content.clone(),
         bytes: 0,
@@ -661,6 +687,7 @@ fn constants_of(
         }
     });
     out.bytes = bytes.len();
+    out.declared = cb.map(|cb| cb.size);
     // the bytes the program reads: its variables', or, when it lists none, all it declares
     let used: Vec<(u32, u32)> = cb
         .map(|cb| {
@@ -710,8 +737,13 @@ fn print_constants(k: &Constants) {
         out!("{} b{}{space}: contents not captured{why}", k.stage, k.slot);
         return;
     }
+    // A bound range larger than the program declares: the rest is the next records or padding.
+    let declared = match k.declared {
+        Some(d) if d as usize != k.bytes => format!(" bound, the program declares {d}"),
+        _ => String::new(),
+    };
     out!(
-        "{} b{}{space} ({}, {} bytes{}):",
+        "{} b{}{space} ({}, {} bytes{declared}{}):",
         k.stage,
         k.slot,
         k.name.as_deref().unwrap_or("no reflection"),
@@ -746,7 +778,8 @@ fn queued(c: &Capture, event: i64) -> Option<Queued> {
         return None;
     }
     c.row(
-        "SELECT l.queue, l.execution, x.list, x.generation, l.command_index FROM d12_event_locations l          JOIN d12_executions x ON x.id = l.execution WHERE l.event = ?1",
+        "SELECT l.queue, l.execution, x.list, x.generation, l.command_index FROM d12_event_locations l \
+         JOIN d12_executions x ON x.id = l.execution WHERE l.event = ?1",
         [event],
         |r| {
             Ok(Queued {
@@ -945,7 +978,7 @@ fn print_bound(d: &Draw) {
                          event {e} ({})",
                         short(key),
                         b.contents_source.as_deref().unwrap_or_default(),
-                        if d.replay {
+                        if d.replay || b.shape.as_deref().is_some_and(|s| s.contains(" buffer ")) {
                             format!("export --at {} gives what it saw", d.event)
                         } else {
                             format!(
@@ -1113,14 +1146,21 @@ fn constants_at(c: &Capture, draw: i64, b: Row, raw: bool, as_json: bool, only: 
     }
     let mut k = constants_of(c, &mut Reflection::default(), draw, &b, true)?;
     if !only.registers.is_empty() || only.name.is_some() {
-        let wanted = only.name.as_ref().map(|n| n.to_lowercase());
+        // parts separated by `|`, any of which a name may hold
+        let wanted: Vec<String> = only
+            .name
+            .iter()
+            .flat_map(|n| n.split('|'))
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
         let keep = |register: &[Word]| {
             let r = register[0].offset / 16;
             only.registers.contains(&r)
-                || wanted.as_ref().is_some_and(|w| {
-                    register
-                        .iter()
-                        .any(|x| x.name.as_ref().is_some_and(|n| n.to_lowercase().contains(w)))
+                || register.iter().any(|x| {
+                    x.name
+                        .as_ref()
+                        .is_some_and(|n| wanted.iter().any(|w| n.to_lowercase().contains(w)))
                 })
         };
         let words = std::mem::take(&mut k.words);

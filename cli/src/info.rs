@@ -10,29 +10,46 @@ use crate::out;
 pub fn captures(dir: &Path, blobs: Option<&Path>) -> Result<(), String> {
     let found = open::list(dir);
     if found.is_empty() {
-        out!("no captures in {}", dir.join("captures").display());
+        out!("no captures under {}", dir.display());
         return Ok(());
     }
+    // What each holds, so which capture can answer a question is one look: its constant buffer contents, resource
+    // contents as the frame began, the passes whose targets were read back, and whether it names the presented buffer.
+    out!("capture\tapi\tframe\tdraws\tconstants\tcontents\ttargets\tpresented\texe");
     for path in found {
-        let name = path
-            .parent()
-            .and_then(Path::file_name)
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        // The capture's folder from `dir` (`m15-sky/locum-log/captures/eldenring-sky` in a folder of runs), which
+        // every command takes as the capture.
+        let folder = path.parent().unwrap_or(&path);
+        let name = folder
+            .strip_prefix(dir)
+            .unwrap_or(folder)
+            .to_string_lossy()
+            .replace('\\', "/");
         match open::open(&path.display().to_string(), blobs) {
             Ok(c) => {
                 let counts = c.meta_json("counts");
                 let exe = c.meta("exe").unwrap_or_default();
                 let exe = exe.rsplit(['\\', '/']).next().unwrap_or(&exe).to_string();
+                let passes = c.count("SELECT count(*) FROM passes", []);
+                let read = c.count(
+                    "SELECT count(DISTINCT d.pass) FROM targets t JOIN draws d ON d.n = t.draw WHERE t.blob IS NOT NULL",
+                    [],
+                );
                 out!(
-                    "{name:<24} frame {:<7} {:>6} draws {:>7} events  {:>9} contents  {exe}",
+                    "{name}\t{}\t{}\t{}\t{}\t{}\t{read} of {passes} passes\t{}\t{exe}",
+                    c.meta("api").unwrap_or_default(),
                     c.meta("frame").unwrap_or_default(),
                     counts["draws"],
-                    counts["events"],
-                    mib(counts["content_bytes"].as_u64().unwrap_or(0))
+                    c.count("SELECT count(*) FROM cb_data", []),
+                    mib(counts["content_bytes"].as_u64().unwrap_or(0)),
+                    if c.meta("presented").is_some() {
+                        "yes"
+                    } else {
+                        "-"
+                    },
                 );
             }
-            Err(e) => out!("{name:<24} {e}"),
+            Err(e) => out!("{name}\t{e}"),
         }
     }
     Ok(())
@@ -55,7 +72,11 @@ pub fn info(c: &Capture) -> Result<(), String> {
         c.meta("api").unwrap_or_default(),
         c.meta("locum").unwrap_or_default()
     );
-    out!("  request: {request}");
+    if request.is_null() {
+        out!("  request: not recorded (locum before the request was kept)");
+    } else {
+        out!("  request: {request}");
+    }
     out!("  blob store: {}", c.blobs.root().display());
     out!("");
 
@@ -187,11 +208,44 @@ pub fn info(c: &Capture) -> Result<(), String> {
     // What is missing.
     let mut missing = Vec::new();
     let gaps: Vec<(String, Option<String>, i64)> =
-        c.rows("SELECT what, detail, count FROM gaps ORDER BY what", [], |r| {
+        c.rows("SELECT what, detail, count FROM gaps ORDER BY what, rowid", [], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         });
+    // One line a kind of gap, with the first details: an older D3D12 locum recorded one row per draw and resource.
+    let mut by_what: Vec<(String, Vec<(String, i64)>)> = Vec::new();
     for (what, detail, count) in gaps {
-        missing.push(format!("{what}: {} ({count})", detail.unwrap_or_default()));
+        match by_what.last_mut() {
+            Some((w, rows)) if *w == what => rows.push((detail.unwrap_or_default(), count)),
+            _ => by_what.push((what, vec![(detail.unwrap_or_default(), count)])),
+        }
+    }
+    for (what, rows) in by_what {
+        if rows.len() <= 3 {
+            for (detail, count) in rows {
+                missing.push(format!("{what}: {detail} ({count})"));
+            }
+            continue;
+        }
+        let total: i64 = rows.iter().map(|r| r.1).sum();
+        let mut first: Vec<&str> = Vec::new();
+        for (detail, _) in &rows {
+            if !first.contains(&detail.as_str()) {
+                first.push(detail);
+            }
+            if first.len() == 2 {
+                break;
+            }
+        }
+        let counted = if total == rows.len() as i64 {
+            format!("{total} records")
+        } else {
+            format!("{total} in {} records", rows.len())
+        };
+        missing.push(format!(
+            "{what}: {counted} (`sql CAPTURE \"SELECT detail, count FROM gaps WHERE what = '{what}'\"` lists them), \
+             the first: {}",
+            first.join("; ")
+        ));
     }
     // No valid root signature binds a register twice; a locum before 2026-11-04 let a D3D12 table range reach
     // descriptors of another type.
