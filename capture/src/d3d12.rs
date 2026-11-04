@@ -372,6 +372,10 @@ impl Prepared {
             "executions":self.projection.executions.len(),
             "targets":capture.targets.len(), "target_bytes":target_bytes, "targets_skipped":skipped
         }));
+        capture.meta(
+            "pass_ends",
+            serde_json::to_value(self.projection.pass_ends).unwrap_or_default(),
+        );
     }
     pub fn write(&self, tx: &Transaction<'_>) -> rusqlite::Result<()> {
         self.frame.write(tx, &self.projection, &self.first_use)
@@ -415,6 +419,20 @@ pub struct Projection {
     uncopied: BTreeMap<String, u64>,
     /// The last draw of the list execution being projected that each (target, view) was bound to.
     drawn: BTreeMap<(String, u64), u64>,
+    /// How the frame's pass ends went, for the capture's meta: where a frame's targets go missing.
+    pass_ends: PassEnds,
+}
+
+/// Counts of the frame's direct-list executions and their checkpoints.
+#[derive(Clone, Copy, Default, Serialize)]
+struct PassEnds {
+    /// Top-level direct-list executions with draws, instrumented or not (recorded before the capture was armed).
+    lists_instrumented: u64,
+    lists_uninstrumented: u64,
+    /// Checkpoints the executed lists carried; those after the last draw that had their target bound (a pass of
+    /// clears, copies or dispatches only), which hold no draw's output.
+    checkpoints: u64,
+    after_no_draw: u64,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -765,6 +783,7 @@ impl Projection {
             targets: Vec::new(),
             uncopied: BTreeMap::new(),
             drawn: BTreeMap::new(),
+            pass_ends: PassEnds::default(),
         }
     }
 
@@ -773,9 +792,11 @@ impl Projection {
     /// execution's bytes.
     fn checkpoints(&mut self, capture: &db::Capture, list: &List, at: usize, first: bool) {
         for c in list.checkpoints.iter().filter(|c| c.at == at) {
+            self.pass_ends.checkpoints += 1;
             // A copy after no draw that had its target bound (an indirect dispatch, a bundle without draws) holds
             // no draw's output.
             let Some(draw) = self.drawn.get(&(c.target.clone(), c.view)).copied() else {
+                self.pass_ends.after_no_draw += 1;
                 continue;
             };
             let why = if first {
@@ -1030,6 +1051,13 @@ impl Projection {
             }
         }
         self.checkpoints(capture, list, list.commands.len(), first);
+        if depth == 0 && list.kind == 0 && last_draw.is_some() {
+            if list.instrumented {
+                self.pass_ends.lists_instrumented += 1;
+            } else {
+                self.pass_ends.lists_uninstrumented += 1;
+            }
+        }
         if depth == 0 && list.kind == 0 && !list.instrumented && last_draw.is_some() {
             *self
                 .uncopied

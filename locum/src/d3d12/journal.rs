@@ -857,6 +857,10 @@ pub fn present(frame_number: u64) {
     let finished = state().capture.take();
     if finished.is_some() {
         super::passes::ARMED.store(false, std::sync::atomic::Ordering::Release);
+        log!(
+            "D3D12 capture closing: {} pass-end copies recorded so far",
+            super::passes::recorded()
+        );
     }
     if let Some(Live {
         path,
@@ -964,7 +968,10 @@ pub fn present(frame_number: u64) {
             executed: HashSet::new(),
         });
         super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
-        log!("D3D12 capture armed at Present {frame_number}; cached list history retained");
+        log!(
+            "D3D12 capture armed at Present {frame_number}; cached list history retained; {} pass-end copies recorded so far",
+            super::passes::recorded()
+        );
     }
 }
 

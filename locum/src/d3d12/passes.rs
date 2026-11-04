@@ -29,6 +29,11 @@ use super::states::{Access, COPY_SOURCE};
 /// Whether lists reset now are instrumented: from the Present that arms a capture to the one that closes it.
 pub static ARMED: AtomicBool = AtomicBool::new(false);
 static NEXT: AtomicU64 = AtomicU64::new(1);
+
+/// Checkpoints recorded since the process started: the log compares it at arming and closing.
+pub fn recorded() -> u64 {
+    NEXT.load(Ordering::Relaxed) - 1
+}
 /// Readback memory the live copies hold, and the most they may.
 static BYTES: AtomicU64 = AtomicU64::new(0);
 const BUDGET: u64 = 3 << 30;
