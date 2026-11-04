@@ -553,6 +553,11 @@ enum Command {
         /// unity-formats' `mesh_keys`: a Unity player's Mesh vertex streams and index buffers).
         #[arg(long)]
         keys: Vec<PathBuf>,
+        /// A tar stream of DDS files and programs to add (`-`: stdin), as a game's extractor writes what is inside
+        /// its archives without putting it on disk (fromsoft-formats' `texture_tar` example: every texture of the
+        /// TPF packages under some archive paths). Named by their paths in the stream.
+        #[arg(long)]
+        tar: Vec<PathBuf>,
     },
     /// What each resource the frame used was made from, by the indexes given (--index).
     Join {
@@ -614,7 +619,9 @@ fn sql(c: &open::Capture, query: &str) -> Result<(), String> {
             &dot
         }
         [w, ..] if w.starts_with('.') => {
-            return Err(format!("{w}: only .tables and .schema [TABLE] of the sqlite shell's commands are known"));
+            return Err(format!(
+                "{w}: only .tables and .schema [TABLE] of the sqlite shell's commands are known"
+            ));
         }
         _ => query,
     };
@@ -1031,7 +1038,12 @@ fn run(cli: Cli) -> Result<(), String> {
             memory::memdiff(&a, &b, from, to, tolerance, limit)
         }
         Command::Diff { a, b, draws, limit } => diff::diff(&open(&a)?, &open(&b)?, draws, limit),
-        Command::Index { out, inputs, keys } => join::index(&out, &inputs, &keys),
+        Command::Index {
+            out,
+            inputs,
+            keys,
+            tar,
+        } => join::index(&out, &inputs, &keys, &tar),
         Command::Join {
             capture,
             all,

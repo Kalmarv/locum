@@ -275,7 +275,7 @@ impl Names {
 /// of `keys` lists: lines of `key<TAB>bytes<TAB>name`, as a game's reader writes them for
 /// what is inside its archives (fromsoft-formats' `flver_keys` for FLVER vertex and index bytes, unity-formats'
 /// `mesh_keys` for a Unity player's Mesh vertex streams and index buffers).
-pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), String> {
+pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf], tars: &[PathBuf]) -> Result<(), String> {
     let mut index = Index::create(out)?;
     let (mut added, mut programs, mut refused) = (0usize, 0usize, Vec::new());
     let mut keyed = 0usize;
@@ -299,6 +299,51 @@ pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), Str
             if keyed % 10000 == 9999 {
                 index.commit()?;
             }
+        }
+    }
+    // One file of the stream or a folder: a DDS file by its name, a program by its magic.
+    let mut add = |index: &mut Index, name: &str, bytes: &[u8]| -> Result<(), String> {
+        let result = if name.to_ascii_lowercase().ends_with(".dds") {
+            index.add_dds(name, bytes).map(|()| added += 1)
+        } else if bytes.starts_with(b"DXBC") {
+            // The container's own size (bytes 24 to 28): an archive may pad what follows it.
+            let size = bytes
+                .get(24..28)
+                .map(|s| u32::from_le_bytes(s.try_into().expect("four bytes")) as usize)
+                .filter(|&n| n >= 32 && n <= bytes.len())
+                .unwrap_or(bytes.len());
+            index.add_program(name, &bytes[..size]).map(|()| programs += 1)
+        } else {
+            return Ok(());
+        };
+        if let Err(e) = result {
+            refused.push(format!("{name}: {e}"));
+        }
+        if (added + programs) % 1000 == 999 {
+            index.commit()?;
+        }
+        Ok(())
+    };
+    for t in tars {
+        let reader: Box<dyn std::io::Read> = if t.as_os_str() == "-" {
+            Box::new(std::io::stdin().lock())
+        } else {
+            Box::new(std::fs::File::open(t).map_err(|e| format!("{}: {e}", t.display()))?)
+        };
+        let mut archive = tar::Archive::new(std::io::BufReader::new(reader));
+        for entry in archive.entries().map_err(|e| format!("{}: {e}", t.display()))? {
+            let mut entry = entry.map_err(|e| format!("{}: {e}", t.display()))?;
+            if !entry.header().entry_type().is_file() {
+                continue;
+            }
+            let name = entry
+                .path()
+                .map_err(|e| format!("{}: {e}", t.display()))?
+                .to_string_lossy()
+                .replace('\\', "/");
+            let mut bytes = Vec::with_capacity(entry.size() as usize);
+            std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|e| format!("{name}: {e}"))?;
+            add(&mut index, &name, &bytes)?;
         }
     }
     for input in inputs {
@@ -325,23 +370,7 @@ pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), Str
                 .to_string_lossy()
                 .replace('\\', "/");
             let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let result = if dds {
-                index.add_dds(&name, &bytes).map(|()| added += 1)
-            } else {
-                // The container's own size (bytes 24 to 28): an archive may pad what follows it.
-                let size = bytes
-                    .get(24..28)
-                    .map(|s| u32::from_le_bytes(s.try_into().expect("four bytes")) as usize)
-                    .filter(|&n| n >= 32 && n <= bytes.len())
-                    .unwrap_or(bytes.len());
-                index.add_program(&name, &bytes[..size]).map(|()| programs += 1)
-            };
-            if let Err(e) = result {
-                refused.push(format!("{name}: {e}"));
-            }
-            if (added + programs) % 1000 == 999 {
-                index.commit()?;
-            }
+            add(&mut index, &name, &bytes)?;
         }
     }
     index.commit()?;
@@ -371,7 +400,10 @@ pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), Str
 fn is_program(p: &Path) -> bool {
     use std::io::Read;
     let mut magic = [0u8; 4];
-    std::fs::File::open(p).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == b"DXBC"
+    std::fs::File::open(p)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && &magic == b"DXBC"
 }
 
 /// The distinct (offset, size) ranges the frame's draws bound buffer `id` at as vertices or indices, each with what
@@ -402,7 +434,11 @@ fn bound_ranges(c: &Capture, id: i64) -> Vec<((i64, i64), Option<Match>)> {
 /// a file whose name holds it (any case) made, whole or in a bound range.
 pub fn join(c: &Capture, all: bool, unnamed: bool, name: Option<&str>, limit: usize) -> Result<(), String> {
     let wanted = name.map(str::to_lowercase);
-    let holds = |m: &Match| wanted.as_ref().is_none_or(|w| m.file.name.to_lowercase().contains(w));
+    let holds = |m: &Match| {
+        wanted
+            .as_ref()
+            .is_none_or(|w| m.file.name.to_lowercase().contains(w))
+    };
     if c.names.is_empty() {
         return Err("no index: give --index INDEX.db (or set LOCUM_INDEX)".into());
     }

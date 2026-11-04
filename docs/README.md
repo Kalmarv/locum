@@ -387,6 +387,7 @@ mip by mip as it is):
 locum-cli index -o files.db DIR...         # key every DDS file and every program (a shader container: it begins
                                            # `DXBC`, whatever its extension) under each DIR
 locum-cli index -o files.db --keys k.tsv   # add buffer keys a game's reader listed (key<TAB>bytes<TAB>name lines)
+extractor | locum-cli index -o files.db --tar -   # DDS files and programs from a tar stream (- is stdin)
 locum-cli --index files.db join last       # what each texture and buffer the frame used was made from
 locum-cli --index files.db draw last 120   # bound resources are shown with their file's name
 ```
@@ -402,6 +403,12 @@ separated by `;`) stands in for `--index`. A game's own extractor can add what i
 `locum_capture::index`, or list keys for `--keys`: fromsoft-formats' `flver_keys` example lists every FLVER's data
 block, vertex buffers and face sets in Sekiro's or Elden Ring's archives, and unity-formats' `mesh_keys` example every
 Mesh's vertex streams and index buffer in a Unity player (a SkateBIRD capture has 183 of its 209 buffers named so).
+Textures packed in a game's archives need not be written to disk: `--tar` reads a tar stream of DDS files and
+programs, each named by its path in the stream, and fromsoft-formats' `texture_tar` example writes one of every
+texture of the TPF packages under the archive paths given (loose, or in the binders that hold them), as
+`<binder>/<package>/<texture>.dds`. Elden Ring's `/asset/ /chr/ /parts/ /map/ /sfx/ /menu/ /other/` are 462,683
+textures, indexed in about five minutes into a 430 MB file; an Elden Ring frame had 1,160 of its 1,288 textures
+named by it.
 `join`'s totals say how many of those not named have no bytes recorded to match (neither upload bytes nor contents), as
 in captures from before first-use contents.
 
