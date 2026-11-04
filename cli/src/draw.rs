@@ -947,8 +947,8 @@ fn print_bound(d: &Draw) {
     if d.doubled > 0 {
         out!(
             "  ({} register{} bound to more than one descriptor: an older locum projected this capture's bindings and let \
-             a table range reach descriptors of another type, so only one of each is what the program read; a new \
-             capture binds one)",
+             a table range reach descriptors of another type, so only one of each is what the program read; \
+             `locum-cli upgrade` projects them again)",
             d.doubled,
             if d.doubled == 1 { "" } else { "s" }
         );
@@ -1032,7 +1032,7 @@ pub fn cb(
     if several {
         let message = format!(
             "{stage} b{slot} is bound to {} descriptors: an older locum projected this capture's bindings, and only \
-             one is what the program read",
+             one is what the program read (`locum-cli upgrade` projects them again)",
             here.len()
         );
         if as_json {

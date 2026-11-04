@@ -187,7 +187,7 @@ pub fn info(c: &Capture) -> Result<(), String> {
     if doubled > 0 {
         missing.push(format!(
             "bindings: {doubled} registers of draws are bound to more than one descriptor: an older locum projected \
-             them, and only one of each is what the program read (`draw` says which draws; a new capture binds one)"
+             them, and only one of each is what the program read (`locum-cli upgrade` projects them again)"
         ));
     }
     let unread: Vec<(String, i64)> = c.rows(

@@ -386,7 +386,11 @@ mod tests {
                 .add_buffer_key("m.flver#vb0", bytes.len() as u64, &key(bytes))
                 .unwrap();
             assert!(index.add_buffer_key("bad", 1, "not a key").is_err());
-            assert!(index.add_buffer_key("upper", 1, &key(bytes).to_uppercase()).is_err());
+            assert!(
+                index
+                    .add_buffer_key("upper", 1, &key(bytes).to_uppercase())
+                    .is_err()
+            );
         }
         let index = Index::open(&path).unwrap();
         let (files, count) = index.whole(&key(bytes), &Like::Buffer, 10);

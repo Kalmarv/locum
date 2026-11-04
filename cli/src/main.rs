@@ -17,6 +17,7 @@ mod resources;
 mod shaders;
 mod states;
 mod trace;
+mod upgrade;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -479,6 +480,15 @@ enum Command {
     },
     /// Any SQL on the capture; rows tab-separated.
     Sql { capture: String, query: String },
+    /// Brings what an older locum derived in a capture up to this one, from the capture's own records: D3D12
+    /// bindings projected again (an older projection bound some registers to two descriptors), structured views'
+    /// element size, and the programs' debug names in `shaders`. Writes the capture.db in place
+    Upgrade {
+        capture: String,
+        /// Say what it would change, and write nothing
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 fn range(s: &str) -> Result<Range, String> {
@@ -834,6 +844,7 @@ fn run(cli: Cli) -> Result<(), String> {
             limit,
         } => join::join(&open(&capture)?, all, unnamed, limit),
         Command::Sql { capture, query } => sql(&open(&capture)?, &query),
+        Command::Upgrade { capture, check } => upgrade::upgrade(&open(&capture)?, check),
     }
 }
 

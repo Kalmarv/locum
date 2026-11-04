@@ -248,7 +248,17 @@ locum-cli changes last 120:rt0 --rect 0,0,640,360  # texels each pass changed in
 locum-cli cb last 120 vs 8 --name ViewProj # only the registers of matching variables (--reg 3,26 by number)
 locum-cli draw last 120 --section bound,cb # only those parts (state, bound, cb, targets)
 locum-cli sql last "SELECT ..."            # anything else
+locum-cli upgrade last --check             # what an older locum derived, brought up to this one (see below)
 ```
+
+`upgrade` rewrites what a capture derived, not what it recorded, from the capture's own authoritative records, in one
+transaction (`--check` says what it would change and writes nothing). D3D12 bindings are projected again from each
+draw's root arguments and the descriptors of its submission: locum before 2026-11-04 let a table range reach
+descriptors of another type and bound root parameters to stages without a program, so some registers had two rows;
+the extra rows go, and the rest keep what the capture composed for them. Structured buffer views get their element
+size (D3D11 from the buffer, D3D12 from the view), and `shaders` gains the programs' debug names. On captures taken
+since, the projection makes exactly the rows they hold. What a capture never recorded (bytes it did not copy, reasons
+it did not count) stays missing. `meta.upgraded` says what was changed.
 
 Replay runs a captured draw again offline, on the GPU or on WARP (`--warp`), with or without rules in the
 `overrides.txt` language changing it:

@@ -163,6 +163,123 @@ pub(super) fn project(
         }
     }
 }
+/// The shader-stage bindings this locum projects for every draw of the D3D12 capture at `conn`, from what the capture
+/// holds authoritatively: each draw's pipeline and root arguments (`d12_draw_state`), the objects as described
+/// (`d12_objects`: root signatures, pipelines, resources), and the descriptor definitions as of the draw's submission
+/// (`d12_submission_descriptors`, applied in the order the frame submitted). A capture projected by an older locum
+/// keeps its own rows; these say which of them the current projection makes. Constant-buffer contents are not
+/// composed here (they come from the capture's upload and first-use copies), and sampler rows' `state` numbers the
+/// returned capture's `states`.
+pub fn reproject(conn: &rusqlite::Connection) -> rusqlite::Result<db::Capture> {
+    let u = |v: i64| v as u64;
+    let objects: BTreeMap<u64, Value> = conn
+        .prepare("SELECT id, description FROM d12_objects")?
+        .query_map([], |r| Ok((u(r.get(0)?), r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .map(|(id, d)| (id, serde_json::from_str(&d).unwrap_or(Value::Null)))
+        .collect();
+    let mut versions: BTreeMap<u64, Descriptor> = BTreeMap::new();
+    for row in conn
+        .prepare("SELECT id, heap, slot, kind, resource, counter_resource, description FROM d12_descriptor_versions")?
+        .query_map([], |r| {
+            Ok((
+                u(r.get(0)?),
+                u(r.get(1)?),
+                r.get::<_, i64>(2)? as u32,
+                r.get::<_, String>(3)?,
+                u(r.get(4)?),
+                u(r.get(5)?),
+                r.get::<_, String>(6)?,
+            ))
+        })?
+    {
+        let (id, heap, slot, kind, resource, counter, description) = row?;
+        let kind = match kind.as_str() {
+            "cb" => "cb",
+            "srv" => "srv",
+            "uav" => "uav",
+            "sampler" => "sampler",
+            "rtv" => "rtv",
+            "dsv" => "dsv",
+            "empty" => "empty",
+            _ => continue,
+        };
+        let description = serde_json::from_str(&description).unwrap_or(Value::Null);
+        versions.insert(id, Descriptor { id, heap, slot, kind, resource, counter, description });
+    }
+    let mut changes: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for row in conn
+        .prepare("SELECT submission, version FROM d12_submission_descriptors ORDER BY submission, version")?
+        .query_map([], |r| Ok((u(r.get(0)?), u(r.get(1)?))))?
+    {
+        let (submission, version) = row?;
+        changes.entry(submission).or_default().push(version);
+    }
+    // Each submission's event, in the frame's order: a draw belongs to the last submission before it.
+    let submits: Vec<(i64, u64)> = conn
+        .prepare("SELECT seq, args FROM events WHERE kind = 'submit' ORDER BY seq")?
+        .query_map([], |r| Ok((r.get(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter_map(|(seq, args)| {
+            let args: Value = serde_json::from_str(&args).ok()?;
+            Some((seq, args["submission"].as_u64()?))
+        })
+        .collect();
+    let draws: Vec<(u64, i64, String, String)> = conn
+        .prepare(
+            "SELECT s.draw, d.event, e.kind, s.root_args_json FROM d12_draw_state s JOIN draws d ON d.n = s.draw \
+             JOIN events e ON e.seq = d.event ORDER BY d.event",
+        )?
+        .query_map([], |r| Ok((u(r.get(0)?), r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let args = |v: &Value| -> BTreeMap<u32, Value> {
+        v.as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(k, v)| Some((k.parse().ok()?, v.clone())))
+            .collect()
+    };
+    let mut capture = db::Capture::default();
+    let mut descriptors: BTreeMap<(u64, u32), Descriptor> = BTreeMap::new();
+    let mut next = submits.iter().peekable();
+    for (draw, event, kind, state) in draws {
+        while let Some((_, submission)) = next.next_if(|(seq, _)| *seq < event) {
+            for d in changes
+                .get(submission)
+                .into_iter()
+                .flatten()
+                .filter_map(|v| versions.get(v))
+            {
+                if d.kind == "empty" {
+                    descriptors.remove(&(d.heap, d.slot));
+                } else {
+                    descriptors.insert((d.heap, d.slot), d.clone());
+                }
+            }
+        }
+        let state: Value = serde_json::from_str(&state).unwrap_or(Value::Null);
+        let pipeline = Pipeline {
+            pso: state["pso"].as_u64().unwrap_or(0),
+            graphics_root: state["graphics_root"].as_u64().unwrap_or(0),
+            compute_root: state["compute_root"].as_u64().unwrap_or(0),
+            graphics_args: args(&state["graphics_args"]),
+            compute_args: args(&state["compute_args"]),
+            ..Pipeline::default()
+        };
+        project(
+            &mut capture,
+            draw,
+            kind == "dispatch",
+            &pipeline,
+            &objects,
+            &descriptors,
+        );
+    }
+    Ok(capture)
+}
+
 fn stages(visibility: u64, compute: bool) -> Vec<&'static str> {
     if compute {
         return if visibility == 0 { vec!["cs"] } else { Vec::new() };

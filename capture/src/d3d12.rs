@@ -11,6 +11,8 @@ use crate::db;
 mod bindings;
 mod graphics;
 
+pub use bindings::reproject;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Command {
     pub call: &'static str,
