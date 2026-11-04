@@ -155,12 +155,16 @@ pub fn bindings(dxbc: &[u8]) -> Option<Vec<Binding>> {
     Some(rdef(dxbc)?.bindings.iter().map(binding).collect())
 }
 
-/// The constant buffers a shader declares, from its DXBC bytecode.
+/// The constant buffers a shader declares, from its DXBC bytecode. The reflection also lays out tbuffers, interface
+/// pointers and each structured buffer's element as buffers; those are bound to t and u registers, not b, so they are
+/// left out.
 pub fn constant_buffers(dxbc: &[u8]) -> Option<Vec<ConstantBuffer>> {
     let rdef = rdef(dxbc)?;
     Some(
         rdef.buffers
             .iter()
+            // D3D_CBUFFER_TYPE: 0 is D3D_CT_CBUFFER.
+            .filter(|cb| cb.kind == 0)
             .map(|cb| {
                 // Constant buffers are bound by name: the binding of type 0 (cbuffer) with the same name gives the
                 // register.
@@ -329,6 +333,12 @@ mod tests {
     /// An SM 5.0 or 5.1 RDEF as fxc writes it: header, tag and record sizes, one binding (b6, in space 2 in 5.1), one
     /// constant buffer `cbCopy` of two float4x4, the second of which the program never reads.
     fn cb_copy(sm51: bool) -> Vec<u8> {
+        laid_out(sm51, 0, 0)
+    }
+
+    /// The same layout as a buffer of `D3D_CBUFFER_TYPE` `buffer_kind`, bound by a binding of `D3D_SHADER_INPUT_TYPE`
+    /// `binding_kind`.
+    fn laid_out(sm51: bool, buffer_kind: u32, binding_kind: u32) -> Vec<u8> {
         let mut r = vec![0u8; 400];
         let put = |r: &mut Vec<u8>, at: usize, v: u32| r[at..at + 4].copy_from_slice(&v.to_le_bytes());
         let text = |r: &mut Vec<u8>, at: usize, t: &str| r[at..at + t.len()].copy_from_slice(t.as_bytes());
@@ -348,7 +358,7 @@ mod tests {
         }
         // The binding: name, cbuffer, register b6, one register; 5.1's space 2 and id 0 end the record at 100.
         put(&mut r, 60, 300);
-        put(&mut r, 64, 0);
+        put(&mut r, 64, binding_kind);
         put(&mut r, 80, 6);
         put(&mut r, 84, 1);
         if sm51 {
@@ -359,6 +369,7 @@ mod tests {
         put(&mut r, 104, 2);
         put(&mut r, 108, 124);
         put(&mut r, 112, 128);
+        put(&mut r, 120, buffer_kind);
         for (v, (name, offset, flags)) in [(320, 0, 2), (330, 64, 0)].into_iter().enumerate() {
             let at = 124 + v * 40;
             put(&mut r, at, name);
@@ -409,6 +420,14 @@ mod tests {
         let cbs = constant_buffers(&cb_copy(true)).expect("reflection");
         assert_eq!((cbs[0].slot, cbs[0].space), (Some(6), 2));
         assert_eq!(cbs[0].name_at(4).unwrap(), "cbCopy.first[1][0]");
+    }
+
+    #[test]
+    fn a_structured_buffers_element_layout_is_not_a_constant_buffer() {
+        // D3D_CT_RESOURCE_BIND_INFO laid out for a D3D_SIT_STRUCTURED binding.
+        let element = laid_out(false, 3, 5);
+        assert!(constant_buffers(&element).expect("reflection").is_empty());
+        assert_eq!(bindings(&element).expect("bindings")[0].class(), "srv");
     }
 
     #[test]
