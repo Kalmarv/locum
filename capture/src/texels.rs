@@ -332,9 +332,54 @@ pub fn decode(format: u32, width: u32, height: u32, bytes: &[u8]) -> Result<Imag
 }
 
 impl Image {
-    /// The image as 8-bit RGBA: single-channel images grey, two-channel ones red and green.
-    pub fn rgba8(&self, range: Range) -> Vec<u8> {
-        let range = match range {
+    /// Channel `c` (0 to 3) alone, as a single-channel image.
+    pub fn channel(&self, c: usize) -> Image {
+        Image {
+            width: self.width,
+            height: self.height,
+            channels: 1,
+            float: self.float,
+            texels: self.texels.iter().map(|t| [t[c.min(3)], 0.0, 0.0, 1.0]).collect(),
+        }
+    }
+
+    /// The texels from (x, y), `w` wide and `h` high, clipped to the image.
+    pub fn crop(&self, [x, y, w, h]: [u32; 4]) -> Image {
+        let (x0, y0) = (x.min(self.width), y.min(self.height));
+        let (x1, y1) = (
+            x.saturating_add(w).min(self.width),
+            y.saturating_add(h).min(self.height),
+        );
+        let mut texels = Vec::with_capacity(((x1 - x0) * (y1 - y0)) as usize);
+        for row in y0..y1 {
+            let at = (row * self.width) as usize;
+            texels.extend_from_slice(&self.texels[at + x0 as usize..at + x1 as usize]);
+        }
+        Image {
+            width: x1 - x0,
+            height: y1 - y0,
+            channels: self.channels,
+            float: self.float,
+            texels,
+        }
+    }
+
+    /// The smallest rectangle (x, y, width, height) holding every texel whose channels are not all zero, if any is.
+    pub fn content(&self) -> Option<[u32; 4]> {
+        let n = usize::from(self.channels.max(1));
+        let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+        for (i, t) in self.texels.iter().enumerate() {
+            if t[..n].iter().any(|v| *v != 0.0) {
+                let (x, y) = (i as u32 % self.width, i as u32 / self.width);
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+            }
+        }
+        (x1 > 0).then(|| [x0, y0, x1 - x0, y1 - y0])
+    }
+
+    /// How `rgba8` maps values for `range`: `Auto` as it resolves for this image.
+    pub fn mapping(&self, range: Range) -> Range {
+        match range {
             Range::Auto if self.channels == 1 => {
                 let (lo, hi) = self
                     .texels
@@ -351,7 +396,12 @@ impl Image {
             Range::Auto if self.float => Range::Tonemap,
             Range::Auto => Range::Clamp,
             r => r,
-        };
+        }
+    }
+
+    /// The image as 8-bit RGBA: single-channel images grey, two-channel ones red and green.
+    pub fn rgba8(&self, range: Range) -> Vec<u8> {
+        let range = self.mapping(range);
         let map = |v: f32| -> u8 {
             let v = if v.is_nan() { 0.0 } else { v };
             let v = match range {
@@ -385,6 +435,25 @@ impl Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_crop_and_content() {
+        // A 4x2 R8G8B8A8 image, zero but for texels (1,0) and (2,1).
+        let mut bytes = vec![0u8; 4 * 2 * 4];
+        bytes[4..8].copy_from_slice(&[255, 0, 0, 255]);
+        bytes[24..28].copy_from_slice(&[0, 255, 0, 0]);
+        let img = decode(28, 4, 2, &bytes).unwrap();
+        assert_eq!(img.content(), Some([1, 0, 2, 2]));
+        let part = img.crop([1, 0, 2, 2]);
+        assert_eq!((part.width, part.height), (2, 2));
+        assert_eq!(part.texels[0], [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(part.texels[3], [0.0, 1.0, 0.0, 0.0]);
+        let g = img.channel(1);
+        assert_eq!((g.channels, g.texels[6][0], g.texels[1][0]), (1, 1.0, 0.0));
+        // Clipped to the image.
+        assert_eq!(img.crop([3, 1, 10, 10]).texels.len(), 1);
+        assert_eq!(decode(28, 1, 1, &[0; 4]).unwrap().content(), None);
+    }
 
     #[test]
     fn halves() {

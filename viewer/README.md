@@ -24,6 +24,19 @@ one the capture names in its meta, so a capture.db sent from the browser still f
 | `--port N` | 5170, or the next free one |
 | `--host H` | 127.0.0.1; the API reads any capture.db the server can see, so keep it local |
 
+Ctrl+C stops it; so does ending the `bun run` that started it (the server exits when its parent does).
+
+Every page is in the address, so links and reloads work:
+
+| address | |
+|---|---|
+| `#/c/<id>` or `#/c/<id>/info` | the capture's summary |
+| `#/c/<id>/pipeline/<seq>` | the timeline at event `seq` (the `events` table's numbering) |
+| `#/c/<id>/pipeline/draw/<n>` | the timeline at draw `n`, the number `locum-cli draws` and `draw` use |
+| `#/c/<id>/resources/<id>` | one resource |
+| `#/c/<id>/shaders/<hash>` | one shader |
+| `#/c/<id>/sql` | a SQL console |
+
 ## What it shows
 
 - **info**: what the capture holds and lacks (as `locum-cli info` says it), its meta, and `locum-cli verify` on request.

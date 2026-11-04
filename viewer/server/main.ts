@@ -206,7 +206,8 @@ async function image(c: Capture, src: Source, range: string, channels: string): 
   if (!RANGE.test(range)) throw new HttpError(400, `bad range ${range}`);
   if (!(CHANNELS as readonly string[]).includes(channels)) throw new HttpError(400, `bad channels ${channels}`);
   const tag = range.replace(/[^a-z0-9.+-]/gi, "_");
-  const common = ["--blobs", c.blobs, "--range", range];
+  // With alpha: the page shows the channels, or the colour without it, itself.
+  const common = ["--blobs", c.blobs, "--range", range, "--alpha"];
   let full: string;
   if (src.kind === "target") {
     const out = join(cacheDir(c), `target-${src.draw}-${src.name}-${tag}.png`);
@@ -394,6 +395,19 @@ function serve(port: number) {
       }
     },
   });
+}
+
+// `bun run viewer` starts this server as its child, and on Windows ending `bun run` (a task runner stopping it, a
+// closed terminal) does not end the child: the server ends with the process that started it.
+const parent = process.ppid;
+if (parent > 1) {
+  setInterval(() => {
+    try {
+      process.kill(parent, 0);
+    } catch {
+      process.exit(0);
+    }
+  }, 2000);
 }
 
 let server: ReturnType<typeof serve> | null = null;

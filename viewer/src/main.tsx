@@ -1,6 +1,6 @@
 import { render } from "preact";
 import { useEffect, useState } from "preact/hooks";
-import { cached, type Info } from "./api";
+import { cached, get, type Info } from "./api";
 import { Lightbox, type Picture } from "./image";
 import { InfoPage } from "./info";
 import { OpenPage, openFile } from "./open";
@@ -9,7 +9,7 @@ import { Pipeline } from "./pipeline";
 import { Resources } from "./resources";
 import { Shaders } from "./shaders";
 import { Sql } from "./sql";
-import { href, Loading, useAsync, useRoute, type ValueMode } from "./util";
+import { go, href, Loading, useAsync, useRoute, type ValueMode } from "./util";
 import "./style.css";
 
 const TABS: [string, string][] = [["info", "info"], ["pipeline", "pipeline"], ["resources", "resources"], ["shaders", "shaders"], ["sql", "sql"]];
@@ -64,7 +64,7 @@ function App() {
       {dragging ? <div class="dropzone">drop a capture.db to open it</div> : null}
       {busy && route.id ? <div class="busy">{busy}</div> : null}
       {error ? <div class="error top" onClick={() => setError(null)}>{error}</div> : null}
-      {route.id ? <CaptureApp key={route.id} id={route.id} tab={route.tab} item={route.item} />
+      {route.id ? <CaptureApp key={route.id} id={route.id} tab={route.tab} item={route.item} sub={route.sub} />
         : <><Header /><OpenPage busy={busy} setBusy={setBusy} blobs={blobs} setBlobs={setBlobs} /></>}
     </>
   );
@@ -84,7 +84,16 @@ function Header({ info, tab }: { info?: Info; tab?: string }) {
   );
 }
 
-function CaptureApp({ id, tab, item }: { id: string; tab: string; item: string | null }) {
+/** `pipeline/draw/N`: the event of draw N (the number locum-cli uses), shown in its place. */
+function DrawLink({ id, n }: { id: string; n: string }) {
+  const draw = useAsync(() => get<{ event: number }>(`c/${id}/draw/${n}`), [id, n]);
+  useEffect(() => {
+    if (draw.data) go(href(id, "pipeline", draw.data.event), true);
+  }, [draw.data]);
+  return <Loading state={draw}>{() => null}</Loading>;
+}
+
+function CaptureApp({ id, tab, item, sub }: { id: string; tab: string; item: string | null; sub: string | null }) {
   const info = useAsync(() => cached<Info>(`c/${id}/info`), [id]);
   const [mode, setModeState] = useState<ValueMode>(() => (localStorage.getItem("locum-mode") as ValueMode) ?? "auto");
   const [picture, setPicture] = useState<Picture | null>(null);
@@ -98,7 +107,9 @@ function CaptureApp({ id, tab, item }: { id: string; tab: string; item: string |
       <main>
         <Loading state={info}>{() => {
           switch (tab) {
-            case "pipeline": return <Pipeline seq={item != null ? Number(item) : null} />;
+            case "pipeline":
+              if (item === "draw" && sub != null) return <DrawLink id={id} n={sub} />;
+              return <Pipeline seq={item != null ? Number(item) : null} />;
             case "resources": return <Resources item={item} />;
             case "shaders": return <Shaders item={item} />;
             case "sql": return <Sql />;

@@ -37,6 +37,48 @@ struct Cli {
     command: Command,
 }
 
+/// How a .png is drawn.
+#[derive(clap::Args)]
+struct PictureArgs {
+    /// PNG values: auto (a single channel stretched from its least to its greatest value, float colour
+    /// tone-mapped, the rest clamped), clamp, tonemap or LO:HI.
+    #[arg(long, default_value = "auto")]
+    range: String,
+    /// PNG: one channel as grey (r, g, b or a); the mapping used is printed.
+    #[arg(long, value_parser = ["r", "g", "b", "a"])]
+    channel: Option<String>,
+    /// PNG: only the texels from X,Y, W wide and H high.
+    #[arg(long, value_name = "X,Y,W,H", conflicts_with = "crop")]
+    rect: Option<String>,
+    /// PNG: only the smallest rectangle holding every texel that is not zero (a sparse atlas's used part).
+    #[arg(long)]
+    crop: bool,
+    /// PNG: the alpha channel as the picture's alpha. Pictures are opaque otherwise: a target's alpha is rarely
+    /// coverage, and a zero there hides the colour (`--channel a` shows it as grey).
+    #[arg(long)]
+    alpha: bool,
+}
+
+impl PictureArgs {
+    fn picture(&self) -> Result<export::Picture, String> {
+        let rect = self
+            .rect
+            .as_ref()
+            .map(|r| {
+                let n: Vec<u32> = r.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+                <[u32; 4]>::try_from(n).map_err(|_| format!("--rect {r}: not X,Y,W,H"))
+            })
+            .transpose()?;
+        Ok(export::Picture {
+            range: range(&self.range)?,
+            channel: self.channel.as_deref().map(|c| "rgba".find(c).unwrap_or(0)),
+            rect,
+            crop: self.crop,
+            alpha: self.alpha,
+        })
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// The captures in locum's folder, newest first.
@@ -232,9 +274,8 @@ enum Command {
         /// Replay on WARP (with --at).
         #[arg(long, requires = "at")]
         warp: bool,
-        /// PNG values: auto, clamp, tonemap or LO:HI.
-        #[arg(long, default_value = "auto")]
-        range: String,
+        #[command(flatten)]
+        picture: PictureArgs,
     },
     /// A target read back after a pass's last draw, as .png, .dds or raw (`-o -`: the raw bytes to stdout).
     Target {
@@ -245,8 +286,8 @@ enum Command {
         name: String,
         #[arg(short, long)]
         out: PathBuf,
-        #[arg(long, default_value = "auto")]
-        range: String,
+        #[command(flatten)]
+        picture: PictureArgs,
     },
     /// One texel of a target in every readback of it after a pass, in the frame's order: where each pass left it,
     /// which changed it, and the pass ends not read back.
@@ -589,7 +630,7 @@ fn run(cli: Cli) -> Result<(), String> {
             upload,
             at,
             warp,
-            range: r,
+            picture,
         } => export::export(
             &open(&capture)?,
             id,
@@ -603,15 +644,15 @@ fn run(cli: Cli) -> Result<(), String> {
                 at,
                 warp,
             },
-            range(&r)?,
+            &picture.picture()?,
         ),
         Command::Target {
             capture,
             draw,
             name,
             out,
-            range: r,
-        } => export::target(&open(&capture)?, draw, &name, &out, range(&r)?),
+            picture,
+        } => export::target(&open(&capture)?, draw, &name, &out, &picture.picture()?),
         Command::Pixel {
             capture,
             target,

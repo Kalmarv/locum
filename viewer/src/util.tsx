@@ -8,8 +8,10 @@ export interface Route {
   id: string | null;
   /** info, pipeline, resources, shaders, sql */
   tab: string;
-  /** The selected item: an event's seq, a resource id, a shader hash. */
+  /** The selected item: an event's seq, a resource id, a shader hash; or `draw` before a draw's number. */
   item: string | null;
+  /** What follows the item: the draw's number in `pipeline/draw/N`. */
+  sub: string | null;
   params: URLSearchParams;
 }
 
@@ -17,8 +19,8 @@ export function parseRoute(hash: string): Route {
   const [path = "", query = ""] = hash.replace(/^#\/?/, "").split("?");
   const parts = path.split("/").filter(Boolean).map(decodeURIComponent);
   const params = new URLSearchParams(query);
-  if (parts[0] !== "c" || !parts[1]) return { id: null, tab: "open", item: null, params };
-  return { id: parts[1], tab: parts[2] ?? "info", item: parts[3] ?? null, params };
+  if (parts[0] !== "c" || !parts[1]) return { id: null, tab: "open", item: null, sub: null, params };
+  return { id: parts[1], tab: parts[2] ?? "info", item: parts[3] ?? null, sub: parts[4] ?? null, params };
 }
 
 export function href(id: string, tab: string, item?: string | number | null, params?: Record<string, string>): string {

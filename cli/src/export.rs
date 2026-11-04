@@ -79,6 +79,73 @@ macro_rules! told {
     };
 }
 
+/// How a PNG is drawn: the value mapping, one channel as grey, and a part of the image.
+pub struct Picture {
+    pub range: Range,
+    /// 0 to 3: r, g, b, a.
+    pub channel: Option<usize>,
+    /// x, y, width, height.
+    pub rect: Option<[u32; 4]>,
+    /// To the smallest rectangle holding every texel that is not zero.
+    pub crop: bool,
+    /// The alpha channel as the PNG's alpha; otherwise the picture is opaque.
+    pub alpha: bool,
+}
+
+impl Picture {
+    /// `image` as asked, and what was done to it: the channel, the part, and the mapping to 0..255.
+    fn apply(&self, image: texels::Image) -> Result<(texels::Image, String), String> {
+        let mut note = Vec::new();
+        let mut image = match self.channel {
+            Some(c) if c >= usize::from(image.channels.max(1)) => {
+                return Err(format!(
+                    "the format has {} channel(s): no channel {}",
+                    image.channels,
+                    ["r", "g", "b", "a"][c]
+                ));
+            }
+            Some(c) => {
+                note.push(format!("channel {} as grey", ["r", "g", "b", "a"][c]));
+                image.channel(c)
+            }
+            None => image,
+        };
+        let rect = match (self.rect, self.crop) {
+            (Some(r), _) => Some(r),
+            (None, true) => Some(image.content().ok_or("every texel is zero: nothing to crop to")?),
+            (None, false) => None,
+        };
+        if let Some(r) = rect {
+            image = image.crop(r);
+            note.push(format!(
+                "texels {},{} {}x{}",
+                r[0], r[1], image.width, image.height
+            ));
+        }
+        note.push(match image.mapping(self.range) {
+            Range::Fixed(lo, hi) => format!("{lo}..{hi} as 0..255"),
+            Range::Tonemap => "x/(1+x) as 0..255".into(),
+            _ => "0..1 as 0..255".into(),
+        });
+        if self.alpha && image.channels == 4 {
+            note.push("alpha as the PNG's alpha".into());
+        }
+        Ok((image, note.join(", ")))
+    }
+
+    /// The PNG's pixels: opaque unless the alpha is kept (a target's alpha is rarely coverage, and a zero there
+    /// would hide the colour).
+    fn rgba8(&self, image: &texels::Image) -> Vec<u8> {
+        let mut rgba = image.rgba8(self.range);
+        if !self.alpha {
+            for a in rgba.iter_mut().skip(3).step_by(4) {
+                *a = 255;
+            }
+        }
+        rgba
+    }
+}
+
 pub struct Which {
     pub sub: Option<u32>,
     pub mip: u32,
@@ -92,7 +159,7 @@ pub struct Which {
     pub warp: bool,
 }
 
-pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, range: Range) -> Result<(), String> {
+pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Picture) -> Result<(), String> {
     let s = shape(c, id).ok_or_else(|| format!("no resource #{id}"))?;
     let (bytes, key) = match which.at {
         Some(event) => {
@@ -234,10 +301,11 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, range: Range
                 sub.height,
                 &bytes[start as usize..(start + sub.slice_bytes()) as usize],
             )?;
-            png(out_path, sub.width, sub.height, &image.rgba8(range))?;
+            let (image, note) = picture.apply(image)?;
+            png(out_path, image.width, image.height, &picture.rgba8(&image))?;
             told!(
                 out_path,
-                "{}: #{id} mip {} slice {}{} {}x{} {}",
+                "{}: #{id} mip {} slice {}{} {}x{} {} ({note})",
                 out_path.display(),
                 sub.mip,
                 sub.slice,
@@ -255,7 +323,7 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, range: Range
     Ok(())
 }
 
-pub fn target(c: &Capture, draw: i64, name: &str, out_path: &Path, range: Range) -> Result<(), String> {
+pub fn target(c: &Capture, draw: i64, name: &str, out_path: &Path, picture: &Picture) -> Result<(), String> {
     let (key, w, h, f): (Option<String>, i64, i64, i64) = c
         .row(
             "SELECT blob, width, height, format FROM targets WHERE draw = ?1 AND target = ?2",
@@ -276,10 +344,12 @@ pub fn target(c: &Capture, draw: i64, name: &str, out_path: &Path, range: Range)
     let key = key.ok_or("the target was not stored")?;
     let bytes = c.blob(&key)?;
     let (w, h, f) = (w as u32, h as u32, f as u32);
+    let mut note = String::new();
     match kind_of(out_path) {
         Kind::Png => {
-            let image = texels::decode(f, w, h, &bytes)?;
-            png(out_path, w, h, &image.rgba8(range))?;
+            let (image, n) = picture.apply(texels::decode(f, w, h, &bytes)?)?;
+            png(out_path, image.width, image.height, &picture.rgba8(&image))?;
+            note = format!(" ({n})");
         }
         Kind::Dds => {
             let t = Texture {
@@ -298,7 +368,7 @@ pub fn target(c: &Capture, draw: i64, name: &str, out_path: &Path, range: Range)
     }
     told!(
         out_path,
-        "{}: {name} after draw {draw}, {w}x{h} {}",
+        "{}: {name} after draw {draw}, {w}x{h} {}{note}",
         out_path.display(),
         format::name(f)
     );
