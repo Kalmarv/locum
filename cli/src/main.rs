@@ -532,8 +532,10 @@ enum Command {
         #[arg(long, default_value_t = 30)]
         limit: usize,
     },
-    /// Adds DDS files (each file given, and every one under each folder given) to an index of files by the keys of
-    /// their bytes, made if there is none.
+    /// Adds DDS files and programs (shader containers, by their `DXBC` magic, whatever the file's name) to an index
+    /// of files by the keys of their bytes, made if there is none: each file given, and every one under each folder
+    /// given. Programs an index names are named by the file in `shaders`, `draws` and `draw` when their bytecode
+    /// records no debug name.
     Index {
         /// The index to make or add to.
         #[arg(short, long)]
@@ -561,8 +563,11 @@ enum Command {
         #[arg(long, default_value_t = 200)]
         limit: usize,
     },
-    /// Any SQL on the capture; rows tab-separated.
+    /// Any SQL on the capture; rows tab-separated. `.tables` lists the tables, `.schema [TABLE]` their columns.
     Sql { capture: String, query: String },
+    /// The hashes locum gives a file's bytes: a Direct3D 11 capture's shader hash (FNV-1a 64 from locum's basis), and
+    /// the blob key (XXH3-128) that names contents, uploads and Direct3D 12 shaders.
+    Hash { files: Vec<PathBuf> },
     /// Brings what an older locum derived in a capture up to this one, from the capture's own records: D3D12
     /// bindings projected again (an older projection bound some registers to two descriptors), structured views'
     /// element size, and the programs' debug names in `shaders`. Writes the capture.db in place
@@ -588,6 +593,24 @@ fn parse_draws(s: &str) -> Result<(i64, i64), String> {
 }
 
 fn sql(c: &open::Capture, query: &str) -> Result<(), String> {
+    // The sqlite shell's two commands for finding one's way.
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let dot;
+    let query = match words.as_slice() {
+        [".tables"] => "SELECT name FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name",
+        [".schema"] => "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type DESC, name",
+        [".schema", table] => {
+            dot = format!(
+                "SELECT sql FROM sqlite_master WHERE tbl_name = '{}' AND sql IS NOT NULL ORDER BY type DESC, name",
+                table.replace('\'', "''")
+            );
+            &dot
+        }
+        [w, ..] if w.starts_with('.') => {
+            return Err(format!("{w}: only .tables and .schema [TABLE] of the sqlite shell's commands are known"));
+        }
+        _ => query,
+    };
     let mut q = c.db.prepare(query).map_err(|e| e.to_string())?;
     let n = q.column_count();
     out!("{}", q.column_names().collect::<Vec<_>>().join("\t"));
@@ -1008,6 +1031,19 @@ fn run(cli: Cli) -> Result<(), String> {
             limit,
         } => join::join(&open(&capture)?, all, unnamed, name.as_deref(), limit),
         Command::Sql { capture, query } => sql(&open(&capture)?, &query),
+        Command::Hash { files } => {
+            for f in files {
+                let bytes = std::fs::read(&f).map_err(|e| format!("{}: {e}", f.display()))?;
+                out!(
+                    "{}  {}  {:>9}  {}",
+                    locum_capture::hash::shader_name(locum_capture::hash::shader(&bytes)),
+                    locum_capture::hash::key(&bytes),
+                    bytes.len(),
+                    f.display()
+                );
+            }
+            Ok(())
+        }
         Command::Upgrade { capture, check } => upgrade::upgrade(&open(&capture)?, check),
     }
 }

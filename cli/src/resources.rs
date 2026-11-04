@@ -425,7 +425,9 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
             }
             _ => String::new(),
         };
-        let kept = upload_source(c, seq, &call, args.as_deref()).unwrap_or_default();
+        let kept = upload_source(c, seq, &call, args.as_deref())
+            .or_else(|| discarded(c, &call, args.as_deref()).map(|d| format!("  ({d})")))
+            .unwrap_or_default();
         out!(
             "{seq:>6} {kind:<9} {call:<28} {place:<8} {}{}{touches}{kept}{}{}",
             draw.map(|d| format!("draw {d} ")).unwrap_or_default(),
@@ -440,6 +442,30 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
         out!("(stopped at --limit {}; --from {next} lists the next)", f.limit);
     }
     Ok(())
+}
+
+/// For a discarding map's Unmap (`D3D11_MAP_WRITE_DISCARD`), how much of the resource the game wrote: what it left
+/// unwritten holds the pattern a discarding map starts as (`locum_capture::maps`), which the GPU read too.
+pub fn discarded(c: &Capture, call: &str, args: Option<&str>) -> Option<String> {
+    if call != "Unmap" {
+        return None;
+    }
+    let args: serde_json::Value = serde_json::from_str(args?).ok()?;
+    if args["type"] != 4 {
+        return None;
+    }
+    // Each range is (offset, length).
+    let wrote: u64 = args["ranges"]
+        .as_array()?
+        .iter()
+        .filter_map(|r| r[1].as_u64())
+        .sum();
+    let size = crate::describe::shape(c, args["resource"].as_i64()?).map(|s| s.bytes)?;
+    Some(match wrote {
+        0 => "wrote no bytes: what it holds is the pattern a discarding map starts as, not data".into(),
+        w if w < size => format!("wrote {w} of its {size} bytes: the rest is the pattern a discarding map starts as"),
+        _ => return None,
+    })
 }
 
 /// For a D3D12 buffer copy from an upload buffer, whether the capture kept the bytes it read: the upload ranges its

@@ -2,7 +2,8 @@
 //! upload key, each subresource's key and its contents' key are those of the canonical layout, which for a texture
 //! is the order a DDS file stores its bytes in; so a DDS file is keyed whole and mip by mip without converting it,
 //! and a texture the game made from fewer mips than the file holds (or from one face) still finds the file through
-//! its subresources. Buffers (vertices, indices) are keyed as their bytes.
+//! its subresources. Buffers (vertices, indices) are keyed as their bytes, and so are programs (shader containers):
+//! a capture keeps each program's bytecode whole.
 //!
 //! The index knows nothing of games: an extractor adds what it reads under names of its choosing (`locum-cli index`
 //! adds loose DDS files; a game's own reader adds what is inside its archives).
@@ -17,7 +18,7 @@ use crate::hash::key;
 use crate::layout;
 
 const SCHEMA: &str = "
--- What was added: a texture (from a DDS file) or a buffer, by a name its extractor chose.
+-- What was added: a texture (from a DDS file), a buffer or a program, by a name its extractor chose.
 CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL,
   format INTEGER, width INTEGER, height INTEGER, depth INTEGER, mips INTEGER, array INTEGER,
   bytes INTEGER NOT NULL, key TEXT NOT NULL);
@@ -61,6 +62,8 @@ pub struct Index {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Like {
     Buffer,
+    /// A shader container.
+    Program,
     Texture {
         formats: Vec<u32>,
         width: u32,
@@ -87,6 +90,7 @@ impl Like {
     fn filter(&self, table: &str) -> String {
         match self {
             Like::Buffer => "f.kind = 'buffer'".into(),
+            Like::Program => "f.kind = 'program'".into(),
             Like::Texture {
                 formats,
                 width,
@@ -206,6 +210,15 @@ impl Index {
     /// Adds a buffer's bytes under `name`.
     pub fn add_buffer(&mut self, name: &str, bytes: &[u8]) -> Result<(), String> {
         self.add_buffer_key(name, bytes.len() as u64, &key(bytes))
+    }
+
+    /// Adds a program's bytes (a shader container, as the game passes it to the API) under `name`.
+    pub fn add_program(&mut self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.db
+            .prepare_cached("INSERT INTO files(name, kind, bytes, key) VALUES (?1, 'program', ?2, ?3)")
+            .and_then(|mut s| s.execute(params![name, bytes.len() as i64, key(bytes)]))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Adds a buffer of `bytes` bytes whose key (`hash::key`) another tool computed, under `name`.
@@ -331,6 +344,7 @@ mod tests {
             let mut index = Index::create(&path).unwrap();
             index.add_dds("a/b.dds", &dds::file(&t, &payload)).unwrap();
             index.add_buffer("a/vertices", b"vertex bytes").unwrap();
+            index.add_program("shader/p.ppo", b"DXBC program bytes").unwrap();
             assert!(
                 index
                     .add_dds("short.dds", &dds::file(&t, &payload[..20]))
@@ -350,6 +364,12 @@ mod tests {
             "buffer"
         );
         assert!(index.sub(&key(b"nothing"), &Like::texture(87, 2, 1)).is_none());
+        // A program is found as a program, not as a buffer of the same bytes.
+        assert_eq!(
+            index.whole(&key(b"DXBC program bytes"), &Like::Program, 10).0[0].name,
+            "shader/p.ppo"
+        );
+        assert_eq!(index.whole(&key(b"DXBC program bytes"), &Like::Buffer, 10).1, 0);
         // The same bytes are not the same data as a buffer, in another layout, or at another size.
         assert_eq!(index.whole(&key(&payload), &Like::Buffer, 10).1, 0);
         assert_eq!(
@@ -369,7 +389,11 @@ mod tests {
         assert!(index.sub(&key(&payload[32..40]), &Like::Buffer).is_none());
         assert_eq!(
             index.counts(),
-            vec![("buffer".to_string(), 1), ("texture".to_string(), 1)]
+            vec![
+                ("buffer".to_string(), 1),
+                ("program".to_string(), 1),
+                ("texture".to_string(), 1)
+            ]
         );
         drop(index);
         let _ = std::fs::remove_file(&path);

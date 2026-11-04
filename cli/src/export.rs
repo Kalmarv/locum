@@ -171,6 +171,18 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
             }
             let source = format!("as event {event} saw it: replayed from the frame's start with {events} events");
             told!(out_path, "#{id} {source}");
+            // The write it holds last: a discarding map that wrote little or nothing leaves locum's pattern.
+            let last: Option<(i64, String, Option<String>)> = c.row(
+                "SELECT e.seq, e.call, e.args FROM events e JOIN event_resources r ON r.event = e.seq \
+                 WHERE r.resource = ?1 AND r.access = 'write' AND e.seq < ?2 ORDER BY e.seq DESC LIMIT 1",
+                rusqlite::params![id, event],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            );
+            if let Some((seq, call, args)) = last
+                && let Some(d) = crate::resources::discarded(c, &call, args.as_deref())
+            {
+                told!(out_path, "warning: the map at event {seq} {d}");
+            }
             (bytes, source)
         }
         None => {

@@ -272,7 +272,9 @@ locum-cli changes last 120:rt0 --rect 0,0,640,360  # texels each pass changed in
 locum-cli cb last 120 vs 8 --name ViewProj # only the registers of matching variables (--reg 3,26 by number;
                                            # --name 'Scroll|waveTime' for several)
 locum-cli draw last 120 --section bound,cb # only those parts (state, bound, cb, targets)
-locum-cli sql last "SELECT ..."            # anything else
+locum-cli sql last "SELECT ..."            # anything else (`.tables` lists the tables, `.schema results` one's columns;
+                                           # capture/src/db.rs explains each)
+locum-cli hash FILE...                     # the D3D11 shader hash and the blob key locum would give a file's bytes
 locum-cli upgrade last --check             # what an older locum derived, brought up to this one (see below)
 ```
 
@@ -379,7 +381,8 @@ the way captures key contents (a texture's canonical layout is a DDS file's orde
 mip by mip as it is):
 
 ```
-locum-cli index -o files.db DIR...         # key every DDS file under each DIR
+locum-cli index -o files.db DIR...         # key every DDS file and every program (a shader container: it begins
+                                           # `DXBC`, whatever its extension) under each DIR
 locum-cli index -o files.db --keys k.tsv   # add buffer keys a game's reader listed (key<TAB>bytes<TAB>name lines)
 locum-cli --index files.db join last       # what each texture and buffer the frame used was made from
 locum-cli --index files.db draw last 120   # bound resources are shown with their file's name
@@ -398,6 +401,11 @@ block, vertex buffers and face sets in Sekiro's or Elden Ring's archives, and un
 Mesh's vertex streams and index buffer in a Unity player (a SkateBIRD capture has 183 of its 209 buffers named so).
 `join`'s totals say how many of those not named have no bytes recorded to match (neither upload bytes nor contents), as
 in captures from before first-use contents.
+
+Programs are named the same way. A program built without a debug name (Sekiro's DXBC, older Elden Ring captures)
+takes the name of the file an index holds with the same bytecode, so `shaders --name`, `draws --name` and `draw`
+find and show it by the game's own file names: index the members of the game's shader archives (Sekiro's
+`.ppo`/`.vpo` files from `shader/*.shaderbnd.dcx`) and give `--index`.
 
 Constants are named from each shader's reflection (its `RDEF` part as `dxbc-reader` reads it, Shader Model 4.0 to 5.1,
 register spaces included), as `cbuffer.variable[index].component`. A program built without names (Unreal's DXIL)

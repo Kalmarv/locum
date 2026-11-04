@@ -195,7 +195,8 @@ impl Reflection {
             .any(|b| b.name.eq_ignore_ascii_case(name))
     }
 
-    /// Shader `shader`'s debug name (`rdef::debug_name`), when its bytecode names one.
+    /// Shader `shader`'s name: its debug name (`rdef::debug_name`) when its bytecode names one, or else the file an
+    /// index (`--index`) says the same bytecode was read from.
     pub fn name(&mut self, c: &Capture, shader: &str) -> Option<&str> {
         self.names
             .entry(shader.to_string())
@@ -205,7 +206,10 @@ impl Reflection {
                     [shader],
                     |r| r.get(0),
                 )?;
-                rdef::debug_name(&c.blob(&key).ok()?)
+                c.blob(&key)
+                    .ok()
+                    .and_then(|code| rdef::debug_name(&code))
+                    .or_else(|| c.names.program(&key).map(|m| m.file.name))
             })
             .as_deref()
     }

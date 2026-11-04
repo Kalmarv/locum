@@ -164,6 +164,16 @@ impl Names {
         found.map(|f| (f, count - 1))
     }
 
+    /// The file a program whose bytecode has blob key `key` was read from, if an index knows.
+    pub fn program(&self, key: &str) -> Option<Match> {
+        let (file, others) = self.whole(key, &Like::Program)?;
+        Some(Match {
+            file,
+            how: "bytecode".into(),
+            others,
+        })
+    }
+
     /// What resource `id` of `c` was made from, if an index knows.
     pub fn of(&self, c: &Capture, id: i64) -> Option<Match> {
         if self.indexes.is_empty() {
@@ -260,13 +270,14 @@ impl Names {
     }
 }
 
-/// Adds every DDS file under each of `inputs` (or the file itself) to the index at `out`, named by its path from the
-/// input, and the buffers each of `keys` lists: lines of `key<TAB>bytes<TAB>name`, as a game's reader writes them for
+/// Adds every DDS file and every program (a shader container, whatever its file is called: it begins `DXBC`) under
+/// each of `inputs` (or the file itself) to the index at `out`, named by its path from the input, and the buffers each
+/// of `keys` lists: lines of `key<TAB>bytes<TAB>name`, as a game's reader writes them for
 /// what is inside its archives (fromsoft-formats' `flver_keys` for FLVER vertex and index bytes, unity-formats'
 /// `mesh_keys` for a Unity player's Mesh vertex streams and index buffers).
 pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), String> {
     let mut index = Index::create(out)?;
-    let (mut added, mut refused) = (0usize, Vec::new());
+    let (mut added, mut programs, mut refused) = (0usize, 0usize, Vec::new());
     let mut keyed = 0usize;
     for list in keys {
         let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
@@ -302,7 +313,8 @@ pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), Str
                 stack.extend(entries.into_iter().rev());
                 continue;
             }
-            if !p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dds")) {
+            let dds = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("dds"));
+            if !dds && !is_program(&p) {
                 continue;
             }
             let name = p
@@ -313,18 +325,28 @@ pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), Str
                 .to_string_lossy()
                 .replace('\\', "/");
             let bytes = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
-            match index.add_dds(&name, &bytes) {
-                Ok(()) => added += 1,
-                Err(e) => refused.push(format!("{name}: {e}")),
+            let result = if dds {
+                index.add_dds(&name, &bytes).map(|()| added += 1)
+            } else {
+                // The container's own size (bytes 24 to 28): an archive may pad what follows it.
+                let size = bytes
+                    .get(24..28)
+                    .map(|s| u32::from_le_bytes(s.try_into().expect("four bytes")) as usize)
+                    .filter(|&n| n >= 32 && n <= bytes.len())
+                    .unwrap_or(bytes.len());
+                index.add_program(&name, &bytes[..size]).map(|()| programs += 1)
+            };
+            if let Err(e) = result {
+                refused.push(format!("{name}: {e}"));
             }
-            if added % 1000 == 999 {
+            if (added + programs) % 1000 == 999 {
                 index.commit()?;
             }
         }
     }
     index.commit()?;
     out!(
-        "{added} DDS files and {keyed} buffer keys added to {}",
+        "{added} DDS files, {programs} programs and {keyed} buffer keys added to {}",
         out.display()
     );
     if !refused.is_empty() {
@@ -343,6 +365,13 @@ pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), Str
         .collect();
     out!("the index holds {}", counts.join(", "));
     Ok(())
+}
+
+/// Whether the file at `p` is a shader container: it begins with the `DXBC` magic DXBC and DXIL programs share.
+fn is_program(p: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 4];
+    std::fs::File::open(p).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && &magic == b"DXBC"
 }
 
 /// The distinct (offset, size) ranges the frame's draws bound buffer `id` at as vertices or indices, each with what
