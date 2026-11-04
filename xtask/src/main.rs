@@ -1052,6 +1052,14 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
         ),
         (
             {
+                let t = run(&["resource", "9"]);
+                t.starts_with("#9 ") && t.contains("events that wrote it") && !t.contains("panicked")
+            },
+            "locum-cli resource 9: a Direct3D 11 capture's resource, with the events that wrote it (no Direct3D 12 \
+             tile tables asked of it)",
+        ),
+        (
+            {
                 let other = log_dir.join("captures").join("device-write-gpu-2d");
                 let out = Command::new(cli)
                     .arg("draw")

@@ -479,6 +479,10 @@ pub fn discarded(c: &Capture, call: &str, args: Option<&str>) -> Option<String> 
 /// the frame's changes to them (`d12_tile_pages`, `d12_tile_mappings`). Nothing for any other resource.
 fn reserved_tiles(c: &Capture, id: i64) -> Vec<String> {
     use locum_capture::tiles::{Layout, Pages, TILE_BYTES};
+    // Direct3D 11 captures, and Direct3D 12 ones from before reserved resources were followed, have neither table.
+    if !c.has_table("d12_tile_pages") || !c.has_table("d12_tile_mappings") {
+        return Vec::new();
+    }
     let row: Option<(Option<String>, Option<String>, Option<String>)> = c.row(
         "SELECT layout_json, pages_json, diagnostic FROM d12_tile_pages WHERE resource = ?1",
         [id],
