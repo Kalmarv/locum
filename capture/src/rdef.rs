@@ -425,20 +425,30 @@ fn name_in(name: &str, ty: &Type, offset: u32) -> (String, u16) {
     }
 }
 
-/// The bytes one array element of `ty` takes in a constant buffer (every element but the last starts a register).
+/// The bytes one array element of `ty` takes in a constant buffer: every element starts a register.
 fn element_stride(ty: &Type) -> u32 {
-    let bytes = match ty.class {
+    size(ty).div_ceil(16) * 16
+}
+
+/// The bytes a value of type `ty` covers in a constant buffer, to the end of its last component: a struct's last
+/// member or an array's last element may end inside a register, and the next variable may start in the rest of it.
+fn size(ty: &Type) -> u32 {
+    let one = match ty.class {
         5 => ty
             .members
             .iter()
-            .map(|m| m.offset + element_stride(&m.ty) * u32::from(m.ty.elements.max(1)))
+            .map(|m| m.offset + size(&m.ty))
             .max()
-            .unwrap_or(16),
-        2 => u32::from(ty.rows) * 16,
-        3 => u32::from(ty.columns) * 16,
+            .unwrap_or(0),
+        // Row-major: each row a register; column-major: each column.
+        2 => u32::from(ty.rows.max(1) - 1) * 16 + u32::from(ty.columns.max(1)) * 4,
+        3 => u32::from(ty.columns.max(1) - 1) * 16 + u32::from(ty.rows.max(1)) * 4,
         _ => u32::from(ty.columns.max(1)) * 4,
     };
-    bytes.div_ceil(16) * 16
+    match ty.elements {
+        0 => one,
+        n => u32::from(n - 1) * one.div_ceil(16) * 16 + one,
+    }
 }
 
 impl ConstantBuffer {
@@ -505,6 +515,55 @@ mod tests {
         };
         assert_eq!(name_in("world", &m, 36).0, "world[2][1]");
         assert_eq!(type_name_check(), "float4[4]");
+    }
+
+    /// An array of structs whose last member ends inside a register: Elden Ring's `VC_SpeedTreeWind[2]`, a struct of
+    /// 272 bytes whose `u_uInteractionFlag` is at 268, puts element 1 at 272, not at 288.
+    #[test]
+    fn struct_array_stride() {
+        let scalar = Type {
+            class: 0,
+            base: 19,
+            rows: 1,
+            columns: 1,
+            elements: 0,
+            members: Vec::new(),
+        };
+        let wind = Type {
+            class: 5,
+            base: 0,
+            rows: 1,
+            columns: 1,
+            elements: 2,
+            members: vec![
+                Member {
+                    name: "dir".into(),
+                    offset: 0,
+                    ty: vector(4, 0),
+                },
+                Member {
+                    name: "flag".into(),
+                    offset: 268,
+                    ty: scalar.clone(),
+                },
+            ],
+        };
+        assert_eq!(name_in("w", &wind, 268).0, "w[0].flag");
+        assert_eq!(name_in("w", &wind, 272).0, "w[1].dir.x");
+        assert_eq!(name_in("w", &wind, 540).0, "w[1].flag");
+        // A float3 array: each element starts a register, the last ends at its third component.
+        assert_eq!(size(&vector(3, 4)), 3 * 16 + 12);
+        assert_eq!(name_in("v", &vector(3, 4), 52).0, "v[3].y");
+        // A row-major float3x4: three registers of four components.
+        let m = Type {
+            class: 2,
+            base: 3,
+            rows: 3,
+            columns: 4,
+            elements: 0,
+            members: Vec::new(),
+        };
+        assert_eq!(size(&m), 48);
     }
 
     fn type_name_check() -> String {
