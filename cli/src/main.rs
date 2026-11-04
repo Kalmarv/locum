@@ -11,6 +11,7 @@ mod info;
 mod join;
 mod memory;
 mod open;
+mod pixels;
 mod replay;
 mod resources;
 mod shaders;
@@ -90,6 +91,9 @@ enum Command {
         /// As JSON: one object per draw, one per line.
         #[arg(long)]
         json: bool,
+        /// Only these parts after the call and shaders: state, bound, cb, targets (`--section bound,cb`).
+        #[arg(long, value_delimiter = ',', value_parser = clap::builder::PossibleValuesParser::new(draw::SECTIONS))]
+        section: Vec<String>,
     },
     /// A draw's constant buffer, every register, with names from the shader.
     Cb {
@@ -107,6 +111,12 @@ enum Command {
         /// As JSON: each 4-byte word with its register, name and value.
         #[arg(long)]
         json: bool,
+        /// Only these registers: `--reg 3,26`.
+        #[arg(long, value_delimiter = ',')]
+        reg: Vec<u32>,
+        /// Only registers holding a variable whose name has this in it (any case): `--name SC_CameraPos`.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// Where a value sits in the frame's constants: each buffer, register, name and the draws that saw it.
     Find {
@@ -226,7 +236,7 @@ enum Command {
         #[arg(long, default_value = "auto")]
         range: String,
     },
-    /// A target read back after a pass's last draw, as .png, .dds or raw.
+    /// A target read back after a pass's last draw, as .png, .dds or raw (`-o -`: the raw bytes to stdout).
     Target {
         capture: String,
         draw: i64,
@@ -238,7 +248,33 @@ enum Command {
         #[arg(long, default_value = "auto")]
         range: String,
     },
-    /// A blob from the store, by key.
+    /// One texel of a target in every readback of it after a pass, in the frame's order: where each pass left it,
+    /// which changed it, and the pass ends not read back.
+    Pixel {
+        capture: String,
+        /// The target: `#ID`, or `DRAW:TARGET` (`1935:rt0`) for the resource and subresource a readback holds.
+        target: String,
+        x: u32,
+        y: u32,
+        /// The subresource (default: the one DRAW:TARGET names, or the resource's first read back).
+        #[arg(long)]
+        sub: Option<u32>,
+        /// Only the readbacks where the texel changed.
+        #[arg(long)]
+        changed: bool,
+    },
+    /// For every readback of a target after a pass, how many texels differ from the readback before and where.
+    Changes {
+        capture: String,
+        /// As for `pixel`.
+        target: String,
+        #[arg(long)]
+        sub: Option<u32>,
+        /// Only the texels from X0,Y0 up to (not including) X1,Y1.
+        #[arg(long, value_name = "X0,Y0,X1,Y1")]
+        rect: Option<String>,
+    },
+    /// A blob from the store, by key (`-o -`: to stdout).
     Blob {
         capture: String,
         key: String,
@@ -453,7 +489,8 @@ fn run(cli: Cli) -> Result<(), String> {
             n,
             all,
             json,
-        } => draw::draw(&open(&capture)?, &n, all, json),
+            section,
+        } => draw::draw(&open(&capture)?, &n, all, json, &section),
         Command::Cb {
             capture,
             draw,
@@ -462,7 +499,18 @@ fn run(cli: Cli) -> Result<(), String> {
             space,
             raw,
             json,
-        } => draw::cb(&open(&capture)?, draw, &stage, slot, space, raw, json),
+            reg,
+            name,
+        } => draw::cb(
+            &open(&capture)?,
+            draw,
+            &stage,
+            slot,
+            space,
+            raw,
+            json,
+            &draw::Only { registers: reg, name },
+        ),
         Command::Find {
             capture,
             value,
@@ -564,6 +612,28 @@ fn run(cli: Cli) -> Result<(), String> {
             out,
             range: r,
         } => export::target(&open(&capture)?, draw, &name, &out, range(&r)?),
+        Command::Pixel {
+            capture,
+            target,
+            x,
+            y,
+            sub,
+            changed,
+        } => pixels::pixel(&open(&capture)?, &target, x, y, sub, changed),
+        Command::Changes {
+            capture,
+            target,
+            sub,
+            rect,
+        } => {
+            let rect = rect
+                .map(|r| {
+                    let n: Vec<u32> = r.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+                    <[u32; 4]>::try_from(n).map_err(|_| format!("--rect {r}: not X0,Y0,X1,Y1"))
+                })
+                .transpose()?;
+            pixels::changes(&open(&capture)?, &target, sub, rect)
+        }
         Command::Blob { capture, key, out } => export::blob(&open(&capture)?, &key, &out),
         Command::Replay {
             capture,

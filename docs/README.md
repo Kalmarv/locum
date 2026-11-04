@@ -88,10 +88,13 @@ contents. locum's own copies run whatever predicate the game has set.
 - `passes` and `targets`: runs of draws with the same targets, and the targets read back after each one's last draw
   (in the format the pass drew in; depth as the colour format of the same bits, D24S8 as R24_UNORM_X8). Every
   array slice and 3D depth plane covered by the view has a row: `sub` identifies its subresource, `z` its depth
-  plane (zero for 2D). Layered names are `rt0[slice2]`, `depth[slice2]`, or `rt0[z2]`;
+  plane (zero for 2D). Layered names are `rt0[slice2]`, `depth[slice2]`, or `rt0[z2]`. `missing_targets` names
+  each pass end whose target was not read back (its draw, target, resource and why), which `passes`, `pixel` and
+  `info` show;
 - `results`: resource contents immediately after each draw/dispatch writes its UAVs or a clear writes its view,
   and whether its shader is order-dependent (below). Clears have `order_dependent=0`;
-- `shaders`, `modules`, `stacks`: bytecode keys, and what the call stacks need to be read.
+- `shaders`, `modules`, `stacks`: bytecode keys and each program's debug name (`name`, the stem of the file name
+  its bytecode records), and what the call stacks need to be read.
 
 Some shaders write different bytes depending on the order the GPU happens to run their threads: a thread that takes
 the next free slot of a buffer with an atomic add (particles, light lists) puts its record wherever it lands, and the
@@ -154,7 +157,17 @@ refused rather than replayed as ordinary resources.
 A pass ends where the targets in effect change on the GPU's timeline: an `OMSetRenderTargets` that binds other
 targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame. Its
 targets are read there, and the capture records the event they were read after (the pass's last draw, or a clear, copy
-or dispatch after it), which is where verify compares them. Each captured execution of a retained command list gets
+or dispatch after it), which is where verify compares them.
+
+On Direct3D 12 the copy of a pass's targets waits for the next command in its list that names the target (binds,
+clears, moves, copies or resolves it), and is made then: until one does, nothing can change what the target holds.
+A copy still waiting when its list closes is decided where the list is submitted. If a later list of the same
+`ExecuteCommandLists` draws to the target with the same views bound before writing it any other way, the pass goes
+on there and is read where it ends (`info` counts these); otherwise a list of locum's copies it right after the
+closed one. Elden Ring records its G-buffer this way, over a dozen lists that each move it into RENDER_TARGET and
+back.
+
+Each captured execution of a retained command list gets
 fresh constant-buffer, target and output copies. Updating or mapping its resources between executions therefore
 produces a separate checkpoint for each execution.
 
@@ -219,7 +232,11 @@ locum-cli draw last all --json > d.jsonl   # every draw as JSON, one per line (a
                                            # shader --json with every constant by its full name)
 locum-cli export last 812 -o tex.dds       # contents as the frame began: .dds (all of it), .png (one mip), or raw
 locum-cli export last 812 --at 3301 -o t.dds  # as event 3301 saw them, replayed with the events that wrote them
-locum-cli target last 120 rt0 -o gbuf0.png # a target read back after a pass
+locum-cli target last 120 rt0 -o gbuf0.png # a target read back after a pass (-o - writes the raw bytes to stdout)
+locum-cli pixel last 120:rt0 960 540       # that texel in every readback of the target: which passes changed it
+locum-cli changes last 120:rt0 --rect 0,0,640,360  # texels each pass changed in a region, and where
+locum-cli cb last 120 vs 8 --name ViewProj # only the registers of matching variables (--reg 3,26 by number)
+locum-cli draw last 120 --section bound,cb # only those parts (state, bound, cb, targets)
 locum-cli sql last "SELECT ..."            # anything else
 ```
 

@@ -1,5 +1,10 @@
-//! The dx and iridia commits this build links, from the workspace's Cargo.lock, for `shader-file --evidence`.
+//! The dx and iridia commits this build links, from the workspace's Cargo.lock, for `shader-file --evidence`; and
+//! an 8 MiB main-thread stack: clap's parser for this many commands needs more than Windows' default 1 MiB in debug
+//! builds.
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+    }
     let lock = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../Cargo.lock");
     println!("cargo:rerun-if-changed={}", lock.display());
     let text = std::fs::read_to_string(&lock).expect("read the workspace Cargo.lock");

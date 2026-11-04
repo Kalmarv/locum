@@ -200,9 +200,11 @@ pub struct Constants {
     pub words: Vec<Word>,
     /// Registers left out because the shader does not use them.
     pub skipped: usize,
+    /// Why there are no contents, as far as the capture says.
+    pub why: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Word {
     pub offset: u32,
     /// The register and component (`c3.y`).
@@ -508,6 +510,25 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
     })
 }
 
+/// Why a capture has constant buffers without contents: its gaps about constants, by reason and count. The rows
+/// do not say which reason was a given binding's.
+fn uncaptured(c: &Capture) -> String {
+    let gaps: Vec<(String, String, i64)> = c.rows(
+        "SELECT what, detail, count FROM gaps WHERE what LIKE '%constant%' OR what = 'cb' ORDER BY count DESC",
+        [],
+        |r| Ok((r.get(0)?, r.get::<_, Option<String>>(1)?.unwrap_or_default(), r.get(2)?)),
+    );
+    if gaps.is_empty() {
+        return "the capture records no reason (captures from before the reasons were counted have none)"
+            .into();
+    }
+    let reasons: Vec<String> = gaps
+        .iter()
+        .map(|(what, why, n)| format!("{what}: {why} ({n})"))
+        .collect();
+    format!("this capture's reasons: {}", reasons.join("; "))
+}
+
 /// A bound constant buffer word by word, named from the shader's reflection. Without `all`, only the registers
 /// holding variables the shader uses.
 fn constants_of(
@@ -527,8 +548,10 @@ fn constants_of(
         bytes: 0,
         words: Vec::new(),
         skipped: 0,
+        why: None,
     };
     let Some(key) = &b.content else {
+        out.why = Some(uncaptured(c));
         return Ok(out);
     };
     let bytes: Vec<u8> = c
@@ -580,7 +603,8 @@ fn print_constants(k: &Constants) {
         s => format!(" space {s}"),
     };
     if k.key.is_none() {
-        out!("{} b{}{space}: contents not captured", k.stage, k.slot);
+        let why = k.why.as_deref().map(|w| format!(": {w}")).unwrap_or_default();
+        out!("{} b{}{space}: contents not captured{why}", k.stage, k.slot);
         return;
     }
     out!(
@@ -633,7 +657,12 @@ fn queued(c: &Capture, event: i64) -> Option<Queued> {
     )
 }
 
-fn print(d: &Draw) {
+/// The parts of a draw's text after its first lines (the call and the shaders): `state`, `bound`, `cb`, `targets`;
+/// none named shows them all.
+pub const SECTIONS: [&str; 4] = ["state", "bound", "cb", "targets"];
+
+fn print(d: &Draw, sections: &[String]) {
+    let show = |s: &str| sections.is_empty() || sections.iter().any(|x| x == s);
     let place = if let Some(q) = &d.queue {
         format!(
             "queue {}, execution {}, list {} generation {}, command {}",
@@ -672,6 +701,33 @@ fn print(d: &Draw) {
         })
         .collect();
     out!("shaders: {}", named.join("  "));
+    if show("state") {
+        print_state(d);
+    }
+    if show("bound") {
+        print_bound(d);
+    }
+    if show("cb") {
+        for k in &d.constants {
+            print_constants(k);
+        }
+    }
+    if show("targets") {
+        for t in &d.targets {
+            out!(
+                "after it, {} read back: {}x{} {} {}",
+                t.target,
+                t.width,
+                t.height,
+                t.format_name,
+                t.blob.as_deref().unwrap_or("-")
+            );
+        }
+    }
+}
+
+/// Topology, pipeline states, predicate, viewports and scissors.
+fn print_state(d: &Draw) {
     if let Some(t) = &d.topology_name {
         out!("topology: {t}");
     }
@@ -722,7 +778,10 @@ fn print(d: &Draw) {
             .collect();
         out!("scissors: {}", s.join("; "));
     }
+}
 
+/// Everything bound, with views, resources and contents.
+fn print_bound(d: &Draw) {
     out!("bound:");
     for b in &d.bindings {
         let mut line = format!("  {} {}{}", b.stage, b.kind, b.slot);
@@ -816,19 +875,6 @@ fn print(d: &Draw) {
             if d.unused == 1 { "it" } else { "them" }
         );
     }
-    for k in &d.constants {
-        print_constants(k);
-    }
-    for t in &d.targets {
-        out!(
-            "after it, {} read back: {}x{} {} {}",
-            t.target,
-            t.width,
-            t.height,
-            t.format_name,
-            t.blob.as_deref().unwrap_or("-")
-        );
-    }
 }
 
 fn json<T: Serialize>(v: &T) -> Result<(), String> {
@@ -837,7 +883,13 @@ fn json<T: Serialize>(v: &T) -> Result<(), String> {
 }
 
 /// `draw`: one draw (a number or `last`), or with `all` every draw, as text or JSON (one object per line).
-pub fn draw(c: &Capture, which: &str, all_constants: bool, as_json: bool) -> Result<(), String> {
+pub fn draw(
+    c: &Capture,
+    which: &str,
+    all_constants: bool,
+    as_json: bool,
+    sections: &[String],
+) -> Result<(), String> {
     let mut reflection = Reflection::default();
     if which == "all" {
         let numbers: Vec<i64> = c.rows("SELECT n FROM draws ORDER BY n", [], |r| r.get(0));
@@ -846,7 +898,7 @@ pub fn draw(c: &Capture, which: &str, all_constants: bool, as_json: bool) -> Res
             if as_json {
                 json(&d)?;
             } else {
-                print(&d);
+                print(&d, sections);
                 out!("");
             }
         }
@@ -857,12 +909,20 @@ pub fn draw(c: &Capture, which: &str, all_constants: bool, as_json: bool) -> Res
     if as_json {
         json(&d)
     } else {
-        print(&d);
+        print(&d, sections);
         Ok(())
     }
 }
 
 /// `cb`: a draw's constant buffer, every register, by name; or its bytes in hex; or as JSON.
+/// Which registers `cb` shows: by register number, or by a part of a variable's name (any case).
+#[derive(Default)]
+pub struct Only {
+    pub registers: Vec<u32>,
+    pub name: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn cb(
     c: &Capture,
     draw: i64,
@@ -871,6 +931,7 @@ pub fn cb(
     space: u32,
     raw: bool,
     as_json: bool,
+    only: &Only,
 ) -> Result<(), String> {
     let (mut here, elsewhere): (Vec<_>, Vec<_>) = rows(c, draw)
         .into_iter()
@@ -898,7 +959,22 @@ pub fn cb(
         }
         return Ok(());
     }
-    let k = constants_of(c, &mut Reflection::default(), draw, &b, true)?;
+    let mut k = constants_of(c, &mut Reflection::default(), draw, &b, true)?;
+    if !only.registers.is_empty() || only.name.is_some() {
+        let wanted = only.name.as_ref().map(|n| n.to_lowercase());
+        let keep = |register: &[Word]| {
+            let r = register[0].offset / 16;
+            only.registers.contains(&r)
+                || wanted.as_ref().is_some_and(|w| {
+                    register
+                        .iter()
+                        .any(|x| x.name.as_ref().is_some_and(|n| n.to_lowercase().contains(w)))
+                })
+        };
+        let words = std::mem::take(&mut k.words);
+        k.words = words.chunks(4).filter(|r| keep(r)).flatten().cloned().collect();
+        k.skipped = 0;
+    }
     if as_json {
         json(&k)
     } else {

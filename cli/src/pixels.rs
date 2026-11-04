@@ -1,0 +1,277 @@
+//! `pixel` and `changes`: what the frame's passes did to a target's texels, over every readback of it after a pass.
+
+use locum_capture::format;
+use locum_capture::texels::{self, Image};
+
+use crate::open::Capture;
+use crate::out;
+
+/// One subresource of a target resource, as `#ID` (or `ID`), or `DRAW:TARGET` for the one a draw's readback holds.
+struct Subject {
+    resource: i64,
+    sub: i64,
+    z: i64,
+}
+
+fn subject(c: &Capture, arg: &str, sub: Option<u32>) -> Result<Subject, String> {
+    if let Some((draw, name)) = arg.split_once(':') {
+        let draw: i64 = draw.parse().map_err(|_| format!("{arg}: not DRAW:TARGET"))?;
+        if let Some((resource, s, z)) = c.row(
+            "SELECT resource, sub, z FROM targets WHERE draw = ?1 AND target = ?2",
+            rusqlite::params![draw, name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ) {
+            return Ok(Subject {
+                resource,
+                sub: sub.map_or(s, i64::from),
+                z,
+            });
+        }
+        let why: Option<String> = c
+            .has_table("missing_targets")
+            .then(|| {
+                c.row(
+                    "SELECT why FROM missing_targets WHERE draw = ?1 AND target = ?2",
+                    rusqlite::params![draw, name],
+                    |r| r.get(0),
+                )
+            })
+            .flatten();
+        return Err(match why {
+            Some(why) => format!("{name} after draw {draw} was not read back: {why}"),
+            None => format!("no {name} read back after draw {draw}"),
+        });
+    }
+    let resource: i64 = arg
+        .trim_start_matches('#')
+        .parse()
+        .map_err(|_| format!("{arg}: not #ID or DRAW:TARGET"))?;
+    let sub = match sub {
+        Some(s) => i64::from(s),
+        None => c
+            .row(
+                "SELECT min(sub) FROM targets WHERE resource = ?1",
+                [resource],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .flatten()
+            .ok_or_else(|| format!("#{resource} was never read back after a pass"))?,
+    };
+    Ok(Subject { resource, sub, z: 0 })
+}
+
+/// A readback of the subject, or a pass end of it that was not read back, in the frame's order.
+enum Entry {
+    Read {
+        draw: i64,
+        pass: Option<i64>,
+        target: String,
+        image: Result<Image, String>,
+        size: (u32, u32),
+    },
+    Missing {
+        draw: i64,
+        target: String,
+        why: String,
+    },
+}
+
+/// A `targets` row: draw, pass, target, width, height, format, blob.
+type Readback = (i64, Option<i64>, String, u32, u32, u32, Option<String>);
+
+fn history(c: &Capture, s: &Subject) -> Result<(String, Vec<Entry>), String> {
+    let rows: Vec<Readback> = c.rows(
+        "SELECT t.draw, d.pass, t.target, t.width, t.height, t.format, t.blob FROM targets t \
+         LEFT JOIN draws d ON d.n = t.draw WHERE t.resource = ?1 AND t.sub = ?2 AND t.z = ?3 ORDER BY t.event",
+        [s.resource, s.sub, s.z],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+    );
+    let Some(&(_, _, _, w, h, f, _)) = rows.first() else {
+        return Err(format!(
+            "#{} sub {} was never read back after a pass",
+            s.resource, s.sub
+        ));
+    };
+    let title = format!("#{} sub {} ({w}x{h} {})", s.resource, s.sub, format::name(f));
+    let mut entries: Vec<Entry> = rows
+        .into_iter()
+        .map(|(draw, pass, target, w, h, f, blob)| Entry::Read {
+            draw,
+            pass,
+            target,
+            image: blob
+                .ok_or_else(|| "not stored".to_string())
+                .and_then(|k| c.blob(&k))
+                .and_then(|b| texels::decode(f, w, h, &b)),
+            size: (w, h),
+        })
+        .collect();
+    if c.has_table("missing_targets") {
+        // The rows do not say which subresource a missing pass end was of: those of the resource are all shown.
+        let missing: Vec<(i64, String, String)> = c.rows(
+            "SELECT draw, target, why FROM missing_targets WHERE resource = ?1",
+            [s.resource],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        );
+        entries.extend(
+            missing
+                .into_iter()
+                .map(|(draw, target, why)| Entry::Missing { draw, target, why }),
+        );
+        let draw = |e: &Entry| match e {
+            Entry::Read { draw, .. } | Entry::Missing { draw, .. } => *draw,
+        };
+        entries.sort_by_key(draw);
+    }
+    Ok((title, entries))
+}
+
+fn value(image: &Image, x: u32, y: u32) -> Option<Vec<f32>> {
+    (x < image.width && y < image.height)
+        .then(|| image.texels[(y * image.width + x) as usize][..usize::from(image.channels.max(1))].to_vec())
+}
+
+fn bits(v: &[f32]) -> Vec<u32> {
+    v.iter().map(|f| f.to_bits()).collect()
+}
+
+/// Texel (x, y) of a target in every readback of it: where each pass left it, and which passes changed it.
+pub fn pixel(
+    c: &Capture,
+    arg: &str,
+    x: u32,
+    y: u32,
+    sub: Option<u32>,
+    changed_only: bool,
+) -> Result<(), String> {
+    let s = subject(c, arg, sub)?;
+    let (title, entries) = history(c, &s)?;
+    out!(
+        "{title}, texel ({x}, {y}): {} readbacks and missing pass ends",
+        entries.len()
+    );
+    out!("{:>5} {:>6} {:<6} value", "pass", "draw", "target");
+    let mut last: Option<Vec<u32>> = None;
+    for e in &entries {
+        match e {
+            Entry::Read {
+                draw,
+                pass,
+                target,
+                image,
+                size,
+            } => {
+                let pass = pass.map_or("-".into(), |p| p.to_string());
+                let v = match image {
+                    Ok(image) => {
+                        value(image, x, y).ok_or_else(|| format!("outside its {}x{}", size.0, size.1))
+                    }
+                    Err(e) => Err(e.clone()),
+                };
+                let (shown, note) = match &v {
+                    Ok(v) => {
+                        let now = bits(v);
+                        let note = match &last {
+                            None => "first readback",
+                            Some(l) if *l != now => "changed",
+                            Some(_) => "",
+                        };
+                        let changed = last.as_ref() != Some(&now);
+                        last = Some(now);
+                        if changed_only && !changed {
+                            continue;
+                        }
+                        (
+                            v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(" "),
+                            note,
+                        )
+                    }
+                    Err(why) => (format!("({why})"), ""),
+                };
+                out!("{pass:>5} {draw:>6} {target:<6} {shown}  {note}");
+            }
+            Entry::Missing { draw, target, why } => {
+                out!("{:>5} {draw:>6} {target:<6} not read back: {why}", "-");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// For each readback of a target, how many texels (in `rect`, or all) differ from the readback before, and where.
+pub fn changes(c: &Capture, arg: &str, sub: Option<u32>, rect: Option<[u32; 4]>) -> Result<(), String> {
+    let s = subject(c, arg, sub)?;
+    let (title, entries) = history(c, &s)?;
+    let region = rect.map_or("all texels".into(), |[x0, y0, x1, y1]| {
+        format!("texels {x0},{y0} to {x1},{y1}")
+    });
+    out!("{title}: {region} changed since the readback before");
+    out!(
+        "{:>5} {:>6} {:<6} {:>9}  bounds (x0,y0 to x1,y1)",
+        "pass",
+        "draw",
+        "target",
+        "changed"
+    );
+    let mut last: Option<Image> = None;
+    for e in entries {
+        match e {
+            Entry::Read {
+                draw,
+                pass,
+                target,
+                image,
+                ..
+            } => {
+                let pass = pass.map_or("-".into(), |p| p.to_string());
+                let image = match image {
+                    Ok(i) => i,
+                    Err(why) => {
+                        out!("{pass:>5} {draw:>6} {target:<6} ({why})");
+                        continue;
+                    }
+                };
+                let [x0, y0, x1, y1] = rect.unwrap_or([0, 0, image.width, image.height]);
+                let (x1, y1) = (x1.min(image.width), y1.min(image.height));
+                let Some(before) = last
+                    .as_ref()
+                    .filter(|b| b.width == image.width && b.height == image.height)
+                else {
+                    out!("{pass:>5} {draw:>6} {target:<6} {:>9}", "first");
+                    last = Some(image);
+                    continue;
+                };
+                let (mut n, mut bounds) = (0u64, [u32::MAX, u32::MAX, 0, 0]);
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let i = (y * image.width + x) as usize;
+                        let differs = image.texels[i]
+                            .iter()
+                            .zip(&before.texels[i])
+                            .any(|(a, b)| a.to_bits() != b.to_bits());
+                        if differs {
+                            n += 1;
+                            bounds = [
+                                bounds[0].min(x),
+                                bounds[1].min(y),
+                                bounds[2].max(x + 1),
+                                bounds[3].max(y + 1),
+                            ];
+                        }
+                    }
+                }
+                let at = if n == 0 {
+                    String::new()
+                } else {
+                    format!("{},{} to {},{}", bounds[0], bounds[1], bounds[2], bounds[3])
+                };
+                out!("{pass:>5} {draw:>6} {target:<6} {n:>9}  {at}");
+                last = Some(image);
+            }
+            Entry::Missing { draw, target, why } => {
+                out!("{:>5} {draw:>6} {target:<6} not read back: {why}", "-");
+            }
+        }
+    }
+    Ok(())
+}

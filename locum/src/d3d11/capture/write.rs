@@ -509,6 +509,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         {
             let key = hash::key(&code);
             row.size = code.len() as u64;
+            row.name = locum_capture::rdef::debug_name(&code);
             let blobs = &settings().blobs;
             writer::blob(blobs, key.clone(), code, true);
             row.blob = Some(key);

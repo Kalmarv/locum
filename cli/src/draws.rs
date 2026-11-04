@@ -275,6 +275,7 @@ pub fn passes(c: &Capture) -> Result<(), String> {
         "list"
     );
     let mut previous: Option<Vec<String>> = None;
+    let missing = c.has_table("missing_targets");
     for (n, first, last, deferred, list) in rows {
         let targets: Vec<String> = c
             .rows(
@@ -305,6 +306,26 @@ pub fn passes(c: &Capture) -> Result<(), String> {
             "{n:>4} {:>11} {count:>5} {place:<9} {shown}",
             format!("{first}-{last}")
         );
+        // Targets of this pass not read back where it ended, by reason.
+        let lost: Vec<(String, String)> = if missing {
+            c.rows(
+                "SELECT why, group_concat(DISTINCT target) FROM missing_targets WHERE draw BETWEEN ?1 AND ?2 \
+                 GROUP BY why",
+                [first, last],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        } else {
+            Vec::new()
+        };
+        for (why, targets) in lost {
+            out!(
+                "{:>4} {:>11} {:>5} {:<9} not read back: {targets}: {why}",
+                "",
+                "",
+                "",
+                ""
+            );
+        }
         previous = Some(targets);
     }
     Ok(())

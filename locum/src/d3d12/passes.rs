@@ -13,9 +13,16 @@
 //! The readback memory lives as long as the GPU may run the list: until the list is reset or destroyed and a fence
 //! locum signals after its last execution has completed.
 //!
-//! A pass still open when its list closes is decided where the list is submitted. Games split one pass over several
-//! lists submitted together (Elden Ring's G-buffer goes over 13 to 15): if the next list of the same submission that
-//! names the target draws to it before naming it any other way, the pass continues there and nothing is copied.
+//! A pass's copy waits for the next command that names its target (binds, clears, moves, copies or resolves it):
+//! until one does, nothing in the list can change what the target holds, and the copy, made then from the state
+//! the target is in, holds what the pass left. A target moved into a state that allows unordered-access writes, or
+//! made for simultaneous access, is copied where its pass ends.
+//!
+//! A pass still open, or whose copy still waits, when its list closes is decided where the list is submitted. Games split one pass over several
+//! lists submitted together (Elden Ring's G-buffer goes over 13 to 15, each list moving it into RENDER_TARGET and
+//! back): if the next list of the same submission that draws to the target or writes it otherwise draws to it, with
+//! the same views bound, before writing it any other way, the pass continues there and nothing is copied. With other
+//! views bound it is another pass by the capture's own reckoning (runs of draws with the same targets).
 //! Otherwise locum records a list of its own that copies the target, and submits it right after the closed list in
 //! the same ExecuteCommandLists call. Its memory is freed once the copy is read, not held for the list's life.
 use core::ffi::c_void;
@@ -102,6 +109,8 @@ struct Pending {
     device: ID3D12Device,
     target: Bound,
     states: Vec<Access>,
+    /// The views bound with it in its pass: a later list continues the pass only with the same.
+    set: Vec<u64>,
 }
 // Free-threaded D3D12 objects.
 unsafe impl Send for Pending {}
@@ -245,10 +254,17 @@ pub unsafe fn ends(s: &mut Submitted, lists: &[Executed]) -> Vec<u64> {
         let mut reads = Vec::new();
         for (id, end) in ends {
             let key = (end.target.resource, end.target.subs[0]);
+            // The first later list that draws to the target or writes it otherwise.
             let next = lists[i + 1..]
                 .iter()
-                .find(|n| n.list.continues.contains(&key) || n.list.named.contains(&key.0));
-            if next.is_some_and(|n| n.first && n.list.continues.contains(&key)) {
+                .find(|n| n.list.continues.iter().any(|(k, _)| *k == key) || n.list.written.contains(&key.0));
+            let continues = |n: &&Executed| {
+                n.list
+                    .continues
+                    .iter()
+                    .any(|(k, set)| *k == key && *set == end.set)
+            };
+            if next.is_some_and(|n| n.first && continues(&n)) {
                 continued.push(id);
                 continue;
             }
@@ -451,6 +467,8 @@ struct Bound {
     discard: bool,
     /// A draw may have written it since it was bound or last copied.
     drawn: bool,
+    /// Made with ALLOW_SIMULTANEOUS_ACCESS: written through views in COMMON with no barrier, so no copy can wait.
+    simultaneous: bool,
 }
 
 impl Bound {
@@ -513,12 +531,22 @@ impl Range {
     }
 }
 
+/// A pass that has ended, its copy waiting for the next command that names the target: until one does, nothing in
+/// the list can change the target's contents.
+struct Ended {
+    target: Bound,
+    /// The command before which the pass ended.
+    at: usize,
+    /// The views bound in the pass.
+    set: Vec<u64>,
+}
+
 /// What an instrumented list generation knows while it is recorded.
 pub struct Pass {
     device: ID3D12Device,
     targets: Vec<Bound>,
-    /// EndRenderPass was recorded: its targets are copied before the next command. A suspending render pass
-    /// resumes in another list, and nothing may come between: its targets are not copied.
+    /// EndRenderPass was recorded: its targets' pass ends before the next command. A suspending render pass resumes
+    /// in another list, and nothing may come between: its targets are not copied.
     ended: Option<bool>,
     /// The render pass being recorded suspends.
     suspending: bool,
@@ -526,19 +554,43 @@ pub struct Pass {
     predicate: Option<(u64, u64, i32)>,
     /// The states and layouts this list's own barriers left resources in, by resource, latest last.
     known: HashMap<u64, Vec<(Range, Access)>>,
-    /// The targets (resource, first plane's subresource) drawn to before the list named them any other way: a pass
-    /// an earlier list left open continues here.
-    continues: HashSet<(u64, u32)>,
-    /// The resources the list names other than as bound targets: barriers, clears, discards, copies.
-    named: HashSet<u64>,
+    /// Passes ended whose copies wait for a command naming their targets, or for Close.
+    waiting: Vec<Ended>,
+    /// The targets (resource, first plane's subresource) drawn to before the list wrote them any other way, with the
+    /// views bound at the first such draw: a pass an earlier list left waiting with the same views continues here.
+    continues: HashMap<(u64, u32), Vec<u64>>,
+    /// The resources the list writes other than by drawing to them (see [`writes`]).
+    written: HashSet<u64>,
 }
 // Free-threaded D3D12 objects; a list's pass is used by whoever records the list, one at a time.
 unsafe impl Send for Pass {}
 
 const DEPTH_READ: i32 = 0x20;
+const UNORDERED_ACCESS: i32 = 0x8;
+const LAYOUT_GENERIC_READ: i32 = 1;
 const LAYOUT_RENDER_TARGET: i32 = 2;
 const LAYOUT_DEPTH_WRITE: i32 = 4;
 const LAYOUT_DEPTH_READ: i32 = 5;
+const LAYOUT_SHADER_RESOURCE: i32 = 6;
+const LAYOUT_COPY_SOURCE: i32 = 7;
+
+/// Whether a target a barrier moved into `access` can be written only by a command that names it (a barrier, a
+/// clear, a copy, a binding as a target), so its copy can wait for one: not a state or layout that allows
+/// unordered-access writes through a view.
+fn waits_in(access: Access) -> bool {
+    match access {
+        Access::State(s) => s & UNORDERED_ACCESS == 0,
+        Access::Layout(l) => matches!(
+            l,
+            LAYOUT_GENERIC_READ
+                | LAYOUT_RENDER_TARGET
+                | LAYOUT_DEPTH_WRITE
+                | LAYOUT_DEPTH_READ
+                | LAYOUT_SHADER_RESOURCE
+                | LAYOUT_COPY_SOURCE
+        ),
+    }
+}
 
 impl Pass {
     /// A pass state for the real graphics list `real` of the direct type, or None for other lists.
@@ -559,21 +611,22 @@ impl Pass {
             suspending: false,
             predicate: None,
             known: HashMap::new(),
-            continues: HashSet::new(),
-            named: HashSet::new(),
+            waiting: Vec::new(),
+            continues: HashMap::new(),
+            written: HashSet::new(),
         })
     }
 
-    /// What the list's continuing draws and namings were, for the submissions that decide pending ends.
-    pub fn touches(&mut self) -> (Vec<(u64, u32)>, Vec<u64>) {
+    /// What the list's continuing draws and other writes were, for the submissions that decide pending ends.
+    pub fn touches(&mut self) -> (model::Continues, Vec<u64>) {
         (
             std::mem::take(&mut self.continues).into_iter().collect(),
-            std::mem::take(&mut self.named).into_iter().collect(),
+            std::mem::take(&mut self.written).into_iter().collect(),
         )
     }
 
     /// Called before the command `call` with recorded arguments `a` is forwarded to the real list, `at` commands
-    /// into it: the copies a pass ending here needs are recorded first.
+    /// into it: the copies of ended passes whose targets it names are recorded first, from the states they are in.
     ///
     /// # Safety
     /// `real` is the application's real list this pass instruments.
@@ -591,7 +644,11 @@ impl Pass {
         if let Some(suspended) = self.ended.take() {
             unsafe { self.end_pass(list, at, suspended, &mut out) };
         }
-        self.name(call, a);
+        let named = mentions(call, a);
+        if !named.is_empty() {
+            unsafe { self.flush(list, |r| named.contains(&r), &mut out) };
+        }
+        self.written.extend(writes(call, a));
         match call {
             "OMSetRenderTargets" => {
                 let mut targets: Vec<Bound> = a[0]
@@ -609,6 +666,8 @@ impl Pass {
                         .all(|(x, y)| x.target == y.target && x.view == y.view);
                 if !same {
                     unsafe { self.end_pass(list, at, false, &mut out) };
+                    // A target bound again is drawn to again: what it held is copied first.
+                    unsafe { self.flush(list, |r| targets.iter().any(|t| t.resource == r), &mut out) };
                     self.targets = targets;
                 }
             }
@@ -627,6 +686,7 @@ impl Pass {
                     "depth".into(),
                     [&depth["depth_end"], &depth["stencil_end"]],
                 ));
+                unsafe { self.flush(list, |r| targets.iter().any(|t| t.resource == r), &mut out) };
                 self.targets = targets;
                 // D3D12_RENDER_PASS_FLAG_SUSPENDING_PASS.
                 self.suspending = a[2].as_u64().unwrap_or(0) & 2 != 0;
@@ -641,10 +701,13 @@ impl Pass {
             | "DispatchMesh"
             | "ExecuteIndirect"
             | "ExecuteBundle" => {
+                let set = views(&self.targets);
                 for t in &mut self.targets {
                     t.drawn = true;
-                    if !self.named.contains(&t.resource) {
-                        self.continues.insert((t.resource, t.subs[0]));
+                    if !self.written.contains(&t.resource) {
+                        self.continues
+                            .entry((t.resource, t.subs[0]))
+                            .or_insert_with(|| set.clone());
                     }
                 }
             }
@@ -683,8 +746,11 @@ impl Pass {
                         continue;
                     };
                     let range = Range::legacy(sub);
-                    unsafe { self.leaving(list, at, r, &range, Access::State(before as i32), &mut out) };
-                    self.learn(r, range, Access::State(after as i32));
+                    let (before, after) = (Access::State(before as i32), Access::State(after as i32));
+                    // A split barrier's beginning leaves the resource in transition until its end: no copy can wait.
+                    let wait = b["flags"] != 1 && waits_in(after);
+                    unsafe { self.leaving(list, at, r, &range, before, wait, &mut out) };
+                    self.learn(r, range, after);
                 }
             }
             "Barrier" => {
@@ -698,8 +764,9 @@ impl Pass {
                             continue;
                         };
                         let range = Range::enhanced(&b["subresources"]);
-                        unsafe { self.leaving(list, at, r, &range, Access::Layout(before as i32), &mut out) };
-                        self.learn(r, range, Access::Layout(after as i32));
+                        let (before, after) = (Access::Layout(before as i32), Access::Layout(after as i32));
+                        unsafe { self.leaving(list, at, r, &range, before, waits_in(after), &mut out) };
+                        self.learn(r, range, after);
                     }
                 }
             }
@@ -714,10 +781,16 @@ impl Pass {
         out
     }
 
-    /// Before Close, `at` commands into the list: a pass still open is pending, decided where the list is submitted.
+    /// Before Close, `at` commands into the list: passes still open, and those whose copies still wait, are pending,
+    /// decided where the list is submitted.
     pub fn closing(&mut self, at: usize) -> Vec<model::Checkpoint> {
         let suspended = self.ended.take().unwrap_or(self.suspending);
         let mut out = Vec::new();
+        let mut ends: Vec<(Bound, usize, Vec<u64>)> = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .map(|w| (w.target, w.at, w.set))
+            .collect();
+        let set = views(&self.targets);
         for t in std::mem::take(&mut self.targets)
             .into_iter()
             .filter(|t| t.drawn && !t.reads_only())
@@ -728,8 +801,11 @@ impl Pass {
                     at,
                     Some("its render pass suspends into another list: not copied yet"),
                 ));
-                continue;
+            } else {
+                ends.push((t, at, set.clone()));
             }
+        }
+        for (t, at, set) in ends {
             let states = (0..t.subs.len()).map(|p| self.state(&t, p)).collect();
             let c = checkpoint(&t, at, None);
             pending().insert(
@@ -739,66 +815,12 @@ impl Pass {
                     device: self.device.clone(),
                     target: t,
                     states,
+                    set,
                 },
             );
             out.push(c);
         }
         out
-    }
-
-    /// Notes the resources a command names other than as bound targets.
-    fn name(&mut self, call: &str, a: &Value) {
-        let resource = |v: &Value| v["resource"].as_u64().or_else(|| v.as_u64()).filter(|r| *r != 0);
-        let mut named = Vec::new();
-        match call {
-            "ClearRenderTargetView" | "ClearDepthStencilView" => named.extend(resource(&a[0]["definition"])),
-            "DiscardResource" => named.extend(resource(&a[0])),
-            "ResourceBarrier" => {
-                for b in a[0].as_array().into_iter().flatten() {
-                    let p = &b["payload"];
-                    match b["type"].as_u64() {
-                        Some(0) => named.extend(resource(p)),
-                        Some(1) => named.extend(resource(&p["after"])),
-                        _ => {}
-                    }
-                }
-            }
-            "Barrier" => {
-                for g in a[0].as_array().into_iter().flatten().filter(|g| g["type"] == 1) {
-                    // D3D12_TEXTURE_BARRIER_FLAG_DISCARD (1).
-                    let changes = |b: &&Value| {
-                        b["layout"][0] != b["layout"][1] || b["flags"].as_u64().unwrap_or(0) & 1 != 0
-                    };
-                    for b in g["barriers"].as_array().into_iter().flatten().filter(changes) {
-                        named.extend(resource(b));
-                    }
-                }
-            }
-            // Source and destination: a copy that reads the target is a consumer of the pass, which has ended.
-            "CopyResource" => named.extend([&a[0], &a[1]].into_iter().filter_map(resource)),
-            "CopyTextureRegion" | "ResolveSubresourceRegion" => {
-                named.extend([&a[0], &a[4]].into_iter().filter_map(resource));
-            }
-            "ResolveSubresource" => named.extend([&a[0], &a[2]].into_iter().filter_map(resource)),
-            "BeginRenderPass" => {
-                // A beginning access that discards (0) or clears (2) overwrites the attachment.
-                let overwrites = |b: &Value| matches!(b["type"].as_u64(), Some(0 | 2));
-                for t in a[0]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter(|t| overwrites(&t["begin"]))
-                {
-                    named.extend(resource(&t["view"]["definition"]));
-                }
-                let d = &a[1];
-                if overwrites(&d["depth_begin"]) || overwrites(&d["stencil_begin"]) {
-                    named.extend(resource(&d["view"]["definition"]));
-                }
-            }
-            _ => {}
-        }
-        self.named.extend(named);
     }
 
     fn learn(&mut self, resource: u64, range: Range, access: Access) {
@@ -832,9 +854,58 @@ impl Pass {
         }
     }
 
+    /// A target's pass, with views `set` bound, has ended before command `at`: its copy waits, unless `now` (or the
+    /// target can be written through a view with no command naming it), when it is copied here from the states it
+    /// is in.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn ended(
+        &mut self,
+        list: &ID3D12GraphicsCommandList,
+        at: usize,
+        t: Bound,
+        set: Vec<u64>,
+        now: Option<Vec<Access>>,
+        out: &mut Vec<model::Checkpoint>,
+    ) {
+        if t.reads_only() {
+            return;
+        }
+        match now {
+            None if !t.simultaneous => self.waiting.push(Ended { target: t, at, set }),
+            now => {
+                let states = now.unwrap_or_else(|| (0..t.subs.len()).map(|p| self.state(&t, p)).collect());
+                unsafe { self.copy(list, at, &t, &states, out) };
+            }
+        }
+    }
+
+    /// The waiting copies of the targets `hit` matches, made here from the states they are in.
+    unsafe fn flush(
+        &mut self,
+        list: &ID3D12GraphicsCommandList,
+        hit: impl Fn(u64) -> bool,
+        out: &mut Vec<model::Checkpoint>,
+    ) {
+        if self.waiting.is_empty() {
+            return;
+        }
+        let (now, keep): (Vec<Ended>, Vec<Ended>) = std::mem::take(&mut self.waiting)
+            .into_iter()
+            .partition(|w| hit(w.target.resource));
+        self.waiting = keep;
+        for w in now {
+            let states: Vec<Access> = (0..w.target.subs.len())
+                .map(|p| self.state(&w.target, p))
+                .collect();
+            unsafe { self.copy(list, w.at, &w.target, &states, out) };
+        }
+    }
+
     /// A barrier moves subresources `range` of `resource` out of `state`: the pass ends for the bound targets it
-    /// touches that were drawn to, copied from that state. They stay bound: the draws after a barrier that moves
+    /// touches that were drawn to. Their copies wait if `wait` (the state it moves them into allows no write but by
+    /// a command naming them), or are made here from `state`. They stay bound: the draws after a barrier that moves
     /// a target back into a writable state write it again.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn leaving(
         &mut self,
         list: &ID3D12GraphicsCommandList,
@@ -842,6 +913,7 @@ impl Pass {
         resource: u64,
         range: &Range,
         state: Access,
+        wait: bool,
         out: &mut Vec<model::Checkpoint>,
     ) {
         for i in 0..self.targets.len() {
@@ -860,8 +932,9 @@ impl Pass {
                     }
                 })
                 .collect();
-            unsafe { self.copy(list, at, &t, &states, out) };
             self.targets[i].drawn = false;
+            let set = views(&self.targets);
+            unsafe { self.ended(list, at, t, set, (!wait).then_some(states), out) };
         }
     }
 
@@ -878,8 +951,8 @@ impl Pass {
             if t.drawn && hit(t) {
                 let t = t.clone();
                 let states: Vec<Access> = (0..t.subs.len()).map(|p| self.state(&t, p)).collect();
-                unsafe { self.copy(list, at, &t, &states, out) };
                 self.targets[i].drawn = false;
+                unsafe { self.ended(list, at, t, Vec::new(), Some(states), out) };
             }
         }
     }
@@ -892,6 +965,7 @@ impl Pass {
         suspended: bool,
         out: &mut Vec<model::Checkpoint>,
     ) {
+        let set = views(&self.targets);
         for t in std::mem::take(&mut self.targets).into_iter().filter(|t| t.drawn) {
             if suspended {
                 if !t.reads_only() {
@@ -903,8 +977,7 @@ impl Pass {
                 }
                 continue;
             }
-            let states: Vec<Access> = (0..t.subs.len()).map(|p| self.state(&t, p)).collect();
-            unsafe { self.copy(list, at, &t, &states, out) };
+            unsafe { self.ended(list, at, t, set.clone(), None, out) };
         }
     }
 
@@ -941,6 +1014,150 @@ impl Pass {
             Err(why) => c.gap = Some(why),
         }
         out.push(c);
+    }
+}
+
+/// The views of bound targets, in slot order with the depth last.
+fn views(targets: &[Bound]) -> Vec<u64> {
+    targets.iter().map(|t| t.view).collect()
+}
+
+/// The resource an argument names: a view's definition, a copy location (`resource`), or an id.
+fn resource_of(v: &Value) -> Option<u64> {
+    v["definition"]["resource"]
+        .as_u64()
+        .or_else(|| v["resource"].as_u64())
+        .or_else(|| v.as_u64())
+        .filter(|r| *r != 0)
+}
+
+/// Every texture a command names: as a target bound, cleared, discarded, moved by a barrier, copied or resolved
+/// from or into. A copy waiting for its target is made before such a command.
+fn mentions(call: &str, a: &Value) -> Vec<u64> {
+    let all = |v: &Value| {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(resource_of)
+            .collect::<Vec<_>>()
+    };
+    match call {
+        "OMSetRenderTargets" => [all(&a[0]), resource_of(&a[1]).into_iter().collect()].concat(),
+        "BeginRenderPass" => {
+            let mut out: Vec<u64> = a[0]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|t| [resource_of(&t["view"]), resource_of(&t["end"]["resolve"]["dst"])])
+                .flatten()
+                .collect();
+            out.extend(resource_of(&a[1]["view"]));
+            out
+        }
+        "ClearRenderTargetView" | "ClearDepthStencilView" | "DiscardResource" => {
+            resource_of(&a[0]).into_iter().collect()
+        }
+        "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat" => {
+            resource_of(&a[2]).into_iter().collect()
+        }
+        "ResourceBarrier" => a[0]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|b| {
+                let p = &b["payload"];
+                [
+                    resource_of(p),
+                    resource_of(&p["before"]),
+                    resource_of(&p["after"]),
+                ]
+            })
+            .flatten()
+            .collect(),
+        "Barrier" => a[0]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|g| {
+                g["barriers"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(resource_of)
+            })
+            .collect(),
+        "CopyResource" => [&a[0], &a[1]].into_iter().filter_map(resource_of).collect(),
+        "CopyTextureRegion" | "ResolveSubresourceRegion" => {
+            [&a[0], &a[4]].into_iter().filter_map(resource_of).collect()
+        }
+        "ResolveSubresource" => [&a[0], &a[2]].into_iter().filter_map(resource_of).collect(),
+        "CopyTiles" => resource_of(&a[0]).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The textures a command writes other than by drawing to them as bound targets: clears, discards, copies and
+/// resolves into them, aliasing, barriers into a state or layout that allows unordered-access writes or that discard,
+/// render passes that begin by clearing or discarding. A list that draws to a target before any of these continues
+/// the pass an earlier list left open; one that writes it so first does not.
+fn writes(call: &str, a: &Value) -> Vec<u64> {
+    let one = |v: &Value| resource_of(v).into_iter().collect::<Vec<_>>();
+    match call {
+        "ClearRenderTargetView" | "ClearDepthStencilView" | "DiscardResource" => one(&a[0]),
+        "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat" => one(&a[2]),
+        "CopyResource"
+        | "CopyTextureRegion"
+        | "ResolveSubresource"
+        | "ResolveSubresourceRegion"
+        | "CopyTiles" => one(&a[0]),
+        "ResourceBarrier" => a[0]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|b| {
+                let p = &b["payload"];
+                match b["type"].as_u64() {
+                    Some(0) => p["after"]
+                        .as_i64()
+                        .filter(|s| !waits_in(Access::State(*s as i32)))
+                        .and_then(|_| resource_of(p)),
+                    Some(1) => resource_of(&p["after"]),
+                    _ => None,
+                }
+            })
+            .collect(),
+        "Barrier" => a[0]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|g| g["type"] == 1)
+            .flat_map(|g| g["barriers"].as_array().into_iter().flatten())
+            .filter(|b| {
+                // D3D12_TEXTURE_BARRIER_FLAG_DISCARD (1); a layout before of UNDEFINED discards too.
+                let after = b["layout"][1].as_i64().unwrap_or(0) as i32;
+                b["flags"].as_u64().unwrap_or(0) & 1 != 0
+                    || b["layout"][0].as_i64().is_some_and(|l| l as i32 == -1)
+                    || !waits_in(Access::Layout(after))
+            })
+            .filter_map(resource_of)
+            .collect(),
+        "BeginRenderPass" => {
+            // A beginning access that discards (0) or clears (2) overwrites the attachment.
+            let overwrites = |b: &Value| matches!(b["type"].as_u64(), Some(0 | 2));
+            let mut out: Vec<u64> = a[0]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| overwrites(&t["begin"]))
+                .filter_map(|t| resource_of(&t["view"]))
+                .collect();
+            let d = &a[1];
+            if overwrites(&d["depth_begin"]) || overwrites(&d["stencil_begin"]) {
+                out.extend(resource_of(&d["view"]));
+            }
+            out
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -1174,6 +1391,7 @@ fn bound(view: &Value, target: String) -> Option<Bound> {
         read_only: [flags & 1 != 0, flags & 2 != 0],
         discard: false,
         drawn: false,
+        simultaneous: desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS),
     })
 }
 
@@ -1237,9 +1455,11 @@ fn barriers(r: &ID3D12Resource, subs: &[(u32, Access)], to_copy: bool) -> Result
             }
             Access::Layout(l) => {
                 let access = match l {
+                    LAYOUT_COPY_SOURCE => continue,
                     LAYOUT_RENDER_TARGET => D3D12_BARRIER_ACCESS_RENDER_TARGET,
                     LAYOUT_DEPTH_WRITE => D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE,
                     LAYOUT_DEPTH_READ => D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ,
+                    LAYOUT_SHADER_RESOURCE | LAYOUT_GENERIC_READ => D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
                     _ => return Err(format!("layout {l} where the pass ended")),
                 };
                 let copy = (

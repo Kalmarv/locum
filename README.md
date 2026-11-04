@@ -42,6 +42,7 @@ cargo build --release
 | `locum-cli shader last 9f2c -d` | a shader's constant buffers and disassembly |
 | `locum-cli resource last 812` | a resource: where it was made, its contents, what the frame did with it |
 | `locum-cli export last 812 -o tex.dds` | a texture or buffer as the frame began |
+| `locum-cli pixel last 120:rt0 960 540` | one texel in every readback of a target: which passes changed it |
 | `locum-cli find last 0.35` | which constant holds a value, and the draws that saw it |
 | `locum-cli sql last "SELECT ..."` | anything else |
 | `locum-cli replay last 120 --rule "skip ps=9f2c"` | the draw replayed with a change, before and after |

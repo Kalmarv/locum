@@ -56,7 +56,9 @@ CREATE TABLE uav_counters(view INTEGER PRIMARY KEY, count INTEGER NOT NULL);
 -- Pipeline state objects: rasterizer, blend, depth_stencil, sampler, input_layout (signature: key of the bytecode it
 -- was created against).
 CREATE TABLE states(id INTEGER PRIMARY KEY, kind TEXT NOT NULL, desc BLOB, json TEXT, signature TEXT);
-CREATE TABLE shaders(hash TEXT PRIMARY KEY, stage TEXT NOT NULL, blob TEXT, size INTEGER);
+-- name: the program's debug name, the stem of the file name its bytecode records (DXIL's ILDN part), for SQL;
+-- captures from before it lack the column, and locum-cli reads the name from the bytecode.
+CREATE TABLE shaders(hash TEXT PRIMARY KEY, stage TEXT NOT NULL, blob TEXT, size INTEGER, name TEXT);
 -- Everything the frame did on the GPU's timeline, in order: draws and dispatches, and every call that changes a
 -- resource (clears, copies, updates, maps, resolves, mips). data: key of the bytes an update or map wrote.
 CREATE TABLE events(seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, call TEXT NOT NULL, context INTEGER,
@@ -83,6 +85,9 @@ CREATE TABLE passes(n INTEGER PRIMARY KEY, first_draw INTEGER NOT NULL, last_dra
 -- event: the event after which they were read, the draw itself or a clear, copy or dispatch after it in the pass.
 CREATE TABLE targets(draw INTEGER NOT NULL, target TEXT NOT NULL, view INTEGER, resource INTEGER, width INTEGER,
   height INTEGER, format INTEGER, sub INTEGER, blob TEXT, event INTEGER, z INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(draw, target));
+-- Pass ends whose targets were not read back, on the pass's last draw that had the target bound, and why. Captures
+-- from before it have only the counts in `gaps`.
+CREATE TABLE missing_targets(draw INTEGER NOT NULL, target TEXT NOT NULL, resource INTEGER, why TEXT NOT NULL);
 -- What the capture could not record, for `locum-cli info`.
 CREATE TABLE gaps(what TEXT NOT NULL, detail TEXT, count INTEGER NOT NULL);
 -- What a draw or dispatch wrote through UAVs, as the game's GPU wrote it (key of the resource's whole contents right
@@ -176,6 +181,8 @@ pub struct Shader {
     pub stage: &'static str,
     pub blob: Option<String>,
     pub size: u64,
+    /// The debug name its bytecode records (`rdef::debug_name`).
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -278,6 +285,15 @@ pub struct Target {
     pub z: u32,
 }
 
+/// A pass end whose target was not read back: see the `missing_targets` table.
+#[derive(Clone, Debug, Default)]
+pub struct MissingTarget {
+    pub draw: u64,
+    pub target: String,
+    pub resource: u64,
+    pub why: String,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Gap {
     pub what: String,
@@ -307,6 +323,7 @@ pub struct Capture {
     pub scissors: Vec<Scissor>,
     pub passes: Vec<Pass>,
     pub targets: Vec<Target>,
+    pub missing_targets: Vec<MissingTarget>,
     /// (event, resource, content key, order-dependent): see the `results` table.
     pub results: Vec<(u64, u64, String, bool)>,
     pub gaps: Vec<Gap>,
@@ -436,9 +453,9 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
         for v in &capture.states {
             s.execute(params![v.id as i64, v.kind, v.desc, v.json, v.signature])?;
         }
-        let mut s = tx.prepare("INSERT OR IGNORE INTO shaders VALUES(?1,?2,?3,?4)")?;
+        let mut s = tx.prepare("INSERT OR IGNORE INTO shaders VALUES(?1,?2,?3,?4,?5)")?;
         for v in &capture.shaders {
-            s.execute(params![v.hash, v.stage, v.blob, v.size as i64])?;
+            s.execute(params![v.hash, v.stage, v.blob, v.size as i64, v.name])?;
         }
         let mut s = tx.prepare("INSERT INTO events VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)")?;
         for e in &capture.events {
@@ -552,6 +569,10 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
                 t.event as i64,
                 t.z
             ])?;
+        }
+        let mut s = tx.prepare("INSERT INTO missing_targets VALUES(?1,?2,?3,?4)")?;
+        for t in &capture.missing_targets {
+            s.execute(params![t.draw as i64, t.target, t.resource as i64, t.why])?;
         }
         let mut s = tx.prepare("INSERT INTO results VALUES(?1,?2,?3,?4)")?;
         for (event, resource, content, ordered) in &capture.results {

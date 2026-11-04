@@ -124,8 +124,8 @@ impl Data {
             for c in checkpoints {
                 recording.checkpoint(c);
             }
-            let (continues, named) = pass.touches();
-            recording.touches(continues, named);
+            let (continues, written) = pass.touches();
+            recording.touches(continues, written);
         }
     }
     pub fn close(&self, hr: HRESULT) {

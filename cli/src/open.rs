@@ -181,4 +181,12 @@ impl Capture {
     pub fn count<P: Params>(&self, sql: &str, params: P) -> i64 {
         self.row(sql, params, |r| r.get(0)).unwrap_or(0)
     }
+
+    /// Whether the capture has table `name`: captures from before a table was added lack it.
+    pub fn has_table(&self, name: &str) -> bool {
+        self.count(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [name],
+        ) > 0
+    }
 }

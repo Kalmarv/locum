@@ -31,17 +31,52 @@ fn kind_of(out: &Path) -> Kind {
 }
 
 pub fn png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
-    let file = std::fs::File::create(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    let mut file = Vec::new();
+    let mut encoder = png::Encoder::new(&mut file, width, height);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
     let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
     writer.write_image_data(rgba).map_err(|e| e.to_string())?;
-    writer.finish().map_err(|e| e.to_string())
+    writer.finish().map_err(|e| e.to_string())?;
+    write(path, &file)
 }
 
+/// Whether `path` is `-`: the bytes go to stdout, and what they are to stderr.
+fn stdout(path: &Path) -> bool {
+    path.as_os_str() == "-"
+}
+
+/// Writes `bytes` to `path` whole or not at all: into a file beside it, renamed over it once written, so a failed
+/// write (a full disk) leaves no partial file. `-` writes them to stdout.
 fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    std::fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+    use std::io::Write as _;
+    if stdout(path) {
+        let mut out = std::io::stdout().lock();
+        return out
+            .write_all(bytes)
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("stdout: {e}"));
+    }
+    let mut partial = path.as_os_str().to_owned();
+    partial.push(".partial");
+    let partial = std::path::PathBuf::from(partial);
+    std::fs::write(&partial, bytes)
+        .and_then(|()| std::fs::rename(&partial, path))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&partial);
+            format!("{}: {e}", path.display())
+        })
+}
+
+/// What was written where: on stderr when the bytes went to stdout.
+macro_rules! told {
+    ($path:expr, $($arg:tt)*) => {
+        if stdout($path) {
+            eprintln!($($arg)*);
+        } else {
+            out!($($arg)*);
+        }
+    };
 }
 
 pub struct Which {
@@ -63,11 +98,11 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, range: Range
         Some(event) => {
             let (bytes, events, warnings) = crate::replay::contents_at(c, id, event, which.warp)?;
             for w in &warnings {
-                out!("warning: {w}");
+                told!(out_path, "warning: {w}");
             }
             let source =
                 format!("as event {event} saw it: replayed from the frame's start with {events} events");
-            out!("#{id} {source}");
+            told!(out_path, "#{id} {source}");
             (bytes, source)
         }
         None => {
@@ -117,13 +152,14 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, range: Range
             };
             write(out_path, &bytes[from..from + len])?;
             if s.kind == "buffer" {
-                out!("{}: {len} bytes of #{id} ({key})", out_path.display());
+                told!(out_path, "{}: {len} bytes of #{id} ({key})", out_path.display());
             } else {
                 // What the bytes are: subresources in order, each mip's rows tightly packed.
                 let texel = format::texel(s.format)
                     .map(|t| format!("; {t}"))
                     .unwrap_or_default();
-                out!(
+                told!(
+                    out_path,
                     "{}: {len} bytes ({key}) of {s}, rows tightly packed{texel}",
                     out_path.display()
                 );
@@ -168,10 +204,16 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, range: Range
             };
             write(out_path, &file)?;
             if whole {
-                out!("{}: {s} as {}", out_path.display(), format::name(readable));
+                told!(
+                    out_path,
+                    "{}: {s} as {}",
+                    out_path.display(),
+                    format::name(readable)
+                );
             } else {
                 let sub = pick()?;
-                out!(
+                told!(
+                    out_path,
                     "{}: #{id} mip {} slice {} {}x{} as {}",
                     out_path.display(),
                     sub.mip,
@@ -193,7 +235,8 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, range: Range
                 &bytes[start as usize..(start + sub.slice_bytes()) as usize],
             )?;
             png(out_path, sub.width, sub.height, &image.rgba8(range))?;
-            out!(
+            told!(
+                out_path,
                 "{}: #{id} mip {} slice {}{} {}x{} {}",
                 out_path.display(),
                 sub.mip,
@@ -253,7 +296,8 @@ pub fn target(c: &Capture, draw: i64, name: &str, out_path: &Path, range: Range)
         }
         Kind::Raw => write(out_path, &bytes)?,
     }
-    out!(
+    told!(
+        out_path,
         "{}: {name} after draw {draw}, {w}x{h} {}",
         out_path.display(),
         format::name(f)
@@ -264,6 +308,6 @@ pub fn target(c: &Capture, draw: i64, name: &str, out_path: &Path, range: Range)
 pub fn blob(c: &Capture, key: &str, out_path: &Path) -> Result<(), String> {
     let bytes = c.blob(key)?;
     write(out_path, &bytes)?;
-    out!("{}: {} bytes", out_path.display(), bytes.len());
+    told!(out_path, "{}: {} bytes", out_path.display(), bytes.len());
     Ok(())
 }

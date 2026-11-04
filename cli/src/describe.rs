@@ -295,6 +295,9 @@ pub fn register_name(names: &[Option<String>; 4]) -> String {
     {
         return base.to_string();
     }
+    if let Some(line) = matrix_line(names) {
+        return line;
+    }
     let mut distinct: Vec<&str> = Vec::new();
     for n in names.iter().flatten() {
         if !distinct.contains(&n.as_str()) {
@@ -302,6 +305,38 @@ pub fn register_name(names: &[Option<String>; 4]) -> String {
         }
     }
     distinct.join(" ")
+}
+
+/// A register holding one row or column of a matrix, named once: `m.VC_MatrixViewProj column 2 ([0..3][2])`. A
+/// column-major matrix keeps a column in each register, so the register `mul(v, M)` dots with v for output .z is
+/// column 2.
+fn matrix_line(names: &[Option<String>; 4]) -> Option<String> {
+    // `base[r][c]`: the matrix's name (an array element's included) and the element's row and column.
+    let element = |n: &str| -> Option<(String, u32, u32)> {
+        let (rest, c) = n.strip_suffix(']')?.rsplit_once('[')?;
+        let (base, r) = rest.strip_suffix(']')?.rsplit_once('[')?;
+        Some((base.to_string(), r.parse().ok()?, c.parse().ok()?))
+    };
+    let lanes: Vec<(String, u32, u32)> = names
+        .iter()
+        .flatten()
+        .map(|n| element(n))
+        .collect::<Option<_>>()?;
+    let (base, r0, c0) = lanes.first()?.clone();
+    if lanes.len() < 2 || lanes.iter().any(|(b, _, _)| *b != base) {
+        return None;
+    }
+    let last = lanes.last()?;
+    let steps = |f: fn(&(String, u32, u32)) -> u32, start: u32| {
+        lanes.iter().enumerate().all(|(i, l)| f(l) == start + i as u32)
+    };
+    if lanes.iter().all(|l| l.2 == c0) && steps(|l| l.1, r0) {
+        return Some(format!("{base} column {c0} ([{r0}..{}][{c0}])", last.1));
+    }
+    if lanes.iter().all(|l| l.1 == r0) && steps(|l| l.2, c0) {
+        return Some(format!("{base} row {r0} ([{r0}][{c0}..{}])", last.2));
+    }
+    None
 }
 
 /// Short key for tables.

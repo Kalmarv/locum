@@ -119,15 +119,46 @@ pub fn info(c: &Capture) -> Result<(), String> {
         uploads - stored,
         c.count("SELECT count(*) FROM resources WHERE upload IS NULL", [])
     );
+    // Which passes have their targets: a capture can read back few of them (lists recorded before it was armed, a
+    // spent budget), and pixel questions need them.
+    let passes = c.count("SELECT count(*) FROM passes", []);
+    let read = c.count(
+        "SELECT count(DISTINCT d.pass) FROM targets t JOIN draws d ON d.n = t.draw WHERE t.blob IS NOT NULL",
+        [],
+    );
+    let reach = if read == 0 {
+        "none read back".to_string()
+    } else {
+        format!("read back in {read} of {passes} passes")
+    };
     // D3D12 captures before the target counts went into meta have only the rows.
     match counts["targets"].as_u64() {
-        Some(targets) => out!(
-            "targets: {targets} read back after their pass ({}), {} skipped",
-            mib(n("target_bytes")),
-            n("targets_skipped")
-        ),
+        Some(targets) => {
+            let skipped = n("targets_skipped");
+            let lost = if c.has_table("missing_targets") && skipped > 0 {
+                let passes = c.count(
+                    "SELECT count(DISTINCT d.pass) FROM missing_targets m JOIN draws d ON d.n = m.draw",
+                    [],
+                );
+                let s = if passes == 1 { "" } else { "es" };
+                format!(" (in {passes} pass{s}: `passes` names them and why)")
+            } else {
+                String::new()
+            };
+            // Pass ends a later list submitted with theirs continued: the pass's targets are read where it ends.
+            let continued = c.meta_json("pass_ends")["continued"].as_u64().unwrap_or(0);
+            let continued = match continued {
+                0 => String::new(),
+                1 => "; 1 pass continued in a later list, read where it ends".into(),
+                n => format!("; {n} passes continued in later lists, read where they end"),
+            };
+            out!(
+                "targets: {reach}: {targets} after their pass ({}), {skipped} skipped{lost}{continued}",
+                mib(n("target_bytes")),
+            )
+        }
         None => out!(
-            "targets: {} read back after their pass (sizes and skips not counted in this capture)",
+            "targets: {reach}: {} after their pass (sizes and skips not counted in this capture)",
             c.count("SELECT count(*) FROM targets", [])
         ),
     }

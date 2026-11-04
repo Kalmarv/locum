@@ -405,9 +405,10 @@ pub(super) unsafe fn capture(
         );
         draw(&list2, (16, 8), white, 0.);
         list2.Close().unwrap();
-        // Draw 8: a third list continues t1's pass, drawing to it before naming it any other way, as Elden Ring's
-        // G-buffer goes on over lists submitted together: no copy where list2 closed, one where list3 does. Where
-        // the first list closed (draw 4), no later list draws to the mip: it is copied by a list of locum's after it.
+        // Draw 8: a third list continues t1's pass, drawing to it with the same view bound before writing it any
+        // other way, as Elden Ring's G-buffer goes on over lists submitted together: no copy where list2 closed, one
+        // where list3 does. Where the first list closed (draws 3 and 4), no later list draws to the mip or the depth,
+        // and list2 draws to t2 with other views bound: they are copied by a list of locum's after it.
         let list3: ID3D12GraphicsCommandList = device
             .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator2, &colour_only)
             .unwrap();
@@ -421,6 +422,11 @@ pub(super) unsafe fn capture(
             Some(list2.cast().unwrap()),
             Some(list3.cast().unwrap()),
         ]);
+        // Draw 9: list3 again, once its first execution is done (a fence of its own: the shared one's values are
+        // taken). Its copies hold the first execution's target: this pass end is missing, with why.
+        let again: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        finish(queue, &again, 1);
+        queue.ExecuteCommandLists(&[Some(list3.cast().unwrap())]);
         finish(queue, fence, 17);
         chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
 
@@ -510,8 +516,13 @@ pub(super) unsafe fn capture(
         colour(7, [0, 255, 255, 255]);
         colour(8, [0, 255, 0, 255]);
         for (sql, n) in [
-            ("SELECT count(*) FROM gaps WHERE what='d3d12-targets'", 0),
-            ("SELECT count(*) FROM draws", 8),
+            ("SELECT sum(count) FROM gaps WHERE what='d3d12-targets'", 1),
+            (
+                "SELECT count(*) FROM missing_targets WHERE draw = 9 AND target = 'rt0' AND why LIKE '%executed again%'",
+                1,
+            ),
+            ("SELECT count(*) FROM missing_targets", 1),
+            ("SELECT count(*) FROM draws", 9),
             (
                 "SELECT json_extract(value, '$.continued') FROM meta WHERE key='pass_ends'",
                 1,
@@ -530,6 +541,6 @@ pub(super) unsafe fn capture(
         debug_errors(device);
     }
     println!(
-        "D3D12 pass-end targets verified: barrier, rebind, clear, Close, render pass and enhanced-barrier ends; a target moved into RENDER_TARGET after binding; a pass continued in the next list; depth and stencil, array mip, layout target"
+        "D3D12 pass-end targets verified: barrier, rebind, clear, Close, render pass and enhanced-barrier ends; a target moved into RENDER_TARGET after binding; a pass continued in the next list; a re-executed list's pass end named as missing; depth and stencil, array mip, layout target"
     );
 }

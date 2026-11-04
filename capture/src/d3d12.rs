@@ -22,6 +22,9 @@ pub struct Command {
     pub diagnostic: Option<String>,
 }
 
+/// Targets (resource, subresource) a list draws to before writing them otherwise, with the views bound then.
+pub type Continues = Vec<((u64, u32), Vec<u64>)>;
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct List {
     pub id: u64,
@@ -34,17 +37,19 @@ pub struct List {
     /// Whether this generation was recorded while a capture was armed, so its pass ends were copied.
     #[serde(skip)]
     pub instrumented: bool,
-    /// The targets copied inside this generation where its passes ended, and those its Close left with a pass
-    /// open, copied after it where it is submitted unless the next list continues the pass.
+    /// The targets copied inside this generation where its passes ended, and those whose copies its Close left
+    /// waiting, copied after it where it is submitted unless a later list continues the pass.
     #[serde(skip)]
     pub checkpoints: Vec<Checkpoint>,
-    /// The targets (resource, subresource) this generation draws to before naming them any other way: where an
-    /// earlier list closed with their pass open, this one continues it.
+    /// The targets (resource, subresource) this generation draws to before writing them any other way, with the
+    /// views bound at the first such draw: where an earlier list left the copy of a pass with the same views
+    /// waiting, this one continues the pass.
     #[serde(skip)]
-    pub continues: Vec<(u64, u32)>,
-    /// The resources it names other than by drawing to them as bound targets (barriers, clears, discards, copies).
+    pub continues: Continues,
+    /// The resources it writes other than by drawing to them as bound targets (clears, discards, copies, barriers
+    /// that discard or allow unordered-access writes).
     #[serde(skip)]
-    pub named: Vec<u64>,
+    pub written: Vec<u64>,
 }
 
 /// A render or depth target copied inside a list where a pass ended, before the command at `at` (after all the
@@ -113,10 +118,10 @@ impl Recording {
     }
 
     /// What the generation's pass tracking learned of the targets it continues and the resources it names.
-    pub fn touches(&mut self, continues: Vec<(u64, u32)>, named: Vec<u64>) {
+    pub fn touches(&mut self, continues: Continues, written: Vec<u64>) {
         let current = Arc::make_mut(&mut self.current);
         current.continues = continues;
-        current.named = named;
+        current.written = written;
     }
 
     /// Commands recorded so far.
@@ -368,6 +373,14 @@ impl Prepared {
             }
         }
         capture.subresources.extend(subresources);
+        // Program names for SQL, from the bytecode the store holds.
+        for s in &mut capture.shaders {
+            s.name = s
+                .blob
+                .as_ref()
+                .and_then(|k| blobs.get(k).ok())
+                .and_then(|code| crate::rdef::debug_name(&code));
+        }
         let mut uncopied = BTreeMap::<String, u64>::new();
         let mut continued = 0;
         for (id, target) in &self.projection.targets {
@@ -375,15 +388,29 @@ impl Prepared {
                 continued += 1;
                 continue;
             }
-            match self.checkpoints.get(id) {
-                Some(Ok(key)) => capture.targets.push(db::Target {
-                    blob: Some(key.clone()),
-                    ..target.clone()
-                }),
-                Some(Err(why)) => *uncopied.entry(why.clone()).or_default() += 1,
-                None => *uncopied.entry("copy not read back".into()).or_default() += 1,
-            }
+            let why = match self.checkpoints.get(id) {
+                Some(Ok(key)) => {
+                    capture.targets.push(db::Target {
+                        blob: Some(key.clone()),
+                        ..target.clone()
+                    });
+                    continue;
+                }
+                Some(Err(why)) => why.clone(),
+                None => "copy not read back".into(),
+            };
+            *uncopied.entry(why.clone()).or_default() += 1;
+            capture.missing_targets.push(db::MissingTarget {
+                draw: target.draw,
+                target: target.target.clone(),
+                resource: target.resource,
+                why,
+            });
         }
+        capture
+            .missing_targets
+            .extend(self.projection.missing.iter().cloned());
+        capture.missing_targets.sort_by_key(|m| m.draw);
         let mut skipped = 0;
         for (why, count) in self.projection.uncopied.iter().chain(&uncopied) {
             capture.gap("d3d12-targets", why, *count);
@@ -569,8 +596,9 @@ pub struct Projection {
     executed: std::collections::HashSet<(u64, u64)>,
     /// The targets the frame's checkpoints copied, by checkpoint, each on its pass's last draw.
     targets: Vec<(u64, db::Target)>,
-    /// Pass ends no copy was made for, by reason.
+    /// Pass ends no copy was made for, by reason, and those of them on a draw.
     uncopied: BTreeMap<String, u64>,
+    missing: Vec<db::MissingTarget>,
     /// The last draw of the list execution being projected that each (target, view) was bound to.
     drawn: BTreeMap<(String, u64), u64>,
     /// How the frame's pass ends went, for the capture's meta: where a frame's targets go missing.
@@ -714,6 +742,7 @@ impl Frame {
                             stage: db::stage_names()[i],
                             blob: Some(hash.into()),
                             size: s["size"].as_u64().unwrap_or(0),
+                            name: None,
                         });
                     }
                 }
@@ -937,6 +966,7 @@ impl Projection {
             executed: std::collections::HashSet::new(),
             targets: Vec::new(),
             uncopied: BTreeMap::new(),
+            missing: Vec::new(),
             drawn: BTreeMap::new(),
             pass_ends: PassEnds::default(),
         }
@@ -963,7 +993,13 @@ impl Projection {
                 )
             };
             if let Some(why) = why {
-                *self.uncopied.entry(why).or_default() += 1;
+                *self.uncopied.entry(why.clone()).or_default() += 1;
+                self.missing.push(db::MissingTarget {
+                    draw,
+                    target: c.target.clone(),
+                    resource: c.resource,
+                    why,
+                });
                 continue;
             }
             self.targets.push((
