@@ -13,7 +13,7 @@ export interface Info {
   constants: { distinct: number; failures: number };
   resources: { live: number; used: number; written: number; contents: number; contentBytes: number; sources: [string, number][] };
   uploads: { total: number; stored: number; hashOnly: number; none: number };
-  targets: { count: number; bytes: number; skipped: number };
+  targets: { count: number; bytes: number | null; skipped: number | null };
   shaders: { count: number; withBytecode: number };
   blobsReferenced: number;
   blobsAbsent: number;

@@ -25,7 +25,7 @@ export function InfoPage({ info }: { info: Info }) {
         <Stat label="constant buffer contents" value={info.constants.distinct} sub={`${info.constants.failures} copies failed`} />
         <Stat label="resources live" value={info.resources.live} sub={`${info.resources.used} used (${info.resources.written} written); contents for ${info.resources.contents} (${mib(info.resources.contentBytes)}): ${info.resources.sources.map(([s, n]) => `${s} ${n}`).join(", ")}`} />
         <Stat label="uploads" value={info.uploads.total} sub={`${info.uploads.stored} stored, ${info.uploads.hashOnly} hash only; ${info.uploads.none} have no upload hash`} />
-        <Stat label="targets read back" value={info.targets.count} sub={`${mib(info.targets.bytes)}, ${info.targets.skipped} skipped`} />
+        <Stat label="targets read back" value={info.targets.count} sub={info.targets.bytes == null ? "size and skips not counted" : `${mib(info.targets.bytes)}, ${info.targets.skipped} skipped`} />
         <Stat label="shaders" value={info.shaders.count} sub={`${info.shaders.withBytecode} with bytecode`} />
         <Stat label="blobs referenced" value={info.blobsReferenced} sub={`${info.blobsAbsent} not in the store`} />
       </div>

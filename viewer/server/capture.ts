@@ -314,8 +314,9 @@ export class Capture {
       },
       uploads: { total: uploads, stored, hashOnly: uploads - stored,
         none: this.count("SELECT count(*) FROM resources WHERE upload IS NULL") },
-      targets: { count: counts.targets ?? this.count("SELECT count(*) FROM targets"), bytes: counts.target_bytes ?? 0,
-        skipped: counts.targets_skipped ?? 0 },
+      // D3D12 captures before the target counts went into meta have only the rows: no size or skips.
+      targets: { count: counts.targets ?? this.count("SELECT count(*) FROM targets"), bytes: counts.target_bytes ?? null,
+        skipped: counts.targets_skipped ?? null },
       shaders: { count: this.count("SELECT count(*) FROM shaders"),
         withBytecode: this.count("SELECT count(*) FROM shaders WHERE blob IS NOT NULL") },
       blobsReferenced: keys.size,

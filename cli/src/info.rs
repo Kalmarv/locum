@@ -119,12 +119,18 @@ pub fn info(c: &Capture) -> Result<(), String> {
         uploads - stored,
         c.count("SELECT count(*) FROM resources WHERE upload IS NULL", [])
     );
-    out!(
-        "targets: {} read back after their pass ({}), {} skipped",
-        n("targets"),
-        mib(n("target_bytes")),
-        n("targets_skipped")
-    );
+    // D3D12 captures before the target counts went into meta have only the rows.
+    match counts["targets"].as_u64() {
+        Some(targets) => out!(
+            "targets: {targets} read back after their pass ({}), {} skipped",
+            mib(n("target_bytes")),
+            n("targets_skipped")
+        ),
+        None => out!(
+            "targets: {} read back after their pass (sizes and skips not counted in this capture)",
+            c.count("SELECT count(*) FROM targets", [])
+        ),
+    }
     out!(
         "shaders: {} used ({} with bytecode)",
         c.count("SELECT count(*) FROM shaders", []),
