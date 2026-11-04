@@ -373,10 +373,15 @@ Each draw runs from the full state captured at it, with its constant buffers mad
 rules, the draw is replayed twice, and its targets are written as recorded (`rt0.recorded.png`) and with the rules
 (`rt0.rules.png`), and `rt0.diff.png` shows the texels that changed in magenta over the unchanged ones in grey.
 
-A Direct3D 12 capture replays the same way, on a device of its own. Each resource is made committed on the heap type
-it was recorded on (a placed one too, so memory the game aliased between resources is not shared, and a reserved one
-with every tile mapped, holding what its first use read, zero where a tile was unmapped; the frame's changes to its
-tile mappings are not run; verify says so). Upload buffers hold, at each submission, the bytes that submission saw. The
+A Direct3D 12 capture replays the same way, on a device of its own. A committed resource is made committed on the heap
+type it was recorded on. Memory the game shared is shared again: its heaps are made from their descriptions, a placed
+resource at its offset in its heap, a reserved one reserved with its tiles mapped as the frame found them, and the
+frame's changes to tile mappings run where the CPU made them among the submissions. Such a resource's first-use
+contents are written when replay reaches the submission they were copied at, so memory two resources share holds what
+the frame saw there at each point; the game's aliasing barriers and discards of placed targets are run. Where that
+cannot be done as the game did (a capture from before heaps were described, a resource that takes more of its heap on
+the replay's device or is aligned otherwise there, a reserved one tiled otherwise or with no page table), it is made
+committed and verify says why. Upload buffers hold, at each submission, the bytes that submission saw. The
 game's shader-visible descriptor heaps are mirrored and their slots rewritten with each submission's changes, so a
 root table points where it pointed in the game. Each event runs in a command list of its own: buffers and most
 textures go back to the common state between them, and depth and multisampled textures get the transitions each

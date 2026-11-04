@@ -1,9 +1,9 @@
 //! Replay on Direct3D 12: resources, descriptor heaps, root signatures and pipeline states made from the capture's
 //! descriptions, each event run as recorded in a command list of its own, waited for before the next.
 //!
-//! - Every resource is made committed, on the kind of heap it was made on (placed and reserved ones too, so memory the
-//!   game aliased is not shared). A reserved resource holds what its first use read, zero in a tile it had unmapped;
-//!   the frame's changes to its tile mappings are not run.
+//! - A resource is made committed, on the kind of heap it was made on, or as the game made it in memory it shares:
+//!   placed at its offset in the game's heap made again, or reserved with its tiles mapped as the frame found them,
+//!   the frame's changes to tile mappings run where the CPU made them (see [`memory`]).
 //! - Barriers: a buffer or a texture made for simultaneous access is promoted from COMMON by each use and decays to
 //!   COMMON when its list completes, so only the textures that cannot be made so (depth-stencil and multisampled
 //!   ones) are moved between states, by replay's own barriers around each event. The game's barriers are not run.
@@ -32,6 +32,7 @@ use crate::open::Capture;
 
 use super::Backend;
 
+mod memory;
 mod pipelines;
 mod views;
 
@@ -229,9 +230,9 @@ pub struct D3d12 {
     dsvs: Mirror,
     /// Room for the CPU handle a UAV clear names.
     cpu_views: Mirror,
-    /// The capture's submissions in the order the CPU made them, and how many have had their descriptors and upload
-    /// bytes put in place.
-    submissions: Option<Vec<i64>>,
+    /// The capture's submissions in the order the CPU made them, with that order's numbers, and how many have had
+    /// their descriptors and upload bytes put in place.
+    submissions: Option<Vec<(i64, i64)>>,
     applied: usize,
     /// Mirror slots a rule changed for the event being run, put back after it.
     changed: Vec<(i64, u32)>,
@@ -243,14 +244,17 @@ pub struct D3d12 {
     /// By command list execution, its depth bounds and shading rate calls, which `d12_draw_state` does not hold.
     list_state: Option<HashMap<i64, Vec<ListCall>>>,
     replaced: HashMap<String, Option<Vec<u8>>>,
-    placed: usize,
-    reserved: usize,
-    /// The frame's changes to the made reserved resources' tile mappings, which replay does not run.
-    remapped: i64,
+    /// Heaps, and the resources made in them.
+    memory: memory::Memory,
     /// Resources the frame uses that the capture holds no description of.
     undescribed: Vec<i64>,
     warnings: BTreeSet<String>,
     debug: Option<ID3D12InfoQueue>,
+}
+
+/// The resources each resource of a Direct3D 12 capture shares memory with (see [`memory`]).
+pub fn aliases(c: &Capture) -> HashMap<i64, BTreeSet<i64>> {
+    memory::aliases(c)
 }
 
 fn u(v: &Value, i: usize) -> u64 {
@@ -396,9 +400,7 @@ impl D3d12 {
                 signatures: HashMap::new(),
                 list_state: None,
                 replaced: HashMap::new(),
-                placed: 0,
-                reserved: 0,
-                remapped: 0,
+                memory: memory::Memory::default(),
                 undescribed: Vec::new(),
                 warnings: BTreeSet::new(),
                 debug,
@@ -663,16 +665,22 @@ impl D3d12 {
     /// Puts in place the descriptors and upload bytes of every submission up to `submission`.
     fn enter(&mut self, c: &Capture, submission: i64) -> Result<(), String> {
         let order = self.submissions.get_or_insert_with(|| {
-            c.rows("SELECT id FROM d12_submissions ORDER BY cpu_seq, id", [], |r| {
-                r.get(0)
-            })
+            c.rows(
+                "SELECT id, cpu_seq FROM d12_submissions ORDER BY cpu_seq, id",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
         });
-        let Some(at) = order.iter().position(|&s| s == submission) else {
+        let Some(at) = order.iter().position(|&(s, _)| s == submission) else {
             return Ok(());
         };
         while self.applied <= at {
-            let s = self.submissions.as_ref().expect("ordered")[self.applied];
+            let (s, cpu_seq) = self.submissions.as_ref().expect("ordered")[self.applied];
             self.applied += 1;
+            // The changes to tile mappings made before it, then the first-use contents copied at it, as the frame had
+            // them when it ran.
+            self.remap_before(c, cpu_seq)?;
+            self.first_uses(s)?;
             let versions: Vec<Version> = c.rows(
                 &format!(
                     "SELECT {VERSION_COLUMNS} FROM d12_submission_descriptors s JOIN d12_descriptor_versions v \
@@ -1899,12 +1907,7 @@ impl Backend for D3d12 {
             self.warn("textures on heaps the CPU maps are made on a default heap");
             heap = Heap::Default;
         }
-        if n("heap") != 0 {
-            self.placed += 1;
-        } else if !props.is_object() {
-            self.reserved += 1;
-            self.remapped += c.count("SELECT count(*) FROM d12_tile_mappings WHERE resource = ?1", [id]);
-        }
+        let placement = memory::Placement::of(&d);
         let format = n("format") as u32;
         let samples = n("sample_count").max(1) as u32;
         let mut desc = D3D12_RESOURCE_DESC {
@@ -1926,10 +1929,13 @@ impl Backend for D3d12 {
             },
             Flags: D3D12_RESOURCE_FLAGS(n("flags") as i32 & KEPT_FLAGS),
         };
-        // Textures that can be are made for simultaneous access, so their uses need no barriers.
-        let can_share = !buffer && desc.Flags.0 & 0x2 == 0 && samples == 1;
-        if can_share {
-            desc.Flags.0 |= SIMULTANEOUS;
+        if matches!(placement, memory::Placement::Placed { .. }) {
+            // The alignment the game placed it with: small resources go at 4 KiB, not the 64 KiB asked of 0.
+            desc.Alignment = d["alignment"].as_u64().unwrap_or(0);
+        }
+        if matches!(placement, memory::Placement::Reserved) && !buffer {
+            // A reserved texture's tiles are laid out as the game's were: 64KB_UNDEFINED_SWIZZLE or a standard swizzle.
+            desc.Layout = D3D12_TEXTURE_LAYOUT(n("layout") as i32);
         }
         let (properties, state) = match heap {
             Heap::Default => (
@@ -1963,10 +1969,11 @@ impl Backend for D3d12 {
                 COMMON,
             ),
         };
+        let device = self.device.clone();
         let make = |desc: &D3D12_RESOURCE_DESC| -> windows::core::Result<ID3D12Resource> {
             let mut r: Option<ID3D12Resource> = None;
             unsafe {
-                self.device.CreateCommittedResource(
+                device.CreateCommittedResource(
                     &properties,
                     D3D12_HEAP_FLAG_NONE,
                     desc,
@@ -1977,13 +1984,32 @@ impl Backend for D3d12 {
             };
             Ok(r.expect("made"))
         };
-        let resource = match make(&desc) {
-            Ok(r) => r,
-            Err(_) if can_share => {
-                desc.Flags.0 &= !SIMULTANEOUS;
+        // In the memory the game shared, with the game's own flags, so it takes what it took there.
+        let shared = match placement {
+            memory::Placement::Committed => None,
+            p => match self.make_shared(c, id, p, &desc, state) {
+                Ok(r) => Some(r),
+                Err(why) => {
+                    self.memory.fell_back(why);
+                    None
+                }
+            },
+        };
+        let resource = match shared {
+            Some(r) => r,
+            None => {
+                desc.Alignment = 0;
+                desc.Layout = if buffer {
+                    D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                } else {
+                    D3D12_TEXTURE_LAYOUT_UNKNOWN
+                };
+                // Textures that can be are made for simultaneous access, so their uses need no barriers.
+                if !buffer && desc.Flags.0 & 0x2 == 0 && samples == 1 {
+                    desc.Flags.0 |= SIMULTANEOUS;
+                }
                 make(&desc).map_err(|e| e.to_string())?
             }
-            Err(e) => return Err(e.to_string()),
         };
         name(&resource, format!("#{id}"));
         let desc = unsafe { resource.GetDesc() };
@@ -2067,6 +2093,8 @@ impl Backend for D3d12 {
             Some(_) if samples > 1 => {
                 self.warn("multisampled textures start empty (their contents were read back resolved)");
             }
+            // In shared memory, written when replay reaches the submission they were copied at.
+            Some(_) if self.memory.shared.contains(&id) && self.defer(c, id) => {}
             Some(bytes) => self.write(c, id, bytes)?,
             None => {}
         }
@@ -2130,7 +2158,11 @@ impl Backend for D3d12 {
             }
             // Barriers are replay's own, state is taken at each draw, and a discard leaves contents undefined:
             // keeping them is one valid outcome. A bundle's commands are recorded after it, as its list's events.
-            "state" | "barrier" | "submit" | "discard" | "bundle" => {}
+            // The game's aliasing barriers and discards of targets in the memory resources share begin their use
+            // there; other barriers are replay's own.
+            "barrier" if call == "ResourceBarrier" => self.aliasing(&a),
+            "discard" => self.discard(&a),
+            "state" | "barrier" | "submit" | "bundle" => {}
             other => self.warn(format!("events of kind {other} ({call}) are not replayed")),
         }
         let ran = self.flush();
@@ -2149,7 +2181,15 @@ impl Backend for D3d12 {
         ran
     }
 
+    fn reach(&mut self, c: &Capture, seq: i64) -> Result<(), String> {
+        match Self::submission_of(c, seq) {
+            Some(s) => self.enter(c, s),
+            None => Ok(()),
+        }
+    }
+
     fn read(&mut self, id: i64) -> Result<Vec<u8>, String> {
+        self.first_use_now(id)?;
         let m = self.made(id)?;
         if m.desc.SampleDesc.Count > 1 {
             return Err(format!("#{id} is multisampled, which replay cannot read back"));
@@ -2207,6 +2247,36 @@ impl Backend for D3d12 {
     }
 
     fn write(&mut self, _c: &Capture, id: i64, contents: &[u8]) -> Result<(), String> {
+        self.put(id, contents)
+    }
+
+    fn warnings(&self) -> Vec<String> {
+        let mut warnings = self.warnings.clone();
+        warnings.extend(self.memory.warnings());
+        if !self.undescribed.is_empty() {
+            let mut ids: Vec<String> = self
+                .undescribed
+                .iter()
+                .take(8)
+                .map(|id| format!("#{id}"))
+                .collect();
+            if self.undescribed.len() > ids.len() {
+                ids.push("...".into());
+            }
+            warnings.insert(format!(
+                "{} resources the frame uses are not described in the capture, so views of them are null: {}",
+                self.undescribed.len(),
+                ids.join(" ")
+            ));
+        }
+        warnings.extend(self.messages());
+        warnings.into_iter().collect()
+    }
+}
+
+impl D3d12 {
+    /// Writes `contents` (canonical layout) into resource `id`.
+    fn put(&mut self, id: i64, contents: &[u8]) -> Result<(), String> {
         let m = self.made(id)?;
         if contents.len() as u64 != layout::total(&m.layout) {
             return Err(format!(
@@ -2254,45 +2324,5 @@ impl Backend for D3d12 {
             }
         }
         self.flush()
-    }
-
-    fn warnings(&self) -> Vec<String> {
-        let mut warnings = self.warnings.clone();
-        if self.placed > 0 {
-            warnings.insert(format!(
-                "{} placed resources were made committed: memory the game aliased between them is not shared",
-                self.placed
-            ));
-        }
-        if !self.undescribed.is_empty() {
-            let mut ids: Vec<String> = self
-                .undescribed
-                .iter()
-                .take(8)
-                .map(|id| format!("#{id}"))
-                .collect();
-            if self.undescribed.len() > ids.len() {
-                ids.push("...".into());
-            }
-            warnings.insert(format!(
-                "{} resources the frame uses are not described in the capture, so views of them are null: {}",
-                self.undescribed.len(),
-                ids.join(" ")
-            ));
-        }
-        if self.reserved > 0 {
-            warnings.insert(format!(
-                "{} reserved resources were made committed, every tile mapped and holding what their first use read \
-                 (zero where a tile was unmapped){}",
-                self.reserved,
-                if self.remapped > 0 {
-                    format!("; the frame's {} changes to their tile mappings are not run", self.remapped)
-                } else {
-                    String::new()
-                }
-            ));
-        }
-        warnings.extend(self.messages());
-        warnings.into_iter().collect()
     }
 }

@@ -114,6 +114,18 @@ pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, initial: Init
         "sample_quality":d.SampleDesc.Quality,"layout":d.Layout.0,"flags":d.Flags.0,
         "heap":heap,"heap_offset":offset,"heap_properties":heap_properties});
     let mut description = description;
+    // What it takes of its heap from its offset: replay places it there only where it takes no more.
+    if heap != 0 {
+        let mut parent: Option<ID3D12Device> = None;
+        if unsafe { resource.GetDevice(&mut parent) }.is_ok()
+            && let Some(parent) = parent
+        {
+            let info = unsafe { parent.GetResourceAllocationInfo(0, &[d]) };
+            if info.SizeInBytes != u64::MAX {
+                description["bytes"] = json!(info.SizeInBytes);
+            }
+        }
+    }
     let initial = match initial {
         Initial::State(s) => {
             description["initial_state"] = json!(s);

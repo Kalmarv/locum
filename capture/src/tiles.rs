@@ -4,6 +4,11 @@
 //! numbering ([`Layout`]); the API crates read it.
 use std::collections::BTreeMap;
 
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_PACKED_MIP_INFO, D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+    D3D12_SUBRESOURCE_TILING, D3D12_TILE_SHAPE, ID3D12Device, ID3D12Resource,
+};
+
 /// The bytes of one tile, for every format and both APIs.
 pub const TILE_BYTES: u64 = 65536;
 
@@ -344,6 +349,65 @@ impl Pages {
         }
         Some(Self { tiles })
     }
+}
+
+/// The tile numbering a reserved resource's device gives it (Direct3D 12): the capture's and replay's alike.
+pub fn d3d12(resource: &ID3D12Resource) -> Result<Layout, String> {
+    let d = unsafe { resource.GetDesc() };
+    let (mips, array) = match d.Dimension {
+        D3D12_RESOURCE_DIMENSION_BUFFER => (1, 1),
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D => (u32::from(d.MipLevels), 1),
+        _ => (u32::from(d.MipLevels), u32::from(d.DepthOrArraySize)),
+    };
+    if mips == 0 || array == 0 {
+        return Err("the resource reports no subresources".into());
+    }
+    let mut device: Option<ID3D12Device> = None;
+    unsafe { resource.GetDevice(&mut device) }.map_err(|e| format!("GetDevice: {e}"))?;
+    let device = device.ok_or("GetDevice gave no device")?;
+    let mut count = mips.checked_mul(array).ok_or("subresource count overflow")?;
+    let mut subs = vec![D3D12_SUBRESOURCE_TILING::default(); count as usize];
+    let mut total = 0;
+    let mut packed = D3D12_PACKED_MIP_INFO::default();
+    let mut shape = D3D12_TILE_SHAPE::default();
+    unsafe {
+        device.GetResourceTiling(
+            resource,
+            Some(&mut total),
+            Some(&mut packed),
+            Some(&mut shape),
+            Some(&mut count),
+            0,
+            subs.as_mut_ptr(),
+        )
+    };
+    subs.truncate(count as usize);
+    if total == 0 {
+        return Err("the device reports no tiles for the resource".into());
+    }
+    Ok(Layout {
+        total,
+        mips,
+        array,
+        packed: [
+            u32::from(packed.NumStandardMips),
+            u32::from(packed.NumPackedMips),
+            packed.NumTilesForPackedMips,
+            packed.StartTileIndexInOverallResource,
+        ],
+        shape: [shape.WidthInTexels, shape.HeightInTexels, shape.DepthInTexels],
+        subs: subs
+            .iter()
+            .map(|s| {
+                [
+                    s.WidthInTiles,
+                    u32::from(s.HeightInTiles),
+                    u32::from(s.DepthInTiles),
+                    s.StartTileIndexInOverallResource,
+                ]
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]

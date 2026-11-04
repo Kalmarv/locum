@@ -470,39 +470,65 @@ fn replay_checks(stage: &std::path::Path, pid: u32) {
             && text.contains("the frame's CopyTileMappings"),
         "resource: a reserved texture's tiles mapped per mip, and the frame's changes"
     );
-    let first: i64 = sql(
-        "reserved",
-        &format!("SELECT min(event) FROM event_resources WHERE resource = {texture}"),
-    )
-    .parse()
-    .expect("the reserved texture's first event");
-    let raw = log.join("reserved.raw");
-    let (ok, text) = run(&[
-        "export",
-        &capture("reserved"),
-        &texture,
-        "--at",
-        &first.to_string(),
-        "--warp",
-        "-o",
-        &raw.display().to_string(),
-    ]);
-    assert!(ok, "export a reserved texture");
-    assert!(
-        text.contains("reserved resources were made committed")
-            && text.contains("2 changes to their tile mappings"),
-        "replay says what it does with a reserved resource: {text}"
-    );
-    // reserved.rs fills mip 0's byte i with 77 + i and leaves tile 2 (x 0..128, y 128..256) unmapped.
-    let bytes = std::fs::read(&raw).unwrap();
-    let mip0 = |x: usize, y: usize| bytes[y * 1024 + x * 4];
+    let events = |id: &str| -> (i64, i64) {
+        let text = sql(
+            "reserved",
+            &format!("SELECT min(event) || ' ' || max(event) FROM event_resources WHERE resource = {id}"),
+        );
+        let mut n = text.split(' ').map(|n| n.parse().expect("an event"));
+        (n.next().unwrap(), n.next().unwrap())
+    };
+    let export = |id: &str, at: i64, name: &str| -> Vec<u8> {
+        let raw = log.join(name);
+        let (ok, text) = run(&[
+            "export",
+            &capture("reserved"),
+            id,
+            "--at",
+            &at.to_string(),
+            "--warp",
+            "-o",
+            &raw.display().to_string(),
+        ]);
+        assert!(ok, "export #{id} at event {at}");
+        assert!(
+            !text.contains("made committed") && !text.contains("are not run"),
+            "replay makes the reserved texture and the placed buffers in the game's heaps: {text}"
+        );
+        std::fs::read(&raw).unwrap()
+    };
+    let (first, last) = events(&texture);
+    assert!(first < last, "the reserved texture read twice");
+    // reserved.rs fills mip 0's byte i with 77 + i and leaves tile 2 (x 0..128, y 128..256) unmapped; in the frame,
+    // after the first read, CopyTileMappings maps tile 2 where tile 0 is.
+    let bytes = export(&texture, first, "reserved.raw");
+    let mip0 = |b: &[u8], x: usize, y: usize| b[y * 1024 + x * 4];
+    let filled = |x: usize, y: usize| (77 + y * 1024 + x * 4) as u8;
     assert!(
         bytes.len() >= 256 * 1024
-            && (0..128).all(|y| (0..256).all(|x| mip0(x, y) == (77 + y * 1024 + x * 4) as u8))
-            && (128..256).all(|y| (0..128).all(|x| mip0(x, y) == 0)),
+            && (0..128).all(|y| (0..256).all(|x| mip0(&bytes, x, y) == filled(x, y)))
+            && (128..256).all(|y| (0..128).all(|x| mip0(&bytes, x, y) == 0)),
         "export: the reserved texture as its first use read it, zero where a tile was unmapped"
     );
+    let bytes = export(&texture, last, "reserved-remapped.raw");
+    assert!(
+        (128..256).all(|y| (0..128).all(|x| mip0(&bytes, x, y) == filled(x, y - 128)))
+            && (128..256).all(|y| (128..256).all(|x| mip0(&bytes, x, y) == filled(x, y))),
+        "export: after the frame's remaps, tile 2 holds what tile 0 does"
+    );
+    // The placed buffer the frame read, holding what it wrote through the other at the same offset.
+    let aliased = sql(
+        "reserved",
+        "SELECT max(id) FROM d12_objects WHERE kind LIKE 'ID3D12Resource%' AND json_extract(description, '$.heap') = \
+         (SELECT id FROM d12_objects WHERE kind LIKE 'ID3D12Heap%' AND json_extract(description, '$.bytes') = 327680)",
+    );
+    let bytes = export(&aliased, events(&aliased).1, "aliased.raw");
+    assert!(
+        bytes.len() == 65536 && bytes.iter().enumerate().all(|(i, &b)| b == (i * 7 + 3) as u8),
+        "export: a placed buffer reads what the frame wrote through another at its offset"
+    );
     println!(
-        "ok   D3D12 reserved: tiles per mip, the frame's mapping changes, and replay's contents as first used"
+        "ok   D3D12 reserved and placed: tiles per mip, contents as first used, the frame's remaps run, and memory \
+         two placed buffers share"
     );
 }

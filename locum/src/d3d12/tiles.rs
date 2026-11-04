@@ -27,72 +27,13 @@ fn entries() -> MutexGuard<'static, BTreeMap<u64, Entry>> {
     ENTRIES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The device's tile numbering of a reserved resource.
-pub fn layout(resource: &ID3D12Resource) -> Result<Layout, String> {
-    let d = unsafe { resource.GetDesc() };
-    let (mips, array) = match d.Dimension {
-        D3D12_RESOURCE_DIMENSION_BUFFER => (1, 1),
-        D3D12_RESOURCE_DIMENSION_TEXTURE3D => (u32::from(d.MipLevels), 1),
-        _ => (u32::from(d.MipLevels), u32::from(d.DepthOrArraySize)),
-    };
-    if mips == 0 || array == 0 {
-        return Err("the resource reports no subresources".into());
-    }
-    let mut device: Option<ID3D12Device> = None;
-    unsafe { resource.GetDevice(&mut device) }.map_err(|e| format!("GetDevice: {e}"))?;
-    let device = device.ok_or("GetDevice gave no device")?;
-    let mut count = mips.checked_mul(array).ok_or("subresource count overflow")?;
-    let mut subs = vec![D3D12_SUBRESOURCE_TILING::default(); count as usize];
-    let mut total = 0;
-    let mut packed = D3D12_PACKED_MIP_INFO::default();
-    let mut shape = D3D12_TILE_SHAPE::default();
-    unsafe {
-        device.GetResourceTiling(
-            resource,
-            Some(&mut total),
-            Some(&mut packed),
-            Some(&mut shape),
-            Some(&mut count),
-            0,
-            subs.as_mut_ptr(),
-        )
-    };
-    subs.truncate(count as usize);
-    if total == 0 {
-        return Err("the device reports no tiles for the resource".into());
-    }
-    Ok(Layout {
-        total,
-        mips,
-        array,
-        packed: [
-            u32::from(packed.NumStandardMips),
-            u32::from(packed.NumPackedMips),
-            packed.NumTilesForPackedMips,
-            packed.StartTileIndexInOverallResource,
-        ],
-        shape: [shape.WidthInTexels, shape.HeightInTexels, shape.DepthInTexels],
-        subs: subs
-            .iter()
-            .map(|s| {
-                [
-                    s.WidthInTiles,
-                    u32::from(s.HeightInTiles),
-                    u32::from(s.DepthInTiles),
-                    s.StartTileIndexInOverallResource,
-                ]
-            })
-            .collect(),
-    })
-}
-
 /// Runs `f` on the entry of reserved resource `id` (`resource`, real), made first if it has none.
 fn with_entry<R>(id: u64, resource: &ID3D12Resource, f: impl FnOnce(&mut Entry) -> R) -> Result<R, String> {
     let fresh = if entries().contains_key(&id) {
         None
     } else {
         Some(Entry {
-            layout: layout(resource)?,
+            layout: locum_capture::tiles::d3d12(resource)?,
             pages: Pages::default(),
             error: None,
         })

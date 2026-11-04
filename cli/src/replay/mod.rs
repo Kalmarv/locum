@@ -33,6 +33,11 @@ pub trait Backend {
     fn write(&mut self, c: &Capture, id: i64, contents: &[u8]) -> Result<(), String>;
     /// What it could not do as recorded, once each.
     fn warnings(&self) -> Vec<String>;
+    /// Brings what the API holds outside events up to just before event `seq` (a Direct3D 12 queue's changes to
+    /// tile mappings, first-use contents waiting for their submission), where no event the plan ran has.
+    fn reach(&mut self, _c: &Capture, _seq: i64) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -80,6 +85,21 @@ fn touches(c: &Capture) -> BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)> {
             e.0.insert(resource);
         }
     }
+    // A write to memory resources share writes each of them.
+    if c.meta("api").as_deref() == Some("d3d12") {
+        let aliases = d3d12::aliases(c);
+        if !aliases.is_empty() {
+            for (_, written) in out.values_mut() {
+                let shared: Vec<i64> = written
+                    .iter()
+                    .filter_map(|r| aliases.get(r))
+                    .flatten()
+                    .copied()
+                    .collect();
+                written.extend(shared);
+            }
+        }
+    }
     if !captured_constants(c) {
         return out;
     }
@@ -101,6 +121,8 @@ fn touches(c: &Capture) -> BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)> {
 pub struct Plan {
     pub events: Vec<i64>,
     pub resources: BTreeSet<i64>,
+    /// The event the replay is read just before, when it runs no event that far.
+    pub until: Option<i64>,
 }
 
 /// The events to run to replay event `target`, and the resources they touch.
@@ -129,7 +151,10 @@ pub fn plan_before(c: &Capture, id: i64, before: i64) -> Plan {
     let touches = touches(c);
     let (mut events, mut resources) = (Vec::new(), BTreeSet::from([id]));
     walk_back(&touches, before, &mut events, &mut resources);
-    with_bound(c, events, resources)
+    Plan {
+        until: Some(before),
+        ..with_bound(c, events, resources)
+    }
 }
 
 type Touches = BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)>;
@@ -179,7 +204,11 @@ fn with_bound(c: &Capture, events: Vec<i64>, mut resources: BTreeSet<i64>) -> Pl
             resources.extend(b);
         }
     }
-    Plan { events, resources }
+    Plan {
+        events,
+        resources,
+        until: None,
+    }
 }
 
 /// Resource `id`'s contents just before event `before` (canonical layout), replayed from the frame's start with the
@@ -485,6 +514,10 @@ pub fn run(
             .filter(|s| s.ordered)
             .count();
         after(seq, b.as_mut())?;
+    }
+    if let Some(until) = plan.until {
+        b.reach(c, until)
+            .map_err(|e| format!("up to event {until}: {e}"))?;
     }
     end(b.as_mut())?;
     let mut warnings = b.warnings();

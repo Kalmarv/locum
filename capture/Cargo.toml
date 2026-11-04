@@ -16,6 +16,8 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_LibraryLoader",
     "Win32_System_ProcessStatus",

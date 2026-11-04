@@ -1,7 +1,9 @@
-//! Reserved resources: a texture whose tiles map two heaps, one tile left unmapped, first used in the frame and then
-//! remapped by UpdateTileMappings and CopyTileMappings. The capture holds its contents as its first use read them
-//! (zero in the unmapped tile), its page table as the frame found it, the frame's two changes in order with the page
-//! table after each, and the heaps' descriptions.
+//! Memory resources share. A reserved texture whose tiles map two heaps, one tile left unmapped, first used in the
+//! frame, remapped by UpdateTileMappings and CopyTileMappings, then read again; and two buffers placed at one offset
+//! of one heap, the frame writing one and reading the other. The capture holds the texture's contents as its first
+//! use read them (zero in the unmapped tile), its page table as the frame found it, the frame's two changes in order
+//! with the page table after each, the heaps' descriptions and what each placed buffer takes of its heap; replay
+//! (xtask) gives the second read the remapped tile, and the read buffer what the frame wrote through the other.
 use super::*;
 use contents::{buffer_desc, committed, fill, pattern, read};
 
@@ -168,6 +170,65 @@ pub(super) unsafe fn capture(
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         );
         list.Close().unwrap();
+        // Two buffers at offset 0 of one heap (of a size no other heap of the smoke test has), and the bytes the
+        // frame writes through the first.
+        let shared = {
+            let mut h: Option<ID3D12Heap> = None;
+            device
+                .CreateHeap(
+                    &D3D12_HEAP_DESC {
+                        SizeInBytes: 5 * TILE,
+                        Properties: D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        Alignment: 0,
+                        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    },
+                    &mut h,
+                )
+                .unwrap();
+            h.unwrap()
+        };
+        let placed = || {
+            let mut b: Option<ID3D12Resource> = None;
+            device
+                .CreatePlacedResource(
+                    &shared,
+                    0,
+                    &buffer_desc(TILE),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut b,
+                )
+                .unwrap();
+            b.unwrap()
+        };
+        let (written, aliased) = (placed(), placed());
+        let bytes: Vec<u8> = (0..TILE as usize).map(|i| (i * 7 + 3) as u8).collect();
+        let upload = committed(
+            device,
+            D3D12_HEAP_TYPE_UPLOAD,
+            &buffer_desc(TILE),
+            D3D12_RESOURCE_STATE_GENERIC_READ,
+        );
+        let mut p = core::ptr::null_mut();
+        upload.Map(0, None, Some(&mut p)).unwrap();
+        core::ptr::copy_nonoverlapping(bytes.as_ptr(), p.cast::<u8>(), bytes.len());
+        upload.Unmap(0, None);
+        let after = committed(
+            device,
+            D3D12_HEAP_TYPE_READBACK,
+            &buffer_desc(512 << 10),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let allocator2: ID3D12CommandAllocator = device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            .unwrap();
+        let list2: ID3D12GraphicsCommandList = device
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator2, None)
+            .unwrap();
+        list2.Close().unwrap();
         let dir = std::path::PathBuf::from(std::env::var_os("LOCUM_DIR").unwrap());
         let label = format!("reserved-{}", std::process::id());
         std::fs::write(dir.join("capture"), format!("label {label}\n")).unwrap();
@@ -194,8 +255,66 @@ pub(super) unsafe fn capture(
             &tiles(1),
             D3D12_TILE_MAPPING_FLAG_NONE,
         );
+        // Mip 0 again after the changes; then the bytes written through one placed buffer, read through the other.
+        allocator2.Reset().unwrap();
+        list2.Reset(&allocator2, None).unwrap();
+        transition(
+            &list2,
+            &r,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        read(device, &list2, &r, &after, 0);
+        transition(
+            &list2,
+            &r,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        );
+        list2.CopyBufferRegion(&written, 0, &upload, 0, TILE);
+        let mut alias = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Aliasing: ManuallyDrop::new(D3D12_RESOURCE_ALIASING_BARRIER {
+                    pResourceBefore: ManuallyDrop::new(Some(written.clone())),
+                    pResourceAfter: ManuallyDrop::new(Some(aliased.clone())),
+                }),
+            },
+        };
+        list2.ResourceBarrier(core::slice::from_ref(&alias));
+        ManuallyDrop::drop(&mut (*alias.Anonymous.Aliasing).pResourceBefore);
+        ManuallyDrop::drop(&mut (*alias.Anonymous.Aliasing).pResourceAfter);
+        list2.CopyBufferRegion(&after, 256 << 10, &aliased, 0, TILE);
+        list2.Close().unwrap();
+        queue.ExecuteCommandLists(&[Some(list2.cast().unwrap())]);
         finish(queue, fence, 41);
         chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        // What the GPU read: tile 2 (x 0..128, y 128..256 of mip 0) as tile 0, the rest as filled; the aliased
+        // buffer as written through the other.
+        let mut p = core::ptr::null_mut();
+        after.Map(0, None, Some(&mut p)).unwrap();
+        let got = core::slice::from_raw_parts(p.cast::<u8>(), 512 << 10);
+        let filled = &data[0];
+        for y in 0..256 {
+            for x in 0..1024 {
+                let from = if y >= 128 && x < 512 {
+                    (y - 128) * 1024 + x
+                } else {
+                    y * 1024 + x
+                };
+                assert_eq!(
+                    got[y * 1024 + x],
+                    filled[from],
+                    "mip 0 after the remaps at byte {x} of row {y}"
+                );
+            }
+        }
+        assert!(
+            got[256 << 10..(256 << 10) + TILE as usize] == bytes[..],
+            "the aliased buffer holds what was written through the other"
+        );
+        after.Unmap(0, None);
 
         let path = dir.join("captures").join(&label).join("capture.db");
         let until = Instant::now() + Duration::from_secs(15);
