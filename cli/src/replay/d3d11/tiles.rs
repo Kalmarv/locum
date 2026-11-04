@@ -96,6 +96,33 @@ pub(super) fn run(
                 }
                 ctx.TiledResourceBarrier(dst, dst);
             }
+            "tile_packed_seed" => {
+                let dst = resource("dst")?;
+                let sub = n(&a["sub"]);
+                let layout = locum_d3d11::tiles::Layout::query(dst)?;
+                if !layout.is_packed(sub) {
+                    return Err("packed mip seed does not address a packed mip on this device".into());
+                }
+                let subs = locum_d3d11::readback::subs(dst)?;
+                let sub_layout = subs
+                    .get(sub as usize)
+                    .ok_or("packed mip seed subresource out of range")?;
+                let bytes = c.blob(data.ok_or("packed mip seed bytes missing")?)?;
+                if u64::try_from(bytes.len()).ok() != Some(sub_layout.size) {
+                    return Err("packed mip seed byte count differs".into());
+                }
+                let depth_pitch = u32::try_from(sub_layout.slice_bytes())
+                    .map_err(|_| "packed mip seed depth pitch overflow")?;
+                ctx.UpdateSubresource(
+                    dst,
+                    sub,
+                    None,
+                    bytes.as_ptr().cast(),
+                    sub_layout.row_bytes,
+                    depth_pitch,
+                );
+                ctx.TiledResourceBarrier(dst, dst);
+            }
             "tile_map" => {
                 let starts = array(&a["starts"], coordinate);
                 let sizes = array(&a["sizes"], size);

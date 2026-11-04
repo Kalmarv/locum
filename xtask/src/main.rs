@@ -441,15 +441,57 @@ fn smoke(root: &Path, debug: bool) {
     }
 
     for driver in ["gpu", "warp"] {
-        for (suffix, expected) in [
-            ("-omit-alias", "targets differ"),
-            ("-packed", "packed mip tile seeds"),
+        for kind in ["", "bc1-"] {
+            let packed_label = format!("tiles-packed-{kind}{driver}");
+            if log_dir
+                .join(format!("captures/{packed_label}/capture.db"))
+                .exists()
+            {
+                for warp in [false, true] {
+                    let mut cmd = Command::new(&cli);
+                    cmd.arg("verify")
+                        .arg(log_dir.join(format!("captures/{packed_label}")));
+                    if warp {
+                        cmd.arg("--warp");
+                    }
+                    if debug {
+                        cmd.arg("--debug");
+                    }
+                    let output = cmd.output().expect("verify packed mip seeds");
+                    let text = String::from_utf8_lossy(&output.stdout).into_owned()
+                        + &String::from_utf8_lossy(&output.stderr);
+                    let incompatible = !output.status.success()
+                        && warp != (driver == "warp")
+                        && text.contains("device tiling differs");
+                    let ok = incompatible
+                        || (output.status.success() && text.contains("7 of 7 targets identical"));
+                    println!("--- {packed_label} WARP={warp}\n{text}");
+                    println!(
+                        "{} packed mips: {}",
+                        if ok { "ok  " } else { "FAIL" },
+                        if incompatible {
+                            "incompatible device layout explicitly rejected"
+                        } else {
+                            "all mips and array slices verify"
+                        }
+                    );
+                    rows_ok &= ok;
+                }
+            }
+        }
+        for (label, expected) in [
+            (format!("tiles-{driver}-omit-alias"), "targets differ"),
+            (format!("tiles-packed-{driver}-zero-seeds"), "targets differ"),
+            (format!("tiles-packed-bc1-{driver}-zero-seeds"), "targets differ"),
+            (
+                format!("tiles-packed-bc1-alias-{driver}"),
+                "packed mip pool tiles have an unverified alias",
+            ),
+            (
+                format!("tiles-packed-alias-{driver}"),
+                "packed mip pool tiles have an unverified alias",
+            ),
         ] {
-            let label = if suffix == "-packed" {
-                format!("tiles-packed-{driver}")
-            } else {
-                format!("tiles-{driver}{suffix}")
-            };
             if !log_dir.join(format!("captures/{label}/capture.db")).exists() {
                 continue;
             }
@@ -464,7 +506,9 @@ fn smoke(root: &Path, debug: bool) {
                     + &String::from_utf8_lossy(&output.stderr);
                 let ok = !output.status.success()
                     && (text.contains(expected)
-                        || (suffix == "-packed" && text.contains("device tiling differs")));
+                        || (label.starts_with("tiles-packed-")
+                            && warp != (driver == "warp")
+                            && text.contains("device tiling differs")));
                 println!("--- {label} WARP={warp}\n{text}");
                 println!(
                     "{} tiles: rejects missing alias writes or packed seeds",

@@ -15,6 +15,27 @@ pub struct Layout {
 }
 
 impl Layout {
+    pub fn is_packed(&self, subresource: u32) -> bool {
+        self.mips != 0 && self.packed[1] != 0 && subresource % self.mips >= self.packed[0]
+    }
+
+    /// The flat virtual tile range backing one array slice's complete packed mip group.
+    pub fn packed_tiles(&self, slice: u32) -> Result<std::ops::Range<u32>, String> {
+        if self.array == 0 || slice >= self.array || !self.total.is_multiple_of(self.array) {
+            return Err("invalid packed mip array layout".into());
+        }
+        let per_slice = self.total / self.array;
+        let start = slice
+            .checked_mul(per_slice)
+            .and_then(|n| n.checked_add(self.packed[3]))
+            .ok_or("packed mip tile range overflow")?;
+        let end = start
+            .checked_add(self.packed[2])
+            .filter(|&n| n <= (slice + 1) * per_slice)
+            .ok_or("packed mip tile range outside array slice")?;
+        Ok(start..end)
+    }
+
     pub fn query(resource: &ID3D11Resource) -> Result<Self, String> {
         let (mips, array) = unsafe {
             if let Ok(t) = resource.cast::<ID3D11Texture2D>() {
@@ -292,6 +313,12 @@ mod tests {
     #[test]
     fn array_and_packed_addresses() {
         let l = layout();
+        assert_eq!(l.packed_tiles(0).unwrap(), 4..6);
+        assert_eq!(l.packed_tiles(1).unwrap(), 10..12);
+        assert!(!l.is_packed(0));
+        assert!(l.is_packed(1));
+        assert!(!l.is_packed(2));
+        assert!(l.is_packed(3));
         assert_eq!(
             l.region(
                 Some([1, 0, 0, 0]),
@@ -325,6 +352,25 @@ mod tests {
             assert_eq!(l.index(l.coordinate(i).unwrap()).unwrap(), i);
         }
         assert!(l.index([2, 0, 0, 3]).is_err());
+    }
+    #[test]
+    fn packed_ranges_reject_invalid_array_and_pool_bounds() {
+        let mut l = layout();
+        assert!(l.packed_tiles(2).is_err());
+        l.array = 0;
+        assert!(l.packed_tiles(0).is_err());
+        l.array = 2;
+        l.total = 11;
+        assert!(l.packed_tiles(0).is_err());
+        l.total = 12;
+        l.packed[2] = 3; // The tail would cross into the next array slice.
+        assert!(l.packed_tiles(0).is_err());
+        l.packed[2] = 2;
+        l.packed[3] = u32::MAX; // Addition must be checked before indexing a page table.
+        assert!(l.packed_tiles(0).is_err());
+        assert!(l.packed_tiles(1).is_err());
+        l.mips = 0;
+        assert!(!l.is_packed(0));
     }
     #[test]
     fn flags_and_pool_switch() {

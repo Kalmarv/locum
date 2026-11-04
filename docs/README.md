@@ -129,13 +129,24 @@ it is used. A pool's size includes resizes made before the capture. Every event 
 writes its pool, so a sliced replay keeps the writes made through another resource mapping the same tiles. Replay
 checks the device's tiling against the capture's and refuses one that differs.
 
+Fully mapped packed-mip groups are seeded as canonical texels, one `tile_packed_seed` per mip. Each readback copies
+just that resident subresource into an ordinary one-mip staging texture; BC staging dimensions round up to whole
+blocks while the readback retains the mip's own row layout. A group's events are appended only after every mip's
+copy succeeds; a failure leaves no partial seed prefix. Replay restores the mips with UpdateSubresource.
+This preserves texels for a matching layout, not the driver's opaque pool bytes. Partial groups, overlapping aliases,
+reinterpreted seed mappings, and CopyTiles/UpdateTiles on packed coordinates retain explicit `tiled` gaps. A standard
+alias of a formerly packed pool tile also stays a gap, including CopyTiles reads after the packed resource was unmapped.
+This packed-use history lasts until the pool is destroyed. Hardware smoke covers RGBA8 and BC1 groups, each with
+seven patterned mips down to 1x1;
+the tested WARP device reports no packed mips, and cross-driver incompatible layouts are explicitly rejected.
+
 Calls on tiled resources and tile pools are recorded in order as `tile_*` events with all their arguments:
 UpdateTileMappings (an array the game passed as null stays null), CopyTileMappings, CopyTiles with its direction and
 byte offset, UpdateTiles with the bytes it wrote, ResizeTilePool and TiledResourceBarrier. A call that fails is not
 recorded. Replay spells out the documented one tile per range where several ranges have null counts (WARP crashes on
 the null pointer). An upload on a deferred context runs where its command list is executed, and so does a mapping
-change, but a mapping change in a command list is a `tiled` gap: the tiles it maps aren't seeded yet. Packed mips
-aren't seeded either, nor tiles of a shrunken pool still mapped beyond its new size: both are `tiled` gaps. Tiled
+change, but a mapping change in a command list is a `tiled` gap: the tiles it maps aren't seeded yet. Tiles of a
+shrunken pool still mapped beyond its new size are also a `tiled` gap. Tiled
 render and depth targets and tiled UAV outputs aren't read back to compare. No readback copies a whole tiled resource
 (on tier 1 hardware it could touch an unmapped tile). A capture from before this, with no mappings or seeds, is
 refused rather than replayed as ordinary resources.

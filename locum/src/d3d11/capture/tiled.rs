@@ -1,4 +1,5 @@
 //! Persistent tile mappings, ordered tiled APIs, and canonical seeds for shared physical pool tiles.
+mod packed;
 use super::{Ctx, ids::resource_id, new_event, record};
 use crate::d3d11::registry;
 use locum_capture::{hash, stacks, writer};
@@ -94,6 +95,7 @@ pub fn event(
     if !super::armed() {
         return;
     }
+    packed::check_call(kind, &args);
     let mut e = new_event(kind, call, ctx.id, ctx.deferred, args);
     e.reads = reads.iter().copied().filter(|id| *id != 0).collect();
     e.writes = writes.iter().copied().filter(|id| *id != 0).collect();
@@ -169,6 +171,7 @@ pub fn resized(raw: *mut c_void, bytes: u64) {
 }
 pub fn destroyed(id: u64) {
     POOL_SIZES.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
+    packed::destroyed(id);
     // Releasing a pool can enter the registry's destruction callback again.
     let old = mappings().remove(&id);
     drop(old);
@@ -240,6 +243,9 @@ impl Change {
             dst.generation += 1;
             let pool_before = dst.mappings.pool;
             let result = self.change(dst, source);
+            if result.is_ok() {
+                packed::mapped(dst);
+            }
             if result.is_ok() && dst.mappings.pool != pool_before {
                 dst.error = None;
             }
@@ -378,8 +384,9 @@ pub(super) fn touch(c: &ID3D11DeviceContext4, resource: &ID3D11Resource) {
     }
     // Every event that touches a tiled resource comes here; its mappings are only read again after they changed.
     let seen = super::state().tile_seen.get(&id).copied();
+    let packed_generation = packed::generation();
     let looked = with_entry(resource, |e| {
-        (seen != Some(e.generation)).then(|| {
+        (seen != Some((e.generation, packed_generation))).then(|| {
             (
                 e.generation,
                 e.error.clone(),
@@ -397,12 +404,15 @@ pub(super) fn touch(c: &ID3D11DeviceContext4, resource: &ID3D11Resource) {
             return;
         }
     };
-    super::state().tile_seen.insert(id, generation);
+    super::state()
+        .tile_seen
+        .insert(id, (generation, packed_generation));
     if let Some(error) = error {
         gap(error);
         return;
     }
     let pool = pool.as_ref().map_or(0, resource_id);
+    packed::check_aliases(id, pool, &layout, &mapped);
     if pool_size(pool).is_some_and(|bytes| mapped.iter().any(|&(_, tile)| u64::from(tile) * 65536 >= bytes)) {
         gap("pool has live mappings beyond its shrunken size; native bootstrap is not verified yet".into());
     }
@@ -424,10 +434,21 @@ pub(super) fn touch(c: &ID3D11DeviceContext4, resource: &ID3D11Resource) {
         }
         super::state().timeline.push(boot);
     }
+    packed::seed(c, resource, id, pool, &layout, &mapped);
+    let standard: Vec<_> = mapped
+        .into_iter()
+        .filter(|&(v, _)| match layout.coordinate(v) {
+            Ok(at) => !layout.is_packed(at[3]),
+            Err(error) => {
+                gap(error);
+                false
+            }
+        })
+        .collect();
     let mut chosen = BTreeSet::new();
     let tiles: Vec<_> = {
         let s = super::state();
-        mapped
+        standard
             .into_iter()
             .filter(|&(_, p)| !s.tile_seeded.contains(&(pool, p)) && chosen.insert(p))
             .collect()
@@ -441,13 +462,6 @@ pub(super) fn touch(c: &ID3D11DeviceContext4, resource: &ID3D11Resource) {
                 continue;
             }
         };
-        if coordinates
-            .iter()
-            .any(|at| at[3] % layout.mips >= layout.packed[0])
-        {
-            gap("packed mip tile seeds are not captured yet".into());
-            continue;
-        }
         let bytes = coordinates.len() as u64 * 65536;
         if super::state().in_flight_bytes + bytes > super::contents::IN_FLIGHT {
             super::read_in_flight(c);

@@ -249,8 +249,10 @@ struct State {
     gaps: BTreeMap<(String, String), u64>,
     tile_initialized: BTreeSet<u64>,
     tile_seeded: BTreeSet<(u64, u32)>,
-    /// The generation of each tiled resource's mappings the capture last looked at (`tiled::touch`).
-    tile_seen: BTreeMap<u64, u64>,
+    /// Packed seeds preserve canonical texels only for their recorded group and ordered pool mappings.
+    tile_packed_seeded: BTreeSet<(u64, u64, u32, Vec<u32>)>,
+    /// The resource and global packed-mapping generations last checked (`tiled::touch`).
+    tile_seen: BTreeMap<u64, (u64, u64)>,
     /// Where in the timeline the tile seeds whose copies are still in flight are.
     tile_seeds: Vec<usize>,
 }
@@ -289,6 +291,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     gaps: BTreeMap::new(),
     tile_initialized: BTreeSet::new(),
     tile_seeded: BTreeSet::new(),
+    tile_packed_seeded: BTreeSet::new(),
     tile_seen: BTreeMap::new(),
     tile_seeds: Vec::new(),
 });
@@ -332,6 +335,7 @@ impl State {
         self.gaps.clear();
         self.tile_initialized.clear();
         self.tile_seeded.clear();
+        self.tile_packed_seeded.clear();
         self.tile_seen.clear();
         self.tile_seeds.clear();
     }

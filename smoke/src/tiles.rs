@@ -405,19 +405,22 @@ pub(super) fn run(
     bad.execute("UPDATE events SET kind='discard' WHERE kind='tile_update'", [])
         .unwrap();
     drop(bad);
-    packed(checks, device, c, swap, driver)?;
+    packed(checks, device, c, swap, driver, false)?;
+    packed(checks, device, c, swap, driver, true)?;
     Ok(())
 }
 
-/// Packed mip groups retain a gap until canonical packed seeding is implemented.
+/// Every packed mip must retain its own canonical texels. Tier 1 forbids arrays with small mips.
 fn packed(
     checks: &mut Checks,
     device: &ID3D11Device,
     c: &ID3D11DeviceContext,
     swap: &IDXGISwapChain1,
     driver: &str,
+    bc1: bool,
 ) -> Result<()> {
-    let label = format!("tiles-packed-{driver}");
+    let kind = if bc1 { "bc1-" } else { "" };
+    let label = format!("tiles-packed-{kind}{driver}");
     let c2: ID3D11DeviceContext2 = c.cast()?;
     let mut texture = None;
     let desc = D3D11_TEXTURE2D_DESC {
@@ -425,33 +428,46 @@ fn packed(
         Height: 64,
         MipLevels: 7,
         ArraySize: 1,
-        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+        Format: if bc1 {
+            DXGI_FORMAT_BC1_UNORM
+        } else {
+            DXGI_FORMAT_R8G8B8A8_UNORM
+        },
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Usage: D3D11_USAGE_DEFAULT,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
         MiscFlags: D3D11_RESOURCE_MISC_TILED.0 as u32,
         ..Default::default()
     };
-    unsafe {
-        device.CreateTexture2D(&desc, None, Some(&mut texture))?;
+    if let Err(error) = unsafe { device.CreateTexture2D(&desc, None, Some(&mut texture)) } {
+        println!(
+            "{label}: CreateTexture2D format={} 64x64/7 mips: {error}",
+            desc.Format.0
+        );
+        return Err(error);
     }
     let texture = texture.unwrap();
     let d2: ID3D11Device2 = device.cast()?;
     let mut total = 0;
     let mut packed = D3D11_PACKED_MIP_DESC::default();
+    let mut shape = D3D11_TILE_SHAPE::default();
     unsafe {
         d2.GetResourceTiling(
             &texture,
             Some(&mut total),
             Some(&mut packed),
-            None,
+            Some(&mut shape),
             None,
             0,
             std::ptr::null_mut(),
         );
     }
+    println!(
+        "{label}: total={total}, standard={}, packed={}, packed tiles={}",
+        packed.NumStandardMips, packed.NumPackedMips, packed.NumTilesForPackedMips
+    );
     if packed.NumPackedMips == 0 {
-        println!("skip tiles-packed-{driver}: runtime reports no packed mips for 64x64/7 mips");
+        println!("skip {label}: runtime reports no packed mips for 64x64/7 mips");
         return Ok(());
     }
     checks.check(total != 0, "tiles: packed mip fixture has packed tiles");
@@ -472,41 +488,234 @@ fn packed(
     unsafe {
         c2.UpdateTileMappings(&texture, 1, None, None, &pool, 1, None, Some(&0), None, 0)?;
     }
-    for mip in 0..7 {
+    let pattern = |mip: u32, slice: u32| {
         let size = (64u32 >> mip).max(1);
-        let data = [17u8, 67, 139, 255].repeat((size * size) as usize);
-        unsafe {
-            c.UpdateSubresource(&texture, mip, None, data.as_ptr().cast(), size * 4, 0);
+        if bc1 {
+            return (0..size.div_ceil(4))
+                .flat_map(|y| {
+                    (0..size.div_ceil(4)).flat_map(move |x| {
+                        // Endpoint 0 uses only full-intensity RGB channels, so its decoded bytes are exact.
+                        // Every mip differs, while alternating endpoint indices exercise the block layout.
+                        let channels = (mip + x + y * 3) % 7 + 1;
+                        let color: u16 = (if channels & 1 != 0 { 0xf800 } else { 0 })
+                            | (if channels & 2 != 0 { 0x07e0 } else { 0 })
+                            | (if channels & 4 != 0 { 0x001f } else { 0 });
+                        let bytes = color.to_le_bytes();
+                        [bytes[0], bytes[1], 0, 0, 0x44, 0x44, 0x44, 0x44]
+                    })
+                })
+                .collect::<Vec<_>>();
         }
-    }
-    let mut srv = None;
-    unsafe {
-        device.CreateShaderResourceView(&texture, None, Some(&mut srv))?;
+        (0..size)
+            .flat_map(|y| {
+                (0..size).flat_map(move |x| {
+                    [
+                        (17 + mip * 29) as u8,
+                        (67 + slice * 101) as u8,
+                        (x + y * 3) as u8,
+                        255,
+                    ]
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    for slice in 0..desc.ArraySize {
+        for mip in 0..desc.MipLevels {
+            let size = (64u32 >> mip).max(1);
+            let data = pattern(mip, slice);
+            unsafe {
+                c.UpdateSubresource(
+                    &texture,
+                    slice * desc.MipLevels + mip,
+                    None,
+                    data.as_ptr().cast(),
+                    if bc1 { size.div_ceil(4) * 8 } else { size * 4 },
+                    0,
+                );
+            }
+        }
     }
     let sh = Shaders::new(device)?;
     let cb = constant_buffer(device, false)?;
-    let (_, rtv) = target(device)?;
+    let (output, rtv) = target(device)?;
     let mut ps = None;
     unsafe {
-        device.CreatePixelShader(&compile("Texture2D<float4> t:register(t0); float4 main(float4 p:SV_Position):SV_Target { return t.Load(int3(uint2(p.xy),0)); }", s!("ps_5_0"))?, None, Some(&mut ps))?;
+        device.CreatePixelShader(&compile("Texture2DArray<float4> t:register(t0); float4 main(float4 p:SV_Position):SV_Target { uint w,h,l; t.GetDimensions(w,h,l); return t.Load(int4(uint2(p.xy)%uint2(w,h),0,0)); }", s!("ps_5_0"))?, None, Some(&mut ps))?;
     }
     let dir = replay_rows::begin(swap, &label)?;
-    unsafe {
-        sh.bind(c, &rtv, &cb);
-        c.PSSetShader(ps.as_ref(), None);
-        c.PSSetShaderResources(0, Some(&[srv]));
-        c.Draw(3, 0);
-        c.ClearState();
+    for slice in 0..desc.ArraySize {
+        for mip in 0..desc.MipLevels {
+            let mut srv = None;
+            let view = D3D11_SHADER_RESOURCE_VIEW_DESC {
+                Format: desc.Format,
+                ViewDimension: windows::Win32::Graphics::Direct3D::D3D_SRV_DIMENSION_TEXTURE2DARRAY,
+                Anonymous: D3D11_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D11_TEX2D_ARRAY_SRV {
+                        MostDetailedMip: mip,
+                        MipLevels: 1,
+                        FirstArraySlice: slice,
+                        ArraySize: 1,
+                    },
+                },
+            };
+            unsafe {
+                device.CreateShaderResourceView(&texture, Some(&view), Some(&mut srv))?;
+                sh.bind(c, &rtv, &cb);
+                c.PSSetShader(ps.as_ref(), None);
+                c.PSSetShaderResources(0, Some(&[srv]));
+                c.Draw(3, 0);
+                c.ClearState();
+            }
+            let pixel = first_pixel(device, c, &output)?;
+            let texel = pattern(mip, slice);
+            let expected = if bc1 {
+                let channels = mip % 7 + 1;
+                [
+                    if channels & 4 != 0 { 255 } else { 0 },
+                    if channels & 2 != 0 { 255 } else { 0 },
+                    if channels & 1 != 0 { 255 } else { 0 },
+                    255,
+                ]
+            } else {
+                [texel[2], texel[1], texel[0], texel[3]]
+            };
+            checks.check(
+                pixel == expected,
+                &format!("{label}: actual mip {mip} slice {slice} pixel"),
+            );
+        }
     }
     replay_rows::finish(checks, swap, &dir, &label)?;
     let db = rusqlite::Connection::open(dir.join(format!("captures/{label}/capture.db"))).unwrap();
     let gaps: u32 = db
+        .query_row("SELECT count(*) FROM gaps WHERE what='tiled'", [], |r| r.get(0))
+        .unwrap();
+    checks.check(
+        gaps == 0,
+        "tiles: fully mapped packed mips have canonical seeds without a gap",
+    );
+    let seeds: Vec<(String, String)> = db
+        .prepare("SELECT args, data FROM events WHERE kind='tile_packed_seed' ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(|row| row.unwrap())
+        .collect();
+    checks.check(
+        seeds.len() == usize::from(packed.NumPackedMips) * desc.ArraySize as usize,
+        "tiles: one canonical seed per packed mip and array slice",
+    );
+    let blobs = locum_capture::blobs::Blobs::new(dir.join("blobs"));
+    for (args, key) in &seeds {
+        let args: serde_json::Value = serde_json::from_str(args).unwrap();
+        let sub = args["sub"].as_u64().unwrap() as u32;
+        checks.check(
+            blobs.get(key).unwrap() == pattern(sub % desc.MipLevels, sub / desc.MipLevels),
+            &format!("{label}: canonical packed seed for subresource {sub}"),
+        );
+    }
+    drop(db);
+    let tampered = dir.join(format!("captures/{label}-zero-seeds"));
+    std::fs::create_dir_all(&tampered).unwrap();
+    std::fs::copy(
+        dir.join(format!("captures/{label}/capture.db")),
+        tampered.join("capture.db"),
+    )
+    .unwrap();
+    let bad = rusqlite::Connection::open(tampered.join("capture.db")).unwrap();
+    for (_, key) in seeds {
+        let zero = vec![0; blobs.get(&key).unwrap().len()];
+        let zero_key = locum_capture::hash::key(&zero);
+        blobs.put(&zero_key, &zero).unwrap();
+        bad.execute(
+            "UPDATE events SET data=?1 WHERE kind='tile_packed_seed' AND data=?2",
+            [&zero_key, &key],
+        )
+        .unwrap();
+    }
+    drop(bad);
+
+    // Remove the packed mappings before reading their pool tiles through a standard alias.
+    // Remembering only currently mapped packed groups would miss this case.
+    let mut alias = None;
+    unsafe {
+        c2.UpdateTileMappings(
+            &texture,
+            1,
+            None,
+            None,
+            None,
+            1,
+            Some(&(D3D11_TILE_RANGE_NULL.0 as u32)),
+            None,
+            None,
+            0,
+        )?;
+        device.CreateTexture2D(
+            &D3D11_TEXTURE2D_DESC {
+                Width: shape.WidthInTexels,
+                Height: shape.HeightInTexels,
+                MipLevels: 1,
+                ArraySize: 1,
+                ..desc
+            },
+            None,
+            Some(&mut alias),
+        )?;
+    }
+    let alias = alias.unwrap();
+    let mut buffer = None;
+    unsafe {
+        c2.UpdateTileMappings(
+            &alias,
+            1,
+            None,
+            None,
+            &pool,
+            1,
+            None,
+            Some(&packed.StartTileIndexInOverallResource),
+            None,
+            0,
+        )?;
+        device.CreateBuffer(
+            &D3D11_BUFFER_DESC {
+                ByteWidth: 65536,
+                Usage: D3D11_USAGE_DEFAULT,
+                ..Default::default()
+            },
+            None,
+            Some(&mut buffer),
+        )?;
+    }
+    let alias_label = format!("tiles-packed-{kind}alias-{driver}");
+    let alias_dir = replay_rows::begin(swap, &alias_label)?;
+    unsafe {
+        c2.CopyTiles(
+            &alias,
+            &D3D11_TILED_RESOURCE_COORDINATE::default(),
+            &D3D11_TILE_REGION_SIZE {
+                NumTiles: 1,
+                ..Default::default()
+            },
+            buffer.as_ref().unwrap(),
+            0,
+            D3D11_TILE_COPY_SWIZZLED_TILED_RESOURCE_TO_LINEAR_BUFFER.0 as u32,
+        );
+    }
+    replay_rows::finish(checks, swap, &alias_dir, &alias_label)?;
+    let db =
+        rusqlite::Connection::open(alias_dir.join(format!("captures/{alias_label}/capture.db"))).unwrap();
+    let gaps: u32 = db
         .query_row(
-            "SELECT count(*) FROM gaps WHERE what='tiled' AND detail LIKE '%packed%'",
+            "SELECT count(*) FROM gaps WHERE what='tiled' AND detail LIKE '%packed%alias%'",
             [],
             |r| r.get(0),
         )
         .unwrap();
-    checks.check(gaps != 0, "tiles: packed initial contents retain an explicit gap");
+    checks.check(
+        gaps != 0,
+        "tiles: CopyTiles through a formerly packed pool alias keeps an explicit gap",
+    );
     Ok(())
 }

@@ -1645,9 +1645,31 @@ fn ordered_capture(
         kept.len() == 3,
         "ordered: what the dispatch wrote is recorded for each of its three UAVs",
     );
+    let records_match = kept
+        .iter()
+        .any(|(_, k)| blobs.get(k).ok().as_deref() == Some(written.as_slice()));
+    if !records_match {
+        let observed = path.parent().unwrap().join("ordered-records-observed.bin");
+        std::fs::write(&observed, &written).expect("save the mismatching post-Present readback");
+        println!(
+            "ordered: post-Present records key={}, bytes={}, saved to {}",
+            locum_capture::hash::key(&written),
+            written.len(),
+            observed.display()
+        );
+        for (resource, key) in &kept {
+            match blobs.get(key) {
+                Ok(bytes) => println!(
+                    "ordered: resource {resource}, key={key}, bytes={}, first differing byte={:?}",
+                    bytes.len(),
+                    bytes.iter().zip(&written).position(|(a, b)| a != b)
+                ),
+                Err(error) => println!("ordered: resource {resource}, key={key}, blob read failed: {error}"),
+            }
+        }
+    }
     checks.check(
-        kept.iter()
-            .any(|(_, k)| blobs.get(k).ok().as_deref() == Some(written.as_slice())),
+        records_match,
         "ordered: the recorded records are the GPU's, in the GPU's order",
     );
 

@@ -79,6 +79,85 @@ pub unsafe fn issue(c: &ID3D11DeviceContext, resource: &ID3D11Resource) -> Resul
     unsafe { crate::predication::unpredicated(c, || issue_now(c, resource)) }
 }
 
+/// Copies one fully resident texture subresource into a staging texture containing only that mip.
+/// Packed tiled mips use ordinary copies: CopyTiles cannot read their implementation-defined layout.
+///
+/// # Safety
+/// The entire source subresource must be mapped on this context's device.
+pub unsafe fn issue_subresource(
+    c: &ID3D11DeviceContext,
+    resource: &ID3D11Resource,
+    index: u32,
+) -> Result<Readback, String> {
+    let mut sub = *subs(resource)?
+        .get(index as usize)
+        .ok_or("subresource out of range")?;
+    let device = unsafe { c.GetDevice() }.map_err(|e| e.to_string())?;
+    let staging: ID3D11Resource = if let Ok(texture) = resource.cast::<ID3D11Texture2D>() {
+        let mut source = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut source) };
+        if source.SampleDesc.Count != 1 {
+            return Err("single-subresource staging does not resolve multisampling".into());
+        }
+        let block = format::layout(source.Format.0 as u32).ok_or("format has no block layout")?;
+        let desc = D3D11_TEXTURE2D_DESC {
+            // A BC staging allocation needs complete blocks even for a 2x2 or 1x1 source mip.
+            // The readback keeps `sub`'s logical dimensions, rows and row bytes.
+            Width: sub.width.div_ceil(block.block_width) * block.block_width,
+            Height: sub.height.div_ceil(block.block_height) * block.block_height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT(copyable(source.Format.0 as u32) as i32),
+            SampleDesc: source.SampleDesc,
+            Usage: D3D11_USAGE_STAGING,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            ..Default::default()
+        };
+        let mut staging = None;
+        unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }.map_err(|e| e.to_string())?;
+        staging
+            .ok_or("no staging mip")?
+            .cast()
+            .map_err(|e| e.to_string())?
+    } else if let Ok(texture) = resource.cast::<ID3D11Texture3D>() {
+        let mut source = D3D11_TEXTURE3D_DESC::default();
+        unsafe { texture.GetDesc(&mut source) };
+        let block = format::layout(source.Format.0 as u32).ok_or("format has no block layout")?;
+        let desc = D3D11_TEXTURE3D_DESC {
+            Width: sub.width.div_ceil(block.block_width) * block.block_width,
+            Height: sub.height.div_ceil(block.block_height) * block.block_height,
+            Depth: sub.depth,
+            MipLevels: 1,
+            Format: DXGI_FORMAT(copyable(source.Format.0 as u32) as i32),
+            Usage: D3D11_USAGE_STAGING,
+            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+            ..Default::default()
+        };
+        let mut staging = None;
+        unsafe { device.CreateTexture3D(&desc, None, Some(&mut staging)) }.map_err(|e| e.to_string())?;
+        staging
+            .ok_or("no staging mip")?
+            .cast()
+            .map_err(|e| e.to_string())?
+    } else {
+        return Err("single-subresource staging requires a 2D or 3D texture".into());
+    };
+    unsafe {
+        crate::predication::unpredicated(c, || {
+            c.CopySubresourceRegion(&staging, 0, 0, 0, 0, resource, index, None);
+        })
+    };
+    sub.index = 0;
+    sub.mip = 0;
+    sub.slice = 0;
+    sub.offset = 0;
+    Ok(Readback {
+        staging,
+        subs: vec![sub],
+        buffer: false,
+    })
+}
+
 /// Copies only the supplied, mapped, non-packed tiles, in canonical 64 KiB layout.
 ///
 /// # Safety
