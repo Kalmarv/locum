@@ -428,9 +428,22 @@ find and show it by the game's own file names: index the members of the game's s
 `.ppo`/`.vpo` files from `shader/*.shaderbnd.dcx`) and give `--index`.
 
 Constants are named from each shader's reflection (its `RDEF` part as `dxbc-reader` reads it, Shader Model 4.0 to 5.1,
-register spaces included), as `cbuffer.variable[index].component`. A program built without names (Unreal's DXIL)
-declares its constant buffers' sizes but no variables: `cb` shows the registers within that size, unnamed. PNGs of depth and other one-channel images are
-stretched from their smallest to largest value, float colour is tone-mapped, and `--range LO:HI` sets the mapping.
+register spaces included), as `cbuffer.variable[index].component`. A matrix element is named as HLSL indexes it,
+`m[row][column]`: a column-major matrix (HLSL's default) keeps a column in each register, so `c0.w` of a `float4x3
+mWorld` is `mWorld[3][0]`, the translation's x in a row-vector transform. A program built without names (Unreal's
+DXIL) declares its constant buffers' sizes but no variables: `cb` shows the registers within that size, unnamed.
+
+A game can bind a constant buffer larger than a program declares, holding more elements of the array it ends with
+than the program reads: Sekiro binds 64,800 bytes of `cbLight` to a program declaring 576, `FC_DirLight[2]` of
+225 light sets. `cb`'s header says both sizes; with `--extend`, `cb` and `constants` name the rest as the further
+elements (`FC_DirLight[2]` on to `[224]`), so `cb ... --extend --name 'FC_DirLight[100].'` reads one record and
+`constants --extend --name 'FC_DirLight[100].Col_0'` that record across the frame. Elements are only named so far as
+one fits whole; what the program reads stays the declared part. Instance data a draw indexes at run time (Elden
+Ring's `VC_InstanceIdxOffset` into `g_InstanceIndexBuffer`) is not in the bound range at all: the buffer holds the
+first records, and `trace` marks a constant the program reads at a run-time index (`[run-time index]`).
+
+PNGs of depth and other one-channel images are stretched from their smallest to largest value, float colour is
+tone-mapped, and `--range LO:HI` sets the mapping.
 
 ## Direct3D 12 (in progress)
 

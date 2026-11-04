@@ -180,6 +180,10 @@ enum Command {
         /// Each name's distinct values, with how many draws read each and the first and last of them.
         #[arg(long)]
         distinct: bool,
+        /// Name ranges bound larger than the program declares as further elements of the array the buffer ends with
+        /// (as `cb --extend`).
+        #[arg(long)]
+        extend: bool,
     },
     /// One draw: its shaders, state, everything bound, its constants by name, and the targets read after it.
     Draw {
@@ -223,6 +227,10 @@ enum Command {
         /// `--name SC_CameraPos`, `--name 'NormalMapScroll|waveTime'`. Across draws: `constants`.
         #[arg(long)]
         name: Option<String>,
+        /// Name a range bound larger than the program declares as further elements of the array the buffer ends
+        /// with (`FC_DirLight[2]` on to `[224]`), so `--name 'FC_DirLight[100].'` picks one record.
+        #[arg(long)]
+        extend: bool,
     },
     /// What a draw fed its vertex shader: each vertex it reads, in order, its attributes decoded through the input
     /// layout from the bound vertex buffers as the draw saw them (a buffer the frame wrote before the draw is
@@ -749,10 +757,11 @@ fn run(cli: Cli) -> Result<(), String> {
             draws,
             stage,
             distinct,
+            extend,
         } => constants::constants(
             &captures,
             open,
-            &constants::Filter::new(&name, draws, stage, distinct),
+            &constants::Filter::new(&name, draws, stage, distinct, extend),
         ),
         Command::Draw {
             capture,
@@ -772,6 +781,7 @@ fn run(cli: Cli) -> Result<(), String> {
             json,
             reg,
             name,
+            extend,
         } => draw::cb(
             &open(&capture)?,
             draw,
@@ -780,7 +790,11 @@ fn run(cli: Cli) -> Result<(), String> {
             space,
             raw,
             json,
-            &draw::Only { registers: reg, name },
+            &draw::Only {
+                registers: reg,
+                name,
+                extend,
+            },
         ),
         Command::Vertices {
             capture,

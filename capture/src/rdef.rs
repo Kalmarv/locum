@@ -545,6 +545,33 @@ fn size(ty: &Type) -> u32 {
 }
 
 impl ConstantBuffer {
+    /// The buffer as it would be declared if its last variable, an array, ran on over `bytes` bytes, with that
+    /// variable's name and its elements as declared and as extended: a game can bind a range larger than a program
+    /// declares that holds more elements than the program reads (Sekiro binds 225 light sets of `cbLight`, where a
+    /// program declares `FC_DirLight[2]`). None when the last variable is not an array or no further element fits.
+    pub fn extended(&self, bytes: u32) -> Option<(ConstantBuffer, String, u16, u16)> {
+        let (i, last) = self.variables.iter().enumerate().max_by_key(|(_, v)| v.offset)?;
+        if last.ty.elements == 0 {
+            return None;
+        }
+        let one = Type {
+            elements: 0,
+            ..last.ty.clone()
+        };
+        let (stride, size) = (element_stride(&one), size(&one));
+        let room = bytes.checked_sub(last.offset)?;
+        let elements = u16::try_from(room.checked_sub(size)? / stride + 1).unwrap_or(u16::MAX);
+        if elements <= last.ty.elements {
+            return None;
+        }
+        let mut cb = self.clone();
+        let v = &mut cb.variables[i];
+        v.ty.elements = elements;
+        v.size = self::size(&v.ty);
+        cb.size = cb.size.max(v.offset + v.size);
+        Some((cb, last.name.clone(), last.ty.elements, elements))
+    }
+
     /// The name of the 4-byte value at `offset` bytes into the buffer, if a variable covers it.
     pub fn name_at(&self, offset: u32) -> Option<String> {
         self.at(offset).map(|(name, _)| name)
@@ -635,6 +662,64 @@ mod tests {
         };
         assert_eq!(name_in("world", &m, 36).0, "world[2][1]");
         assert_eq!(type_name_check(), "float4[4]");
+    }
+
+    #[test]
+    fn a_last_array_runs_on_over_a_larger_binding() {
+        // struct { float4 v; float f; } lights[2] after a float4 head: 32 bytes an element (20 used), from 16.
+        let light = Type {
+            class: 5,
+            base: 0,
+            rows: 1,
+            columns: 1,
+            elements: 2,
+            members: vec![
+                Member {
+                    name: "v".into(),
+                    offset: 0,
+                    ty: vector(4, 0),
+                },
+                Member {
+                    name: "f".into(),
+                    offset: 16,
+                    ty: vector(1, 0),
+                },
+            ],
+        };
+        let cb = ConstantBuffer {
+            name: "cbLight".into(),
+            slot: Some(5),
+            space: 0,
+            size: 80,
+            variables: vec![
+                Variable {
+                    name: "head".into(),
+                    offset: 0,
+                    size: 16,
+                    used: true,
+                    ty: vector(4, 0),
+                },
+                Variable {
+                    name: "lights".into(),
+                    offset: 16,
+                    size: 52,
+                    used: true,
+                    ty: light,
+                },
+            ],
+        };
+        assert_eq!(cb.name_at(84), None);
+        // 16 + 32 * 3 + 20 = 132 bytes hold a fourth element's used part; 131 do not.
+        let (wide, name, was, now) = cb.extended(132).unwrap();
+        assert_eq!((name.as_str(), was, now), ("lights", 2, 4));
+        assert_eq!(wide.name_at(80).unwrap(), "cbLight.lights[2].v.x");
+        assert_eq!(wide.name_at(128).unwrap(), "cbLight.lights[3].f.x");
+        assert_eq!(cb.extended(131).unwrap().3, 3);
+        // Nothing more fits, or the last variable is no array.
+        assert!(cb.extended(80).is_none());
+        let mut plain = cb.clone();
+        plain.variables.pop();
+        assert!(plain.extended(4096).is_none());
     }
 
     /// An array of structs whose last member ends inside a register: Elden Ring's `VC_SpeedTreeWind[2]`, a struct of

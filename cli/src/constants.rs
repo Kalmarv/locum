@@ -21,10 +21,18 @@ pub struct Filter {
     pub stage: Option<String>,
     /// Each name's distinct values and the draws that read each, instead of a row per draw.
     pub distinct: bool,
+    /// Name ranges bound larger than declared as further elements of the buffer's last array.
+    pub extend: bool,
 }
 
 impl Filter {
-    pub fn new(name: &str, draws: Option<(i64, i64)>, stage: Option<String>, distinct: bool) -> Filter {
+    pub fn new(
+        name: &str,
+        draws: Option<(i64, i64)>,
+        stage: Option<String>,
+        distinct: bool,
+        extend: bool,
+    ) -> Filter {
         Filter {
             name: name
                 .split('|')
@@ -34,6 +42,7 @@ impl Filter {
             draws,
             stage,
             distinct,
+            extend,
         }
     }
 
@@ -108,7 +117,7 @@ fn found(c: &Capture, f: &Filter) -> Result<(Vec<Found>, usize), String> {
                 uncaptured += 1;
                 continue;
             }
-            let k = constants_of(c, &mut reflection, n, b, false)?;
+            let k = constants_of(c, &mut reflection, n, b, false, f.extend)?;
             let buffer = k.name.clone().unwrap_or_default();
             for w in k.words {
                 let Some(name) = w.name.filter(|name| f.matches(name)) else {
@@ -199,7 +208,14 @@ pub fn constants(
         }
     }
     if !any {
-        eprintln!("locum-cli: no constant named like that is bound with contents");
+        eprintln!(
+            "locum-cli: no constant named like that is bound with contents{}",
+            if f.extend || !f.name.iter().any(|p| p.contains('[')) {
+                ""
+            } else {
+                " (an element past an array's declared length is named with --extend)"
+            }
+        );
     }
     Ok(())
 }

@@ -209,6 +209,19 @@ pub struct Constants {
     pub skipped: usize,
     /// Why there are no contents, as far as the capture says.
     pub why: Option<String>,
+    /// The program's last variable, an array, run on over the bound range (`--extend`); or, without `--extend`, how
+    /// far it would run.
+    pub extended: Option<Extended>,
+}
+
+/// An array a constant buffer ends with, named past its declared length over the bytes bound.
+#[derive(Serialize)]
+pub struct Extended {
+    pub variable: String,
+    pub declared: u16,
+    pub elements: u16,
+    /// Whether its words are named so (`--extend`), not only told.
+    pub named: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -552,7 +565,7 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
     let mut constants = Vec::new();
     for (b, binding) in rows.iter().zip(&bindings).filter(|(b, _)| b.kind == "cb") {
         if all || binding.used != Some(false) {
-            constants.push(constants_of(c, reflection, n, b, all)?);
+            constants.push(constants_of(c, reflection, n, b, all, false)?);
         }
     }
     let unread = |b: &Binding| b.used == Some(false);
@@ -650,6 +663,7 @@ pub(crate) fn constants_of(
     draw: i64,
     b: &Row,
     all: bool,
+    extend: bool,
 ) -> Result<Constants, String> {
     let mut out = Constants {
         stage: b.stage.clone(),
@@ -663,6 +677,7 @@ pub(crate) fn constants_of(
         words: Vec::new(),
         skipped: 0,
         why: None,
+        extended: None,
     };
     let Some(key) = &b.content else {
         out.why = Some(uncaptured(c));
@@ -675,6 +690,18 @@ pub(crate) fn constants_of(
     let cb = shader
         .as_deref()
         .and_then(|s| reflection.cb(c, s, b.slot, b.space));
+    out.declared = cb.map(|cb| cb.size);
+    let wide = cb.and_then(|cb| cb.extended(u32::try_from(bytes.len()).unwrap_or(u32::MAX)));
+    out.extended = wide.as_ref().map(|(_, variable, declared, elements)| Extended {
+        variable: variable.clone(),
+        declared: *declared,
+        elements: *elements,
+        named: extend,
+    });
+    let cb = match &wide {
+        Some((wide, ..)) if extend => Some(wide),
+        _ => cb,
+    };
     // a program built without names (Unreal's DXIL) declares the buffer and its size but no variables
     out.name = cb.map(|cb| {
         if cb.name.is_empty() {
@@ -684,7 +711,6 @@ pub(crate) fn constants_of(
         }
     });
     out.bytes = bytes.len();
-    out.declared = cb.map(|cb| cb.size);
     // the bytes the program reads: its variables', or, when it lists none, all it declares
     let used: Vec<(u32, u32)> = cb
         .map(|cb| {
@@ -739,8 +765,24 @@ fn print_constants(k: &Constants) {
         Some(d) if d as usize != k.bytes => format!(" bound, the program declares {d}"),
         _ => String::new(),
     };
+    let extended = match &k.extended {
+        Some(e) if e.named => format!(
+            "; {} named as {} elements, {} past the {} declared",
+            e.variable,
+            e.elements,
+            e.elements - e.declared,
+            e.declared
+        ),
+        Some(e) => format!(
+            "; `cb --extend` names the rest as {}[{}..{}]",
+            e.variable,
+            e.declared,
+            e.elements - 1
+        ),
+        None => String::new(),
+    };
     out!(
-        "{} b{}{space} ({}, {} bytes{declared}{}):",
+        "{} b{}{space} ({}, {} bytes{declared}{}{extended}):",
         k.stage,
         k.slot,
         k.name.as_deref().unwrap_or("no reflection"),
@@ -1148,6 +1190,8 @@ fn sectioned(d: &Draw, sections: &[String]) -> Result<Value, String> {
 pub struct Only {
     pub registers: Vec<u32>,
     pub name: Option<String>,
+    /// Name the registers past the program's declared size as further elements of its last array.
+    pub extend: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1218,7 +1262,7 @@ fn constants_at(c: &Capture, draw: i64, b: Row, raw: bool, as_json: bool, only: 
         }
         return Ok(());
     }
-    let mut k = constants_of(c, &mut Reflection::default(), draw, &b, true)?;
+    let mut k = constants_of(c, &mut Reflection::default(), draw, &b, true, only.extend)?;
     if !only.registers.is_empty() || only.name.is_some() {
         // parts separated by `|`, any of which a name may hold
         let wanted: Vec<String> = only
