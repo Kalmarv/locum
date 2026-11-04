@@ -251,6 +251,10 @@ locum-cli sql last "SELECT ..."            # anything else
 locum-cli upgrade last --check             # what an older locum derived, brought up to this one (see below)
 ```
 
+`draw` leaves out what the draw does not read (`--all` keeps it, marked): registers its programs' reflection does not
+list, and vertex buffer slots no element of its input layout reads, where a game left buffers bound for an earlier draw.
+A match of only index bytes is corroborated by the vertex buffers the draw reads, not those it leaves unread.
+
 `upgrade` rewrites what a capture derived, not what it recorded, from the capture's own authoritative records, in one
 transaction (`--check` says what it would change and writes nothing). D3D12 bindings are projected again from each
 draw's root arguments and the descriptors of its submission: locum before 2026-11-04 let a table range reach

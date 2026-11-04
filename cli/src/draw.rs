@@ -106,6 +106,9 @@ pub struct Draw {
     /// Bound registers left out because the shaders' reflection does not list them (`--all` keeps them): a D3D12
     /// root table binds every descriptor of its ranges, whatever the program reads.
     pub unused: usize,
+    /// Bound vertex buffer slots left out because no element of the input layout reads them (`--all` keeps them): a
+    /// game can leave buffers bound in slots a later draw's layout does not use.
+    pub unread_slots: usize,
     /// Registers bound to more than one descriptor, which no valid root signature does: captures whose D3D12 bindings
     /// a locum before 2026-11-04 projected let a table range reach descriptors of another type.
     pub doubled: usize,
@@ -414,12 +417,25 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
     );
 
     let rows = rows(c, n);
-    let mut bindings = Vec::with_capacity(rows.len());
+    // the vertex buffer slots the input layout reads; none known without a layout
+    let layout_slots: Option<Vec<u32>> = layout.and_then(|id| {
+        let json: String = c
+            .row("SELECT json FROM states WHERE id = ?1", [id], |r| r.get(0))
+            .flatten()?;
+        let elements: Vec<Value> = serde_json::from_str(&json).ok()?;
+        elements
+            .iter()
+            .map(|e| e["slot"].as_u64().and_then(|s| u32::try_from(s).ok()))
+            .collect()
+    });
+    // the vertex buffers the draw reads, which a match of only index bytes can be corroborated by
     let vbs: Vec<Vb> = rows
         .iter()
         .filter(|b| b.kind == "vb")
+        .filter(|b| layout_slots.as_ref().is_none_or(|s| s.contains(&b.slot)))
         .filter_map(|b| Some((b.resource?, b.offset, b.size)))
         .collect();
+    let mut bindings = Vec::with_capacity(rows.len());
     for b in &rows {
         let (name, used) = if matches!(b.kind.as_str(), "srv" | "uav" | "sampler" | "cb")
             && let Some(shader) = shader_of(c, n, &b.stage)
@@ -429,6 +445,10 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
                 describe::Slot::Unused => (None, Some(false)),
                 describe::Slot::Unknown => (None, None),
             }
+        } else if b.kind == "vb"
+            && let Some(slots) = &layout_slots
+        {
+            (None, Some(slots.contains(&b.slot)))
         } else {
             (None, None)
         };
@@ -512,11 +532,12 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
             constants.push(constants_of(c, reflection, n, b, all)?);
         }
     }
-    let before = bindings.len();
+    let unread = |b: &Binding| b.used == Some(false);
+    let unused = bindings.iter().filter(|b| unread(b) && b.kind != "vb").count();
+    let unread_slots = bindings.iter().filter(|b| unread(b) && b.kind == "vb").count();
     if !all {
-        bindings.retain(|b| b.used != Some(false));
+        bindings.retain(|b| !unread(b));
     }
-    let unused = before - bindings.len();
     let mut registers: HashMap<(&str, &str, u32, u32), usize> = HashMap::new();
     for b in &rows {
         *registers
@@ -573,6 +594,7 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
         scissors,
         bindings,
         unused,
+        unread_slots,
         doubled,
         constants,
         targets,
@@ -859,6 +881,7 @@ fn print_bound(d: &Draw) {
         }
         match (&b.name, b.used) {
             (Some(name), _) => line += &format!(" {name}"),
+            (None, Some(false)) if b.kind == "vb" => line += " (the input layout does not read it)",
             (None, Some(false)) => line += " (the shader does not use it)",
             _ => {}
         }
@@ -942,6 +965,14 @@ fn print_bound(d: &Draw) {
             d.unused,
             if d.unused == 1 { "" } else { "s" },
             if d.unused == 1 { "it" } else { "them" }
+        );
+    }
+    if d.unread_slots > 0 {
+        out!(
+            "  ({} bound vertex buffer slot{} the input layout does not read; --all shows {})",
+            d.unread_slots,
+            if d.unread_slots == 1 { "" } else { "s" },
+            if d.unread_slots == 1 { "it" } else { "them" }
         );
     }
     if d.doubled > 0 {
