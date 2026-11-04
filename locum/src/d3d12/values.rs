@@ -83,7 +83,14 @@ pub enum Initial {
     State(i32),
     Layout(i32),
 }
-pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, initial: Initial, heap: u64, offset: u64) {
+/// How a resource was made: on a heap of its own, at an offset in a heap, or reserved (tiles mapped later).
+pub enum Placement {
+    Committed,
+    Placed(u64, u64),
+    Reserved,
+}
+
+pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, initial: Initial, placement: Placement) {
     let Some(resource) = (unsafe { output::<ID3D12Resource>(out) }) else {
         return;
     };
@@ -91,7 +98,15 @@ pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, initial: Init
     let d = unsafe { resource.GetDesc() };
     let mut properties = D3D12_HEAP_PROPERTIES::default();
     let mut flags = D3D12_HEAP_FLAGS::default();
-    let heap_properties = unsafe { resource.GetHeapProperties(Some(&mut properties),Some(&mut flags)) }.ok().map(|()|
+    let (heap, offset) = match placement {
+        Placement::Placed(heap, offset) => (heap, offset),
+        _ => (0, 0),
+    };
+    // A reserved resource has no heap of its own; the runtime refuses to be asked.
+    let heap_properties = (!matches!(placement, Placement::Reserved))
+        .then(|| unsafe { resource.GetHeapProperties(Some(&mut properties), Some(&mut flags)) }.ok())
+        .flatten()
+        .map(|()|
         json!({"type":properties.Type.0,"cpu_page":properties.CPUPageProperty.0,"memory_pool":properties.MemoryPoolPreference.0,
             "creation_node_mask":properties.CreationNodeMask,"visible_node_mask":properties.VisibleNodeMask,"flags":flags.0}));
     let description = json!({"dimension":d.Dimension.0,"alignment":d.Alignment,"width":d.Width,"height":d.Height,
@@ -115,6 +130,23 @@ pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, initial: Init
     }
     super::journal::track(id, &description, initial);
     super::journal::describe(id, device, description);
+}
+
+/// A heap's description: placed resources and reserved resources' tiles name it.
+pub unsafe fn created_heap(device: u64, out: *mut *mut c_void) {
+    let Some(heap) = (unsafe { output::<ID3D12Heap>(out) }) else {
+        return;
+    };
+    let id = id(unsafe { *out });
+    let d = unsafe { heap.GetDesc() };
+    let p = d.Properties;
+    super::journal::describe(
+        id,
+        device,
+        json!({"bytes":d.SizeInBytes,"alignment":d.Alignment,"flags":d.Flags.0,
+            "heap_properties":{"type":p.Type.0,"cpu_page":p.CPUPageProperty.0,"memory_pool":p.MemoryPoolPreference.0,
+                "creation_node_mask":p.CreationNodeMask,"visible_node_mask":p.VisibleNodeMask}}),
+    );
 }
 
 pub unsafe fn created_descriptor_heap(device: u64, out: *mut *mut c_void) {

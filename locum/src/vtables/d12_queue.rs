@@ -528,6 +528,7 @@ unsafe impl Queue12Methods for crate::d3d12::Object {
                 a8,
                 a9,
             );
+            crate::d3d12::tiles::update(&self.data, *queue_order, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9);
         }
     }
     unsafe fn CopyTileMappings(
@@ -551,6 +552,7 @@ unsafe impl Queue12Methods for crate::d3d12::Object {
                 a4,
                 a5,
             );
+            crate::d3d12::tiles::copy(&self.data, *queue_order, a0, a1, a2, a3, a4, a5);
         }
     }
     unsafe fn ExecuteCommandLists(&self, a0: u32, a1: *const *mut core::ffi::c_void) {

@@ -2,7 +2,8 @@
 //! descriptions, each event run as recorded in a command list of its own, waited for before the next.
 //!
 //! - Every resource is made committed, on the kind of heap it was made on (placed and reserved ones too, so memory the
-//!   game aliased is not shared).
+//!   game aliased is not shared). A reserved resource holds what its first use read, zero in a tile it had unmapped;
+//!   the frame's changes to its tile mappings are not run.
 //! - Barriers: a buffer or a texture made for simultaneous access is promoted from COMMON by each use and decays to
 //!   COMMON when its list completes, so only the textures that cannot be made so (depth-stencil and multisampled
 //!   ones) are moved between states, by replay's own barriers around each event. The game's barriers are not run.
@@ -244,6 +245,8 @@ pub struct D3d12 {
     replaced: HashMap<String, Option<Vec<u8>>>,
     placed: usize,
     reserved: usize,
+    /// The frame's changes to the made reserved resources' tile mappings, which replay does not run.
+    remapped: i64,
     /// Resources the frame uses that the capture holds no description of.
     undescribed: Vec<i64>,
     warnings: BTreeSet<String>,
@@ -395,6 +398,7 @@ impl D3d12 {
                 replaced: HashMap::new(),
                 placed: 0,
                 reserved: 0,
+                remapped: 0,
                 undescribed: Vec::new(),
                 warnings: BTreeSet::new(),
                 debug,
@@ -1899,6 +1903,7 @@ impl Backend for D3d12 {
             self.placed += 1;
         } else if !props.is_object() {
             self.reserved += 1;
+            self.remapped += c.count("SELECT count(*) FROM d12_tile_mappings WHERE resource = ?1", [id]);
         }
         let format = n("format") as u32;
         let samples = n("sample_count").max(1) as u32;
@@ -2277,8 +2282,14 @@ impl Backend for D3d12 {
         }
         if self.reserved > 0 {
             warnings.insert(format!(
-                "{} reserved resources were made committed, every tile mapped",
-                self.reserved
+                "{} reserved resources were made committed, every tile mapped and holding what their first use read \
+                 (zero where a tile was unmapped){}",
+                self.reserved,
+                if self.remapped > 0 {
+                    format!("; the frame's {} changes to their tile mappings are not run", self.remapped)
+                } else {
+                    String::new()
+                }
             ));
         }
         warnings.extend(self.messages());

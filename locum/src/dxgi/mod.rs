@@ -510,7 +510,14 @@ unsafe impl SwapChainMethods for SwapChain {
                 let device = crate::d3d12::journal::owner_device(crate::d3d12::id(queue.as_raw()));
                 // A back buffer begins in PRESENT, which is COMMON (0).
                 let initial = crate::d3d12::values::Initial::State(0);
-                unsafe { crate::d3d12::values::created_resource(device, out, initial, 0, 0) };
+                unsafe {
+                    crate::d3d12::values::created_resource(
+                        device,
+                        out,
+                        initial,
+                        crate::d3d12::values::Placement::Committed,
+                    )
+                };
             }
         }
         hr

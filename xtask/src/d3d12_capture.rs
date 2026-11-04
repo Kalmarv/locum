@@ -301,6 +301,18 @@ pub fn after(c: &Class, e: &Entry) -> String {
         ("d12_queue", "ExecuteCommandLists") => {
             "crate::d3d12::journal::submitted(&self.data,self.real(),submission);"
         }
+        ("d12_queue", "UpdateTileMappings") => {
+            "crate::d3d12::tiles::update(&self.data,*queue_order,a0,a1,a2,a3,a4,a5,a6,a7,a8,a9);"
+        }
+        ("d12_queue", "CopyTileMappings") => {
+            "crate::d3d12::tiles::copy(&self.data,*queue_order,a0,a1,a2,a3,a4,a5);"
+        }
+        ("d12_device", "CreateHeap") => {
+            "if result.is_ok() { crate::d3d12::values::created_heap(self.data.id,a2); }"
+        }
+        ("d12_device", "CreateHeap1") => {
+            "if result.is_ok() { crate::d3d12::values::created_heap(self.data.id,a3); }"
+        }
         ("d12_queue", "Signal" | "Wait") => {
             return format!("crate::d3d12::journal::sync(&self.data,*queue_order,\"{n}\",a0,a1,result);\n");
         }
@@ -320,34 +332,34 @@ pub fn after(c: &Class, e: &Entry) -> String {
             "if result.is_ok() { crate::d3d12::values::created_descriptor_heap(self.data.id,a2); }"
         }
         ("d12_device", "CreateCommittedResource") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,crate::d3d12::values::Initial::State(a3.0),0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,crate::d3d12::values::Initial::State(a3.0),crate::d3d12::values::Placement::Committed); }"
         }
         ("d12_device", "CreateCommittedResource1") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a7,crate::d3d12::values::Initial::State(a3.0),0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a7,crate::d3d12::values::Initial::State(a3.0),crate::d3d12::values::Placement::Committed); }"
         }
         ("d12_device", "CreatePlacedResource") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,crate::d3d12::values::Initial::State(a3.0),crate::d3d12::id(a0),a1); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,crate::d3d12::values::Initial::State(a3.0),crate::d3d12::values::Placement::Placed(crate::d3d12::id(a0),a1)); }"
         }
         ("d12_device", "CreateReservedResource") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a4,crate::d3d12::values::Initial::State(a1.0),0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a4,crate::d3d12::values::Initial::State(a1.0),crate::d3d12::values::Placement::Reserved); }"
         }
         ("d12_device", "CreateReservedResource1") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a5,crate::d3d12::values::Initial::State(a1.0),0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a5,crate::d3d12::values::Initial::State(a1.0),crate::d3d12::values::Placement::Reserved); }"
         }
         ("d12_device", "CreateCommittedResource2") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a7,crate::d3d12::values::Initial::State(a3.0),0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a7,crate::d3d12::values::Initial::State(a3.0),crate::d3d12::values::Placement::Committed); }"
         }
         ("d12_device", "CreatePlacedResource1") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,crate::d3d12::values::Initial::State(a3.0),crate::d3d12::id(a0),a1); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,crate::d3d12::values::Initial::State(a3.0),crate::d3d12::values::Placement::Placed(crate::d3d12::id(a0),a1)); }"
         }
         ("d12_device", "CreateCommittedResource3") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a9,crate::d3d12::values::Initial::Layout(a3.0),0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a9,crate::d3d12::values::Initial::Layout(a3.0),crate::d3d12::values::Placement::Committed); }"
         }
         ("d12_device", "CreatePlacedResource2") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a8,crate::d3d12::values::Initial::Layout(a3.0),crate::d3d12::id(a0),a1); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a8,crate::d3d12::values::Initial::Layout(a3.0),crate::d3d12::values::Placement::Placed(crate::d3d12::id(a0),a1)); }"
         }
         ("d12_device", "CreateReservedResource2") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a7,crate::d3d12::values::Initial::Layout(a1.0),0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a7,crate::d3d12::values::Initial::Layout(a1.0),crate::d3d12::values::Placement::Reserved); }"
         }
         ("d12_device", "CreateCommandQueue1") => {
             "if result.is_ok() { crate::d3d12::values::created_queue(self.data.id,a3,a0); }"

@@ -128,7 +128,7 @@ struct Entry {
 impl Entry {
     fn new(resource: &ID3D11Resource) -> Result<Self, String> {
         Ok(Self {
-            layout: Layout::query(resource)?,
+            layout: locum_d3d11::tiles::layout(resource)?,
             mappings: Mappings::default(),
             pool: None,
             error: None,
@@ -423,9 +423,7 @@ pub(super) fn touch(c: &ID3D11DeviceContext4, resource: &ID3D11Resource) {
             "InitialTileMappings",
             0,
             false,
-            json!({"dst": id, "pool": pool, "tiles": mapped,
-                "layout": {"total": l.total, "mips": l.mips, "array": l.array, "packed": l.packed,
-                    "shape": l.shape, "subs": l.subs}}),
+            json!({"dst": id, "pool": pool, "tiles": mapped, "layout": l.json()}),
         );
         boot.writes.push(id);
         if pool != 0 {

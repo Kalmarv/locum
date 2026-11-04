@@ -16,6 +16,7 @@ mod readback;
 pub mod shaders;
 mod slots;
 pub mod states;
+pub mod tiles;
 pub mod values;
 use crate::log::log;
 use core::ffi::c_void;

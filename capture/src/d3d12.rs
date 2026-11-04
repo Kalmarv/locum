@@ -207,11 +207,37 @@ pub struct Sync {
     pub value: u64,
 }
 
+/// A reserved resource's tile mappings as the frame found them: when its first use or the frame's first change to
+/// its mappings saw it (`cpu_seq`), its tile numbering ([`crate::tiles::Layout::json`]) and page table
+/// ([`crate::tiles::Pages::runs`]); or why they are not known.
+#[derive(Clone, Debug)]
+pub struct TilePages {
+    pub resource: u64,
+    pub cpu_seq: u64,
+    pub pages: Result<(Value, Value), String>,
+}
+
+/// A change to tile mappings in the frame, in its queue's order: `UpdateTileMappings` or `CopyTileMappings`, its
+/// arguments (resources and heaps by id), and the destination's page table after it, or why that is not known.
+#[derive(Clone, Debug)]
+pub struct TileMapping {
+    pub queue: u64,
+    pub queue_seq: u64,
+    pub cpu_seq: u64,
+    pub call: &'static str,
+    pub resource: u64,
+    pub source: Option<u64>,
+    pub args: Value,
+    pub after: Result<Value, String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     pub objects: Vec<Object>,
     pub submissions: Vec<Submission>,
     pub sync: Vec<Sync>,
+    pub tile_pages: Vec<TilePages>,
+    pub tile_mappings: Vec<TileMapping>,
     pub diagnostics: Vec<String>,
 }
 
@@ -989,6 +1015,39 @@ impl Frame {
             tx.execute("INSERT INTO d12_sync(queue,queue_seq,cpu_seq,kind,fence,value_u64) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![integer(s.queue)?,integer(s.queue_seq)?,integer(s.cpu_seq)?,s.kind,integer(s.fence)?,s.value.to_le_bytes().as_slice()])?;
         }
+        for t in &self.tile_pages {
+            let (layout, pages) = match &t.pages {
+                Ok((layout, pages)) => (Some(layout.to_string()), Some(pages.to_string())),
+                Err(_) => (None, None),
+            };
+            tx.execute(
+                "INSERT INTO d12_tile_pages VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    integer(t.resource)?,
+                    integer(t.cpu_seq)?,
+                    layout,
+                    pages,
+                    t.pages.as_ref().err()
+                ],
+            )?;
+        }
+        for m in &self.tile_mappings {
+            tx.execute(
+                "INSERT INTO d12_tile_mappings(queue,queue_seq,cpu_seq,call,resource,source,args_json,pages_json,diagnostic) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    integer(m.queue)?,
+                    integer(m.queue_seq)?,
+                    integer(m.cpu_seq)?,
+                    m.call,
+                    integer(m.resource)?,
+                    m.source.map(integer).transpose()?,
+                    m.args.to_string(),
+                    m.after.as_ref().ok().map(Value::to_string),
+                    m.after.as_ref().err()
+                ],
+            )?;
+        }
         for (resource, first) in first_use {
             tx.execute(
                 "INSERT INTO d12_first_use VALUES(?1,?2,?3,?4)",
@@ -1556,6 +1615,11 @@ CREATE TABLE d12_event_locations(event INTEGER PRIMARY KEY,execution INTEGER NOT
  queue INTEGER NOT NULL,FOREIGN KEY(event) REFERENCES events(seq),FOREIGN KEY(execution) REFERENCES d12_executions(id));
 CREATE TABLE d12_sync(id INTEGER PRIMARY KEY,queue INTEGER NOT NULL,queue_seq INTEGER NOT NULL,cpu_seq INTEGER NOT NULL,
  kind TEXT NOT NULL,fence INTEGER NOT NULL,value_u64 BLOB NOT NULL CHECK(length(value_u64)=8));
+CREATE TABLE d12_tile_pages(resource INTEGER PRIMARY KEY,cpu_seq INTEGER NOT NULL,layout_json TEXT,pages_json TEXT,
+ diagnostic TEXT);
+CREATE TABLE d12_tile_mappings(id INTEGER PRIMARY KEY,queue INTEGER NOT NULL,queue_seq INTEGER NOT NULL,
+ cpu_seq INTEGER NOT NULL,call TEXT NOT NULL,resource INTEGER NOT NULL,source INTEGER,args_json TEXT NOT NULL,
+ pages_json TEXT,diagnostic TEXT);
 CREATE TABLE d12_psos(id INTEGER PRIMARY KEY,kind TEXT NOT NULL,description TEXT NOT NULL);
 CREATE TABLE d12_roots(id INTEGER PRIMARY KEY,blob TEXT,decoded_json TEXT NOT NULL);
 CREATE TABLE d12_draw_state(draw INTEGER PRIMARY KEY,pso INTEGER,graphics_root INTEGER,compute_root INTEGER,root_args_json TEXT NOT NULL);

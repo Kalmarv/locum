@@ -44,8 +44,8 @@ pub(super) fn run(
         match kind {
             "tile_bootstrap" => {
                 let dst = resource("dst")?;
-                let l = locum_d3d11::tiles::Layout::query(dst)?;
-                let actual = json!({"total": l.total, "mips": l.mips, "array": l.array, "packed": l.packed, "shape": l.shape, "subs": l.subs});
+                let l = locum_d3d11::tiles::layout(dst)?;
+                let actual = l.json();
                 if a["layout"] != actual {
                     return Err(format!(
                         "device tiling differs from captured layout: recorded {}, device {}",
@@ -99,7 +99,7 @@ pub(super) fn run(
             "tile_packed_seed" => {
                 let dst = resource("dst")?;
                 let sub = n(&a["sub"]);
-                let layout = locum_d3d11::tiles::Layout::query(dst)?;
+                let layout = locum_d3d11::tiles::layout(dst)?;
                 if !layout.is_packed(sub) {
                     return Err("packed mip seed does not address a packed mip on this device".into());
                 }

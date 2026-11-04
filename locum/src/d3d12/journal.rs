@@ -227,6 +227,8 @@ struct Live {
     used: HashSet<u64>,
     /// The list generations executed in the frame: a generation's first execution has its checkpoints' bytes.
     executed: HashSet<(u64, u64)>,
+    /// The reserved resources whose page tables as the frame found them are recorded (see [`super::tiles`]).
+    paged: HashSet<u64>,
 }
 #[derive(Default)]
 struct Upload {
@@ -292,6 +294,7 @@ pub fn destroy(id: u64) {
         s.uploads.remove(&id);
         s.states.destroy(id);
     }
+    super::tiles::destroyed(id);
     super::slots::destroy(id);
     DESTROY_COST.add(start, 0);
 }
@@ -551,7 +554,7 @@ pub unsafe fn submit(
         let submission = live.frame.submissions.last().expect("pushed");
         let touched = live.projection.submit(&mut live.capture, submission);
         let unknown = unsafe { unknown_wait(waits.entry(queue.id).or_default(), signals) };
-        let snapshots = first_uses(live, objects, states, touched, unknown.as_deref());
+        let snapshots = first_uses(live, objects, states, touched, unknown.as_deref(), cpu_seq);
         let copies = upload_copies(uploads, first, &lists, constant_buffers.values());
         if !copies.is_empty() || !snapshots.is_empty() {
             unsafe { super::readback::submit(real, id, copies, snapshots, &live.results) };
@@ -633,6 +636,7 @@ fn first_uses(
     states: &super::states::Tracker,
     touched: Vec<u64>,
     unknown: Option<&str>,
+    cpu_seq: u64,
 ) -> Vec<super::readback::Snapshot> {
     let submission = live.frame.submissions.last().map_or(0, |s| s.id);
     let mut snapshots = Vec::new();
@@ -672,10 +676,14 @@ fn first_uses(
         let simultaneous = n("flags") & 0x20 != 0;
         let format = n("format");
         let layout = model::layout(d);
+        let reserved = d["heap_properties"].is_null();
+        if reserved {
+            page(live, resource, cpu_seq);
+        }
         let why = if let Some(why) = unknown {
             Some(why.to_string())
-        } else if d["heap_properties"].is_null() {
-            Some("reserved resource: its tile mappings are not tracked yet".to_string())
+        } else if let Some(why) = reserved.then(|| super::tiles::unreadable(resource)).flatten() {
+            Some(why)
         } else if n("sample_count") > 1 {
             Some("multisampled: copying samples out is not supported yet".to_string())
         } else if layout.is_none() {
@@ -821,6 +829,55 @@ fn runs(mut ranges: Vec<(u64, u64, u64)>, gap: u64) -> Vec<(u64, u64, u64)> {
         }
     }
     merged
+}
+
+/// Records reserved resource `resource`'s page table as the armed frame finds it, once per frame.
+fn page(live: &mut Live, resource: u64, cpu_seq: u64) {
+    if resource != 0 && live.paged.insert(resource) {
+        live.frame.tile_pages.push(model::TilePages {
+            resource,
+            cpu_seq,
+            pages: super::tiles::pages(resource),
+        });
+    }
+}
+
+/// Before a change to the tile mappings of `resources`: an armed frame records their page tables as it found them.
+pub fn tiles_changing(resources: &[u64]) {
+    let mut s = state();
+    let cpu_seq = s.cpu_seq;
+    if let Some(live) = s.capture.as_mut() {
+        for &resource in resources {
+            page(live, resource, cpu_seq);
+        }
+    }
+}
+
+/// A change to tile mappings, the `queue_seq`th operation of queue `queue`: an armed frame records it.
+pub fn tile_mapping(
+    queue: u64,
+    queue_seq: u64,
+    call: &'static str,
+    resource: u64,
+    source: Option<u64>,
+    args: Value,
+    after: Result<Value, String>,
+) {
+    let mut s = state();
+    s.cpu_seq += 1;
+    let cpu_seq = s.cpu_seq;
+    if let Some(live) = s.capture.as_mut() {
+        live.frame.tile_mappings.push(model::TileMapping {
+            queue,
+            queue_seq,
+            cpu_seq,
+            call,
+            resource,
+            source,
+            args,
+            after,
+        });
+    }
 }
 
 pub fn sync(queue: &Data, sequence: u64, kind: &'static str, fence: *mut c_void, value: u64, hr: HRESULT) {
@@ -1089,6 +1146,7 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         results: Default::default(),
         used: HashSet::new(),
         executed: HashSet::new(),
+        paged: HashSet::new(),
     });
     s.series = Some(series.clone());
     super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);

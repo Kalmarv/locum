@@ -3697,8 +3697,7 @@ unsafe impl Device12Methods for crate::d3d12::Object {
                     self.data.id,
                     a6,
                     crate::d3d12::values::Initial::State(a3.0),
-                    0,
-                    0,
+                    crate::d3d12::values::Placement::Committed,
                 );
             }
             result
@@ -3713,6 +3712,9 @@ unsafe impl Device12Methods for crate::d3d12::Object {
         unsafe {
             let result = real::CreateHeap(self.real(), a0, a1, a2);
             crate::d3d12::wrap_output(result, a1, a2);
+            if result.is_ok() {
+                crate::d3d12::values::created_heap(self.data.id, a2);
+            }
             result
         }
     }
@@ -3735,8 +3737,7 @@ unsafe impl Device12Methods for crate::d3d12::Object {
                     self.data.id,
                     a6,
                     crate::d3d12::values::Initial::State(a3.0),
-                    crate::d3d12::id(a0),
-                    a1,
+                    crate::d3d12::values::Placement::Placed(crate::d3d12::id(a0), a1),
                 );
             }
             result
@@ -3758,8 +3759,7 @@ unsafe impl Device12Methods for crate::d3d12::Object {
                     self.data.id,
                     a4,
                     crate::d3d12::values::Initial::State(a1.0),
-                    0,
-                    0,
+                    crate::d3d12::values::Placement::Reserved,
                 );
             }
             result
@@ -4071,8 +4071,7 @@ unsafe impl Device12Methods for crate::d3d12::Object {
                     self.data.id,
                     a7,
                     crate::d3d12::values::Initial::State(a3.0),
-                    0,
-                    0,
+                    crate::d3d12::values::Placement::Committed,
                 );
             }
             result
@@ -4088,6 +4087,9 @@ unsafe impl Device12Methods for crate::d3d12::Object {
         unsafe {
             let result = real::CreateHeap1(self.real(), a0, crate::d3d12::unwrap(a1), a2, a3);
             crate::d3d12::wrap_output(result, a2, a3);
+            if result.is_ok() {
+                crate::d3d12::values::created_heap(self.data.id, a3);
+            }
             result
         }
     }
@@ -4109,8 +4111,7 @@ unsafe impl Device12Methods for crate::d3d12::Object {
                     self.data.id,
                     a5,
                     crate::d3d12::values::Initial::State(a1.0),
-                    0,
-                    0,
+                    crate::d3d12::values::Placement::Reserved,
                 );
             }
             result
@@ -4302,8 +4303,7 @@ unsafe impl Device12Methods for crate::d3d12::Object {
                     self.data.id,
                     a7,
                     crate::d3d12::values::Initial::State(a3.0),
-                    0,
-                    0,
+                    crate::d3d12::values::Placement::Committed,
                 );
             }
             result
@@ -4328,8 +4328,7 @@ unsafe impl Device12Methods for crate::d3d12::Object {
                     self.data.id,
                     a6,
                     crate::d3d12::values::Initial::State(a3.0),
-                    crate::d3d12::id(a0),
-                    a1,
+                    crate::d3d12::values::Placement::Placed(crate::d3d12::id(a0), a1),
                 );
             }
             result
@@ -4437,8 +4436,7 @@ unsafe impl Device12Methods for crate::d3d12::Object {
                     self.data.id,
                     a9,
                     crate::d3d12::values::Initial::Layout(a3.0),
-                    0,
-                    0,
+                    crate::d3d12::values::Placement::Committed,
                 );
             }
             result
@@ -4475,8 +4473,7 @@ unsafe impl Device12Methods for crate::d3d12::Object {
                     self.data.id,
                     a8,
                     crate::d3d12::values::Initial::Layout(a3.0),
-                    crate::d3d12::id(a0),
-                    a1,
+                    crate::d3d12::values::Placement::Placed(crate::d3d12::id(a0), a1),
                 );
             }
             result
@@ -4511,8 +4508,7 @@ unsafe impl Device12Methods for crate::d3d12::Object {
                     self.data.id,
                     a7,
                     crate::d3d12::values::Initial::Layout(a1.0),
-                    0,
-                    0,
+                    crate::d3d12::values::Placement::Reserved,
                 );
             }
             result

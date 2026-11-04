@@ -66,8 +66,7 @@ cargo build --release
 
 - 64-bit only. Direct3D 12 captures record every command, state, shader and constant, the contents each resource
   had when the frame first used it, the targets each pass ended with and what draws and dispatches wrote through
-  UAVs, and replay; they do not yet record the contents of reserved (tiled) resources. Vulkan games run as normal,
-  unseen.
+  UAVs, the tile mappings of reserved resources, and replay. Vulkan games run as normal, unseen.
 - Don't use it on games with anti-cheat.
 
 ## Development

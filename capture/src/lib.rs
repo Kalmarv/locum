@@ -18,4 +18,5 @@ pub mod rdef;
 pub mod rules;
 pub mod stacks;
 pub mod texels;
+pub mod tiles;
 pub mod writer;

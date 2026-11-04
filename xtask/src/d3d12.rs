@@ -314,6 +314,7 @@ fn replay_checks(stage: &std::path::Path, pid: u32) {
         "compute-first",
         "cb-copied",
         "results",
+        "reserved",
     ] {
         let (_, text) = run(&["verify", "--warp", &capture(name)]);
         assert!(
@@ -406,4 +407,52 @@ fn replay_checks(stage: &std::path::Path, pid: u32) {
         "export --at: draw 6's cyan in every texel"
     );
     println!("ok   D3D12 export --at: a target as the event after a draw saw it");
+
+    // A reserved texture: its tiles as the frame found them, and replay's copy holding what its first use read.
+    let texture = sql(
+        "reserved",
+        "SELECT id FROM resources WHERE width = 256 AND height = 256 AND mips = 2",
+    );
+    let (ok, text) = run(&["resource", &capture("reserved"), &texture]);
+    assert!(
+        ok && text.contains("  mip 0: 3 of 4 tiles mapped")
+            && text.contains("the frame's UpdateTileMappings")
+            && text.contains("the frame's CopyTileMappings"),
+        "resource: a reserved texture's tiles mapped per mip, and the frame's changes"
+    );
+    let first: i64 = sql(
+        "reserved",
+        &format!("SELECT min(event) FROM event_resources WHERE resource = {texture}"),
+    )
+    .parse()
+    .expect("the reserved texture's first event");
+    let raw = log.join("reserved.raw");
+    let (ok, text) = run(&[
+        "export",
+        &capture("reserved"),
+        &texture,
+        "--at",
+        &first.to_string(),
+        "--warp",
+        "-o",
+        &raw.display().to_string(),
+    ]);
+    assert!(ok, "export a reserved texture");
+    assert!(
+        text.contains("reserved resources were made committed")
+            && text.contains("2 changes to their tile mappings"),
+        "replay says what it does with a reserved resource: {text}"
+    );
+    // reserved.rs fills mip 0's byte i with 77 + i and leaves tile 2 (x 0..128, y 128..256) unmapped.
+    let bytes = std::fs::read(&raw).unwrap();
+    let mip0 = |x: usize, y: usize| bytes[y * 1024 + x * 4];
+    assert!(
+        bytes.len() >= 256 * 1024
+            && (0..128).all(|y| (0..256).all(|x| mip0(x, y) == (77 + y * 1024 + x * 4) as u8))
+            && (128..256).all(|y| (0..128).all(|x| mip0(x, y) == 0)),
+        "export: the reserved texture as its first use read it, zero where a tile was unmapped"
+    );
+    println!(
+        "ok   D3D12 reserved: tiles per mip, the frame's mapping changes, and replay's contents as first used"
+    );
 }

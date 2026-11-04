@@ -375,7 +375,8 @@ rules, the draw is replayed twice, and its targets are written as recorded (`rt0
 
 A Direct3D 12 capture replays the same way, on a device of its own. Each resource is made committed on the heap type
 it was recorded on (a placed one too, so memory the game aliased between resources is not shared, and a reserved one
-with every tile mapped; verify says so). Upload buffers hold, at each submission, the bytes that submission saw. The
+with every tile mapped, holding what its first use read, zero where a tile was unmapped; the frame's changes to its
+tile mappings are not run; verify says so). Upload buffers hold, at each submission, the bytes that submission saw. The
 game's shader-visible descriptor heaps are mirrored and their slots rewritten with each submission's changes, so a
 root table points where it pointed in the game. Each event runs in a command list of its own: buffers and most
 textures go back to the common state between them, and depth and multisampled textures get the transitions each
@@ -545,9 +546,18 @@ COPY_SOURCE and back from the state locum tracks for it, from its creation and e
 `D3D12 states` line counts barriers whose before-state differed from the tracked one. A compute or copy queue's
 barriers cannot name every state (a compute list may not name PIXEL_SHADER_RESOURCE, and enhanced barriers may not
 name a subresource in a legacy state): such a resource is copied on a direct queue of locum's, after the work its
-queue was given so far, and the queue waits for that copy before the game's lists. Multisampled and reserved
-resources, and a submission on a queue waiting for a fence nothing has signalled yet, are recorded gaps; a resource
-only a stale descriptor names (destroyed before the submission) is noted as such.
+queue was given so far, and the queue waits for that copy before the game's lists. Multisampled resources, and a
+submission on a queue waiting for a fence nothing has signalled yet, are recorded gaps; a resource only a stale
+descriptor names (destroyed before the submission) is noted as such.
+
+A reserved resource is copied like any other: on tiled resources tier 2 and up an unmapped tile reads zero, as a
+shader reads it (tier 1, where it reads undefined values, is a gap). locum follows every `UpdateTileMappings` and
+`CopyTileMappings`, armed or not, in the tile model D3D11 captures use. `d12_tile_pages` keeps each reserved
+resource's tile numbering (`layout_json`) and page table as the frame found it, at its first use or the frame's
+first change to it: `pages_json` holds runs `[first tile, tiles, heap, first heap tile]`, the heaps being
+`d12_objects` with their sizes and properties. `d12_tile_mappings` keeps the frame's changes in queue order, each
+call's arguments (resources and heaps by id) and the page table after it. `resource ID` shows how many tiles of
+each mip were mapped, from which heaps, and the frame's changes.
 
 Lists reset or created while a capture is armed are instrumented: where a pass ends, locum records copies of its
 render and depth targets into the game's own list, so they run on the GPU right after the pass's last draw. A pass
@@ -585,8 +595,6 @@ request, compute and copy queues, bundles, a list executed again, arrays of more
 ones, multisampled UAVs, an output over 64 MiB, and copies past the 2 GiB of the readback budget outputs may hold
 (the rest is kept for pass-end targets).
 
-Captures do not yet record the contents and tile mappings of reserved resources, so a reserved resource starts
-replay with undefined contents.
 Upload copies assume the application's host writes obey D3D12 synchronization. Captures retain the original
 shader bytes regardless of whether reflection succeeds. Resource reachability comes from API state and root
 signatures, not a single shader parser's conclusions.

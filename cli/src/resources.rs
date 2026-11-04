@@ -1,5 +1,7 @@
 //! `resources`, `resource`, `events` and `stack`: what was alive, what the frame did to it, and where from.
 
+use std::collections::BTreeMap;
+
 use locum_capture::format;
 use rusqlite::types::Value;
 
@@ -247,6 +249,9 @@ pub fn resource(c: &Capture, id: i64) -> Result<(), String> {
     if let Some(n) = note {
         out!("  note: {n}");
     }
+    for line in reserved_tiles(c, id) {
+        out!("{line}");
+    }
     let subs: Vec<(i64, Option<String>)> = c.rows(
         "SELECT sub, hash FROM subresources WHERE resource = ?1 ORDER BY sub",
         [id],
@@ -468,6 +473,107 @@ pub fn discarded(c: &Capture, call: &str, args: Option<&str>) -> Option<String> 
         }
         _ => return None,
     })
+}
+
+/// A D3D12 reserved resource's tiles: how many of each mip were mapped as the frame found them, from which heaps, and
+/// the frame's changes to them (`d12_tile_pages`, `d12_tile_mappings`). Nothing for any other resource.
+fn reserved_tiles(c: &Capture, id: i64) -> Vec<String> {
+    use locum_capture::tiles::{Layout, Pages, TILE_BYTES};
+    let row: Option<(Option<String>, Option<String>, Option<String>)> = c.row(
+        "SELECT layout_json, pages_json, diagnostic FROM d12_tile_pages WHERE resource = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    );
+    let Some((layout, pages, diagnostic)) = row else {
+        return Vec::new();
+    };
+    let parse = |s: Option<String>| s.and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let (Some(layout), Some(pages)) = (
+        parse(layout).as_ref().and_then(Layout::from_json),
+        parse(pages).as_ref().and_then(Pages::from_runs),
+    ) else {
+        return vec![format!(
+            "reserved: its tile mappings are not known ({})",
+            diagnostic.as_deref().unwrap_or("unreadable record")
+        )];
+    };
+    let mut heaps: BTreeMap<u64, usize> = BTreeMap::new();
+    for &(heap, _) in pages.tiles.values() {
+        *heaps.entry(heap).or_default() += 1;
+    }
+    let mut out = vec![format!(
+        "reserved: {} tiles of {} KiB, {} mapped as the frame found them{}",
+        layout.total,
+        TILE_BYTES / 1024,
+        pages.tiles.len(),
+        if heaps.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", in {}",
+                heaps
+                    .iter()
+                    .map(|(h, n)| format!("heap #{h} ({n})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    )];
+    let mapped = |tiles: std::ops::Range<u32>| tiles.clone().filter(|t| pages.tiles.contains_key(t)).count();
+    for slice in 0..layout.array {
+        for mip in 0..layout.mips {
+            let sub = slice * layout.mips + mip;
+            if layout.is_packed(sub) {
+                continue;
+            }
+            let Some(&[w, h, d, start]) = layout.subs.get(sub as usize) else {
+                continue;
+            };
+            let n = w * h * d;
+            out.push(format!(
+                "  mip {mip}{}: {} of {n} tiles mapped",
+                if layout.array > 1 {
+                    format!(" slice {slice}")
+                } else {
+                    String::new()
+                },
+                mapped(start..start + n)
+            ));
+        }
+        if let Some(tiles) = (layout.packed[1] > 0)
+            .then(|| layout.packed_tiles(slice).ok())
+            .flatten()
+        {
+            out.push(format!(
+                "  packed mips {}..{}{}: {} of {} tiles mapped",
+                layout.packed[0],
+                layout.mips - 1,
+                if layout.array > 1 {
+                    format!(" slice {slice}")
+                } else {
+                    String::new()
+                },
+                mapped(tiles.clone()),
+                tiles.len()
+            ));
+        }
+    }
+    let changes: Vec<(String, i64, Option<String>, Option<String>)> = c.rows(
+        "SELECT call, cpu_seq, pages_json, diagnostic FROM d12_tile_mappings WHERE resource = ?1 ORDER BY cpu_seq",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    );
+    for (call, at, after, diagnostic) in changes {
+        let after = parse(after).as_ref().and_then(Pages::from_runs);
+        out.push(match (after, diagnostic) {
+            (Some(p), _) => format!(
+                "  the frame's {call} (cpu order {at}): {} tiles mapped after it",
+                p.tiles.len()
+            ),
+            (None, d) => format!("  the frame's {call} (cpu order {at}): {}", d.unwrap_or_default()),
+        });
+    }
+    out
 }
 
 /// For a D3D12 buffer copy from an upload buffer, whether the capture kept the bytes it read: the upload ranges its
