@@ -425,7 +425,9 @@ texture of the TPF packages under the archive paths given (loose, or in the bind
 `<binder>/<package>/<texture>.dds`. Elden Ring's `/asset/ /chr/ /parts/ /map/ /sfx/ /menu/ /other/` are 462,683
 textures, indexed in about five minutes into a 430 MB file; an Elden Ring frame had 1,160 of its 1,288 textures
 named by it.
-`join`'s totals say how many of those not named have no bytes recorded to match (neither upload bytes nor contents), as
+Where several files have the same bytes (a model placed in two map blocks), the name shown is the first and
+`(+N with the same bytes)` follows it; `draw --json` and `bindings --json` list them in `files` (up to 17), since
+which one the game loaded the capture cannot say. `join`'s totals say how many of those not named have no bytes recorded to match (neither upload bytes nor contents), as
 in captures from before first-use contents.
 
 A DXBC program stripped of its reflection (no `RDEF`; some of Elden Ring's) is read from the declarations in its

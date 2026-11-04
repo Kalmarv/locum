@@ -37,7 +37,13 @@ pub struct Match {
     pub how: String,
     /// Other files in the indexes with the same bytes.
     pub others: usize,
+    /// The names of the first of them (at most `ALSO`): a model in two map blocks has the same bytes in both, and
+    /// the name picked may be the other block's.
+    pub also: Vec<String>,
 }
+
+/// How many of the other files with a match's bytes are named.
+const ALSO: usize = 16;
 
 impl std::fmt::Display for Match {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,11 +99,12 @@ impl Names {
         let bytes = self.contents_of(c, id)?;
         let end = offset.checked_add(len)?;
         let part = bytes.get(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)?;
-        let (file, others) = self.whole(&key(part), &Like::Buffer)?;
+        let (file, others, also) = self.whole(&key(part), &Like::Buffer)?;
         Some(Match {
             file,
             how: format!("bytes {offset}..{end}"),
             others,
+            also,
         })
     }
 
@@ -151,26 +158,33 @@ impl Names {
         self.indexes.is_empty()
     }
 
-    fn whole(&self, key: &str, like: &Like) -> Option<(File, usize)> {
+    /// The first file in the indexes with bytes `key`, how many others have them, and the first of those's names.
+    fn whole(&self, key: &str, like: &Like) -> Option<(File, usize, Vec<String>)> {
         let mut found = None;
         let mut count = 0;
+        let mut also = Vec::new();
         for index in &self.indexes {
-            let (files, n) = index.whole(key, like, 1);
+            let (files, n) = index.whole(key, like, ALSO + 1);
             count += n;
-            if found.is_none() {
-                found = files.into_iter().next();
+            for f in files {
+                if found.is_none() {
+                    found = Some(f);
+                } else if also.len() < ALSO {
+                    also.push(f.name);
+                }
             }
         }
-        found.map(|f| (f, count - 1))
+        found.map(|f| (f, count - 1, also))
     }
 
     /// The file a program whose bytecode has blob key `key` was read from, if an index knows.
     pub fn program(&self, key: &str) -> Option<Match> {
-        let (file, others) = self.whole(key, &Like::Program)?;
+        let (file, others, also) = self.whole(key, &Like::Program)?;
         Some(Match {
             file,
             how: "bytecode".into(),
             others,
+            also,
         })
     }
 
@@ -211,11 +225,12 @@ impl Names {
             Like::texture(s.format, s.width, s.height)
         };
         for (key, how) in [(&upload, "upload"), (&content, "contents")] {
-            if let Some((file, others)) = key.as_deref().and_then(|k| self.whole(k, &like)) {
+            if let Some((file, others, also)) = key.as_deref().and_then(|k| self.whole(k, &like)) {
                 return Some(Match {
                     file,
                     how: how.into(),
                     others,
+                    also,
                 });
             }
         }
@@ -266,6 +281,7 @@ impl Names {
             file,
             how,
             others: n - 1,
+            also: Vec::new(),
         })
     }
 }

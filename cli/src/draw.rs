@@ -174,6 +174,10 @@ pub struct Binding {
     pub shape: Option<String>,
     /// The game file it was loaded from, when an index names it.
     pub file: Option<String>,
+    /// Every file an index holds with the same bytes, `file`'s first (at most 17): which of them it was the capture
+    /// cannot say.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
     pub offset: Option<i64>,
     pub size: Option<i64>,
     pub stride: Option<i64>,
@@ -468,15 +472,29 @@ pub(crate) fn register(
 /// The game file binding `b` of a draw (`call` with `args`, reading vertices `vbs`) was made from, when an index
 /// names it: the whole resource, or the vertex or index range the draw reads.
 pub(crate) fn file_of(c: &Capture, b: &Row, call: &str, args: &str, vbs: &[Vb]) -> Option<String> {
+    files_of(c, b, call, args, vbs).map(|(text, _)| text)
+}
+
+/// `file_of`, with the names of every file found with the same bytes (the first of them as `file_of` names it).
+pub(crate) fn files_of(
+    c: &Capture,
+    b: &Row,
+    call: &str,
+    args: &str,
+    vbs: &[Vb],
+) -> Option<(String, Vec<String>)> {
     let r = b.resource?;
     let m = c
         .names
         .of(c, r)
         .or_else(|| range_name(c, r, b, call, args, vbs))?;
-    Some(match m.others {
+    let text = match m.others {
         0 => m.file.name.clone(),
         n => format!("{} (+{n} with the same bytes)", m.file.name),
-    })
+    };
+    let mut files = vec![m.file.name];
+    files.extend(m.also);
+    Some((text, files))
 }
 
 /// Draw `n` as `draw` shows it. Without `all`, only constant registers the shader uses.
@@ -616,6 +634,9 @@ pub fn describe(
                 range: j["range"].clone(),
             }
         });
+        // Every file with the bytes, when there is more than one.
+        let named = files_of(c, b, &call, &args, &vbs)
+            .map(|(text, files)| (text, if files.len() > 1 { files } else { Vec::new() }));
         let mut binding = Binding {
             stage: b.stage.clone(),
             kind: b.kind.clone(),
@@ -627,7 +648,8 @@ pub fn describe(
             state: b.state.and_then(|s| state(c, s)),
             resource: b.resource,
             shape: b.resource.and_then(|r| shape(c, r)).map(|s| s.to_string()),
-            file: file_of(c, b, &call, &args, &vbs),
+            file: named.as_ref().map(|n| n.0.clone()),
+            files: named.map(|n| n.1).unwrap_or_default(),
             offset: b.offset,
             size: b.size,
             stride: b.stride,
