@@ -408,8 +408,35 @@ pub fn target(c: &Capture, draw: i64, name: &str, out_path: &Path, picture: &Pic
 }
 
 pub fn blob(c: &Capture, key: &str, out_path: &Path) -> Result<(), String> {
-    let bytes = c.blob(key)?;
+    let key = full_key(c, key)?;
+    let bytes = c.blob(&key)?;
     write(out_path, &bytes)?;
     told!(out_path, "{}: {} bytes", out_path.display(), bytes.len());
     Ok(())
+}
+
+/// The whole key a capture names that starts with `start` (the CLI shows keys by their first 12 digits); a whole key
+/// as it is.
+fn full_key(c: &Capture, start: &str) -> Result<String, String> {
+    if start.len() >= 32 {
+        return Ok(start.to_string());
+    }
+    if start.is_empty() || !start.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(format!("{start:?} is not a blob key (hex digits)"));
+    }
+    let pattern = format!("{}%", start.to_lowercase());
+    let keys: Vec<String> = c.rows(
+        "SELECT k FROM (SELECT content AS k FROM resources UNION SELECT upload FROM resources \
+         UNION SELECT hash FROM cb_data UNION SELECT blob FROM targets UNION SELECT blob FROM shaders) \
+         WHERE k LIKE ?1 LIMIT 2",
+        [&pattern],
+        |r| r.get(0),
+    );
+    match keys.as_slice() {
+        [one] => Ok(one.clone()),
+        [] => Err(format!("the capture names no blob whose key starts {start}")),
+        _ => Err(format!(
+            "more than one blob's key starts {start}: give more digits"
+        )),
+    }
 }

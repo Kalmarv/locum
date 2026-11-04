@@ -463,11 +463,12 @@ enum Command {
         #[arg(long, value_name = "X0,Y0,X1,Y1")]
         rect: Option<String>,
     },
-    /// A blob from the store, by key (`-o -`: to stdout).
+    /// A blob from the store, by key (or the start of one a capture names), its raw bytes to stdout or `-o FILE`.
     Blob {
         capture: String,
         key: String,
-        #[arg(short, long)]
+        /// The file to write; stdout when left out (or `-`).
+        #[arg(short, long, default_value = "-")]
         out: PathBuf,
     },
     /// Replays a draw offline (with what it depends on), optionally with rules changing it, and writes what it drew.

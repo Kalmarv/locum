@@ -288,6 +288,7 @@ locum-cli draw last 120-180,200 --section cb --name 'envData|g_LightColor'
 locum-cli sql last "SELECT ..."            # anything else (`.tables` lists the tables, `.schema results` one's columns;
                                            # capture/src/db.rs explains each)
 locum-cli hash FILE...                     # the D3D11 shader hash and the blob key locum would give a file's bytes
+locum-cli blob last 507b9612 > b.bin        # a blob's raw bytes by its key (-o FILE writes a file instead)
 locum-cli upgrade last --check             # what an older locum derived, brought up to this one (see below)
 ```
 
