@@ -6,6 +6,7 @@ use windows::Win32::Graphics::{Direct3D::*, Direct3D12::*, Dxgi::Common::*, Dxgi
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
+mod contents;
 mod graphics;
 mod modern;
 
@@ -455,6 +456,8 @@ unsafe fn run() {
         finish(&queue, &fence, 11);
         modern::capture(&device, &queue, &fence, &chain);
         finish(&queue, &fence, 13);
+        contents::capture(&device, &queue, &fence, &chain);
+        finish(&queue, &fence, 16);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

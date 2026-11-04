@@ -61,8 +61,8 @@ cargo build --release
 
 ## Limits
 
-- 64-bit only. Direct3D 12 captures record every command, state, shader and constant, but not yet GPU resource
-  contents or pass targets, and do not replay; Vulkan games run as normal, unseen.
+- 64-bit only. Direct3D 12 captures record every command, state, shader and constant and the contents each resource
+  had when the frame first used it, but not yet pass targets, and do not replay; Vulkan games run as normal, unseen.
 - Don't use it on games with anti-cheat.
 
 ## Development

@@ -73,6 +73,12 @@ pub fn is_depth(format: u32) -> bool {
     matches!(format, 19 | 20 | 39 | 40 | 44 | 45 | 53 | 55)
 }
 
+/// Whether Direct3D 12 keeps a format's depth and stencil in separate planes (copied apart: depth 4 bytes a texel,
+/// stencil 1), where Direct3D 11 interleaves them in one texel.
+pub fn is_depth_stencil(format: u32) -> bool {
+    matches!(format, 19 | 20 | 44 | 45)
+}
+
 /// The format to read a texture of `format` back as: typeless formats as their plain typed format, depth formats as
 /// the colour format of the same bits. Copies between the two are bit-exact.
 pub fn readable(format: u32) -> u32 {

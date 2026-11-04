@@ -317,20 +317,26 @@ and method, with periodic counts and journal timings. Object identities remain i
 
 The inspection foundation records command lists continuously, so lists and bundles recorded before a capture request
 retain their original generations. A request arms at the next non-test Present and closes at the following Present.
-Captures use schema 4 with `api=d3d12`: queue submissions, list executions, fence values, descriptor versions, root
+Captures use schema 5 with `api=d3d12`: queue submissions, list executions, fence values, descriptor versions, root
 signatures, root arguments and PSO inputs are authoritative records. Upload buffers are copied whole once, at the
 frame's first submission; each later submission keeps only the constant-buffer ranges its root and descriptor CBVs
-name, copying ranges less than 64 KiB apart as one. The GPU makes these copies, on the submitting queue just before
-the game's lists, into readback memory read after the frame: the CPU reads upload heaps at a few MB/s. Each submission records the descriptor definitions that changed
+name, copying ranges less than 64 KiB apart as one. Every other resource a submission is the first of the frame to
+read or write is copied whole just before it (`content_source` `first-use`), in the canonical layout D3D11 captures
+use; `d12_first_use` keeps the submission and the state or layout of each subresource the copy began from. The GPU
+makes all these copies, on the submitting queue just before the game's lists, into readback memory a background
+thread reads (at most 1 GiB waits at once): the CPU reads upload heaps at a few MB/s. A texture is transitioned to
+COPY_SOURCE and back from the state locum tracks for it, from its creation and every submitted barrier; the log's
+`D3D12 states` line counts barriers whose before-state differed from the tracked one. Multisampled and reserved
+resources, and a submission on a queue waiting for a fence nothing has signalled yet, are recorded gaps. Each
+submission records the descriptor definitions that changed
 since the previous one (all of them at the first; `empty` marks a slot emptied), so `d12_submission_descriptors`
 holds changes, not whole heaps. The CLI and viewer project these into their
 draw, resource, binding and pipeline views. Display order across queues is not a GPU execution order; queue order
 and fence operations are retained separately. CPU-consumed descriptor definitions are frozen when recorded, while
 GPU descriptor tables use the versions present at submission.
 
-This milestone remains explicitly incomplete: GPU first-use snapshots, pass-end/output checkpoints and D3D12 replay
-are subsequent work. Upload buffers are copied at armed submissions; these CPU observations assume the application's
-host writes obey D3D12 synchronization and are not a substitute for GPU checkpoints. Captures retain the original
+This milestone remains explicitly incomplete: pass-end/output checkpoints and D3D12 replay are subsequent work.
+Upload copies assume the application's host writes obey D3D12 synchronization. Captures retain the original
 shader bytes regardless of whether reflection succeeds. Resource reachability comes from API state and root
 signatures, not a single shader parser's conclusions.
 

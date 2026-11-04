@@ -1,18 +1,33 @@
-//! GPU copies of the bytes an armed frame reads, made on the submitting queue just before the application's lists,
-//! into readback memory the CPU reads once the frame is over.
+//! GPU copies of what an armed frame reads, made on the submitting queue just before the application's lists, into
+//! readback memory a collector thread reads once the GPU is done: upload-buffer ranges (constant buffers), and the
+//! whole of each resource the submission is the first to use, as the frame found it.
 //!
 //! The CPU cannot read upload heaps quickly: they are write-combined, and with resizable BAR they can be video memory
 //! across PCIe. Elden Ring's armed frame read 742 MiB of them at 6.6 MB/s, 112 s. A copy on the queue reads the bytes
-//! when the GPU reaches the application's work, which is when that work reads them, and upload resources stay in
-//! GENERIC_READ for their whole life, so the copies need no barriers.
+//! when the GPU reaches the application's work, which is when that work reads them. Upload resources stay in
+//! GENERIC_READ for their whole life and buffers are COMMON whenever a submission begins, so their copies need no
+//! barriers; a texture is transitioned from its tracked state (see [`super::states`]) to COPY_SOURCE and back.
+//!
+//! Copies go in chunks of at most [`CHUNK`] bytes, each its own submission and fence, and at most [`BUDGET`] bytes of
+//! readback memory wait for the collector at once: a frame's first-use contents can be gigabytes.
 use core::ffi::c_void;
+use core::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
+
+use locum_capture::d3d12::FirstUse;
+use locum_capture::layout::Sub;
 use serde_json::{Value, json};
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::core::Interface;
 
-/// One range of a buffer to copy: `whole` marks the copy of a whole upload buffer at the frame's first submission.
+use super::states::{Access, COMMON, COPY_SOURCE, UNDEFINED};
+
+/// One range of an upload buffer to copy: `whole` marks the copy of a whole upload buffer at the frame's first
+/// submission.
 pub struct Copy {
     pub resource: u64,
     pub offset: u64,
@@ -20,46 +35,429 @@ pub struct Copy {
     pub whole: bool,
 }
 
-/// Copies queued on the GPU: where each landed in the readback buffer, and the fence value that says they are done.
-pub struct Pending {
-    copies: Vec<(Copy, u64)>,
+/// A resource to copy whole, as the submission about to use it first will find it.
+pub struct Snapshot {
+    pub resource: u64,
+    /// Each D3D12 subresource's state (planes included); empty for a resource that is COMMON whenever a submission
+    /// begins (buffers, simultaneous-access textures).
+    pub states: Vec<Access>,
+    /// D3D12 subresources, planes included.
+    pub subresources: u32,
+    /// The canonical layout's subresources (see [`locum_capture::layout`]).
+    pub layout: Vec<Sub>,
+    /// For a depth-stencil format D3D12 keeps in two planes, the bytes of its joined canonical texel.
+    pub joined: Option<u32>,
+}
+
+/// What one chunk of a submission's copies gave.
+#[derive(Default)]
+pub struct Batch {
+    pub submission: u64,
+    pub uploads: Vec<(u64, Value)>,
+    pub contents: Vec<(u64, FirstUse)>,
+}
+
+/// A capture's batches, filled by the collector.
+pub type Results = Arc<Mutex<Vec<Batch>>>;
+
+/// Readback memory a chunk may use, and all chunks waiting for the collector.
+const CHUNK: u64 = 256 << 20;
+const BUDGET: u64 = 1 << 30;
+/// How long a submission waits for the budget before giving up its remaining copies: a queue can wait on a fence the
+/// application signals later, and the application cannot signal it while locum holds its submitting thread.
+const PATIENCE: Duration = Duration::from_secs(10);
+static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+
+/// Offsets in the readback buffer are aligned like placed footprints, which keeps each copy's start aligned.
+const ALIGN: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+
+enum Item {
+    Upload {
+        copy: Copy,
+        resource: ID3D12Resource,
+    },
+    Contents {
+        snapshot: Snapshot,
+        resource: ID3D12Resource,
+        /// Per D3D12 subresource: its footprint (offset relative to the item), rows and row bytes; empty for a
+        /// buffer.
+        footprints: Vec<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)>,
+    },
+}
+
+struct Placed {
+    item: Item,
+    at: u64,
+    bytes: u64,
+}
+
+/// One chunk on the GPU.
+struct Pending {
+    submission: u64,
+    placed: Vec<Placed>,
     readback: ID3D12Resource,
     fence: ID3D12Fence,
+    bytes: u64,
     // The list and allocator live until the copies are done.
     _list: ID3D12GraphicsCommandList,
     _allocator: ID3D12CommandAllocator,
 }
 
-/// Offsets in the readback buffer are aligned like placed footprints, which keeps each copy's start aligned.
-const ALIGN: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
-
-/// Records `copies` on a list of the queue's type and executes it on the real queue `queue`, then signals a fence of
-/// our own. Errors say which step failed; every copy of a failed batch then has a diagnostic instead of bytes.
+/// Records `copies` and `snapshots` for `submission` on lists of the queue's type and executes them on the real
+/// queue `queue`, each chunk then signalling a fence of our own; the collector reads them into `results`. Copies that
+/// cannot be made are in `results` at once, with the reason.
 ///
 /// # Safety
 /// `queue` is the application's real queue, called from its ExecuteCommandLists before the application's lists.
-pub unsafe fn submit(queue: *mut c_void, copies: Vec<Copy>) -> Result<Pending, (Vec<Copy>, String)> {
-    if copies.is_empty() {
-        return Err((copies, "nothing to copy".into()));
-    }
-    let Some(queue) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else {
-        return Err((copies, "no queue".into()));
+pub unsafe fn submit(
+    queue: *mut c_void,
+    submission: u64,
+    copies: Vec<Copy>,
+    snapshots: Vec<Snapshot>,
+    results: &Results,
+) {
+    let mut failed = Batch {
+        submission,
+        ..Batch::default()
     };
-    let fail =
-        |copies, step: &str, e: windows::core::Error| Err((copies, format!("upload readback {step}: {e}")));
-    let mut device: Option<ID3D12Device> = None;
-    if let Err(e) = unsafe { queue.GetDevice(&mut device) } {
-        return fail(copies, "GetDevice", e);
-    }
-    let device = device.expect("GetDevice succeeded");
+    let items = copies
+        .into_iter()
+        .map(Ok)
+        .chain(snapshots.into_iter().map(Err))
+        .collect::<Vec<_>>();
+    let context = unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }.ok_or("no queue".to_string());
+    let context = context.and_then(|queue| {
+        let mut device: Option<ID3D12Device> = None;
+        unsafe { queue.GetDevice(&mut device) }.map_err(|e| format!("GetDevice: {e}"))?;
+        Ok((queue, device.expect("GetDevice succeeded")))
+    });
+    let (queue, device) = match context {
+        Ok(c) => c,
+        Err(reason) => {
+            for item in items {
+                fail(&mut failed, item, &reason);
+            }
+            results.lock().unwrap_or_else(|e| e.into_inner()).push(failed);
+            return;
+        }
+    };
     let kind = unsafe { queue.GetDesc() }.Type;
-    let mut placed = Vec::with_capacity(copies.len());
-    let mut total = 0u64;
-    for c in copies {
-        placed.push((c, total));
-        total = (total + placed.last().unwrap().0.len).next_multiple_of(ALIGN);
+    // Place every item, finding each resource's real object and footprints.
+    let mut chunks: Vec<Vec<Placed>> = vec![Vec::new()];
+    let mut chunk_bytes = 0;
+    for item in items {
+        let placed = match item {
+            Ok(copy) => match super::real(copy.resource).and_then(|r| r.cast::<ID3D12Resource>().ok()) {
+                Some(resource) => {
+                    let len = copy.len;
+                    Ok((Item::Upload { copy, resource }, len))
+                }
+                None => Err(Ok(copy)),
+            },
+            Err(snapshot) => unsafe { contents(&device, kind, snapshot) }.map_err(Err),
+        };
+        let (item, bytes) = match placed {
+            Ok(placed) => placed,
+            Err(Ok(copy)) => {
+                failed.uploads.push(upload_failed(copy, "no live upload buffer"));
+                continue;
+            }
+            Err(Err((snapshot, reason))) => {
+                failed
+                    .contents
+                    .push(first_use(submission, &snapshot, Err(reason)));
+                continue;
+            }
+        };
+        if chunk_bytes > 0 && chunk_bytes + bytes > CHUNK {
+            chunks.push(Vec::new());
+            chunk_bytes = 0;
+        }
+        chunks.last_mut().unwrap().push(Placed {
+            item,
+            at: chunk_bytes,
+            bytes,
+        });
+        chunk_bytes = (chunk_bytes + bytes).next_multiple_of(ALIGN);
     }
-    let unplace = |placed: Vec<(Copy, u64)>| placed.into_iter().map(|(c, _)| c).collect::<Vec<_>>();
+    let start = Instant::now();
+    for placed in chunks.into_iter().filter(|c| !c.is_empty()) {
+        let bytes = placed.last().map_or(0, |p| p.at + p.bytes);
+        // Wait for the collector to make room; past our patience, the chunk is given up.
+        loop {
+            let in_flight = IN_FLIGHT.load(Ordering::Acquire);
+            if in_flight == 0 || in_flight + bytes <= BUDGET {
+                break;
+            }
+            if start.elapsed() > PATIENCE {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let in_flight = IN_FLIGHT.load(Ordering::Acquire);
+        if in_flight != 0 && in_flight + bytes > BUDGET {
+            let reason = format!(
+                "readback budget: {in_flight} bytes of earlier copies still waited for the GPU after {} s",
+                PATIENCE.as_secs()
+            );
+            for p in placed {
+                fail_item(&mut failed, p.item, &reason);
+            }
+            continue;
+        }
+        match unsafe { record(queue, &device, kind, submission, placed, bytes) } {
+            Ok(pending) => {
+                IN_FLIGHT.fetch_add(bytes, Ordering::AcqRel);
+                let results = results.clone();
+                collector(Box::new(move || {
+                    let batch = collect(pending);
+                    IN_FLIGHT.fetch_sub(bytes, Ordering::AcqRel);
+                    results.lock().unwrap_or_else(|e| e.into_inner()).push(batch);
+                }));
+            }
+            Err((placed, reason)) => {
+                for p in placed {
+                    fail_item(&mut failed, p.item, &reason);
+                }
+            }
+        }
+    }
+    if !failed.uploads.is_empty() || !failed.contents.is_empty() {
+        results.lock().unwrap_or_else(|e| e.into_inner()).push(failed);
+    }
+}
+
+/// Queues `f` on the collector after everything queued before it: a capture queues its writing this way, after its
+/// copies are read.
+pub fn then(f: impl FnOnce() + Send + 'static) {
+    collector(Box::new(f));
+}
+
+type Job = Box<dyn FnOnce() + Send>;
+
+fn collector(job: Job) {
+    static QUEUE: OnceLock<Mutex<mpsc::Sender<Job>>> = OnceLock::new();
+    QUEUE
+        .get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<Job>();
+            std::thread::Builder::new()
+                .name("locum-readback".into())
+                .spawn(move || {
+                    for job in rx {
+                        job();
+                    }
+                })
+                .expect("readback collector thread");
+            Mutex::new(tx)
+        })
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .send(job)
+        .expect("readback collector alive");
+}
+
+/// A snapshot's real resource and footprints, and the bytes its copy takes; or why it cannot be copied on a queue of
+/// `kind`.
+unsafe fn contents(
+    device: &ID3D12Device,
+    kind: D3D12_COMMAND_LIST_TYPE,
+    snapshot: Snapshot,
+) -> Result<(Item, u64), (Snapshot, String)> {
+    let Some(resource) = super::real(snapshot.resource).and_then(|r| r.cast::<ID3D12Resource>().ok()) else {
+        return Err((snapshot, "no live resource".into()));
+    };
+    if let Some(reason) = snapshot.states.iter().find_map(|s| unreadable(*s, kind)) {
+        return Err((snapshot, reason));
+    }
+    let desc = unsafe { resource.GetDesc() };
+    if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        return Ok((
+            Item::Contents {
+                snapshot,
+                resource,
+                footprints: Vec::new(),
+            },
+            desc.Width,
+        ));
+    }
+    let n = snapshot.subresources as usize;
+    let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
+    let mut rows = vec![0u32; n];
+    let mut row_bytes = vec![0u64; n];
+    let mut total = 0u64;
+    unsafe {
+        device.GetCopyableFootprints(
+            &desc,
+            0,
+            n as u32,
+            0,
+            Some(layouts.as_mut_ptr()),
+            Some(rows.as_mut_ptr()),
+            Some(row_bytes.as_mut_ptr()),
+            Some(&mut total),
+        )
+    };
+    if total == u64::MAX || row_bytes.contains(&u64::MAX) {
+        return Err((
+            snapshot,
+            format!("GetCopyableFootprints refused the description ({n} subresources)"),
+        ));
+    }
+    Ok((
+        Item::Contents {
+            snapshot,
+            resource,
+            footprints: layouts
+                .into_iter()
+                .zip(rows)
+                .zip(row_bytes)
+                .map(|((f, r), b)| (f, r, b))
+                .collect(),
+        },
+        total,
+    ))
+}
+
+/// Why a subresource in `state` cannot be copied on a queue of `kind`, if it cannot.
+fn unreadable(state: Access, kind: D3D12_COMMAND_LIST_TYPE) -> Option<String> {
+    match state {
+        Access::State(s) => {
+            // The states each queue type's barriers may name.
+            let legal = match kind {
+                D3D12_COMMAND_LIST_TYPE_COMPUTE => 0x1 | 0x8 | 0x40 | 0x200 | 0x400 | 0x800 | 0x40_0000,
+                D3D12_COMMAND_LIST_TYPE_COPY => 0x400 | 0x800,
+                _ => !0,
+            };
+            (s & !legal != 0).then(|| {
+                format!(
+                    "state {s:#x} cannot be transitioned on a queue of type {}",
+                    kind.0
+                )
+            })
+        }
+        Access::Layout(UNDEFINED) => Some("layout UNDEFINED: no defined contents".into()),
+        Access::Layout(l) => {
+            let legal = match kind {
+                D3D12_COMMAND_LIST_TYPE_COMPUTE => matches!(l, 0 | 1 | 3 | 6 | 7 | 8 | 24..=29),
+                D3D12_COMMAND_LIST_TYPE_COPY => matches!(l, 0 | 7 | 8),
+                _ => !matches!(l, 24..=29),
+            };
+            (!legal).then(|| format!("layout {l} cannot be transitioned on a queue of type {}", kind.0))
+        }
+    }
+}
+
+/// Whether a subresource in `state` must be transitioned before a copy reads it, and so after.
+fn transition(state: Access) -> bool {
+    match state {
+        // COMMON is promoted implicitly; GENERIC_READ includes COPY_SOURCE.
+        Access::State(s) => s != COMMON && s & COPY_SOURCE == 0,
+        Access::Layout(l) => !matches!(l, 0 | 1 | 7 | 18 | 19 | 22 | 24 | 25 | 28),
+    }
+}
+
+/// A borrowed resource as the API's struct fields hold one, without a reference of its own.
+fn borrowed(r: &ID3D12Resource) -> ManuallyDrop<Option<ID3D12Resource>> {
+    unsafe { core::mem::transmute_copy(r) }
+}
+
+/// The barriers to COPY_SOURCE (`to_copy`) or back for every subresource a chunk's snapshots must transition: legacy
+/// transitions on `list`, layout barriers on `list7`.
+unsafe fn barriers(list: &ID3D12GraphicsCommandList, placed: &[Placed], to_copy: bool) -> Result<(), String> {
+    let mut legacy = Vec::new();
+    let mut layouts = Vec::new();
+    for p in placed {
+        let Item::Contents {
+            snapshot, resource, ..
+        } = &p.item
+        else {
+            continue;
+        };
+        for (i, state) in snapshot.states.iter().enumerate() {
+            if !transition(*state) {
+                continue;
+            }
+            match *state {
+                Access::State(s) => {
+                    let (before, after) = if to_copy {
+                        (s, COPY_SOURCE)
+                    } else {
+                        (COPY_SOURCE, s)
+                    };
+                    legacy.push(D3D12_RESOURCE_BARRIER {
+                        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                            Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                                pResource: borrowed(resource),
+                                Subresource: i as u32,
+                                StateBefore: D3D12_RESOURCE_STATES(before),
+                                StateAfter: D3D12_RESOURCE_STATES(after),
+                            }),
+                        },
+                    });
+                }
+                Access::Layout(l) => {
+                    let copy = (
+                        D3D12_BARRIER_SYNC_COPY,
+                        D3D12_BARRIER_ACCESS_COPY_SOURCE,
+                        D3D12_BARRIER_LAYOUT_COPY_SOURCE,
+                    );
+                    // Nothing in our fresh list touched it before, and nothing after needs it.
+                    let none = (
+                        D3D12_BARRIER_SYNC_NONE,
+                        D3D12_BARRIER_ACCESS_NO_ACCESS,
+                        D3D12_BARRIER_LAYOUT(l),
+                    );
+                    let (before, after) = if to_copy { (none, copy) } else { (copy, none) };
+                    layouts.push(D3D12_TEXTURE_BARRIER {
+                        SyncBefore: before.0,
+                        SyncAfter: after.0,
+                        AccessBefore: before.1,
+                        AccessAfter: after.1,
+                        LayoutBefore: before.2,
+                        LayoutAfter: after.2,
+                        pResource: borrowed(resource),
+                        Subresources: D3D12_BARRIER_SUBRESOURCE_RANGE {
+                            IndexOrFirstMipLevel: i as u32,
+                            NumMipLevels: 0,
+                            ..Default::default()
+                        },
+                        Flags: D3D12_TEXTURE_BARRIER_FLAG_NONE,
+                    });
+                }
+            }
+        }
+    }
+    if !legacy.is_empty() {
+        unsafe { list.ResourceBarrier(&legacy) };
+    }
+    if !layouts.is_empty() {
+        let list7: ID3D12GraphicsCommandList7 = list
+            .cast()
+            .map_err(|e| format!("layout barriers need ID3D12GraphicsCommandList7: {e}"))?;
+        let group = D3D12_BARRIER_GROUP {
+            Type: D3D12_BARRIER_TYPE_TEXTURE,
+            NumBarriers: layouts.len() as u32,
+            Anonymous: D3D12_BARRIER_GROUP_0 {
+                pTextureBarriers: layouts.as_ptr(),
+            },
+        };
+        unsafe { list7.Barrier(&[group]) };
+    }
+    Ok(())
+}
+
+/// Records and executes one chunk.
+unsafe fn record(
+    queue: &ID3D12CommandQueue,
+    device: &ID3D12Device,
+    kind: D3D12_COMMAND_LIST_TYPE,
+    submission: u64,
+    placed: Vec<Placed>,
+    bytes: u64,
+) -> Result<Pending, (Vec<Placed>, String)> {
+    let fail = |placed, step: &str, e: windows::core::Error| Err((placed, format!("readback {step}: {e}")));
     let mut readback: Option<ID3D12Resource> = None;
     if let Err(e) = unsafe {
         device.CreateCommittedResource(
@@ -70,7 +468,7 @@ pub unsafe fn submit(queue: *mut c_void, copies: Vec<Copy>) -> Result<Pending, (
             D3D12_HEAP_FLAG_NONE,
             &D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: total.max(1),
+                Width: bytes.max(1),
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
@@ -83,95 +481,320 @@ pub unsafe fn submit(queue: *mut c_void, copies: Vec<Copy>) -> Result<Pending, (
             &mut readback,
         )
     } {
-        return fail(unplace(placed), &format!("readback buffer of {total} bytes"), e);
+        return fail(placed, &format!("buffer of {bytes} bytes"), e);
     }
     let readback = readback.expect("created");
     let allocator: ID3D12CommandAllocator = match unsafe { device.CreateCommandAllocator(kind) } {
         Ok(a) => a,
-        Err(e) => return fail(unplace(placed), "CreateCommandAllocator", e),
+        Err(e) => return fail(placed, "CreateCommandAllocator", e),
     };
     let list: ID3D12GraphicsCommandList = match unsafe { device.CreateCommandList(0, kind, &allocator, None) }
     {
         Ok(l) => l,
-        Err(e) => return fail(unplace(placed), "CreateCommandList", e),
+        Err(e) => return fail(placed, "CreateCommandList", e),
     };
-    for (c, at) in &placed {
-        // The application's resource: its real object, so our list never sees a wrapper.
-        if let Some(source) = super::real(c.resource).and_then(|r| r.cast::<ID3D12Resource>().ok()) {
-            unsafe { list.CopyBufferRegion(&readback, *at, &source, c.offset, c.len) };
+    if let Err(reason) = unsafe { barriers(&list, &placed, true) } {
+        return Err((placed, reason));
+    }
+    for p in &placed {
+        match &p.item {
+            Item::Upload { copy, resource } => unsafe {
+                list.CopyBufferRegion(&readback, p.at, resource, copy.offset, copy.len)
+            },
+            Item::Contents {
+                resource, footprints, ..
+            } if footprints.is_empty() => unsafe {
+                list.CopyBufferRegion(&readback, p.at, resource, 0, p.bytes)
+            },
+            Item::Contents {
+                resource, footprints, ..
+            } => {
+                for (i, (f, _, _)) in footprints.iter().enumerate() {
+                    let mut f = *f;
+                    f.Offset += p.at;
+                    let dst = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: borrowed(&readback),
+                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+                    };
+                    let src = D3D12_TEXTURE_COPY_LOCATION {
+                        pResource: borrowed(resource),
+                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                            SubresourceIndex: i as u32,
+                        },
+                    };
+                    unsafe { list.CopyTextureRegion(&dst, 0, 0, 0, &src, None) };
+                }
+            }
         }
     }
+    if let Err(reason) = unsafe { barriers(&list, &placed, false) } {
+        return Err((placed, reason));
+    }
     if let Err(e) = unsafe { list.Close() } {
-        return fail(unplace(placed), "Close", e);
+        return fail(placed, "Close", e);
     }
     let fence: ID3D12Fence = match unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) } {
         Ok(f) => f,
-        Err(e) => return fail(unplace(placed), "CreateFence", e),
+        Err(e) => return fail(placed, "CreateFence", e),
     };
     unsafe { queue.ExecuteCommandLists(&[Some(list.cast().expect("a graphics list is a command list"))]) };
     if let Err(e) = unsafe { queue.Signal(&fence, 1) } {
-        return fail(unplace(placed), "Signal", e);
+        return fail(placed, "Signal", e);
     }
     Ok(Pending {
-        copies: placed,
+        submission,
+        placed,
         readback,
         fence,
+        bytes,
         _list: list,
         _allocator: allocator,
     })
 }
 
-/// Waits for the copies, then stores each range in the blob store: (resource, content) as the capture records
-/// upload versions.
-pub fn collect(pending: Pending) -> Vec<(u64, Value)> {
+/// Waits for a chunk's copies, then stores each in the blob store: upload ranges as the capture records upload
+/// versions, contents in the canonical layout with a key per subresource.
+fn collect(pending: Pending) -> Batch {
     let Pending {
-        copies,
+        submission,
+        placed,
         readback,
         fence,
+        bytes,
         ..
     } = pending;
+    let mut batch = Batch {
+        submission,
+        ..Batch::default()
+    };
     // A null event makes SetEventOnCompletion wait until the fence reaches the value.
-    if let Err(e) = unsafe { fence.SetEventOnCompletion(1, HANDLE::default()) } {
-        return failed(
-            copies.into_iter().map(|(c, _)| c).collect(),
-            &format!("upload readback wait: {e}"),
-        );
-    }
-    let mut p = core::ptr::null_mut();
-    if let Err(e) = unsafe { readback.Map(0, None, Some(&mut p)) } {
-        return failed(
-            copies.into_iter().map(|(c, _)| c).collect(),
-            &format!("upload readback Map: {e}"),
-        );
-    }
-    let out = copies
-        .into_iter()
-        .map(|(c, at)| {
-            let start = std::time::Instant::now();
-            let mut content =
-                unsafe { super::pipelines::bytes(p.cast::<u8>().add(at as usize).cast(), c.len as usize) };
-            super::journal::UPLOAD_COST.add(start, c.len);
-            content["offset"] = json!(c.offset);
-            if c.whole {
-                content["whole"] = json!(true);
+    let mapped = unsafe { fence.SetEventOnCompletion(1, HANDLE::default()) }
+        .map_err(|e| format!("readback wait: {e}"))
+        .and_then(|()| {
+            let mut p = core::ptr::null_mut();
+            unsafe {
+                readback.Map(
+                    0,
+                    Some(&D3D12_RANGE {
+                        Begin: 0,
+                        End: bytes as usize,
+                    }),
+                    Some(&mut p),
+                )
             }
-            (c.resource, content)
-        })
-        .collect();
+            .map_err(|e| format!("readback Map: {e}"))
+            .map(|()| p.cast::<u8>())
+        });
+    let base = match mapped {
+        Ok(base) => base,
+        Err(reason) => {
+            for p in placed {
+                fail_item(&mut batch, p.item, &reason);
+            }
+            return batch;
+        }
+    };
+    for p in placed {
+        let data = unsafe { base.add(p.at as usize) };
+        match p.item {
+            Item::Upload { copy: c, .. } => {
+                let start = Instant::now();
+                let mut content = unsafe { super::pipelines::bytes(data.cast(), c.len as usize) };
+                super::journal::UPLOAD_COST.add(start, c.len);
+                content["offset"] = json!(c.offset);
+                if c.whole {
+                    content["whole"] = json!(true);
+                }
+                batch.uploads.push((c.resource, content));
+            }
+            Item::Contents {
+                snapshot, footprints, ..
+            } => {
+                let content = unsafe { canonical(&snapshot, &footprints, data, p.bytes) }.map(|bytes| {
+                    let subs = snapshot
+                        .layout
+                        .iter()
+                        .map(|s| {
+                            locum_capture::hash::key(&bytes[s.offset as usize..(s.offset + s.size) as usize])
+                        })
+                        .collect();
+                    let key = locum_capture::hash::key(&bytes);
+                    locum_capture::writer::blob(&crate::settings::settings().blobs, key.clone(), bytes, true);
+                    (key, subs)
+                });
+                batch.contents.push(first_use(submission, &snapshot, content));
+            }
+        }
+    }
     unsafe { readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
-    out
+    batch
 }
 
-/// Every copy of a batch that failed, with the reason in place of its bytes.
-pub fn failed(copies: Vec<Copy>, reason: &str) -> Vec<(u64, Value)> {
-    copies
-        .into_iter()
-        .map(|c| {
-            let mut content = json!({"diagnostic":reason,"offset":c.offset,"size":c.len});
-            if c.whole {
-                content["whole"] = json!(true);
+/// A snapshot's bytes in the canonical layout, from the footprints the GPU copied them into at `data`.
+unsafe fn canonical(
+    snapshot: &Snapshot,
+    footprints: &[(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)],
+    data: *const u8,
+    bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let total = locum_capture::layout::total(&snapshot.layout);
+    if footprints.is_empty() {
+        // A buffer: its bytes as they are.
+        return Ok(unsafe { core::slice::from_raw_parts(data, total.min(bytes) as usize) }.to_vec());
+    }
+    // One plane of one subresource, tightly packed.
+    let plane = |index: usize| -> Result<(Vec<u8>, u64), String> {
+        let (f, rows, row_bytes) = footprints
+            .get(index)
+            .ok_or(format!("no footprint for subresource {index}"))?;
+        let (pitch, depth) = (f.Footprint.RowPitch as usize, f.Footprint.Depth as usize);
+        let mut out = Vec::with_capacity(*row_bytes as usize * *rows as usize * depth);
+        for z in 0..depth {
+            for y in 0..*rows as usize {
+                let at = f.Offset as usize + (z * *rows as usize + y) * pitch;
+                out.extend_from_slice(unsafe {
+                    core::slice::from_raw_parts(data.add(at), *row_bytes as usize)
+                });
             }
-            (c.resource, content)
-        })
-        .collect()
+        }
+        Ok((out, *row_bytes))
+    };
+    let mut out = Vec::with_capacity(total as usize);
+    let per_plane = snapshot.layout.len();
+    for sub in &snapshot.layout {
+        let i = sub.index as usize;
+        let (first, row_bytes) = plane(i)?;
+        match snapshot.joined {
+            Some(texel) => {
+                let (stencil, _) = plane(i + per_plane)?;
+                locum_capture::layout::join_depth_stencil(texel, &first, &stencil, &mut out);
+            }
+            None => {
+                if row_bytes != u64::from(sub.row_bytes) || first.len() as u64 != sub.size {
+                    return Err(format!(
+                        "subresource {i}: the copy's {row_bytes}-byte rows ({} bytes) differ from the canonical layout's {} ({} bytes)",
+                        first.len(),
+                        sub.row_bytes,
+                        sub.size
+                    ));
+                }
+                out.extend_from_slice(&first);
+            }
+        }
+    }
+    if out.len() as u64 != total {
+        return Err(format!(
+            "{} bytes copied for a {total}-byte canonical layout",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+fn first_use(
+    submission: u64,
+    snapshot: &Snapshot,
+    content: Result<(String, Vec<String>), String>,
+) -> (u64, FirstUse) {
+    (
+        snapshot.resource,
+        FirstUse {
+            submission,
+            states: Value::Array(snapshot.states.iter().map(|s| s.value()).collect()),
+            content,
+        },
+    )
+}
+
+fn fail(batch: &mut Batch, item: Result<Copy, Snapshot>, reason: &str) {
+    match item {
+        Ok(c) => batch.uploads.push(upload_failed(c, reason)),
+        Err(s) => batch
+            .contents
+            .push(first_use(batch.submission, &s, Err(reason.into()))),
+    }
+}
+
+fn fail_item(batch: &mut Batch, item: Item, reason: &str) {
+    match item {
+        Item::Upload { copy, .. } => batch.uploads.push(upload_failed(copy, reason)),
+        Item::Contents { snapshot, .. } => {
+            batch
+                .contents
+                .push(first_use(batch.submission, &snapshot, Err(reason.into())))
+        }
+    }
+}
+
+fn upload_failed(c: Copy, reason: &str) -> (u64, Value) {
+    let mut content = json!({"diagnostic":reason,"offset":c.offset,"size":c.len});
+    if c.whole {
+        content["whole"] = json!(true);
+    }
+    (c.resource, content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copies_transition_only_from_states_that_cannot_be_read() {
+        assert!(!transition(Access::State(COMMON)));
+        // GENERIC_READ includes COPY_SOURCE.
+        assert!(!transition(Access::State(0xAC3)));
+        assert!(transition(Access::State(0x4)));
+        assert!(!transition(Access::Layout(7)));
+        assert!(transition(Access::Layout(2)));
+        assert!(unreadable(Access::State(0x4), D3D12_COMMAND_LIST_TYPE_COMPUTE).is_some());
+        assert!(unreadable(Access::State(0x8), D3D12_COMMAND_LIST_TYPE_COMPUTE).is_none());
+        assert!(unreadable(Access::State(0x80), D3D12_COMMAND_LIST_TYPE_DIRECT).is_none());
+        assert!(unreadable(Access::Layout(UNDEFINED), D3D12_COMMAND_LIST_TYPE_DIRECT).is_some());
+        assert!(unreadable(Access::Layout(24), D3D12_COMMAND_LIST_TYPE_DIRECT).is_some());
+    }
+
+    #[test]
+    fn footprints_lose_their_row_padding_and_depth_stencil_planes_join() {
+        let footprint =
+            |offset: u64, width: u32, height: u32, pitch: u32| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: offset,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Width: width,
+                    Height: height,
+                    Depth: 1,
+                    RowPitch: pitch,
+                    ..Default::default()
+                },
+            };
+        // A 2x2 RGBA8 texture copied with 256-byte rows.
+        let mut data = vec![0u8; 512];
+        data[..8].copy_from_slice(&[1; 8]);
+        data[256..264].copy_from_slice(&[2; 8]);
+        let snapshot = Snapshot {
+            resource: 1,
+            states: Vec::new(),
+            subresources: 1,
+            layout: locum_capture::layout::texture(28, 2, 2, 1, 1, 1).unwrap(),
+            joined: None,
+        };
+        let out =
+            unsafe { canonical(&snapshot, &[(footprint(0, 2, 2, 256), 2, 8)], data.as_ptr(), 512) }.unwrap();
+        assert_eq!(out, [[1u8; 8], [2u8; 8]].concat());
+        // A 1x1 D24S8 texture: depth plane then stencil plane.
+        let mut data = vec![0u8; 1024];
+        data[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0]);
+        data[512] = 0x7F;
+        let snapshot = Snapshot {
+            resource: 2,
+            states: Vec::new(),
+            subresources: 2,
+            layout: locum_capture::layout::texture(45, 1, 1, 1, 1, 1).unwrap(),
+            joined: Some(4),
+        };
+        let planes = [(footprint(0, 1, 1, 256), 1, 4), (footprint(512, 1, 1, 256), 1, 1)];
+        let out = unsafe { canonical(&snapshot, &planes, data.as_ptr(), 1024) }.unwrap();
+        assert_eq!(out, [0x11, 0x22, 0x33, 0x7F]);
+    }
 }

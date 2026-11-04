@@ -131,13 +131,30 @@ pub struct Frame {
 pub struct Prepared {
     frame: Frame,
     projection: Projection,
+    first_use: BTreeMap<u64, FirstUse>,
+}
+
+/// A resource's contents as its first use in the frame found them, copied on the GPU just before the submission that
+/// first used it, or why they could not be.
+#[derive(Clone, Debug)]
+pub struct FirstUse {
+    pub submission: u64,
+    /// The state or layout of each subresource the copy began from (empty for buffers, which are always COMMON
+    /// between submissions).
+    pub states: Value,
+    /// The key of the bytes in the canonical layout, and each subresource's key; or the reason there are none.
+    pub content: Result<(String, Vec<String>), String>,
 }
 
 impl Prepared {
-    /// A submission's upload copies, read back after the frame.
-    pub fn set_uploads(&mut self, submission: u64, uploads: Vec<(u64, Value)>) {
+    /// A resource's contents before its first use.
+    pub fn set_first_use(&mut self, resource: u64, first_use: FirstUse) {
+        self.first_use.insert(resource, first_use);
+    }
+    /// Upload copies a submission made, read back after the frame (in one batch or several).
+    pub fn add_uploads(&mut self, submission: u64, uploads: Vec<(u64, Value)>) {
         if let Some(s) = self.frame.submissions.iter_mut().find(|s| s.id == submission) {
-            s.uploads = uploads;
+            s.uploads.extend(uploads);
         }
     }
     /// Populate CPU upload contents and per-draw constant bytes after queued blobs are durable.
@@ -209,7 +226,16 @@ impl Prepared {
                 )),
             }
         }
+        let descriptions: BTreeMap<_, _> = self
+            .frame
+            .objects
+            .iter()
+            .map(|o| (o.id, &o.description))
+            .collect();
+        let mut missing = BTreeMap::<String, u64>::new();
+        let mut subresources = Vec::new();
         for resource in &mut capture.resources {
+            let mut hashes = Vec::new();
             if let Some(content) = whole.get(&resource.id)
                 && let Some(key) = content["blob"].as_str()
                 && blobs.has(key)
@@ -218,10 +244,52 @@ impl Prepared {
                 resource.content_source = Some("upload-at-first-submission");
                 resource.content_note =
                     Some("upload bytes as the GPU reached the frame's first captured submission".into());
+            } else if let Some(first) = self.first_use.get(&resource.id) {
+                match &first.content {
+                    Ok((key, subs)) => {
+                        resource.content = Some(key.clone());
+                        resource.content_source = Some("first-use");
+                        resource.content_note = Some(format!(
+                            "copied on the GPU just before submission {}, the first to use it",
+                            first.submission
+                        ));
+                        hashes.clone_from(subs);
+                    }
+                    Err(why) => {
+                        resource.content_note = Some(why.clone());
+                        *missing.entry(why.clone()).or_default() += 1;
+                    }
+                }
+            } else if descriptions
+                .get(&resource.id)
+                .is_some_and(|d| d["heap_properties"]["type"] == 3)
+            {
+                resource.content_note = Some("readback heap: only the GPU writes it".into());
+            } else if resource.used {
+                let why = "used, but no copy was made before its first use".to_string();
+                resource.content_note = Some(why.clone());
+                *missing.entry(why).or_default() += 1;
+            }
+            if resource.used || resource.content.is_some() {
+                let subs = descriptions
+                    .get(&resource.id)
+                    .and_then(|d| layout(d))
+                    .unwrap_or_default();
+                for (i, sub) in subs.into_iter().enumerate() {
+                    subresources.push(db::Subresource {
+                        resource: resource.id,
+                        sub,
+                        hash: hashes.get(i).filter(|h| !h.is_empty()).cloned(),
+                    });
+                }
             }
         }
+        capture.subresources.extend(subresources);
         for gap in gaps {
             capture.gap("d3d12-upload-content", gap, 1);
+        }
+        for (why, count) in missing {
+            capture.gap("contents", why, count);
         }
         capture.meta("counts", serde_json::json!({
             "events":capture.events.len(), "draws":capture.draws.len(),
@@ -235,7 +303,7 @@ impl Prepared {
         }));
     }
     pub fn write(&self, tx: &Transaction<'_>) -> rusqlite::Result<()> {
-        self.frame.write(tx, &self.projection)
+        self.frame.write(tx, &self.projection, &self.first_use)
     }
 }
 
@@ -247,7 +315,8 @@ struct Execution {
     parent: Option<u64>,
 }
 
-struct Projection {
+/// The frame's command history projected into the common tables, one submission at a time.
+pub struct Projection {
     next_execution: u64,
     executions: Vec<Execution>,
     locations: Vec<(u64, u64, usize, u64)>,
@@ -341,7 +410,8 @@ impl Pipeline {
 }
 
 impl Frame {
-    fn project(&self, capture: &mut db::Capture) -> Projection {
+    /// The frame's resources and shaders, from its objects as they were when it ended.
+    fn project_objects(&self, capture: &mut db::Capture) {
         for diagnostic in &self.diagnostics {
             capture.gap("d3d12-submission", diagnostic, 1);
         }
@@ -356,25 +426,8 @@ impl Frame {
                     4 => "texture3d",
                     _ => "unknown",
                 };
-                let depth = if dimension == 4 {
-                    n("depth_or_array_size")
-                } else {
-                    1
-                };
-                let array = if dimension == 4 {
-                    1
-                } else {
-                    n("depth_or_array_size")
-                };
-                let layout = if dimension == 1 {
-                    Some(crate::layout::buffer(n("width")))
-                } else {
-                    crate::layout::texture(n("format"), n("width"), n("height"), depth, n("mips"), array)
-                };
-                let bytes = layout
-                    .as_ref()
-                    .and_then(|s| s.last())
-                    .map_or(0, |s| s.offset + s.size);
+                let (depth, array) = extent(d);
+                let bytes = layout(d).as_deref().map_or(0, crate::layout::total);
                 capture.resources.push(db::Resource {
                     id: object.id,
                     kind,
@@ -387,16 +440,8 @@ impl Frame {
                     samples: n("sample_count"),
                     bytes,
                     desc: d.to_string().into_bytes(),
-                    content_note: Some("GPU initial/checkpoint readbacks pending".into()),
                     ..db::Resource::default()
                 });
-                for sub in layout.unwrap_or_default() {
-                    capture.subresources.push(db::Subresource {
-                        resource: object.id,
-                        sub,
-                        hash: None,
-                    });
-                }
             }
             if let Some(shaders) = d["shaders"].as_array() {
                 for (i, s) in shaders.iter().take(6).enumerate() {
@@ -411,52 +456,22 @@ impl Frame {
                 }
             }
         }
-        let mut p = Projection {
-            next_execution: 1,
-            executions: Vec::new(),
-            locations: Vec::new(),
-            objects: self
-                .objects
-                .iter()
-                .map(|o| (o.id, o.description.clone()))
-                .collect(),
-            draw_states: Vec::new(),
-            descriptors: BTreeMap::new(),
-        };
-        for submission in &self.submissions {
-            for d in &submission.descriptors {
-                if d.kind == "empty" {
-                    p.descriptors.remove(&(d.heap, d.slot));
-                } else {
-                    p.descriptors.insert((d.heap, d.slot), d.clone());
-                }
-            }
-            capture.events.push(db::Event {
-                seq: capture.events.len() as u64 + 1,
-                kind: "submit",
-                call: "ExecuteCommandLists",
-                args: serde_json::json!({"submission":submission.id,"queue":submission.queue,
-                    "queue_seq":submission.queue_seq,"cpu_seq":submission.cpu_seq,
-                    "lists":submission.lists.iter().map(|l| [l.id,l.generation]).collect::<Vec<_>>()})
-                .to_string(),
-                ..db::Event::default()
-            });
-            for (ordinal, list) in submission.lists.iter().enumerate() {
-                p.execute(
-                    capture,
-                    submission,
-                    list,
-                    (ordinal, None, 0),
-                    &mut Pipeline::default(),
-                );
-            }
-        }
-        p
     }
 
-    /// Appends the shared events/draws projection, leaving D3D12 identities authoritative.
+    /// Projects every submission at once and prepares the capture (a journal projects each submission as it is
+    /// made, with [`Projection::submit`], then calls [`Frame::finish`]).
     pub fn prepare(self, capture: &mut db::Capture) -> Prepared {
-        let mut projection = self.project(capture);
+        let mut projection = Projection::new(&self.objects);
+        for submission in &self.submissions {
+            projection.submit(capture, submission);
+        }
+        self.finish(capture, projection)
+    }
+
+    /// Adds the frame's resources and shaders to a capture whose submissions `projection` has projected, and marks
+    /// the resources its events read and wrote.
+    pub fn finish(self, capture: &mut db::Capture, mut projection: Projection) -> Prepared {
+        self.project_objects(capture);
         let reads: std::collections::BTreeSet<_> = capture
             .events
             .iter()
@@ -475,10 +490,16 @@ impl Frame {
         Prepared {
             frame: self,
             projection,
+            first_use: BTreeMap::new(),
         }
     }
 
-    fn write(&self, tx: &Transaction<'_>, p: &Projection) -> rusqlite::Result<()> {
+    fn write(
+        &self,
+        tx: &Transaction<'_>,
+        p: &Projection,
+        first_use: &BTreeMap<u64, FirstUse>,
+    ) -> rusqlite::Result<()> {
         tx.execute_batch(SCHEMA)?;
         for object in &self.objects {
             tx.execute(
@@ -610,6 +631,17 @@ impl Frame {
             tx.execute("INSERT INTO d12_sync(queue,queue_seq,cpu_seq,kind,fence,value_u64) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![integer(s.queue)?,integer(s.queue_seq)?,integer(s.cpu_seq)?,s.kind,integer(s.fence)?,s.value.to_le_bytes().as_slice()])?;
         }
+        for (resource, first) in first_use {
+            tx.execute(
+                "INSERT INTO d12_first_use VALUES(?1,?2,?3,?4)",
+                params![
+                    integer(*resource)?,
+                    integer(first.submission)?,
+                    first.states.to_string(),
+                    first.content.as_ref().err()
+                ],
+            )?;
+        }
         for s in &self.submissions {
             for (resource, content) in &s.uploads {
                 tx.execute(
@@ -629,6 +661,60 @@ impl Frame {
 }
 
 impl Projection {
+    pub fn new(objects: &[Object]) -> Self {
+        Self {
+            next_execution: 1,
+            executions: Vec::new(),
+            locations: Vec::new(),
+            objects: objects.iter().map(|o| (o.id, o.description.clone())).collect(),
+            draw_states: Vec::new(),
+            descriptors: BTreeMap::new(),
+        }
+    }
+
+    /// An object (re)described while the frame is projected.
+    pub fn describe(&mut self, id: u64, description: &Value) {
+        self.objects.insert(id, description.clone());
+    }
+
+    /// Projects one submission, after the frame's earlier ones. Returns the resources its events read or write, each
+    /// once, in the order they are first touched.
+    pub fn submit(&mut self, capture: &mut db::Capture, submission: &Submission) -> Vec<u64> {
+        for d in &submission.descriptors {
+            if d.kind == "empty" {
+                self.descriptors.remove(&(d.heap, d.slot));
+            } else {
+                self.descriptors.insert((d.heap, d.slot), d.clone());
+            }
+        }
+        let first = capture.events.len();
+        capture.events.push(db::Event {
+            seq: capture.events.len() as u64 + 1,
+            kind: "submit",
+            call: "ExecuteCommandLists",
+            args: serde_json::json!({"submission":submission.id,"queue":submission.queue,
+                "queue_seq":submission.queue_seq,"cpu_seq":submission.cpu_seq,
+                "lists":submission.lists.iter().map(|l| [l.id,l.generation]).collect::<Vec<_>>()})
+            .to_string(),
+            ..db::Event::default()
+        });
+        for (ordinal, list) in submission.lists.iter().enumerate() {
+            self.execute(
+                capture,
+                submission,
+                list,
+                (ordinal, None, 0),
+                &mut Pipeline::default(),
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        capture.events[first..]
+            .iter()
+            .flat_map(|e| e.reads.iter().chain(&e.writes).copied())
+            .filter(|r| seen.insert(*r))
+            .collect()
+    }
+
     fn execute(
         &mut self,
         capture: &mut db::Capture,
@@ -699,6 +785,8 @@ impl Projection {
                 "ExecuteBundle" => "bundle",
                 _ => "state",
             };
+            // The bindings this event's draw adds, which say what it reads and writes.
+            let bound = capture.bindings.len();
             let draw = if matches!(kind, "draw" | "dispatch" | "indirect") {
                 let n = capture.draws.len() as u64 + 1;
                 let mut shaders = std::array::from_fn(|_| None);
@@ -748,39 +836,22 @@ impl Projection {
                 ..db::Event::default()
             });
             let event = capture.events.last_mut().unwrap();
-            let a = &command.args;
-            let (read, write) = match command.call {
-                "CopyBufferRegion" => (a[2].as_u64(), a[0].as_u64()),
-                "CopyResource" => (a[1].as_u64(), a[0].as_u64()),
-                "CopyTextureRegion" => (a[4]["resource"].as_u64(), a[0]["resource"].as_u64()),
-                "ResolveSubresource" => (a[2].as_u64(), a[0].as_u64()),
-                "ResolveQueryData" => (None, a[4].as_u64()),
-                "ClearRenderTargetView" | "ClearDepthStencilView" => {
-                    (None, a[0]["definition"]["resource"].as_u64())
-                }
-                "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat" => (None, a[2].as_u64()),
-                _ => (None, None),
-            };
-            event.reads.extend(read.filter(|r| *r != 0));
-            event.writes.extend(write.filter(|r| *r != 0));
-            if let Some(draw) = draw {
-                let event = capture.events.last_mut().unwrap();
-                for binding in capture.bindings.iter().filter(|b| b.draw == draw) {
-                    if let Some(resource) = binding.resource {
-                        if matches!(
-                            binding.kind,
-                            "uav" | "uav_counter" | "rtv" | "dsv" | "so" | "so_counter"
-                        ) {
-                            event.writes.push(resource);
-                        }
-                        event.reads.push(resource);
+            accesses(command, &mut event.reads, &mut event.writes);
+            for binding in &capture.bindings[bound..] {
+                if let Some(resource) = binding.resource {
+                    if matches!(
+                        binding.kind,
+                        "uav" | "uav_counter" | "rtv" | "dsv" | "so" | "so_counter"
+                    ) {
+                        event.writes.push(resource);
                     }
+                    event.reads.push(resource);
                 }
-                event.reads.sort_unstable();
-                event.reads.dedup();
-                event.writes.sort_unstable();
-                event.writes.dedup();
             }
+            event.reads.sort_unstable();
+            event.reads.dedup();
+            event.writes.sort_unstable();
+            event.writes.dedup();
             self.locations.push((seq, execution, index, submission.queue));
             if let Some(diagnostic) = &command.diagnostic {
                 capture.gap(
@@ -799,6 +870,142 @@ impl Projection {
                 );
             }
         }
+    }
+}
+
+/// A resource's depth and array size: a volume's DepthOrArraySize is its depth, any other texture's its slices.
+fn extent(d: &Value) -> (u32, u32) {
+    let n = d["depth_or_array_size"].as_u64().unwrap_or(1) as u32;
+    if d["dimension"] == 4 { (n, 1) } else { (1, n) }
+}
+
+/// A resource's subresources in the canonical layout (see [`crate::layout`]), from its description. D3D12's planar
+/// depth-stencil formats are laid out as the Direct3D 11 format of the same name, one texel holding both planes.
+pub fn layout(d: &Value) -> Option<Vec<crate::layout::Sub>> {
+    let n = |key: &str| d[key].as_u64().unwrap_or(0) as u32;
+    if d["dimension"] == 1 {
+        return Some(crate::layout::buffer(n("width")));
+    }
+    let (depth, array) = extent(d);
+    crate::layout::texture(n("format"), n("width"), n("height"), depth, n("mips"), array)
+}
+
+/// The resources a command reads and writes by itself, apart from the views and buffers a draw or dispatch binds
+/// (those come from its bindings).
+fn accesses(command: &Command, r: &mut Vec<u64>, w: &mut Vec<u64>) {
+    let a = &command.args;
+    // A resource id, or an address resolved to one.
+    let at = |v: &Value| v["resource"].as_u64().or_else(|| v.as_u64()).filter(|r| *r != 0);
+    let view = |v: &Value| v["definition"]["resource"].as_u64().filter(|r| *r != 0);
+    match command.call {
+        "CopyBufferRegion" => {
+            r.extend(at(&a[2]));
+            w.extend(at(&a[0]));
+        }
+        "CopyResource" => {
+            r.extend(at(&a[1]));
+            w.extend(at(&a[0]));
+        }
+        "CopyTextureRegion" => {
+            r.extend(at(&a[4]));
+            w.extend(at(&a[0]));
+        }
+        "ResolveSubresource" => {
+            r.extend(at(&a[2]));
+            w.extend(at(&a[0]));
+        }
+        "ResolveSubresourceRegion" => {
+            r.extend(at(&a[4]));
+            w.extend(at(&a[0]));
+        }
+        "AtomicCopyBufferUINT" | "AtomicCopyBufferUINT64" => {
+            r.extend(at(&a[2]));
+            r.extend(a[4].as_array().into_iter().flatten().filter_map(at));
+            w.extend(at(&a[0]));
+        }
+        // LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE fills the tiled resource; otherwise the buffer is filled.
+        "CopyTiles" if a[5].as_u64().unwrap_or(0) & 2 != 0 => {
+            r.extend(at(&a[3]));
+            w.extend(at(&a[0]));
+        }
+        "CopyTiles" => {
+            r.extend(at(&a[0]));
+            w.extend(at(&a[3]));
+        }
+        "ResolveQueryData" => w.extend(at(&a[4])),
+        "ClearRenderTargetView" | "ClearDepthStencilView" => w.extend(view(&a[0])),
+        "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat" => w.extend(at(&a[2])),
+        "DiscardResource" => w.extend(at(&a[0])),
+        "WriteBufferImmediate" => w.extend(
+            a[0].as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| at(&v["address"])),
+        ),
+        "ExecuteIndirect" => {
+            r.extend(at(&a[2]));
+            r.extend(at(&a[4]));
+        }
+        "SetPredication" | "RSSetShadingRateImage" => r.extend(at(&a[0])),
+        "BeginRenderPass" => {
+            for t in a[0].as_array().into_iter().flatten() {
+                w.extend(view(&t["view"]));
+                r.extend(at(&t["end"]["resolve"]["src"]));
+                w.extend(at(&t["end"]["resolve"]["dst"]));
+            }
+            w.extend(view(&a[1]["view"]));
+            for end in ["depth_end", "stencil_end"] {
+                r.extend(at(&a[1][end]["resolve"]["src"]));
+                w.extend(at(&a[1][end]["resolve"]["dst"]));
+            }
+        }
+        "BuildRaytracingAccelerationStructure" => {
+            let b = &a[0];
+            w.extend(at(&b["dest"]));
+            w.extend(at(&b["scratch"]));
+            r.extend(at(&b["source"]));
+            let content = &b["inputs"]["content"];
+            r.extend(at(&content["instances"]));
+            for g in content["geometry"].as_array().into_iter().flatten() {
+                let s = &g["shape"];
+                for v in [
+                    &s["transform"],
+                    &s["index_buffer"],
+                    &s["vertex_buffer"]["address"],
+                    &s["buffer"]["address"],
+                ] {
+                    r.extend(at(v));
+                }
+            }
+            w.extend(
+                a[1].as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| at(&p["dest"])),
+            );
+        }
+        "EmitRaytracingAccelerationStructurePostbuildInfo" => {
+            w.extend(
+                a[0].as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| at(&p["dest"])),
+            );
+            r.extend(a[1].as_array().into_iter().flatten().filter_map(at));
+        }
+        "CopyRaytracingAccelerationStructure" => {
+            r.extend(at(&a[1]));
+            w.extend(at(&a[0]));
+        }
+        "DispatchRays" => {
+            let d = &a[0];
+            for table in ["ray_generation", "miss", "hit_groups", "callable"] {
+                r.extend(at(&d[table]["address"]));
+            }
+        }
+        "DispatchGraph" => r.extend(at(&a[0]["input"]["address"])),
+        "SetProgram" => w.extend(at(&a[0]["backing"]["address"])),
+        _ => {}
     }
 }
 
@@ -863,6 +1070,8 @@ CREATE TABLE d12_draw_state(draw INTEGER PRIMARY KEY,pso INTEGER,graphics_root I
 CREATE TABLE d12_descriptor_versions(id INTEGER PRIMARY KEY,heap INTEGER NOT NULL,slot INTEGER NOT NULL,
  kind TEXT NOT NULL,resource INTEGER NOT NULL,counter_resource INTEGER NOT NULL,description TEXT NOT NULL);
 CREATE TABLE d12_submission_descriptors(submission INTEGER NOT NULL,version INTEGER NOT NULL,PRIMARY KEY(submission,version));
+CREATE TABLE d12_first_use(resource INTEGER PRIMARY KEY,submission INTEGER NOT NULL,states_json TEXT NOT NULL,
+ diagnostic TEXT);
 CREATE TABLE d12_upload_versions(submission INTEGER NOT NULL,resource INTEGER NOT NULL,whole INTEGER NOT NULL,
  offset INTEGER NOT NULL,content_json TEXT NOT NULL,PRIMARY KEY(submission,resource,whole,offset));
 "#;

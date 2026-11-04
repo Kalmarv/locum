@@ -50,13 +50,20 @@ pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, initial: Init
         "sample_quality":d.SampleDesc.Quality,"layout":d.Layout.0,"flags":d.Flags.0,
         "heap":heap,"heap_offset":offset,"heap_properties":heap_properties});
     let mut description = description;
-    match initial {
-        Initial::State(s) => description["initial_state"] = json!(s),
-        Initial::Layout(l) => description["initial_layout"] = json!(l),
-    }
+    let initial = match initial {
+        Initial::State(s) => {
+            description["initial_state"] = json!(s);
+            super::states::Access::State(s)
+        }
+        Initial::Layout(l) => {
+            description["initial_layout"] = json!(l);
+            super::states::Access::Layout(l)
+        }
+    };
     if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
         super::journal::resource_address(id, unsafe { resource.GetGPUVirtualAddress() }, d.Width);
     }
+    super::journal::track(id, &description, initial);
     super::journal::describe(id, device, description);
 }
 

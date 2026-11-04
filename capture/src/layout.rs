@@ -115,6 +115,22 @@ pub unsafe fn unpack(sub: &Sub, src: &[u8], dst: *mut u8, row_pitch: usize, dept
     }
 }
 
+/// Joins one subresource's depth and stencil planes, as Direct3D 12 copies them, into the canonical texel of
+/// Direct3D 11's format: for the D24S8 family (4-byte texels) depth in the low 24 bits and stencil in the top byte;
+/// for the D32S8X24 family (8-byte texels) the 32-bit depth, then the stencil byte and three bytes of zero.
+/// `depth` holds 4 bytes a texel and `stencil` 1, both tightly packed.
+pub fn join_depth_stencil(texel_bytes: u32, depth: &[u8], stencil: &[u8], out: &mut Vec<u8>) {
+    for (d, s) in depth.as_chunks::<4>().0.iter().zip(stencil) {
+        if texel_bytes == 8 {
+            out.extend_from_slice(d);
+            out.extend_from_slice(&[*s, 0, 0, 0]);
+        } else {
+            out.extend_from_slice(&d[..3]);
+            out.push(*s);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,6 +155,17 @@ mod tests {
         let subs = texture(28, 4, 4, 4, 2, 1).unwrap();
         assert_eq!(subs[0].size, 4 * 4 * 4 * 4);
         assert_eq!((subs[1].width, subs[1].depth), (2, 2));
+    }
+
+    #[test]
+    fn depth_and_stencil_planes_join_into_direct3d_11_texels() {
+        let depth = [0x11, 0x22, 0x33, 0xEE, 0x44, 0x55, 0x66, 0xEE];
+        let mut out = Vec::new();
+        join_depth_stencil(4, &depth, &[0xA1, 0xA2], &mut out);
+        assert_eq!(out, [0x11, 0x22, 0x33, 0xA1, 0x44, 0x55, 0x66, 0xA2]);
+        out.clear();
+        join_depth_stencil(8, &depth[..4], &[0xA1], &mut out);
+        assert_eq!(out, [0x11, 0x22, 0x33, 0xEE, 0xA1, 0, 0, 0]);
     }
 
     #[test]

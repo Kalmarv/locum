@@ -1,7 +1,7 @@
 //! Continuous list history and per-submission capture. No COM ownership is kept in
 //! the portable history; object IDs survive pointer and descriptor-slot reuse.
 use core::ffi::c_void;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
@@ -108,17 +108,29 @@ struct State {
     uploads: BTreeMap<u64, Upload>,
     cpu_seq: u64,
     next_submission: u64,
-    capture: Option<(PathBuf, model::Frame)>,
+    /// The armed frame, projected one submission at a time.
+    capture: Option<Live>,
     /// The descriptor versions the armed frame's submissions have reported.
     descriptors: super::slots::Known,
     /// The armed frame's constant-buffer views as of its latest submission: (heap, slot) to (resource, begin, end).
     constant_buffers: BTreeMap<(u64, u32), (u64, u64, u64)>,
-    /// The armed frame's upload copies, by submission: on the GPU, or failed with their reason.
-    readbacks: Vec<(u64, Readback)>,
+    /// Every texture's state as the next submission will find it.
+    states: super::states::Tracker,
+    /// Fence values each queue has been told to wait for and no submitted Signal is known to reach, by queue.
+    waits: HashMap<u64, Vec<(u64, u64)>>,
+    /// The highest value submitted to signal each fence, by fence.
+    signals: HashMap<u64, u64>,
 }
-enum Readback {
-    Queued(super::readback::Pending),
-    Failed(Vec<(u64, Value)>),
+
+/// An armed frame: its history so far, projected as it is submitted, and the copies its submissions made.
+struct Live {
+    path: PathBuf,
+    frame: model::Frame,
+    projection: model::Projection,
+    capture: db::Capture,
+    results: super::readback::Results,
+    /// The resources a submission of the frame has used: their first-use copies are made, or given up.
+    used: HashSet<u64>,
 }
 #[derive(Default)]
 struct Upload {
@@ -151,11 +163,25 @@ pub fn describe(id: u64, device: u64, description: Value) {
         object.device = device;
         object.description = description;
         let object = object.clone();
-        if let Some((_, frame)) = s.capture.as_mut() {
-            frame.objects.retain(|o| o.id != id);
-            frame.objects.push(object);
+        if let Some(live) = s.capture.as_mut() {
+            live.projection.describe(id, &object.description);
+            live.frame.objects.retain(|o| o.id != id);
+            live.frame.objects.push(object);
         }
     }
+}
+/// A resource's states from its creation in `initial` (see [`super::states`]).
+pub fn track(id: u64, description: &Value, initial: super::states::Access) {
+    if !enabled() {
+        return;
+    }
+    let format = description["format"].as_u64().unwrap_or(0) as u32;
+    let planes = if locum_capture::format::is_depth_stencil(format) {
+        2
+    } else {
+        1
+    };
+    state().states.create(id, description, initial, planes);
 }
 pub fn owner_device(id: u64) -> u64 {
     state().objects.get(&id).map_or(0, |o| o.device)
@@ -166,6 +192,7 @@ pub fn destroy(id: u64) {
         let mut s = state();
         s.objects.remove(&id);
         s.uploads.remove(&id);
+        s.states.destroy(id);
     }
     super::slots::destroy(id);
     DESTROY_COST.add(start, 0);
@@ -370,56 +397,176 @@ pub unsafe fn submit(
     } else {
         Vec::new()
     };
+    // Every submission's lists, armed or not: the state tracker follows them all.
     let mut lists = Vec::new();
     let mut diagnostics = Vec::new();
-    if armed {
-        for (ordinal, pointer) in unsafe { slice(pointers, count as usize) }.iter().enumerate() {
-            if let Some(data) = super::data(*pointer) {
-                lists.push(data.snapshot().unwrap_or_else(|| {
-                    Arc::new(model::List {
-                        id: data.id,
-                        ..model::List::default()
-                    })
-                }));
-            } else {
-                diagnostics.push(format!(
-                    "submission {id} queue {}: list {ordinal} of {count} has no registered identity",
-                    queue.id
-                ));
-            }
+    for (ordinal, pointer) in unsafe { slice(pointers, count as usize) }.iter().enumerate() {
+        if let Some(data) = super::data(*pointer) {
+            lists.push(data.snapshot().unwrap_or_else(|| {
+                Arc::new(model::List {
+                    id: data.id,
+                    ..model::List::default()
+                })
+            }));
+        } else if armed {
+            diagnostics.push(format!(
+                "submission {id} queue {}: list {ordinal} of {count} has no registered identity",
+                queue.id
+            ));
         }
     }
-    if let Some((_, frame)) = s.capture.as_ref() {
+    let queue_type = s
+        .objects
+        .get(&queue.id)
+        .and_then(|o| o.description["type"].as_i64())
+        .unwrap_or(0) as i32;
+    let State {
+        capture,
+        objects,
+        uploads,
+        constant_buffers,
+        states,
+        waits,
+        signals,
+        ..
+    } = &mut *s;
+    if let Some(live) = capture.as_mut() {
         let start = Instant::now();
-        let copies = upload_copies(
-            &s.uploads,
-            frame.submissions.is_empty(),
-            &lists,
-            s.constant_buffers.values(),
-        );
-        if !copies.is_empty() {
-            let readback = match unsafe { super::readback::submit(real, copies) } {
-                Ok(pending) => Readback::Queued(pending),
-                Err((copies, reason)) => Readback::Failed(super::readback::failed(copies, &reason)),
-            };
-            s.readbacks.push((id, readback));
-        }
-        UPLOAD_COST.add(start, 0);
-    }
-    if let Some((_, frame)) = s.capture.as_mut() {
-        frame.diagnostics.extend(diagnostics);
-        frame.submissions.push(model::Submission {
+        let first = live.frame.submissions.is_empty();
+        live.frame.diagnostics.extend(diagnostics);
+        live.frame.submissions.push(model::Submission {
             id,
             queue: queue.id,
             queue_seq: sequence,
             cpu_seq,
-            lists,
+            lists: lists.clone(),
             descriptors,
             // Filled from the GPU's copies when the capture is written.
             uploads: Vec::new(),
         });
+        let submission = live.frame.submissions.last().expect("pushed");
+        let touched = live.projection.submit(&mut live.capture, submission);
+        let unknown = unsafe { unknown_wait(waits.entry(queue.id).or_default(), signals) };
+        let snapshots = first_uses(live, objects, states, touched, unknown.as_deref());
+        let copies = upload_copies(uploads, first, &lists, constant_buffers.values());
+        if !copies.is_empty() || !snapshots.is_empty() {
+            unsafe { super::readback::submit(real, id, copies, snapshots, &live.results) };
+        }
+        UPLOAD_COST.add(start, 0);
     }
+    // The copies run before these lists, which change states for the next submission.
+    states.execute(&lists, queue_type);
     SUBMISSION_COST.add(start, 0);
+}
+
+/// The first wait this queue has been told of that no submitted Signal and no completed fence value is known to
+/// reach, as the reason its submission's first-use copies cannot be made: the GPU will run work submitted later
+/// first, so the states and contents the copies would find are not yet known. Waits found reached are forgotten.
+unsafe fn unknown_wait(waits: &mut Vec<(u64, u64)>, signals: &HashMap<u64, u64>) -> Option<String> {
+    unsafe { prune(waits, signals) };
+    waits.first().map(|(fence, value)| {
+        format!(
+            "the queue waits for fence {fence} to reach {value}, which nothing submitted yet signals: the GPU runs later work first"
+        )
+    })
+}
+
+/// Forgets the waits a submitted Signal or the fence's completed value reaches.
+unsafe fn prune(waits: &mut Vec<(u64, u64)>, signals: &HashMap<u64, u64>) {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
+    use windows::core::Interface;
+    waits.retain(|&(fence, value)| {
+        let signalled = signals.get(&fence).is_some_and(|&v| v >= value);
+        let completed = super::real(fence)
+            .and_then(|f| f.cast::<ID3D12Fence>().ok())
+            .is_none_or(|f| unsafe { f.GetCompletedValue() } >= value);
+        !(signalled || completed)
+    });
+}
+
+/// The snapshots to copy before a submission's lists: each resource it touches that no earlier submission of the
+/// frame used, unless its contents come another way (upload buffers, copied whole at the first submission;
+/// readback buffers, which only the GPU writes) or cannot be copied, which is recorded with the reason.
+fn first_uses(
+    live: &mut Live,
+    objects: &BTreeMap<u64, model::Object>,
+    states: &super::states::Tracker,
+    touched: Vec<u64>,
+    unknown: Option<&str>,
+) -> Vec<super::readback::Snapshot> {
+    let submission = live.frame.submissions.last().map_or(0, |s| s.id);
+    let mut snapshots = Vec::new();
+    let mut failed = Vec::new();
+    for resource in touched {
+        if !live.used.insert(resource) {
+            continue;
+        }
+        let Some(d) = objects
+            .get(&resource)
+            .map(|o| &o.description)
+            .filter(|d| d["dimension"].is_u64())
+        else {
+            continue;
+        };
+        let n = |key: &str| d[key].as_u64().unwrap_or(0) as u32;
+        // Upload and readback heaps.
+        if matches!(d["heap_properties"]["type"].as_u64(), Some(2 | 3)) {
+            continue;
+        }
+        let texture = n("dimension") > 1;
+        let simultaneous = n("flags") & 0x20 != 0;
+        let format = n("format");
+        let layout = model::layout(d);
+        let why = if let Some(why) = unknown {
+            Some(why.to_string())
+        } else if d["heap_properties"].is_null() {
+            Some("reserved resource: its tile mappings are not tracked yet".to_string())
+        } else if n("sample_count") > 1 {
+            Some("multisampled: copying samples out is not supported yet".to_string())
+        } else if layout.is_none() {
+            Some(format!("format {format} has no canonical layout"))
+        } else if texture && !simultaneous && !states.tracked(resource) {
+            Some("its state is unknown: no creation locum saw".to_string())
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            failed.push((
+                resource,
+                model::FirstUse {
+                    submission,
+                    states: json!([]),
+                    content: Err(why),
+                },
+            ));
+            continue;
+        }
+        let states = states.states(resource).map(<[_]>::to_vec).unwrap_or_default();
+        let planes = if locum_capture::format::is_depth_stencil(format) {
+            2
+        } else {
+            1
+        };
+        let layout = layout.expect("checked");
+        snapshots.push(super::readback::Snapshot {
+            resource,
+            subresources: if texture { layout.len() as u32 * planes } else { 1 },
+            joined: (planes == 2).then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes)),
+            states,
+            layout,
+        });
+    }
+    if !failed.is_empty() {
+        live.results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(super::readback::Batch {
+                submission,
+                contents: failed,
+                ..Default::default()
+            });
+    }
+    snapshots
 }
 
 /// D3D12's largest constant buffer view: 4096 constants of 16 bytes.
@@ -511,8 +658,27 @@ pub fn sync(queue: &Data, sequence: u64, kind: &'static str, fence: *mut c_void,
     let mut s = state();
     s.cpu_seq += 1;
     let cpu_seq = s.cpu_seq;
-    if let Some((_, frame)) = s.capture.as_mut() {
-        frame.sync.push(model::Sync {
+    match kind {
+        "Signal" => {
+            let v = s.signals.entry(fence).or_default();
+            *v = (*v).max(value);
+            for waits in s.waits.values_mut() {
+                waits.retain(|&(f, v)| f != fence || v > value);
+            }
+        }
+        "Wait" => {
+            let State { waits, signals, .. } = &mut *s;
+            let waits = waits.entry(queue.id).or_default();
+            waits.push((fence, value));
+            // Fences the CPU signals are only seen reached by asking them.
+            if waits.len() > 64 {
+                unsafe { prune(waits, signals) };
+            }
+        }
+        _ => {}
+    }
+    if let Some(live) = s.capture.as_mut() {
+        live.frame.sync.push(model::Sync {
             queue: queue.id,
             queue_seq: sequence,
             cpu_seq,
@@ -573,6 +739,12 @@ pub fn present(frame_number: u64) {
             slots,
             s.uploads.len()
         );
+        log!(
+            "D3D12 states: {} textures tracked, {} transitions, {} not from the tracked state",
+            s.states.count(),
+            s.states.transitions,
+            s.states.mismatches
+        );
     }
     drop(last);
     if !enabled() {
@@ -581,13 +753,17 @@ pub fn present(frame_number: u64) {
     let Some(root) = folder() else {
         return;
     };
-    let (finished, readbacks) = {
-        let mut s = state();
-        (s.capture.take(), std::mem::take(&mut s.readbacks))
-    };
-    if let Some((path, frame)) = finished {
+    let finished = state().capture.take();
+    if let Some(Live {
+        path,
+        frame,
+        projection,
+        mut capture,
+        results,
+        ..
+    }) = finished
+    {
         super::log_counts();
-        let mut capture = db::Capture::default();
         capture.meta("api", "d3d12");
         capture.meta("name", path.file_name().unwrap_or_default().to_string_lossy());
         capture.meta("locum", env!("CARGO_PKG_VERSION"));
@@ -603,42 +779,44 @@ pub fn present(frame_number: u64) {
         capture.meta("capture_status", "incomplete");
         capture.meta(
             "verification_scope",
-            "command history; resource checkpoints not yet implemented",
+            "command history and first-use contents; pass-end checkpoints not yet implemented",
         );
-        let mut prepared = frame.prepare(&mut capture);
+        let mut prepared = frame.finish(&mut capture, projection);
         capture.gap(
             "d3d12-capture-development",
-            "GPU first-use/pass-end checkpoints and full pipeline inspection are in development",
+            "GPU pass-end checkpoints and full pipeline inspection are in development",
             1,
         );
-        // The same "capture written" / "capture NOT written" lines as Direct3D 11's: runners wait for them.
-        writer::run(move || {
-            let t = std::time::Instant::now();
-            // The upload copies finish on the GPU soon after the frame; reading them waits here, off the game's threads.
-            for (submission, readback) in readbacks {
-                let uploads = match readback {
-                    Readback::Queued(pending) => super::readback::collect(pending),
-                    Readback::Failed(uploads) => uploads,
-                };
-                prepared.set_uploads(submission, uploads);
-            }
-            prepared.contents(&mut capture, &crate::settings::settings().blobs);
-            capture.d3d12 = Some(prepared);
-            let file = path.join("capture.db");
-            let result = std::fs::create_dir_all(&path)
-                .map_err(|e| e.to_string())
-                .and_then(|()| db::write(&file, &capture).map_err(|e| e.to_string()));
-            match result {
-                Ok(()) => log!(
-                    "capture written: {} ({} events, {} draws, {} gaps; {:.1} s after the frame)",
-                    file.display(),
-                    capture.events.len(),
-                    capture.draws.len(),
-                    capture.gaps.len(),
-                    t.elapsed().as_secs_f64()
-                ),
-                Err(e) => log!("capture NOT written to {}: {e}", file.display()),
-            }
+        let t = std::time::Instant::now();
+        // The copies finish on the GPU soon after the frame and the collector reads them in order: the capture is
+        // written after the last, off the game's threads. The same "capture written" / "capture NOT written" lines as
+        // Direct3D 11's: runners wait for them.
+        super::readback::then(move || {
+            writer::run(move || {
+                for batch in std::mem::take(&mut *results.lock().unwrap_or_else(|e| e.into_inner())) {
+                    prepared.add_uploads(batch.submission, batch.uploads);
+                    for (resource, first) in batch.contents {
+                        prepared.set_first_use(resource, first);
+                    }
+                }
+                prepared.contents(&mut capture, &crate::settings::settings().blobs);
+                capture.d3d12 = Some(prepared);
+                let file = path.join("capture.db");
+                let result = std::fs::create_dir_all(&path)
+                    .map_err(|e| e.to_string())
+                    .and_then(|()| db::write(&file, &capture).map_err(|e| e.to_string()));
+                match result {
+                    Ok(()) => log!(
+                        "capture written: {} ({} events, {} draws, {} gaps; {:.1} s after the frame)",
+                        file.display(),
+                        capture.events.len(),
+                        capture.draws.len(),
+                        capture.gaps.len(),
+                        t.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => log!("capture NOT written to {}: {e}", file.display()),
+                }
+            })
         });
     }
     let request = root.join("capture");
@@ -665,14 +843,18 @@ pub fn present(frame_number: u64) {
         let mut s = state();
         s.descriptors.clear();
         s.constant_buffers.clear();
-        s.readbacks.clear();
-        s.capture = Some((
+        let objects: Vec<_> = s.objects.values().cloned().collect();
+        s.capture = Some(Live {
             path,
-            model::Frame {
-                objects: s.objects.values().cloned().collect(),
+            projection: model::Projection::new(&objects),
+            frame: model::Frame {
+                objects,
                 ..model::Frame::default()
             },
-        ));
+            capture: db::Capture::default(),
+            results: Default::default(),
+            used: HashSet::new(),
+        });
         log!("D3D12 capture armed at Present {frame_number}; cached list history retained");
     }
 }
