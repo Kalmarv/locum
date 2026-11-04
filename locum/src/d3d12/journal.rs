@@ -586,12 +586,27 @@ fn first_uses(
         if !live.used.insert(resource) {
             continue;
         }
-        let Some(d) = objects
-            .get(&resource)
-            .map(|o| &o.description)
-            .filter(|d| d["dimension"].is_u64())
-        else {
-            continue;
+        // Every resource an event names gets a copy or a reason: none is skipped unsaid.
+        let d = match objects.get(&resource).map(|o| &o.description) {
+            Some(d) if d["dimension"].is_u64() => d,
+            found => {
+                let why = if found.is_none() {
+                    // A descriptor table can keep naming a resource destroyed since its view was written; a shader
+                    // that read it would be reading freed memory, so this is most likely a slot it never reads.
+                    "destroyed before the submission that names it (a stale descriptor)"
+                } else {
+                    "no description: locum did not see its creation"
+                };
+                failed.push((
+                    resource,
+                    model::FirstUse {
+                        submission,
+                        states: json!([]),
+                        content: Err(why.to_string()),
+                    },
+                ));
+                continue;
+            }
         };
         let n = |key: &str| d[key].as_u64().unwrap_or(0) as u32;
         // Upload and readback heaps.

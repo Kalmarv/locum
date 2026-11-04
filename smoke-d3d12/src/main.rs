@@ -525,20 +525,31 @@ unsafe fn journal_capture(
 ) {
     unsafe {
         let dir = std::path::PathBuf::from(std::env::var_os("LOCUM_DIR").expect("smoke LOCUM_DIR"));
-        let range = D3D12_DESCRIPTOR_RANGE {
-            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
-            NumDescriptors: 1,
-            BaseShaderRegister: 3,
-            RegisterSpace: 7,
-            OffsetInDescriptorsFromTableStart: 0,
-        };
+        // The table's SRVs name buffers destroyed after their views were written, as engines leave table slots their
+        // shaders do not read: the capture must say so rather than skip them.
+        let ranges = [
+            D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+                NumDescriptors: 1,
+                BaseShaderRegister: 3,
+                RegisterSpace: 7,
+                OffsetInDescriptorsFromTableStart: 0,
+            },
+            D3D12_DESCRIPTOR_RANGE {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                NumDescriptors: 2,
+                BaseShaderRegister: 0,
+                RegisterSpace: 7,
+                OffsetInDescriptorsFromTableStart: 1,
+            },
+        ];
         let parameters = [
             D3D12_ROOT_PARAMETER {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
                 Anonymous: D3D12_ROOT_PARAMETER_0 {
                     DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                        NumDescriptorRanges: 1,
-                        pDescriptorRanges: &range,
+                        NumDescriptorRanges: ranges.len() as u32,
+                        pDescriptorRanges: ranges.as_ptr(),
                     },
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
@@ -610,7 +621,7 @@ unsafe fn journal_capture(
         let gpu_heap: ID3D12DescriptorHeap = device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 1,
+                NumDescriptors: 3,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 ..Default::default()
             })
@@ -625,6 +636,30 @@ unsafe fn journal_capture(
             cpu,
         );
         device.CopyDescriptorsSimple(1, gpu, cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        // `early` is destroyed before the capture is requested, `late` between the arming Present and the submission.
+        let early = buffer(device, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        let late = buffer(device, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON);
+        let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+        for (i, b) in [&early, &late].into_iter().enumerate() {
+            device.CreateShaderResourceView(
+                b,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_UINT,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            NumElements: 64,
+                            ..Default::default()
+                        },
+                    },
+                }),
+                D3D12_CPU_DESCRIPTOR_HANDLE {
+                    ptr: gpu.ptr + (i + 1) * step,
+                },
+            );
+        }
+        drop(early);
         // Overwriting the source must not retroactively change the copied destination.
         device.CreateConstantBufferView(
             Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC {
@@ -658,6 +693,7 @@ unsafe fn journal_capture(
             "TEST present must not consume a capture"
         );
         chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        drop(late);
         queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
         finish(queue, fence, 6);
         verify_fill(&readback, 0x11);
@@ -703,11 +739,11 @@ unsafe fn journal_capture(
         let db = rusqlite::Connection::open(&path).unwrap();
         for (query, expected) in [
             ("SELECT count(*) FROM d12_submissions", 3),
-            // Each submission records the descriptor definitions that changed since the previous one: all three
-            // at the first, the copied CBV at the second, nothing at the third.
+            // Each submission records the descriptor definitions that changed since the previous one: all five
+            // at the first (the stale SRVs' too), the copied CBV at the second, nothing at the third.
             (
                 "SELECT count(*) FROM d12_submission_descriptors WHERE submission=(SELECT min(id) FROM d12_submissions)",
-                3,
+                5,
             ),
             (
                 "SELECT count(*) FROM d12_submission_descriptors WHERE submission=(SELECT min(id) FROM d12_submissions)+1",
@@ -723,6 +759,11 @@ unsafe fn journal_capture(
             ("SELECT count(*) FROM draws WHERE args='[2,3,1]'", 2),
             ("SELECT count(*) FROM draws WHERE args='[7,1,1]'", 1),
             ("SELECT count(*) FROM pragma_foreign_key_check", 0),
+            // The slot naming `late`, destroyed after the frame was armed, says why it has no contents.
+            (
+                "SELECT count(*) FROM resources WHERE content IS NULL AND content_note LIKE 'destroyed before the submission%'",
+                1,
+            ),
             ("SELECT count(*) FROM draws WHERE cs IS NOT NULL", 3),
             (
                 "SELECT count(*) FROM bindings WHERE stage='cs' AND kind='cb' AND space=7",

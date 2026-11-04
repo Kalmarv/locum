@@ -321,6 +321,11 @@ unsafe fn contents(
 }
 
 /// Why a subresource in `state` cannot be copied on a queue of `kind`, if it cannot.
+///
+/// A legacy state a compute list may not name (PIXEL_SHADER_RESOURCE, say) cannot be got around with an enhanced
+/// barrier either: legacy states map to internal LEGACY_* layouts, and an enhanced Barrier may name a subresource in
+/// a legacy state only once it is in COMMON (the Enhanced Barriers spec, "Legacy layouts"). Such a copy has to be
+/// made on a direct queue.
 fn unreadable(state: Access, kind: D3D12_COMMAND_LIST_TYPE) -> Option<String> {
     match state {
         Access::State(s) => {
