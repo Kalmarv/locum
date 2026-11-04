@@ -344,6 +344,56 @@ pub fn decode(format: u32, width: u32, height: u32, bytes: &[u8]) -> Result<Imag
     })
 }
 
+/// One channel of an element: integer formats' exactly, the rest as floats.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Number {
+    Float(f32),
+    Uint(u32),
+    Sint(i32),
+}
+
+/// The channels of one element of `format` at the start of `bytes` (a vertex attribute, one texel), as many as the
+/// format has.
+pub fn element(format: u32, bytes: &[u8]) -> Result<Vec<Number>, String> {
+    let size = format::layout(format)
+        .filter(|l| l.block_width == 1 && l.block_height == 1)
+        .map(|l| l.block_bytes as usize)
+        .ok_or_else(|| format!("{} is not a format of single elements", format::name(format)))?;
+    let bytes = bytes
+        .get(..size)
+        .ok_or_else(|| format!("{} bytes, {size} needed", bytes.len()))?;
+    if let Some((n, bits, kind @ (Kind::Uint | Kind::Sint))) = plain(format) {
+        let width = (bits / 8) as usize;
+        return Ok((0..usize::from(n))
+            .map(|c| {
+                let b = &bytes[c * width..];
+                match (bits, kind) {
+                    (32, Kind::Uint) => Number::Uint(u32::from_le_bytes(b[..4].try_into().unwrap())),
+                    (32, _) => Number::Sint(i32::from_le_bytes(b[..4].try_into().unwrap())),
+                    (16, Kind::Uint) => {
+                        Number::Uint(u32::from(u16::from_le_bytes(b[..2].try_into().unwrap())))
+                    }
+                    (16, _) => Number::Sint(i32::from(i16::from_le_bytes(b[..2].try_into().unwrap()))),
+                    (_, Kind::Uint) => Number::Uint(u32::from(b[0])),
+                    _ => Number::Sint(i32::from(b[0] as i8)),
+                }
+            })
+            .collect());
+    }
+    if format == 25 {
+        // R10G10B10A2_UINT
+        let v = u32::from_le_bytes(bytes[..4].try_into().unwrap());
+        return Ok([v & 1023, (v >> 10) & 1023, (v >> 20) & 1023, v >> 30]
+            .map(Number::Uint)
+            .to_vec());
+    }
+    let image = decode(format, 1, 1, bytes)?;
+    Ok(image.texels[0][..usize::from(image.channels)]
+        .iter()
+        .map(|&v| Number::Float(v))
+        .collect())
+}
+
 impl Image {
     /// Channel `c` (0 to 3) alone, as a single-channel image.
     pub fn channel(&self, c: usize) -> Image {
@@ -455,6 +505,43 @@ impl Image {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elements_keep_integers_exact() {
+        use Number::*;
+        // R32G32B32_FLOAT
+        let mut b = Vec::new();
+        for v in [1.5f32, -2.0, 0.25] {
+            b.extend(v.to_le_bytes());
+        }
+        assert_eq!(element(6, &b).unwrap(), [Float(1.5), Float(-2.0), Float(0.25)]);
+        // R32_UINT past what a float holds exactly, R16G16_SINT, R8G8B8A8_UINT
+        assert_eq!(
+            element(42, &16_777_217u32.to_le_bytes()).unwrap(),
+            [Uint(16_777_217)]
+        );
+        assert_eq!(element(38, &[0xff, 0xff, 2, 0]).unwrap(), [Sint(-1), Sint(2)]);
+        assert_eq!(
+            element(30, &[1, 2, 3, 250]).unwrap(),
+            [Uint(1), Uint(2), Uint(3), Uint(250)]
+        );
+        // R8G8B8A8_SNORM, R16G16_FLOAT (1.0, -0.5)
+        assert_eq!(
+            element(31, &[127, 0x81, 0, 0]).unwrap()[..2],
+            [Float(1.0), Float(-1.0)]
+        );
+        assert_eq!(
+            element(34, &[0, 0x3c, 0, 0xb8]).unwrap(),
+            [Float(1.0), Float(-0.5)]
+        );
+        // R10G10B10A2_UINT
+        assert_eq!(
+            element(25, &(1u32 | 2 << 10 | 3 << 20 | 1 << 30).to_le_bytes()).unwrap(),
+            [Uint(1), Uint(2), Uint(3), Uint(1)]
+        );
+        assert!(element(6, &[0; 8]).is_err());
+        assert!(element(71, &[0; 8]).is_err());
+    }
 
     #[test]
     fn channel_crop_and_content() {

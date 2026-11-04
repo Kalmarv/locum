@@ -20,6 +20,7 @@ mod shaders;
 mod states;
 mod trace;
 mod upgrade;
+mod vertices;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -222,6 +223,35 @@ enum Command {
         /// `--name SC_CameraPos`, `--name 'NormalMapScroll|waveTime'`. Across draws: `constants`.
         #[arg(long)]
         name: Option<String>,
+    },
+    /// What a draw fed its vertex shader: each vertex it reads, in order, its attributes decoded through the input
+    /// layout from the bound vertex buffers as the draw saw them (a buffer the frame wrote before the draw is
+    /// replayed, as `export --at` does). A tab-separated row each; the buffers and layout are told on stderr.
+    Vertices {
+        capture: String,
+        /// The draw's number or `last`.
+        draw: String,
+        /// The first of the draw's vertices (by its place in the draw) to list.
+        #[arg(long, default_value_t = 0)]
+        from: u64,
+        /// List at most this many; 0 lists them all.
+        #[arg(long, default_value_t = 64)]
+        limit: u64,
+        /// Each vertex once, in the order the draw first reads it (an indexed draw reads most several times).
+        #[arg(long)]
+        unique: bool,
+        /// The instance whose per-instance attributes are shown.
+        #[arg(long, default_value_t = 0)]
+        instance: u64,
+        /// The buffers' contents as the frame began, even when the frame wrote them before the draw (no replay).
+        #[arg(long)]
+        frame_start: bool,
+        /// Replay on WARP.
+        #[arg(long)]
+        warp: bool,
+        /// As JSON: the draw's counts, buffers, layout and each vertex's values by element.
+        #[arg(long)]
+        json: bool,
     },
     /// Where a value sits in the frame's constants: each buffer, register, name and the draws that saw it.
     Find {
@@ -751,6 +781,29 @@ fn run(cli: Cli) -> Result<(), String> {
             raw,
             json,
             &draw::Only { registers: reg, name },
+        ),
+        Command::Vertices {
+            capture,
+            draw,
+            from,
+            limit,
+            unique,
+            instance,
+            frame_start,
+            warp,
+            json,
+        } => vertices::vertices(
+            &open(&capture)?,
+            &draw,
+            &vertices::Options {
+                from,
+                limit,
+                unique,
+                instance,
+                frame_start,
+                warp,
+                json,
+            },
         ),
         Command::Find {
             capture,

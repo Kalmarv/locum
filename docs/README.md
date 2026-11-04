@@ -251,6 +251,12 @@ locum-cli trace last 120 rt1.z            # what target 1's blue lane is made of
                                            # address (a coordinate, an index) or only through a condition. Lanes:
                                            # SV_Target1.z, rt1, o1.z, depth, SV_Position.z, discard; none: all
 locum-cli shader last 9f2c --trace o1.z   # the same for one program, to its own inputs
+locum-cli vertices last 120 --limit 8      # what the draw fed its vertex shader: each vertex in the order it reads
+                                           # them (index, vertex, then every input-layout element decoded from its
+                                           # format, integers exact), from the bound buffers as the draw saw them (a
+                                           # buffer the frame wrote first is replayed; --frame-start does not);
+                                           # --unique, --from N, --limit 0 for all, --instance K, --json. An
+                                           # indirect draw's counts are read from its argument buffer
 locum-cli draw last all --json > d.jsonl   # every draw as JSON, one per line (also: draw N --json, cb --json,
                                            # trace --json, shader --json with every constant by its full name);
                                            # `bindings` and `constants` are the smaller routes for a census

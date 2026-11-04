@@ -149,18 +149,8 @@ struct Bound {
 struct Draw {
     n: i64,
     bindings: HashMap<Slot, Bound>,
-    layout: Vec<Element>,
+    layout: Vec<crate::vertices::Element>,
     bytes: HashMap<String, Vec<u8>>,
-}
-
-/// An input-layout element.
-struct Element {
-    semantic: String,
-    index: u32,
-    slot: u32,
-    offset: u32,
-    format: u32,
-    per_instance: bool,
 }
 
 impl Draw {
@@ -178,28 +168,10 @@ impl Draw {
                 ))
             },
         );
-        let json: Option<String> = layout.and_then(|id| {
-            c.row("SELECT json FROM states WHERE id = ?1", [id], |r| r.get(0))
-                .flatten()
-        });
-        let elements: Vec<Value> = json
-            .and_then(|j| serde_json::from_str(&j).ok())
-            .unwrap_or_default();
-        let number = |e: &Value, k: &str| e[k].as_u64().unwrap_or(0) as u32;
         Draw {
             n,
             bindings: bindings.into_iter().collect(),
-            layout: elements
-                .iter()
-                .map(|e| Element {
-                    semantic: e["semantic"].as_str().unwrap_or_default().to_string(),
-                    index: number(e, "index"),
-                    slot: number(e, "slot"),
-                    offset: number(e, "offset"),
-                    format: number(e, "format"),
-                    per_instance: e["per_instance"].as_bool().unwrap_or(false),
-                })
-                .collect(),
+            layout: crate::vertices::elements(c, layout),
             bytes: HashMap::new(),
         }
     }
