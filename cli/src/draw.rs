@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::describe::{self, Reflection, STAGE_ORDER, register_name, shape, short, value};
 use crate::draws::shader_of;
+use crate::join::Vb;
 use crate::open::Capture;
 use crate::out;
 use crate::states;
@@ -258,7 +259,14 @@ pub fn number(bytes: [u8; 4], base: Option<u16>) -> Value {
 
 /// What a vertex or index binding's bytes were made from when no file is the whole buffer: for indices, the ones the
 /// draw reads (a FLVER face set) before the bound range (its data block); for vertices, the bound range.
-fn range_name(c: &Capture, r: i64, b: &Row, call: &str, args: &str) -> Option<crate::join::Match> {
+fn range_name(
+    c: &Capture,
+    r: i64,
+    b: &Row,
+    call: &str,
+    args: &str,
+    vbs: &[Vb],
+) -> Option<crate::join::Match> {
     let (offset, size) = (u64::try_from(b.offset?).ok()?, u64::try_from(b.size?).ok()?);
     match b.kind.as_str() {
         "vb" => c.names.range(c, r, offset, size),
@@ -266,7 +274,7 @@ fn range_name(c: &Capture, r: i64, b: &Row, call: &str, args: &str) -> Option<cr
             let width: u64 = match b.format? {
                 57 => 2,
                 42 => 4,
-                _ => return c.names.range(c, r, offset, size),
+                _ => return c.names.indices(c, r, offset, size, vbs),
             };
             let a: Vec<u64> = serde_json::from_str::<Vec<Value>>(args)
                 .unwrap_or_default()
@@ -279,9 +287,10 @@ fn range_name(c: &Capture, r: i64, b: &Row, call: &str, args: &str) -> Option<cr
                 "DrawIndexedInstanced" => a.first().zip(a.get(2)),
                 _ => None,
             };
-            let drawn =
-                drawn.and_then(|(&count, &start)| c.names.range(c, r, offset + start * width, count * width));
-            let bound = c.names.range(c, r, offset, size);
+            let drawn = drawn.and_then(|(&count, &start)| {
+                c.names.indices(c, r, offset + start * width, count * width, vbs)
+            });
+            let bound = c.names.indices(c, r, offset, size, vbs);
             // The one fewer files share: a face set's indices are often the same in models of one shape, the data
             // block holding them seldom.
             match (drawn, bound) {
@@ -403,6 +412,11 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
 
     let rows = rows(c, n);
     let mut bindings = Vec::with_capacity(rows.len());
+    let vbs: Vec<Vb> = rows
+        .iter()
+        .filter(|b| b.kind == "vb")
+        .filter_map(|b| Some((b.resource?, b.offset, b.size)))
+        .collect();
     for b in &rows {
         let (name, used) = if matches!(b.kind.as_str(), "srv" | "uav" | "sampler" | "cb")
             && let Some(shader) = shader_of(c, n, &b.stage)
@@ -445,7 +459,11 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
             shape: b.resource.and_then(|r| shape(c, r)).map(|s| s.to_string()),
             file: b
                 .resource
-                .and_then(|r| c.names.of(c, r).or_else(|| range_name(c, r, b, &call, &args)))
+                .and_then(|r| {
+                    c.names
+                        .of(c, r)
+                        .or_else(|| range_name(c, r, b, &call, &args, &vbs))
+                })
                 .map(|m| match m.others {
                     0 => m.file.name.clone(),
                     n => format!("{} (+{n} with the same bytes)", m.file.name),

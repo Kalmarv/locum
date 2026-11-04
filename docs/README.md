@@ -334,7 +334,10 @@ locum-cli --index files.db draw last 120   # bound resources are shown with thei
 A resource is matched by its upload, its contents, or subresource by subresource (a texture made from fewer mips
 than its file holds, or from one face). A buffer no file is whole is matched range by range: each vertex range a
 draw binds, and for indices the ones the draw reads (a face set) or the bound range, whichever fewer files share; a
-game that uploads a model's data block padded, or many models into one pool, is named this way. `LOCUM_INDEX` (paths
+game that uploads a model's data block padded, or many models into one pool, is named this way. Index bytes alone
+name nothing, since a quad's or a grid's indices are the same in any engine's meshes: a match the frame binds only as
+indices needs some of its bytes bound as vertices too (a data block holding both), or the draw's vertex data named
+from the same file (the part of a key-list name before `#`). `LOCUM_INDEX` (paths
 separated by `;`) stands in for `--index`. A game's own extractor can add what it reads from its archives through
 `locum_capture::index`, or list keys for `--keys`: fromsoft-formats' `flver_keys` example lists every FLVER's data
 block, vertex buffers and face sets in Sekiro's or Elden Ring's archives.

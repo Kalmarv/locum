@@ -49,6 +49,25 @@ impl std::fmt::Display for Match {
     }
 }
 
+/// A vertex binding: its resource, offset and size.
+pub type Vb = (i64, Option<i64>, Option<i64>);
+
+/// Whether the frame binds any of bytes `offset..offset + len` of buffer `id` as vertices.
+fn holds_vertices(c: &Capture, id: i64, offset: u64, len: u64) -> bool {
+    let end = i64::try_from(offset.saturating_add(len)).unwrap_or(i64::MAX);
+    let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+    c.count(
+        "SELECT count(*) FROM bindings WHERE resource = ?1 AND kind = 'vb' \
+         AND coalesce(offset, 0) < ?3 AND (size IS NULL OR coalesce(offset, 0) + size > ?2)",
+        rusqlite::params![id, offset, end],
+    ) > 0
+}
+
+/// The file a key list's name is part of: the name up to `#` (`m.flver#vb0` is part of `m.flver`).
+fn file_part(name: &str) -> &str {
+    name.split('#').next().unwrap_or(name)
+}
+
 #[derive(Default)]
 pub struct Names {
     indexes: Vec<Index>,
@@ -80,6 +99,39 @@ impl Names {
             how: format!("bytes {offset}..{end}"),
             others,
         })
+    }
+
+    /// What the bytes at `offset` of buffer `id`, bound as indices, were made from. Index lists alone name nothing: two
+    /// triangles of a quad, or a grid's rows, are the same bytes in any engine's meshes. So the match must hold bytes the
+    /// frame binds as vertices too (a FLVER's data block, indices and vertices in one), or vertex data bound with the
+    /// indices (`vbs`: each vertex binding's resource, offset and size) must name the same file.
+    pub fn indices(&self, c: &Capture, id: i64, offset: u64, len: u64, vbs: &[Vb]) -> Option<Match> {
+        let m = self.range(c, id, offset, len)?;
+        (holds_vertices(c, id, offset, len) || self.agrees(c, &m, vbs)).then_some(m)
+    }
+
+    /// Whether one of `vbs` is named from the same file as `m` (the names' part before `#`: a key list names the
+    /// parts of a file `file#part`).
+    fn agrees(&self, c: &Capture, m: &Match, vbs: &[Vb]) -> bool {
+        vbs.iter().any(|&(r, offset, size)| {
+            let named = self.of(c, r).or_else(|| {
+                let (o, n) = (u64::try_from(offset?).ok()?, u64::try_from(size?).ok()?);
+                self.range(c, r, o, n)
+            });
+            named.is_some_and(|v| file_part(&v.file.name) == file_part(&m.file.name))
+        })
+    }
+
+    /// The vertex bindings of the draws that bind buffer `id` as indices (at `range`, or anywhere).
+    pub fn vertices_beside(c: &Capture, id: i64, range: Option<(i64, i64)>) -> Vec<Vb> {
+        let (offset, size) = range.unzip();
+        c.rows(
+            "SELECT DISTINCT v.resource, v.offset, v.size FROM bindings b JOIN bindings v ON v.draw = b.draw \
+             AND v.kind = 'vb' AND v.resource IS NOT NULL WHERE b.resource = ?1 AND b.kind = 'ib' \
+             AND (?2 IS NULL OR (b.offset = ?2 AND b.size = ?3))",
+            rusqlite::params![id, offset, size],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
     }
 
     fn contents_of(&self, c: &Capture, id: i64) -> Option<Rc<Vec<u8>>> {
@@ -120,7 +172,19 @@ impl Names {
         if let Some(m) = self.cache.borrow().get(&id) {
             return m.clone();
         }
-        let m = self.find(c, id);
+        let mut m = self.find(c, id);
+        // A buffer the frame binds only as indices is named only when its draws' vertex data agrees (see `indices`).
+        if let Some(found) = &m
+            && found.file.kind == "buffer"
+            && !holds_vertices(c, id, 0, u64::MAX)
+            && c.count(
+                "SELECT count(*) FROM bindings WHERE resource = ?1 AND kind = 'ib'",
+                [id],
+            ) > 0
+            && !self.agrees(c, found, &Names::vertices_beside(c, id, None))
+        {
+            m = None;
+        }
         self.cache.borrow_mut().insert(id, m.clone());
         m
     }
@@ -283,15 +347,24 @@ pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), Str
 /// The distinct (offset, size) ranges the frame's draws bound buffer `id` at as vertices or indices, each with what
 /// an index names it.
 fn bound_ranges(c: &Capture, id: i64) -> Vec<((i64, i64), Option<Match>)> {
-    let ranges: Vec<(i64, i64)> = c.rows(
-        "SELECT DISTINCT offset, size FROM bindings WHERE resource = ?1 AND kind IN ('vb', 'ib') \
-         AND offset IS NOT NULL AND size > 0 ORDER BY offset, size",
+    // Each range once, with whether any draw binds it as indices.
+    let ranges: Vec<(bool, i64, i64)> = c.rows(
+        "SELECT max(kind = 'ib'), offset, size FROM bindings WHERE resource = ?1 AND kind IN ('vb', 'ib') \
+         AND offset IS NOT NULL AND size > 0 GROUP BY offset, size ORDER BY offset, size",
         [id],
-        |r| Ok((r.get(0)?, r.get(1)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     );
     ranges
         .into_iter()
-        .map(|(o, n)| ((o, n), c.names.range(c, id, o as u64, n as u64)))
+        .map(|(indices, o, n)| {
+            let m = if indices {
+                let vbs = Names::vertices_beside(c, id, Some((o, n)));
+                c.names.indices(c, id, o as u64, n as u64, &vbs)
+            } else {
+                c.names.range(c, id, o as u64, n as u64)
+            };
+            ((o, n), m)
+        })
         .collect()
 }
 
