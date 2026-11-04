@@ -47,6 +47,9 @@ pub(super) fn run() -> Result<()> {
     if std::env::args().any(|a| a == "--maps") {
         return maps(&device, &deferred);
     }
+    if std::env::args().any(|a| a == "--state") {
+        return state(&device, &deferred);
+    }
     let cb = constant_buffer(&device, false)?;
     let sh = Shaders::new(&device)?;
     let (_, rtv) = target(&device)?;
@@ -75,6 +78,118 @@ pub(super) fn run() -> Result<()> {
             after as i64 - before as i64
         );
         drop(lists);
+    }
+    Ok(())
+}
+
+/// Lists of state-heavy draws, as games record them: per draw, nine calls that bind shader resources, samplers,
+/// constant and vertex buffers, blend state, a viewport and a shader. Recording and releasing the lists are timed
+/// apart: a list's recording is freed when the application releases it.
+fn state(device: &ID3D11Device, deferred: &ID3D11DeviceContext) -> Result<()> {
+    let sh = Shaders::new(device)?;
+    let (_, rtv) = target(device)?;
+    let cb = constant_buffer(device, false)?;
+    let mut texture = None;
+    unsafe {
+        device.CreateTexture2D(
+            &D3D11_TEXTURE2D_DESC {
+                Width: 4,
+                Height: 4,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+                ..Default::default()
+            },
+            None,
+            Some(&mut texture),
+        )
+    }?;
+    let texture = texture.unwrap();
+    let mut srv = None;
+    unsafe { device.CreateShaderResourceView(&texture, None, Some(&mut srv)) }?;
+    let srvs: Vec<Option<ID3D11ShaderResourceView>> = vec![srv; 8];
+    let mut sampler = None;
+    unsafe {
+        device.CreateSamplerState(
+            &D3D11_SAMPLER_DESC {
+                Filter: D3D11_FILTER_MIN_MAG_MIP_POINT,
+                AddressU: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressV: D3D11_TEXTURE_ADDRESS_CLAMP,
+                AddressW: D3D11_TEXTURE_ADDRESS_CLAMP,
+                MaxLOD: f32::MAX,
+                ..Default::default()
+            },
+            Some(&mut sampler),
+        )
+    }?;
+    let samplers = vec![sampler; 4];
+    let mut vb = None;
+    unsafe {
+        device.CreateBuffer(
+            &D3D11_BUFFER_DESC {
+                ByteWidth: 256,
+                Usage: D3D11_USAGE_DEFAULT,
+                BindFlags: D3D11_BIND_VERTEX_BUFFER.0 as u32,
+                ..Default::default()
+            },
+            None,
+            Some(&mut vb),
+        )
+    }?;
+    let vbs = [vb.clone(), vb];
+    let (strides, offsets) = ([16u32, 16], [0u32, 0]);
+    let cbs = [Some(cb.clone()), Some(cb.clone())];
+    let mut blend = None;
+    unsafe { device.CreateBlendState(&D3D11_BLEND_DESC::default(), Some(&mut blend)) }?;
+    let blend = blend.unwrap();
+    let viewport = D3D11_VIEWPORT {
+        Width: 64.0,
+        Height: 64.0,
+        MaxDepth: 1.0,
+        ..Default::default()
+    };
+    for trial in 0..6 {
+        let before = private_bytes();
+        let started = std::time::Instant::now();
+        let mut lists = Vec::new();
+        for _ in 0..100 {
+            sh.bind(deferred, &rtv, &cb);
+            for _ in 0..500 {
+                unsafe {
+                    deferred.PSSetShaderResources(0, Some(&srvs));
+                    deferred.PSSetSamplers(0, Some(&samplers));
+                    deferred.VSSetConstantBuffers(0, Some(&cbs));
+                    deferred.PSSetConstantBuffers(0, Some(&cbs));
+                    deferred.IASetVertexBuffers(
+                        0,
+                        2,
+                        Some(vbs.as_ptr()),
+                        Some(strides.as_ptr()),
+                        Some(offsets.as_ptr()),
+                    );
+                    deferred.OMSetBlendState(&blend, Some(&[1.0; 4]), u32::MAX);
+                    deferred.RSSetViewports(Some(&[viewport]));
+                    deferred.PSSetShader(&sh.ps, None);
+                    deferred.Draw(3, 0);
+                }
+            }
+            let mut list = None;
+            unsafe { deferred.FinishCommandList(false, Some(&mut list)) }?;
+            lists.push(list.unwrap());
+        }
+        let recorded = started.elapsed();
+        let after = private_bytes();
+        let released = std::time::Instant::now();
+        drop(lists);
+        println!(
+            "trial {trial}: 100 lists, 50000 draws with 400000 state calls: recorded in {:.3} ms, released in {:.3} ms, private bytes delta {}",
+            recorded.as_secs_f64() * 1000.,
+            released.elapsed().as_secs_f64() * 1000.,
+            after as i64 - before as i64
+        );
     }
     Ok(())
 }

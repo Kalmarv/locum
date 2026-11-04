@@ -183,6 +183,12 @@ probed mapping calls with `E_INVALIDARG`, so this is an observed runtime limitat
 `locum-smoke --record-bench` measures the real unarmed recorder: 100 retained lists, each with 500 draws and 500 CPU
 uploads, six trials, with elapsed time and process-private memory. Run the same executable beside baseline/new DLLs
 (and with `--warp`) to compare recorder cost without submitting any of those lists to the GPU.
+Add `--state` for lists of state-heavy draws as games record them, nine calls per draw that bind shader resources,
+samplers, constant and vertex buffers, blend state, a viewport and a shader, with recording and release timed apart.
+A deferred list's calls are written end to end on one tape of 8-byte cells, arrays and object pointers inline, with
+a reference held once per object (a small table of objects the tape already holds skips the rest), so recording a
+call allocates nothing once the tape has grown and releasing a list frees a few buffers. On hardware, 400,000 state
+calls record in 24 ms and release in 2 ms, against 51 and 29 ms with one allocation per call, and 8 ms native.
 Add `--maps` for four trials of 4/16 MiB dynamic buffers: one DISCARD followed by 255 small NO_OVERWRITE writes,
 both within pages and across pages, plus repeated 16 MiB DISCARD maps with 64-byte writes. It reports us/map,
 FinishCommandList time, and private-memory deltas before and after Finish. The old full-shadow implementation can

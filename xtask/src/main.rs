@@ -1520,16 +1520,13 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
             if owning || special || unsupported {
                 before.push_str("    let object = unsafe { &*(this as *const T) };\n    let recorder = object.recorder();\n    if let Some(r) = recorder { unsafe { r.begin(object.inner()) }; }\n");
             }
-            if owning {
-                writeln!(before, "    let command = recorder.map(|_| unsafe {{ crate::vtables::recorded_context::Command::capture_{}({}) }});", e.name, args.join(", ")).unwrap();
-            }
             let condition = if e.ret.is_some() { "result.is_ok() && " } else { "" };
             let mut after = String::new();
             if unsupported {
                 writeln!(after,"    if {condition}let Some(r) = recorder {{ r.gap(\"{} cannot be reconstructed exactly\"); }}",e.name).unwrap();
             }
             if owning {
-                writeln!(after,"    if {condition}let (Some(r), Some(command)) = (recorder, command) {{ r.push(command); }}").unwrap();
+                writeln!(after,"    if {condition}let Some(r) = recorder {{ r.record(|tape| unsafe {{ tape.{}({}) }}); }}", e.name, args.join(", ")).unwrap();
             }
             let call = format!(
                 "unsafe {{ (*(this as *const T)).{}({}) }}",

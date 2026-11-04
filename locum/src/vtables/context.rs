@@ -2913,12 +2913,9 @@ unsafe extern "system" fn VSSetConstantBuffers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_VSSetConstantBuffers(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).VSSetConstantBuffers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.VSSetConstantBuffers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn PSSetShaderResources<T: ContextMethods>(
@@ -2932,12 +2929,9 @@ unsafe extern "system" fn PSSetShaderResources<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_PSSetShaderResources(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).PSSetShaderResources(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.PSSetShaderResources(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn PSSetShader<T: ContextMethods>(
@@ -2951,11 +2945,9 @@ unsafe extern "system" fn PSSetShader<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_PSSetShader(a0, a1, a2) });
     unsafe { (*(this as *const T)).PSSetShader(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.PSSetShader(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn PSSetSamplers<T: ContextMethods>(
@@ -2969,11 +2961,9 @@ unsafe extern "system" fn PSSetSamplers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_PSSetSamplers(a0, a1, a2) });
     unsafe { (*(this as *const T)).PSSetSamplers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.PSSetSamplers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn VSSetShader<T: ContextMethods>(
@@ -2987,11 +2977,9 @@ unsafe extern "system" fn VSSetShader<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_VSSetShader(a0, a1, a2) });
     unsafe { (*(this as *const T)).VSSetShader(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.VSSetShader(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn DrawIndexed<T: ContextMethods>(this: *mut c_void, a0: u32, a1: u32, a2: i32) {
@@ -3001,11 +2989,9 @@ unsafe extern "system" fn DrawIndexed<T: ContextMethods>(this: *mut c_void, a0: 
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_DrawIndexed(a0, a1, a2) });
     unsafe { (*(this as *const T)).DrawIndexed(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DrawIndexed(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn Draw<T: ContextMethods>(this: *mut c_void, a0: u32, a1: u32) {
@@ -3015,11 +3001,9 @@ unsafe extern "system" fn Draw<T: ContextMethods>(this: *mut c_void, a0: u32, a1
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command =
-        recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_Draw(a0, a1) });
     unsafe { (*(this as *const T)).Draw(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.Draw(a0, a1) });
     }
 }
 unsafe extern "system" fn Map<T: ContextMethods>(
@@ -3053,12 +3037,9 @@ unsafe extern "system" fn PSSetConstantBuffers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_PSSetConstantBuffers(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).PSSetConstantBuffers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.PSSetConstantBuffers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn IASetInputLayout<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
@@ -3067,11 +3048,9 @@ unsafe extern "system" fn IASetInputLayout<T: ContextMethods>(this: *mut c_void,
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command =
-        recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_IASetInputLayout(a0) });
     unsafe { (*(this as *const T)).IASetInputLayout(a0) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.IASetInputLayout(a0) });
     }
 }
 unsafe extern "system" fn IASetVertexBuffers<T: ContextMethods>(
@@ -3087,12 +3066,9 @@ unsafe extern "system" fn IASetVertexBuffers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_IASetVertexBuffers(a0, a1, a2, a3, a4)
-    });
     unsafe { (*(this as *const T)).IASetVertexBuffers(a0, a1, a2, a3, a4) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.IASetVertexBuffers(a0, a1, a2, a3, a4) });
     }
 }
 unsafe extern "system" fn IASetIndexBuffer<T: ContextMethods>(
@@ -3106,11 +3082,9 @@ unsafe extern "system" fn IASetIndexBuffer<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_IASetIndexBuffer(a0, a1, a2) });
     unsafe { (*(this as *const T)).IASetIndexBuffer(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.IASetIndexBuffer(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn DrawIndexedInstanced<T: ContextMethods>(
@@ -3127,12 +3101,9 @@ unsafe extern "system" fn DrawIndexedInstanced<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_DrawIndexedInstanced(a0, a1, a2, a3, a4)
-    });
     unsafe { (*(this as *const T)).DrawIndexedInstanced(a0, a1, a2, a3, a4) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DrawIndexedInstanced(a0, a1, a2, a3, a4) });
     }
 }
 unsafe extern "system" fn DrawInstanced<T: ContextMethods>(
@@ -3148,11 +3119,9 @@ unsafe extern "system" fn DrawInstanced<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_DrawInstanced(a0, a1, a2, a3) });
     unsafe { (*(this as *const T)).DrawInstanced(a0, a1, a2, a3) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DrawInstanced(a0, a1, a2, a3) });
     }
 }
 unsafe extern "system" fn GSSetConstantBuffers<T: ContextMethods>(
@@ -3166,12 +3135,9 @@ unsafe extern "system" fn GSSetConstantBuffers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_GSSetConstantBuffers(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).GSSetConstantBuffers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.GSSetConstantBuffers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn GSSetShader<T: ContextMethods>(
@@ -3185,11 +3151,9 @@ unsafe extern "system" fn GSSetShader<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_GSSetShader(a0, a1, a2) });
     unsafe { (*(this as *const T)).GSSetShader(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.GSSetShader(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn IASetPrimitiveTopology<T: ContextMethods>(
@@ -3201,11 +3165,9 @@ unsafe extern "system" fn IASetPrimitiveTopology<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_IASetPrimitiveTopology(a0) });
     unsafe { (*(this as *const T)).IASetPrimitiveTopology(a0) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.IASetPrimitiveTopology(a0) });
     }
 }
 unsafe extern "system" fn VSSetShaderResources<T: ContextMethods>(
@@ -3219,12 +3181,9 @@ unsafe extern "system" fn VSSetShaderResources<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_VSSetShaderResources(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).VSSetShaderResources(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.VSSetShaderResources(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn VSSetSamplers<T: ContextMethods>(
@@ -3238,11 +3197,9 @@ unsafe extern "system" fn VSSetSamplers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_VSSetSamplers(a0, a1, a2) });
     unsafe { (*(this as *const T)).VSSetSamplers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.VSSetSamplers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn Begin<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
@@ -3252,10 +3209,9 @@ unsafe extern "system" fn Begin<T: ContextMethods>(this: *mut c_void, a0: *mut c
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_Begin(a0) });
     unsafe { (*(this as *const T)).Begin(a0) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.Begin(a0) });
     }
 }
 unsafe extern "system" fn End<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
@@ -3265,10 +3221,9 @@ unsafe extern "system" fn End<T: ContextMethods>(this: *mut c_void, a0: *mut cor
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_End(a0) });
     unsafe { (*(this as *const T)).End(a0) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.End(a0) });
     }
 }
 unsafe extern "system" fn GetData<T: ContextMethods>(
@@ -3290,11 +3245,9 @@ unsafe extern "system" fn SetPredication<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_SetPredication(a0, a1) });
     unsafe { (*(this as *const T)).SetPredication(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.SetPredication(a0, a1) });
     }
 }
 unsafe extern "system" fn GSSetShaderResources<T: ContextMethods>(
@@ -3308,12 +3261,9 @@ unsafe extern "system" fn GSSetShaderResources<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_GSSetShaderResources(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).GSSetShaderResources(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.GSSetShaderResources(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn GSSetSamplers<T: ContextMethods>(
@@ -3327,11 +3277,9 @@ unsafe extern "system" fn GSSetSamplers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_GSSetSamplers(a0, a1, a2) });
     unsafe { (*(this as *const T)).GSSetSamplers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.GSSetSamplers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn OMSetRenderTargets<T: ContextMethods>(
@@ -3345,12 +3293,9 @@ unsafe extern "system" fn OMSetRenderTargets<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_OMSetRenderTargets(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).OMSetRenderTargets(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.OMSetRenderTargets(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn OMSetRenderTargetsAndUnorderedAccessViews<T: ContextMethods>(
@@ -3368,14 +3313,11 @@ unsafe extern "system" fn OMSetRenderTargetsAndUnorderedAccessViews<T: ContextMe
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_OMSetRenderTargetsAndUnorderedAccessViews(
-            a0, a1, a2, a3, a4, a5, a6,
-        )
-    });
     unsafe { (*(this as *const T)).OMSetRenderTargetsAndUnorderedAccessViews(a0, a1, a2, a3, a4, a5, a6) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe {
+            tape.OMSetRenderTargetsAndUnorderedAccessViews(a0, a1, a2, a3, a4, a5, a6)
+        });
     }
 }
 unsafe extern "system" fn OMSetBlendState<T: ContextMethods>(
@@ -3389,11 +3331,9 @@ unsafe extern "system" fn OMSetBlendState<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_OMSetBlendState(a0, a1, a2) });
     unsafe { (*(this as *const T)).OMSetBlendState(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.OMSetBlendState(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn OMSetDepthStencilState<T: ContextMethods>(
@@ -3406,12 +3346,9 @@ unsafe extern "system" fn OMSetDepthStencilState<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_OMSetDepthStencilState(a0, a1)
-    });
     unsafe { (*(this as *const T)).OMSetDepthStencilState(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.OMSetDepthStencilState(a0, a1) });
     }
 }
 unsafe extern "system" fn SOSetTargets<T: ContextMethods>(
@@ -3425,11 +3362,9 @@ unsafe extern "system" fn SOSetTargets<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_SOSetTargets(a0, a1, a2) });
     unsafe { (*(this as *const T)).SOSetTargets(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.SOSetTargets(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn DrawAuto<T: ContextMethods>(this: *mut c_void) {
@@ -3439,10 +3374,9 @@ unsafe extern "system" fn DrawAuto<T: ContextMethods>(this: *mut c_void) {
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_DrawAuto() });
     unsafe { (*(this as *const T)).DrawAuto() };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DrawAuto() });
     }
 }
 unsafe extern "system" fn DrawIndexedInstancedIndirect<T: ContextMethods>(
@@ -3456,12 +3390,9 @@ unsafe extern "system" fn DrawIndexedInstancedIndirect<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_DrawIndexedInstancedIndirect(a0, a1)
-    });
     unsafe { (*(this as *const T)).DrawIndexedInstancedIndirect(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DrawIndexedInstancedIndirect(a0, a1) });
     }
 }
 unsafe extern "system" fn DrawInstancedIndirect<T: ContextMethods>(
@@ -3475,11 +3406,9 @@ unsafe extern "system" fn DrawInstancedIndirect<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_DrawInstancedIndirect(a0, a1) });
     unsafe { (*(this as *const T)).DrawInstancedIndirect(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DrawInstancedIndirect(a0, a1) });
     }
 }
 unsafe extern "system" fn Dispatch<T: ContextMethods>(this: *mut c_void, a0: u32, a1: u32, a2: u32) {
@@ -3489,11 +3418,9 @@ unsafe extern "system" fn Dispatch<T: ContextMethods>(this: *mut c_void, a0: u32
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command =
-        recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_Dispatch(a0, a1, a2) });
     unsafe { (*(this as *const T)).Dispatch(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.Dispatch(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn DispatchIndirect<T: ContextMethods>(
@@ -3507,11 +3434,9 @@ unsafe extern "system" fn DispatchIndirect<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_DispatchIndirect(a0, a1) });
     unsafe { (*(this as *const T)).DispatchIndirect(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DispatchIndirect(a0, a1) });
     }
 }
 unsafe extern "system" fn RSSetState<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
@@ -3520,11 +3445,9 @@ unsafe extern "system" fn RSSetState<T: ContextMethods>(this: *mut c_void, a0: *
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command =
-        recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_RSSetState(a0) });
     unsafe { (*(this as *const T)).RSSetState(a0) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.RSSetState(a0) });
     }
 }
 unsafe extern "system" fn RSSetViewports<T: ContextMethods>(
@@ -3537,11 +3460,9 @@ unsafe extern "system" fn RSSetViewports<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_RSSetViewports(a0, a1) });
     unsafe { (*(this as *const T)).RSSetViewports(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.RSSetViewports(a0, a1) });
     }
 }
 unsafe extern "system" fn RSSetScissorRects<T: ContextMethods>(
@@ -3554,11 +3475,9 @@ unsafe extern "system" fn RSSetScissorRects<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_RSSetScissorRects(a0, a1) });
     unsafe { (*(this as *const T)).RSSetScissorRects(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.RSSetScissorRects(a0, a1) });
     }
 }
 unsafe extern "system" fn CopySubresourceRegion<T: ContextMethods>(
@@ -3578,14 +3497,9 @@ unsafe extern "system" fn CopySubresourceRegion<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_CopySubresourceRegion(
-            a0, a1, a2, a3, a4, a5, a6, a7,
-        )
-    });
     unsafe { (*(this as *const T)).CopySubresourceRegion(a0, a1, a2, a3, a4, a5, a6, a7) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CopySubresourceRegion(a0, a1, a2, a3, a4, a5, a6, a7) });
     }
 }
 unsafe extern "system" fn CopyResource<T: ContextMethods>(
@@ -3599,11 +3513,9 @@ unsafe extern "system" fn CopyResource<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command =
-        recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_CopyResource(a0, a1) });
     unsafe { (*(this as *const T)).CopyResource(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CopyResource(a0, a1) });
     }
 }
 unsafe extern "system" fn UpdateSubresource<T: ContextMethods>(
@@ -3635,12 +3547,9 @@ unsafe extern "system" fn CopyStructureCount<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_CopyStructureCount(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).CopyStructureCount(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CopyStructureCount(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn ClearRenderTargetView<T: ContextMethods>(
@@ -3654,11 +3563,9 @@ unsafe extern "system" fn ClearRenderTargetView<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_ClearRenderTargetView(a0, a1) });
     unsafe { (*(this as *const T)).ClearRenderTargetView(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.ClearRenderTargetView(a0, a1) });
     }
 }
 unsafe extern "system" fn ClearUnorderedAccessViewUint<T: ContextMethods>(
@@ -3672,12 +3579,9 @@ unsafe extern "system" fn ClearUnorderedAccessViewUint<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_ClearUnorderedAccessViewUint(a0, a1)
-    });
     unsafe { (*(this as *const T)).ClearUnorderedAccessViewUint(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.ClearUnorderedAccessViewUint(a0, a1) });
     }
 }
 unsafe extern "system" fn ClearUnorderedAccessViewFloat<T: ContextMethods>(
@@ -3691,12 +3595,9 @@ unsafe extern "system" fn ClearUnorderedAccessViewFloat<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_ClearUnorderedAccessViewFloat(a0, a1)
-    });
     unsafe { (*(this as *const T)).ClearUnorderedAccessViewFloat(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.ClearUnorderedAccessViewFloat(a0, a1) });
     }
 }
 unsafe extern "system" fn ClearDepthStencilView<T: ContextMethods>(
@@ -3712,12 +3613,9 @@ unsafe extern "system" fn ClearDepthStencilView<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_ClearDepthStencilView(a0, a1, a2, a3)
-    });
     unsafe { (*(this as *const T)).ClearDepthStencilView(a0, a1, a2, a3) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.ClearDepthStencilView(a0, a1, a2, a3) });
     }
 }
 unsafe extern "system" fn GenerateMips<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
@@ -3727,11 +3625,9 @@ unsafe extern "system" fn GenerateMips<T: ContextMethods>(this: *mut c_void, a0:
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command =
-        recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_GenerateMips(a0) });
     unsafe { (*(this as *const T)).GenerateMips(a0) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.GenerateMips(a0) });
     }
 }
 unsafe extern "system" fn SetResourceMinLOD<T: ContextMethods>(
@@ -3745,14 +3641,12 @@ unsafe extern "system" fn SetResourceMinLOD<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_SetResourceMinLOD(a0, a1) });
     unsafe { (*(this as *const T)).SetResourceMinLOD(a0, a1) };
     if let Some(r) = recorder {
         r.gap("SetResourceMinLOD cannot be reconstructed exactly");
     }
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.SetResourceMinLOD(a0, a1) });
     }
 }
 unsafe extern "system" fn GetResourceMinLOD<T: ContextMethods>(
@@ -3775,12 +3669,9 @@ unsafe extern "system" fn ResolveSubresource<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_ResolveSubresource(a0, a1, a2, a3, a4)
-    });
     unsafe { (*(this as *const T)).ResolveSubresource(a0, a1, a2, a3, a4) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.ResolveSubresource(a0, a1, a2, a3, a4) });
     }
 }
 unsafe extern "system" fn ExecuteCommandList<T: ContextMethods>(
@@ -3794,11 +3685,9 @@ unsafe extern "system" fn ExecuteCommandList<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_ExecuteCommandList(a0, a1) });
     unsafe { (*(this as *const T)).ExecuteCommandList(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.ExecuteCommandList(a0, a1) });
     }
 }
 unsafe extern "system" fn HSSetShaderResources<T: ContextMethods>(
@@ -3812,12 +3701,9 @@ unsafe extern "system" fn HSSetShaderResources<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_HSSetShaderResources(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).HSSetShaderResources(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.HSSetShaderResources(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn HSSetShader<T: ContextMethods>(
@@ -3831,11 +3717,9 @@ unsafe extern "system" fn HSSetShader<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_HSSetShader(a0, a1, a2) });
     unsafe { (*(this as *const T)).HSSetShader(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.HSSetShader(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn HSSetSamplers<T: ContextMethods>(
@@ -3849,11 +3733,9 @@ unsafe extern "system" fn HSSetSamplers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_HSSetSamplers(a0, a1, a2) });
     unsafe { (*(this as *const T)).HSSetSamplers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.HSSetSamplers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn HSSetConstantBuffers<T: ContextMethods>(
@@ -3867,12 +3749,9 @@ unsafe extern "system" fn HSSetConstantBuffers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_HSSetConstantBuffers(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).HSSetConstantBuffers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.HSSetConstantBuffers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn DSSetShaderResources<T: ContextMethods>(
@@ -3886,12 +3765,9 @@ unsafe extern "system" fn DSSetShaderResources<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_DSSetShaderResources(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).DSSetShaderResources(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DSSetShaderResources(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn DSSetShader<T: ContextMethods>(
@@ -3905,11 +3781,9 @@ unsafe extern "system" fn DSSetShader<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_DSSetShader(a0, a1, a2) });
     unsafe { (*(this as *const T)).DSSetShader(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DSSetShader(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn DSSetSamplers<T: ContextMethods>(
@@ -3923,11 +3797,9 @@ unsafe extern "system" fn DSSetSamplers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_DSSetSamplers(a0, a1, a2) });
     unsafe { (*(this as *const T)).DSSetSamplers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DSSetSamplers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn DSSetConstantBuffers<T: ContextMethods>(
@@ -3941,12 +3813,9 @@ unsafe extern "system" fn DSSetConstantBuffers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_DSSetConstantBuffers(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).DSSetConstantBuffers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DSSetConstantBuffers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn CSSetShaderResources<T: ContextMethods>(
@@ -3960,12 +3829,9 @@ unsafe extern "system" fn CSSetShaderResources<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_CSSetShaderResources(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).CSSetShaderResources(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CSSetShaderResources(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn CSSetUnorderedAccessViews<T: ContextMethods>(
@@ -3980,12 +3846,9 @@ unsafe extern "system" fn CSSetUnorderedAccessViews<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_CSSetUnorderedAccessViews(a0, a1, a2, a3)
-    });
     unsafe { (*(this as *const T)).CSSetUnorderedAccessViews(a0, a1, a2, a3) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CSSetUnorderedAccessViews(a0, a1, a2, a3) });
     }
 }
 unsafe extern "system" fn CSSetShader<T: ContextMethods>(
@@ -3999,11 +3862,9 @@ unsafe extern "system" fn CSSetShader<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_CSSetShader(a0, a1, a2) });
     unsafe { (*(this as *const T)).CSSetShader(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CSSetShader(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn CSSetSamplers<T: ContextMethods>(
@@ -4017,11 +3878,9 @@ unsafe extern "system" fn CSSetSamplers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_CSSetSamplers(a0, a1, a2) });
     unsafe { (*(this as *const T)).CSSetSamplers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CSSetSamplers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn CSSetConstantBuffers<T: ContextMethods>(
@@ -4035,12 +3894,9 @@ unsafe extern "system" fn CSSetConstantBuffers<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_CSSetConstantBuffers(a0, a1, a2)
-    });
     unsafe { (*(this as *const T)).CSSetConstantBuffers(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CSSetConstantBuffers(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn VSGetConstantBuffers<T: ContextMethods>(
@@ -4344,11 +4200,9 @@ unsafe extern "system" fn ClearState<T: ContextMethods>(this: *mut c_void) {
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command =
-        recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_ClearState() });
     unsafe { (*(this as *const T)).ClearState() };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.ClearState() });
     }
 }
 unsafe extern "system" fn Flush<T: ContextMethods>(this: *mut c_void) {
@@ -4387,14 +4241,9 @@ unsafe extern "system" fn CopySubresourceRegion1<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_CopySubresourceRegion1(
-            a0, a1, a2, a3, a4, a5, a6, a7, a8,
-        )
-    });
     unsafe { (*(this as *const T)).CopySubresourceRegion1(a0, a1, a2, a3, a4, a5, a6, a7, a8) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CopySubresourceRegion1(a0, a1, a2, a3, a4, a5, a6, a7, a8) });
     }
 }
 unsafe extern "system" fn UpdateSubresource1<T: ContextMethods>(
@@ -4422,11 +4271,9 @@ unsafe extern "system" fn DiscardResource<T: ContextMethods>(this: *mut c_void, 
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command =
-        recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_DiscardResource(a0) });
     unsafe { (*(this as *const T)).DiscardResource(a0) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DiscardResource(a0) });
     }
 }
 unsafe extern "system" fn DiscardView<T: ContextMethods>(this: *mut c_void, a0: *mut core::ffi::c_void) {
@@ -4436,11 +4283,9 @@ unsafe extern "system" fn DiscardView<T: ContextMethods>(this: *mut c_void, a0: 
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command =
-        recorder.map(|_| unsafe { crate::vtables::recorded_context::Command::capture_DiscardView(a0) });
     unsafe { (*(this as *const T)).DiscardView(a0) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DiscardView(a0) });
     }
 }
 unsafe extern "system" fn VSSetConstantBuffers1<T: ContextMethods>(
@@ -4456,12 +4301,9 @@ unsafe extern "system" fn VSSetConstantBuffers1<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_VSSetConstantBuffers1(a0, a1, a2, a3, a4)
-    });
     unsafe { (*(this as *const T)).VSSetConstantBuffers1(a0, a1, a2, a3, a4) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.VSSetConstantBuffers1(a0, a1, a2, a3, a4) });
     }
 }
 unsafe extern "system" fn HSSetConstantBuffers1<T: ContextMethods>(
@@ -4477,12 +4319,9 @@ unsafe extern "system" fn HSSetConstantBuffers1<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_HSSetConstantBuffers1(a0, a1, a2, a3, a4)
-    });
     unsafe { (*(this as *const T)).HSSetConstantBuffers1(a0, a1, a2, a3, a4) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.HSSetConstantBuffers1(a0, a1, a2, a3, a4) });
     }
 }
 unsafe extern "system" fn DSSetConstantBuffers1<T: ContextMethods>(
@@ -4498,12 +4337,9 @@ unsafe extern "system" fn DSSetConstantBuffers1<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_DSSetConstantBuffers1(a0, a1, a2, a3, a4)
-    });
     unsafe { (*(this as *const T)).DSSetConstantBuffers1(a0, a1, a2, a3, a4) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DSSetConstantBuffers1(a0, a1, a2, a3, a4) });
     }
 }
 unsafe extern "system" fn GSSetConstantBuffers1<T: ContextMethods>(
@@ -4519,12 +4355,9 @@ unsafe extern "system" fn GSSetConstantBuffers1<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_GSSetConstantBuffers1(a0, a1, a2, a3, a4)
-    });
     unsafe { (*(this as *const T)).GSSetConstantBuffers1(a0, a1, a2, a3, a4) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.GSSetConstantBuffers1(a0, a1, a2, a3, a4) });
     }
 }
 unsafe extern "system" fn PSSetConstantBuffers1<T: ContextMethods>(
@@ -4540,12 +4373,9 @@ unsafe extern "system" fn PSSetConstantBuffers1<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_PSSetConstantBuffers1(a0, a1, a2, a3, a4)
-    });
     unsafe { (*(this as *const T)).PSSetConstantBuffers1(a0, a1, a2, a3, a4) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.PSSetConstantBuffers1(a0, a1, a2, a3, a4) });
     }
 }
 unsafe extern "system" fn CSSetConstantBuffers1<T: ContextMethods>(
@@ -4561,12 +4391,9 @@ unsafe extern "system" fn CSSetConstantBuffers1<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_CSSetConstantBuffers1(a0, a1, a2, a3, a4)
-    });
     unsafe { (*(this as *const T)).CSSetConstantBuffers1(a0, a1, a2, a3, a4) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CSSetConstantBuffers1(a0, a1, a2, a3, a4) });
     }
 }
 unsafe extern "system" fn VSGetConstantBuffers1<T: ContextMethods>(
@@ -4657,11 +4484,9 @@ unsafe extern "system" fn ClearView<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_ClearView(a0, a1, a2, a3) });
     unsafe { (*(this as *const T)).ClearView(a0, a1, a2, a3) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.ClearView(a0, a1, a2, a3) });
     }
 }
 unsafe extern "system" fn DiscardView1<T: ContextMethods>(
@@ -4676,11 +4501,9 @@ unsafe extern "system" fn DiscardView1<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_DiscardView1(a0, a1, a2) });
     unsafe { (*(this as *const T)).DiscardView1(a0, a1, a2) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.DiscardView1(a0, a1, a2) });
     }
 }
 unsafe extern "system" fn UpdateTileMappings<T: ContextMethods>(
@@ -4702,16 +4525,11 @@ unsafe extern "system" fn UpdateTileMappings<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_UpdateTileMappings(
-            a0, a1, a2, a3, a4, a5, a6, a7, a8, a9,
-        )
-    });
     let result = unsafe { (*(this as *const T)).UpdateTileMappings(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) };
     if result.is_ok()
-        && let (Some(r), Some(command)) = (recorder, command)
+        && let Some(r) = recorder
     {
-        r.push(command);
+        r.record(|tape| unsafe { tape.UpdateTileMappings(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9) });
     }
     result
 }
@@ -4730,14 +4548,11 @@ unsafe extern "system" fn CopyTileMappings<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_CopyTileMappings(a0, a1, a2, a3, a4, a5)
-    });
     let result = unsafe { (*(this as *const T)).CopyTileMappings(a0, a1, a2, a3, a4, a5) };
     if result.is_ok()
-        && let (Some(r), Some(command)) = (recorder, command)
+        && let Some(r) = recorder
     {
-        r.push(command);
+        r.record(|tape| unsafe { tape.CopyTileMappings(a0, a1, a2, a3, a4, a5) });
     }
     result
 }
@@ -4756,12 +4571,9 @@ unsafe extern "system" fn CopyTiles<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder.map(|_| unsafe {
-        crate::vtables::recorded_context::Command::capture_CopyTiles(a0, a1, a2, a3, a4, a5)
-    });
     unsafe { (*(this as *const T)).CopyTiles(a0, a1, a2, a3, a4, a5) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.CopyTiles(a0, a1, a2, a3, a4, a5) });
     }
 }
 unsafe extern "system" fn UpdateTiles<T: ContextMethods>(
@@ -4791,13 +4603,11 @@ unsafe extern "system" fn ResizeTilePool<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_ResizeTilePool(a0, a1) });
     let result = unsafe { (*(this as *const T)).ResizeTilePool(a0, a1) };
     if result.is_ok()
-        && let (Some(r), Some(command)) = (recorder, command)
+        && let Some(r) = recorder
     {
-        r.push(command);
+        r.record(|tape| unsafe { tape.ResizeTilePool(a0, a1) });
     }
     result
 }
@@ -4812,11 +4622,9 @@ unsafe extern "system" fn TiledResourceBarrier<T: ContextMethods>(
     if let Some(r) = recorder {
         unsafe { r.begin(object.inner()) };
     }
-    let command = recorder
-        .map(|_| unsafe { crate::vtables::recorded_context::Command::capture_TiledResourceBarrier(a0, a1) });
     unsafe { (*(this as *const T)).TiledResourceBarrier(a0, a1) };
-    if let (Some(r), Some(command)) = (recorder, command) {
-        r.push(command);
+    if let Some(r) = recorder {
+        r.record(|tape| unsafe { tape.TiledResourceBarrier(a0, a1) });
     }
 }
 unsafe extern "system" fn IsAnnotationEnabled<T: ContextMethods>(this: *mut c_void) -> windows::core::BOOL {

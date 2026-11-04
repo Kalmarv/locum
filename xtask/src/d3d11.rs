@@ -84,7 +84,8 @@ fn arg(ty: &str) -> Arg {
         Arg::Scalar
     }
 }
-fn fields(e: &Entry) -> Vec<(String, String, String)> {
+/// How each argument of a call is written to a tape and read back for its replay.
+fn fields(e: &Entry) -> Vec<(String, String)> {
     e.params
         .iter()
         .enumerate()
@@ -92,21 +93,18 @@ fn fields(e: &Entry) -> Vec<(String, String, String)> {
             let a = format!("a{i}");
             let count = count(&e.name, i);
             match arg(t) {
-                Arg::Scalar => (t.clone(), a.clone(), format!("*{a}")),
+                Arg::Scalar => (format!("self.put({a});"), format!("let {a}: {t} = r.get();")),
                 Arg::Object => (
-                    "Object".into(),
-                    format!("unsafe {{ Object::copy({a}) }}"),
-                    format!("{a}.raw()"),
+                    format!("unsafe {{ self.object({a}) }};"),
+                    format!("let {a} = r.object();"),
                 ),
                 Arg::Objects => (
-                    "Objects".into(),
-                    format!("unsafe {{ Objects::copy({a}, {count}) }}"),
-                    format!("{a}.raw()"),
+                    format!("unsafe {{ self.objects({a}, {count}) }};"),
+                    format!("let {a} = r.objects();"),
                 ),
                 Arg::Array(t) => (
-                    format!("Array<{t}>"),
-                    format!("unsafe {{ Array::copy({a}, {count}) }}"),
-                    format!("{a}.raw()"),
+                    format!("unsafe {{ self.array({a}, {count}) }};"),
+                    format!("let {a}: *const {t} = r.array();"),
                 ),
             }
         })
@@ -119,21 +117,13 @@ pub fn commands(vtbls: &HashMap<String, Vtbl>) -> String {
         .filter(|e| recorded(&e.name))
         .collect();
     let mut out = String::from(
-        "//! Generated owned context commands by `cargo xtask gen`; do not edit.\n#![allow(non_snake_case, clippy::too_many_arguments, clippy::missing_safety_doc, dead_code)]\nuse crate::d3d11::recorder::{Object, Objects, Array};\nuse core::ffi::c_void;\n",
+        "//! Generated deferred-context calls by `cargo xtask gen`; do not edit: each written to a tape and replayed from it.\n#![allow(non_snake_case, non_upper_case_globals, clippy::too_many_arguments, clippy::missing_safety_doc, dead_code)]\nuse crate::d3d11::recorder::{Reader, Tape};\nuse core::ffi::c_void;\n",
     );
-    // Each payload is independently sized: a Draw does not pay the size of UpdateTileMappings.
-    for e in &entries {
-        writeln!(out, "#[derive(Clone)]\npub struct {} {{", e.name).unwrap();
-        for (i, (ty, _, _)) in fields(e).iter().enumerate() {
-            writeln!(out, "    a{i}: {ty},").unwrap();
-        }
-        out.push_str("}\n");
+    out.push_str("/// Each recorded call's tag on a tape.\npub mod tag {\n");
+    for (n, e) in entries.iter().enumerate() {
+        writeln!(out, "    pub const {}: u32 = {n};", e.name).unwrap();
     }
-    out.push_str("#[derive(Clone)]\npub enum Command {\n");
-    for e in &entries {
-        writeln!(out, "    {}(Box<{}>),", e.name, e.name).unwrap();
-    }
-    out.push_str("}\nimpl Command {\n");
+    out.push_str("}\nimpl Tape {\n");
     for e in &entries {
         let params = e
             .params
@@ -144,39 +134,28 @@ pub fn commands(vtbls: &HashMap<String, Vtbl>) -> String {
             .join(", ");
         writeln!(
             out,
-            "pub unsafe fn capture_{}({params}) -> Self {{ Self::{}(Box::new({} {{",
-            e.name, e.name, e.name
-        )
-        .unwrap();
-        for (i, (_, take, _)) in fields(e).iter().enumerate() {
-            if take == &format!("a{i}") {
-                writeln!(out, "a{i},").unwrap();
-            } else {
-                writeln!(out, "a{i}: {take},").unwrap();
-            }
-        }
-        out.push_str("})) }\n");
-    }
-    out.push_str(
-        "pub unsafe fn replay(&self, context: *mut c_void) -> windows::core::Result<()> { match self {\n",
-    );
-    for e in &entries {
-        let names = (0..e.params.len())
-            .map(|i| format!("a{i}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let args = fields(e)
-            .iter()
-            .map(|(_, _, r)| r.clone())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let comma = if args.is_empty() { "" } else { ", " };
-        writeln!(
-            out,
-            "Self::{}(p) => {{ let {} {{ {names} }} = &**p;",
+            "pub unsafe fn {}(&mut self, {params}) {{ self.tag(tag::{});",
             e.name, e.name
         )
         .unwrap();
+        for (write, _) in fields(e) {
+            writeln!(out, "{write}").unwrap();
+        }
+        out.push_str("}\n");
+    }
+    out.push_str(
+        "}\n/// Replays the call tagged `tag`, its arguments read from `r`.\npub unsafe fn call(tag: u32, r: &mut Reader, context: *mut c_void) -> windows::core::Result<()> { match tag {\n",
+    );
+    for e in &entries {
+        writeln!(out, "tag::{} => {{", e.name).unwrap();
+        for (_, read) in fields(e) {
+            writeln!(out, "{read}").unwrap();
+        }
+        let args = (0..e.params.len())
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let comma = if args.is_empty() { "" } else { ", " };
         let call = format!(
             "unsafe {{ crate::vtables::context::real::{}(context{comma}{args}) }}",
             e.name
@@ -187,6 +166,6 @@ pub fn commands(vtbls: &HashMap<String, Vtbl>) -> String {
             writeln!(out, "{call}; Ok(()) }}").unwrap();
         }
     }
-    out.push_str("} }\n}\n");
+    out.push_str("_ => unreachable!(\"tag {tag} is no recorded call\"),\n} }\n");
     out
 }

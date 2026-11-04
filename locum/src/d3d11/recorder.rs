@@ -1,7 +1,12 @@
-//! Immutable command arguments retained from the start of a deferred list.
+//! Deferred lists recorded from their start: every call written to a tape (see [`tape`]), replayed when a captured
+//! frame executes the list.
 mod state;
+mod tape;
 use core::ffi::c_void;
+pub use tape::{Reader, Tape};
 use windows::core::{IUnknown, Interface};
+
+/// An object an upload names, with a reference held.
 #[derive(Clone)]
 pub struct Object(Option<IUnknown>);
 impl Object {
@@ -14,53 +19,14 @@ impl Object {
         self.0.as_ref().map_or(core::ptr::null_mut(), Interface::as_raw)
     }
 }
-#[derive(Clone)]
-pub struct Objects(Option<Box<[Option<IUnknown>]>>);
-impl Objects {
-    /// # Safety
-    /// The array contains `count` live/null COM interface pointers, or is null.
-    pub unsafe fn copy(raw: *const *mut c_void, count: u32) -> Self {
-        Self((!raw.is_null()).then(|| {
-            if count == 0 {
-                Box::default()
-            } else {
-                unsafe { core::slice::from_raw_parts(raw, count as usize) }
-                    .iter()
-                    .map(|p| unsafe { IUnknown::from_raw_borrowed(p) }.cloned())
-                    .collect()
-            }
-        }))
-    }
-    pub fn raw(&self) -> *const *mut c_void {
-        self.0.as_ref().map_or(core::ptr::null(), |v| v.as_ptr().cast())
-    }
-}
-#[derive(Clone)]
-pub struct Array<T>(Option<Box<[T]>>);
-impl<T: Copy> Array<T> {
-    /// # Safety
-    /// The pointer contains `count` input elements, or is null.
-    pub unsafe fn copy(raw: *const T, count: u32) -> Self {
-        Self((!raw.is_null()).then(|| {
-            if count == 0 {
-                Box::default()
-            } else {
-                unsafe { core::slice::from_raw_parts(raw, count as usize) }.into()
-            }
-        }))
-    }
-    pub fn raw(&self) -> *const T {
-        self.0.as_ref().map_or(core::ptr::null(), |v| v.as_ptr())
-    }
-}
 
-use crate::vtables::recorded_context::Command;
+use crate::vtables::recorded_context::tag;
 use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D11::*;
 mod private;
 mod uploads;
 mod watch;
-use uploads::{Mapped, Upload};
+use uploads::Mapped;
 
 #[derive(Default)]
 pub struct Recorder {
@@ -68,27 +34,22 @@ pub struct Recorder {
 }
 #[derive(Default)]
 struct Current {
-    initial: Option<Vec<Command>>,
+    initial: Option<Tape>,
     inherited: bool,
-    commands: Vec<Recorded>,
-    so: Option<Command>,
+    commands: Tape,
+    /// The stream-output targets the list set last, which a list inheriting its state starts with.
+    so: Option<Tape>,
     gaps: Vec<&'static str>,
     maps: std::collections::HashMap<(usize, u32), Mapped>,
     shadows: std::collections::HashMap<(usize, u32), watch::Shadow>,
 }
+/// A finished list: the state it inherited, as calls, and its own calls. Plans are immutable; the caller serializes
+/// access to replay's context.
 pub struct Plan {
     pub frame: u64,
-    initial: Vec<Command>,
-    commands: Vec<Recorded>,
+    initial: Tape,
+    commands: Tape,
     pub gaps: Vec<&'static str>,
-}
-// Plans are immutable. Their COM pointers are D3D11 device-child interfaces, whose references may
-// move from a recording thread to an execution thread. The caller serializes access to replay's context.
-unsafe impl Send for Plan {}
-unsafe impl Sync for Plan {}
-enum Recorded {
-    Call(Command),
-    Upload(Box<Upload>),
 }
 impl Recorder {
     /// # Safety
@@ -99,26 +60,29 @@ impl Recorder {
             s.initial = Some(if s.inherited {
                 unsafe { state::snapshot(context, s.so.as_ref()) }
             } else {
-                Vec::new()
+                Tape::default()
             });
             if s.inherited && s.so.is_some() {
                 s.gaps.push("inherited stream-output cursor is not observable");
             }
         }
     }
-    pub fn push(&self, command: Command) {
+    /// Records the call `write` writes to a tape, after the real context made it.
+    pub fn record(&self, write: impl Fn(&mut Tape)) {
         let mut s = self.current.lock().unwrap_or_else(|e| e.into_inner());
-        if matches!(command, Command::SOSetTargets(_)) {
-            s.so = Some(command.clone());
+        write(&mut s.commands);
+        match s.commands.last() {
+            Some(tag::SOSetTargets) => {
+                let mut so = Tape::default();
+                write(&mut so);
+                s.so = Some(so);
+            }
+            Some(tag::ClearState) => s.so = None,
+            Some(tag::ExecuteCommandList) => s
+                .gaps
+                .push("nested command-list readbacks cannot be reconstructed on this runtime"),
+            _ => {}
         }
-        if matches!(command, Command::ClearState(_)) {
-            s.so = None;
-        }
-        if matches!(command, Command::ExecuteCommandList(_)) {
-            s.gaps
-                .push("nested command-list readbacks cannot be reconstructed on this runtime");
-        }
-        s.commands.push(Recorded::Call(command));
     }
     pub fn gap(&self, reason: &'static str) {
         let mut s = self.current.lock().unwrap_or_else(|e| e.into_inner());
@@ -140,7 +104,11 @@ impl Recorder {
             let plan = Plan {
                 frame: crate::dxgi::frame(),
                 initial: s.initial.take().unwrap_or_default(),
-                commands: std::mem::take(&mut s.commands),
+                commands: {
+                    // The next list is likely as long as this one.
+                    let next = Tape::sized_like(&s.commands);
+                    std::mem::replace(&mut s.commands, next)
+                },
                 gaps: std::mem::take(&mut s.gaps),
             };
             s.inherited = restore;
@@ -156,16 +124,8 @@ impl Plan {
     /// # Safety
     /// The context is an empty private deferred context with recursive recording disabled.
     pub unsafe fn replay(&self, context: *mut c_void) -> windows::core::Result<()> {
-        for c in &self.initial {
-            unsafe { c.replay(context) }?;
-        }
-        for c in &self.commands {
-            match c {
-                Recorded::Call(c) => unsafe { c.replay(context) }?,
-                Recorded::Upload(u) => unsafe { u.replay(context) }?,
-            }
-        }
-        Ok(())
+        unsafe { self.initial.replay(context) }?;
+        unsafe { self.commands.replay(context) }
     }
 }
 /// # Safety

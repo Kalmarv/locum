@@ -183,7 +183,7 @@ impl Recorder {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .commands
-            .push(Recorded::Upload(Box::new(upload)));
+            .upload(upload);
     }
     pub unsafe fn tiles(
         &self,
@@ -212,7 +212,7 @@ impl Recorder {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .commands
-            .push(Recorded::Upload(Box::new(upload)));
+            .upload(upload);
     }
     pub unsafe fn mapped(
         &self,
@@ -296,14 +296,14 @@ impl Recorder {
         let writes = canonical(&m.layout, pitches, &physical);
         unsafe { copy_writes(&m.layout, pitches, &writes, m.real.pData.cast()) };
         s.shadows.insert((resource as usize, sub), m.shadow);
-        s.commands.push(Recorded::Upload(Box::new(Upload::Map {
+        s.commands.upload(Upload::Map {
             resource: m.resource,
             sub: m.sub,
             kind: m.kind,
             flags: m.flags,
             writes,
             layout: m.layout,
-        })));
+        });
     }
 }
 impl Upload {
