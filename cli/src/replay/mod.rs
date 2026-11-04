@@ -639,11 +639,13 @@ enum Settled {
     Differs(String),
 }
 
-/// How a record says the length of its slice: a count of the list's records in one of its words, or the word where
-/// the slice ends.
+/// How a record says the length of its slice: a count of the list's records in one of its words; two counts in its
+/// 16-bit halves, the slice the one run after the other (Sekiro's tile lists: point lights, then spot lights); or the
+/// word where the slice ends.
 #[derive(Clone, Copy)]
 enum Length {
     Count(usize),
+    Halves(usize),
     End(usize),
 }
 
@@ -663,6 +665,7 @@ impl std::fmt::Display for Settled {
                 )?;
                 match length {
                     Length::Count(w) => write!(f, "word {w} counts it)"),
+                    Length::Halves(w) => write!(f, "word {w}'s 16-bit halves count it)"),
                     Length::End(w) => write!(f, "word {w} ends it)"),
                 }
             }
@@ -872,6 +875,7 @@ fn sliced_as(
             let (m, g) = (word(mine, r, start), word(game, r, start));
             let n = match length {
                 Length::Count(k) => Some(word(game, r, k)),
+                Length::Halves(k) => Some((word(game, r, k) & 0xffff) + (word(game, r, k) >> 16)),
                 Length::End(e) => {
                     let (nm, ng) = (word(mine, r, e).checked_sub(m), word(game, r, e).checked_sub(g));
                     (nm == ng).then_some(ng).flatten()
@@ -887,7 +891,7 @@ fn sliced_as(
     match moved.as_slice() {
         [start] => (0..words)
             .filter(|&k| k != *start)
-            .map(Length::Count)
+            .flat_map(|k| [Length::Count(k), Length::Halves(k)])
             .find(|&length| fits(*start, length))
             .map(|length| (*start, length)),
         [a, b] => [(*a, *b), (*b, *a)]
@@ -1472,5 +1476,10 @@ mod tests {
         let mine = bytes(&[1, 3, 0, 1]);
         let found = sliced(&mine, &game, Some(8), &list, &theirs, 4);
         assert!(matches!(found, Some((8, 0, Length::End(1)))));
+        // Two counts in one word's halves, as Sekiro's tile lists have them: (first entry, points | spots << 16).
+        let game = bytes(&[0, 1 | 1 << 16, 2, 1]);
+        let mine = bytes(&[1, 1 | 1 << 16, 0, 1]);
+        let found = sliced(&mine, &game, Some(8), &list, &theirs, 4);
+        assert!(matches!(found, Some((8, 0, Length::Halves(1)))));
     }
 }
