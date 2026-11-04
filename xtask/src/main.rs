@@ -344,7 +344,9 @@ fn main() {
         .to_path_buf();
     match args.first().map(String::as_str) {
         Some("gen") => generate_all(&root),
-        Some("smoke") if args.windows(2).any(|p| p[0] == "--api" && p[1] == "d3d12") => d3d12::smoke(&root),
+        Some("smoke") if args.windows(2).any(|p| p[0] == "--api" && p[1] == "d3d12") => {
+            d3d12::smoke(&root, args.iter().any(|a| a == "--hardware"))
+        }
         Some("smoke") => smoke(&root, args.iter().any(|a| a == "--debug")),
         _ => {
             eprintln!("usage: cargo xtask gen | smoke");

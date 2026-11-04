@@ -184,7 +184,8 @@ pub fn implementation(c: &Class, levels: &[(String, &Vtbl)]) -> String {
     s
 }
 
-pub fn smoke(root: &std::path::Path) {
+/// The D3D12 smoke on WARP, or with `hardware` what only a real GPU shows, on the default adapter.
+pub fn smoke(root: &std::path::Path, hardware: bool) {
     use std::process::Command;
     let status = Command::new(env!("CARGO"))
         .current_dir(root)
@@ -224,6 +225,9 @@ pub fn smoke(root: &std::path::Path) {
     let old_log = log.join("locum.log");
     if old_log.is_file() {
         std::fs::remove_file(&old_log).unwrap();
+    }
+    if hardware {
+        return hardware_smoke(&stage, &log);
     }
     // The fixture labels its captures with its process ID.
     let child = Command::new(stage.join("locum-smoke-d3d12.exe"))
@@ -278,6 +282,45 @@ pub fn smoke(root: &std::path::Path) {
     replay_checks(&stage, pid);
 }
 
+/// The fixture's hardware scenarios on the default adapter, then their captures replayed there.
+fn hardware_smoke(stage: &std::path::Path, log: &std::path::Path) {
+    use std::process::Command;
+    let child = Command::new(stage.join("locum-smoke-d3d12.exe"))
+        .arg("--hardware")
+        .current_dir(stage)
+        .env("LOCUM_DIR", log)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run D3D12 hardware smoke");
+    let pid = child.id();
+    let result = child.wait_with_output().expect("run D3D12 hardware smoke");
+    print!("{}", String::from_utf8_lossy(&result.stdout));
+    eprint!("{}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "D3D12 hardware smoke failed: {}",
+        result.status
+    );
+    let capture = log.join("captures").join(format!("planes-{pid}"));
+    let output = Command::new(stage.join("locum-cli.exe"))
+        .arg("verify")
+        .arg(&capture)
+        .env("LOCUM_DIR", log)
+        .output()
+        .expect("verify the planes capture");
+    let text =
+        String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+    println!("--- locum-cli verify {}\n{text}", capture.display());
+    assert!(
+        text.contains("2 of 2 targets identical"),
+        "planes: both draws' depth-stencil replay as copied"
+    );
+    println!(
+        "ok   D3D12 hardware: a split-plane depth-stencil copied between two passes holds what the first left"
+    );
+}
+
 /// Replays the fixture's captures with locum-cli on WARP: verify, a rule, and contents at an event.
 fn replay_checks(stage: &std::path::Path, pid: u32) {
     use std::process::Command;
@@ -315,6 +358,7 @@ fn replay_checks(stage: &std::path::Path, pid: u32) {
         "cb-copied",
         "results",
         "reserved",
+        "planes",
     ] {
         let (_, text) = run(&["verify", "--warp", &capture(name)]);
         assert!(
@@ -361,6 +405,12 @@ fn replay_checks(stage: &std::path::Path, pid: u32) {
     });
     let targets = identical.expect("passes: every target identical on replay");
     println!("ok   D3D12 verify: passes' {targets} targets replay bit for bit");
+    let (_, text) = run(&["verify", "--warp", &capture("planes")]);
+    assert!(
+        text.contains("2 of 2 targets identical"),
+        "planes: both draws' depth-stencil replay as copied"
+    );
+    println!("ok   D3D12 verify: a split-plane depth-stencil's two passes replay as copied");
 
     // A constant rule on a root constants register: the fixture's colour as recorded, the rule's after.
     let out = log.join("replay-rule");

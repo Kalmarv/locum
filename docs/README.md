@@ -565,7 +565,10 @@ ends for a target when a barrier moves it out of its state, its views are reboun
 or discard is about to overwrite it, a native render pass ends (after EndRenderPass, its ending accesses done), or the
 list closes. Each copy transitions the target from the state the game's own barrier names, the state binding it
 requires (RENDER_TARGET, DEPTH_WRITE or DEPTH_READ per plane, or the layouts of those names for a resource made in a
-layout), or what the list's own barriers left it in, to COPY_SOURCE and back, with predication suspended. Its bytes
+layout), or what the list's own barriers left it in, to COPY_SOURCE and back, with predication suspended. A legacy
+state that allows no write is gone back to through COPY_DEST: straight from COPY_SOURCE to the shader-resource states,
+an NVIDIA driver let the list's next barrier into DEPTH_WRITE and the draw after it overlap the copy (Elden Ring's
+split-plane depth-stencil, its stencil copied wrong from row 32 on). Its bytes
 are read after the list's first execution in the frame completes, into `targets` rows on the last draw that had the
 target bound. Lists recorded before the request, a list executed again in the frame, multisampled targets,
 attachments a render pass discards or suspends into another list, and copies past the 3 GiB readback budget are
@@ -628,8 +631,9 @@ disk I/O without an additional in-memory copy or unbounded writer queue.
 An unrecognized PSO stream type logs its first occurrence once per type per process.
 
 `cargo xtask smoke --api d3d12` runs a program through it on WARP with the debug layer on (copies, dispatches, fences,
-pipeline states and libraries, placed resources, barriers, swap chain present and resize); `cargo xtask smoke` stays
-the Direct3D 11 suite. The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
+pipeline states and libraries, placed resources, barriers, swap chain present and resize); `cargo xtask smoke --api
+d3d12 --hardware` runs what WARP cannot show on the default adapter, at the game's size (a copy's order against the
+list's next draw), and verifies the capture there; `cargo xtask smoke` stays the Direct3D 11 suite. The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
 
 ## Crash investigation
 

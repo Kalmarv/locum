@@ -6,7 +6,8 @@
 //! native render pass ends. A barrier leaves the target bound: games bind a target and only then move it into
 //! RENDER_TARGET or DEPTH_WRITE (Elden Ring's shadow and G-buffer passes), and draw to it again after moving it back. Its targets are copied just before the command that ends it (after EndRenderPass itself, its ending
 //! access done): a transition from the state the target is in to COPY_SOURCE, a copy of the view's subresource into
-//! readback memory, the transition back. The application's own barrier names that state; otherwise a bound target
+//! readback memory, the transition back (through COPY_DEST to a state that allows no write, so that the list's later
+//! writes wait for the copy: see [`barriers`]). The application's own barrier names that state; otherwise a bound target
 //! is in RENDER_TARGET or DEPTH_WRITE (the layouts of those names for resources made in a layout), or what this
 //! list's own barriers left it in. Predication is suspended around the copies.
 //!
@@ -43,7 +44,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::core::Interface;
 
-use super::states::{Access, COPY_SOURCE};
+use super::states::{Access, COPY_DEST, COPY_SOURCE};
 
 /// Whether lists reset now are instrumented: from the Present that arms a capture to the one that closes it.
 pub static ARMED: AtomicBool = AtomicBool::new(false);
@@ -63,6 +64,9 @@ const OUTPUT_BYTES: u64 = 64 << 20;
 const RENDER_TARGET: i32 = 0x4;
 const DEPTH_WRITE: i32 = 0x10;
 const ALL_SUBRESOURCES: u64 = 0xFFFF_FFFF;
+/// The legacy states that allow a write: RENDER_TARGET, UNORDERED_ACCESS, DEPTH_WRITE, STREAM_OUT, COPY_DEST,
+/// RESOLVE_DEST and the video writes.
+const WRITES: i32 = 0x4 | 0x8 | 0x10 | 0x100 | COPY_DEST | 0x1000 | 0x20000 | 0x80000 | 0x800000;
 
 /// The readback memory of one target's copy; dropping the last reference gives its bytes back to the budget.
 struct Readback {
@@ -1650,6 +1654,9 @@ fn borrowed(r: &ID3D12Resource) -> ManuallyDrop<Option<ID3D12Resource>> {
 /// The barriers moving subresources between where they are and COPY_SOURCE.
 struct Barriers {
     legacy: Vec<D3D12_RESOURCE_BARRIER>,
+    /// Legacy transitions recorded in a second call, after `legacy`: from COPY_DEST to the read-only states copied
+    /// subresources go back to (see [`barriers`]).
+    settle: Vec<D3D12_RESOURCE_BARRIER>,
     enhanced: Vec<D3D12_TEXTURE_BARRIER>,
     buffers: Vec<D3D12_BUFFER_BARRIER>,
 }
@@ -1666,8 +1673,10 @@ impl Barriers {
     }
 
     unsafe fn issue(&self, list: &ID3D12GraphicsCommandList) {
-        if !self.legacy.is_empty() {
-            unsafe { list.ResourceBarrier(&self.legacy) };
+        for batch in [&self.legacy, &self.settle] {
+            if !batch.is_empty() {
+                unsafe { list.ResourceBarrier(batch) };
+            }
         }
         let mut groups = Vec::new();
         if !self.enhanced.is_empty() {
@@ -1699,6 +1708,12 @@ impl Barriers {
 /// The transitions of a resource's subresources, each from its state or layout, to COPY_SOURCE (`to_copy`) or back.
 /// A buffer has one, `ALL_SUBRESOURCES`; where it is moved by enhanced barriers (a layout given), it has no layout
 /// and only its access changes. `common` is how a subresource in the COMMON layout was used.
+///
+/// A legacy transition from COPY_SOURCE straight back to a state that allows no write does not hold back the list's
+/// later writes: on an NVIDIA driver the game's next barrier into a write state and the draw after it overlap the
+/// copy, which reads what they write (Elden Ring's split-plane depth-stencil, each copy of its stencil wrong from row
+/// 32 on; WARP keeps the order). A subresource going back to such a state goes through COPY_DEST: the transition into
+/// a write state waits for the copy's reads.
 fn barriers(
     r: &ID3D12Resource,
     subs: &[(u32, Access)],
@@ -1707,6 +1722,7 @@ fn barriers(
 ) -> Result<Barriers, String> {
     let mut out = Barriers {
         legacy: Vec::new(),
+        settle: Vec::new(),
         enhanced: Vec::new(),
         buffers: Vec::new(),
     };
@@ -1716,28 +1732,27 @@ fn barriers(
         D3D12_BARRIER_ACCESS_COPY_SOURCE,
         D3D12_BARRIER_LAYOUT_COPY_SOURCE,
     );
+    let transition = |sub: u32, before: i32, after: i32| D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                pResource: borrowed(r),
+                Subresource: sub,
+                StateBefore: D3D12_RESOURCE_STATES(before),
+                StateAfter: D3D12_RESOURCE_STATES(after),
+            }),
+        },
+    };
     for &(sub, access) in subs {
         match access {
             Access::State(s) if s & COPY_SOURCE != 0 => {}
-            Access::State(s) => {
-                let (before, after) = if to_copy {
-                    (s, COPY_SOURCE)
-                } else {
-                    (COPY_SOURCE, s)
-                };
-                out.legacy.push(D3D12_RESOURCE_BARRIER {
-                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
-                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
-                        Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
-                            pResource: borrowed(r),
-                            Subresource: sub,
-                            StateBefore: D3D12_RESOURCE_STATES(before),
-                            StateAfter: D3D12_RESOURCE_STATES(after),
-                        }),
-                    },
-                });
+            Access::State(s) if to_copy => out.legacy.push(transition(sub, s, COPY_SOURCE)),
+            Access::State(s) if s & WRITES == 0 => {
+                out.legacy.push(transition(sub, COPY_SOURCE, COPY_DEST));
+                out.settle.push(transition(sub, COPY_DEST, s));
             }
+            Access::State(s) => out.legacy.push(transition(sub, COPY_SOURCE, s)),
             Access::Layout(_) if buffer => {
                 let written = (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
                 let (before, after) = if to_copy {

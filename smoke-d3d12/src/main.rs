@@ -1,4 +1,5 @@
-//! Exercises real WARP12 calls through the shims. This is not a game launcher.
+//! Exercises real WARP12 calls through the shims. This is not a game launcher. With `--hardware` it runs what only a
+//! real GPU shows on the default adapter instead.
 use core::{ffi::c_void, mem::ManuallyDrop};
 use std::time::{Duration, Instant};
 use windows::Win32::Foundation::*;
@@ -12,6 +13,7 @@ mod contents;
 mod graphics;
 mod modern;
 mod passes;
+mod planes;
 mod reserved;
 mod results;
 
@@ -78,10 +80,111 @@ unsafe extern "system" fn debug_message(
     }
 }
 fn main() {
+    if std::env::args().any(|a| a == "--hardware") {
+        unsafe { hardware() };
+        println!("D3D12 hardware smoke: all checks passed");
+        return;
+    }
     unsafe {
         run();
     }
     println!("D3D12 WARP smoke: all checks passed");
+}
+
+/// A window and a swap chain on `queue`: what a capture is requested and closed by.
+unsafe fn swap_chain(factory: &IDXGIFactory4, queue: &ID3D12CommandQueue) -> (HWND, IDXGISwapChain1) {
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap();
+        let class = w!("LocumD3d12Smoke");
+        assert_ne!(
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(window_proc),
+                hInstance: instance.into(),
+                lpszClassName: class,
+                ..Default::default()
+            }),
+            0
+        );
+        let hwnd = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class,
+            w!("locum D3D12 smoke"),
+            WS_OVERLAPPEDWINDOW,
+            0,
+            0,
+            64,
+            64,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .unwrap();
+        let chain = factory
+            .CreateSwapChainForHwnd(
+                queue,
+                hwnd,
+                &DXGI_SWAP_CHAIN_DESC1 {
+                    Width: 64,
+                    Height: 64,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+                    BufferCount: 2,
+                    SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        (hwnd, chain)
+    }
+}
+
+/// What only a real GPU shows: the scenarios WARP keeps in order whatever the barriers, on the default adapter
+/// through the shims, with no debug layer (it changes a driver's timing).
+unsafe fn hardware() {
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let dll = LoadLibraryW(w!("d3d12.dll")).unwrap();
+        type Create = unsafe extern "system" fn(
+            *mut c_void,
+            D3D_FEATURE_LEVEL,
+            *const GUID,
+            *mut *mut c_void,
+        ) -> HRESULT;
+        let create: Create = core::mem::transmute(GetProcAddress(dll, s!("D3D12CreateDevice")).unwrap());
+        let mut raw = core::ptr::null_mut();
+        create(
+            core::ptr::null_mut(),
+            D3D_FEATURE_LEVEL_11_0,
+            &ID3D12Device::IID,
+            &mut raw,
+        )
+        .ok()
+        .unwrap();
+        let device = ID3D12Device::from_raw(raw);
+        let adapter = factory
+            .EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid())
+            .unwrap();
+        let name = String::from_utf16_lossy(&adapter.GetDesc1().unwrap().Description);
+        println!("adapter: {}", name.trim_end_matches('\0'));
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+            .unwrap();
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let (hwnd, chain) = swap_chain(&factory, &queue);
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        // The game's size: at Elden Ring's 2560x1440 every copy of the race was wrong.
+        planes::capture(&device, &queue, &fence, &chain, (2560, 1440));
+        finish(&queue, &fence, 44);
+        drop(chain);
+        DestroyWindow(hwnd).unwrap();
+    }
 }
 unsafe fn run() {
     unsafe {
@@ -409,50 +512,7 @@ unsafe fn run() {
         output.Unmap(0, None);
         debug_errors(&device);
         println!("placed heap resource, nested transition barrier and readback bytes verified");
-        let instance = GetModuleHandleW(None).unwrap();
-        let class = w!("LocumD3d12Smoke");
-        assert_ne!(
-            RegisterClassW(&WNDCLASSW {
-                lpfnWndProc: Some(window_proc),
-                hInstance: instance.into(),
-                lpszClassName: class,
-                ..Default::default()
-            }),
-            0
-        );
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            class,
-            w!("locum WARP12 smoke"),
-            WS_OVERLAPPEDWINDOW,
-            0,
-            0,
-            64,
-            64,
-            None,
-            None,
-            Some(instance.into()),
-            None,
-        )
-        .unwrap();
-        let chain = factory
-            .CreateSwapChainForHwnd(
-                &queue,
-                hwnd,
-                &DXGI_SWAP_CHAIN_DESC1 {
-                    Width: 64,
-                    Height: 64,
-                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-                    BufferCount: 2,
-                    SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-                    ..Default::default()
-                },
-                None,
-                None,
-            )
-            .unwrap();
+        let (hwnd, chain) = swap_chain(&factory, &queue);
         let from_chain: ID3D12Device = chain.GetDevice().unwrap();
         identity(&device, &from_chain);
         let back: ID3D12Resource = chain.GetBuffer(0).unwrap();
@@ -484,6 +544,8 @@ unsafe fn run() {
         finish(&queue, &fence, 27);
         reserved::capture(&device, &queue, &fence, &chain);
         finish(&queue, &fence, 42);
+        planes::capture(&device, &queue, &fence, &chain, (256, 128));
+        finish(&queue, &fence, 44);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();
