@@ -389,6 +389,13 @@ Each hit is named: a module and offset, a thread's stack, or a heap allocation a
 parameters copied straight into constant buffers are found this way; values the game computes each frame (matrices)
 usually are not in memory as the GPU saw them.
 
+A stack's frames are `module+offset`, the offset from where the module was loaded (the `modules` table has each
+module's base in the run). To find a frame in a disassembler, add the offset to the image base the project uses: a
+64-bit exe's PE header names it (0x140000000 unless the linker was told otherwise), and Ghidra shows it in the memory
+map; a dump of the running image (an exe unpacked from memory) keeps the base it ran at. The innermost frames are the
+D3D call and the engine's wrapper of it: the code that filled the bytes is often further out, or on another thread
+that queued them (a render thread replaying the game thread's commands), so the same stack can carry every value.
+
 Two captures, of the same game run twice or of a scene before and after a change, are compared draw by draw:
 
 ```
