@@ -68,14 +68,18 @@ pub fn subobjects(desc: &Value) -> Vec<(u32, Value)> {
                 };
                 out.push((t, s.clone()));
             }
-            if desc["stream_output"]["entries"].as_array().is_some_and(|e| !e.is_empty()) {
+            if desc["stream_output"]["entries"]
+                .as_array()
+                .is_some_and(|e| !e.is_empty())
+            {
                 out.push((STREAM_OUTPUT, desc["stream_output"].clone()));
             }
             let rt = serde_json::json!({
                 "NumRenderTargets": desc["render_target_count"],
                 "RTFormats": desc["rt_formats"],
             });
-            let sample = serde_json::json!({"count": desc["sample_count"], "quality": desc["sample_quality"]});
+            let sample =
+                serde_json::json!({"count": desc["sample_count"], "quality": desc["sample_quality"]});
             out.extend([
                 (BLEND, desc["blend"].clone()),
                 (SAMPLE_MASK, desc["sample_mask"].clone()),
@@ -135,7 +139,13 @@ fn blend(v: &Value) -> D3D12_BLEND_DESC {
         IndependentBlendEnable: b(v, "IndependentBlendEnable"),
         ..Default::default()
     };
-    for (i, t) in v["RenderTarget"].as_array().into_iter().flatten().take(8).enumerate() {
+    for (i, t) in v["RenderTarget"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(8)
+        .enumerate()
+    {
         d.RenderTarget[i] = D3D12_RENDER_TARGET_BLEND_DESC {
             BlendEnable: b(t, "BlendEnable"),
             LogicOpEnable: b(t, "LogicOpEnable"),
@@ -281,19 +291,32 @@ pub fn make(
                 s.push(
                     *ty,
                     D3D12_INPUT_LAYOUT_DESC {
-                        pInputElementDescs: if descs.is_empty() { core::ptr::null() } else { descs.as_ptr() },
+                        pInputElementDescs: if descs.is_empty() {
+                            core::ptr::null()
+                        } else {
+                            descs.as_ptr()
+                        },
                         NumElements: descs.len() as u32,
                     },
                 );
             }
-            STRIP_CUT => s.push(*ty, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(v.as_u64().unwrap_or(0) as i32)),
+            STRIP_CUT => s.push(
+                *ty,
+                D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(v.as_u64().unwrap_or(0) as i32),
+            ),
             TOPOLOGY => s.push(*ty, D3D12_PRIMITIVE_TOPOLOGY_TYPE(v.as_u64().unwrap_or(0) as i32)),
             RT_FORMATS => {
                 let mut f = D3D12_RT_FORMAT_ARRAY {
                     NumRenderTargets: u(v, "NumRenderTargets"),
                     ..Default::default()
                 };
-                for (i, x) in v["RTFormats"].as_array().into_iter().flatten().take(8).enumerate() {
+                for (i, x) in v["RTFormats"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(8)
+                    .enumerate()
+                {
                     f.RTFormats[i] = DXGI_FORMAT(x.as_u64().unwrap_or(0) as i32);
                 }
                 s.push(*ty, f);

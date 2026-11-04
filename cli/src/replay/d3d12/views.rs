@@ -33,7 +33,9 @@ pub fn srv(desc: &Value) -> D3D12_SHADER_RESOURCE_VIEW_DESC {
     let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: format(desc),
         ViewDimension: D3D12_SRV_DIMENSION(u(desc, "dimension") as i32),
-        Shader4ComponentMapping: desc["mapping"].as_u64().map_or(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, |m| m as u32),
+        Shader4ComponentMapping: desc["mapping"]
+            .as_u64()
+            .map_or(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, |m| m as u32),
         ..Default::default()
     };
     let clamp = f(p, "ResourceMinLODClamp");
@@ -135,7 +137,9 @@ pub fn uav(desc: &Value) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
             },
         },
         D3D12_UAV_DIMENSION_TEXTURE1D => D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-            Texture1D: D3D12_TEX1D_UAV { MipSlice: u(p, "MipSlice") },
+            Texture1D: D3D12_TEX1D_UAV {
+                MipSlice: u(p, "MipSlice"),
+            },
         },
         D3D12_UAV_DIMENSION_TEXTURE1DARRAY => D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
             Texture1DArray: D3D12_TEX1D_ARRAY_UAV {
@@ -185,7 +189,9 @@ pub fn rtv(desc: &Value) -> D3D12_RENDER_TARGET_VIEW_DESC {
             },
         },
         D3D12_RTV_DIMENSION_TEXTURE1D => D3D12_RENDER_TARGET_VIEW_DESC_0 {
-            Texture1D: D3D12_TEX1D_RTV { MipSlice: u(p, "MipSlice") },
+            Texture1D: D3D12_TEX1D_RTV {
+                MipSlice: u(p, "MipSlice"),
+            },
         },
         D3D12_RTV_DIMENSION_TEXTURE1DARRAY => D3D12_RENDER_TARGET_VIEW_DESC_0 {
             Texture1DArray: D3D12_TEX1D_ARRAY_RTV {
@@ -239,7 +245,9 @@ pub fn dsv(desc: &Value) -> D3D12_DEPTH_STENCIL_VIEW_DESC {
     };
     d.Anonymous = match d.ViewDimension {
         D3D12_DSV_DIMENSION_TEXTURE1D => D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
-            Texture1D: D3D12_TEX1D_DSV { MipSlice: u(p, "MipSlice") },
+            Texture1D: D3D12_TEX1D_DSV {
+                MipSlice: u(p, "MipSlice"),
+            },
         },
         D3D12_DSV_DIMENSION_TEXTURE1DARRAY => D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
             Texture1DArray: D3D12_TEX1D_ARRAY_DSV {
@@ -249,7 +257,9 @@ pub fn dsv(desc: &Value) -> D3D12_DEPTH_STENCIL_VIEW_DESC {
             },
         },
         D3D12_DSV_DIMENSION_TEXTURE2D => D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
-            Texture2D: D3D12_TEX2D_DSV { MipSlice: u(p, "MipSlice") },
+            Texture2D: D3D12_TEX2D_DSV {
+                MipSlice: u(p, "MipSlice"),
+            },
         },
         D3D12_DSV_DIMENSION_TEXTURE2DARRAY => D3D12_DEPTH_STENCIL_VIEW_DESC_0 {
             Texture2DArray: D3D12_TEX2D_ARRAY_DSV {
@@ -324,24 +334,44 @@ pub fn subresources(kind: &str, desc: &Value, e: Extent) -> Vec<u32> {
     let dim = u(desc, "dimension");
     let span = |first: u32, count: u32, limit: u32| {
         let first = first.min(limit);
-        first..if count == u32::MAX { limit } else { (first + count).min(limit) }
+        first..if count == u32::MAX {
+            limit
+        } else {
+            (first + count).min(limit)
+        }
     };
     // Mips, slices and planes, by the dimension's numbering in each kind of view.
     let (mips, slices, planes) = match (kind, dim) {
-        ("srv", 2 | 4 | 8) =>(span(u(p, "MostDetailedMip"), u(p, "MipLevels"), e.mips), 0..1, plane(p, e)),
+        ("srv", 2 | 4 | 8) => (
+            span(u(p, "MostDetailedMip"), u(p, "MipLevels"), e.mips),
+            0..1,
+            plane(p, e),
+        ),
         ("srv", 3 | 5) => (
             span(u(p, "MostDetailedMip"), u(p, "MipLevels"), e.mips),
             span(u(p, "FirstArraySlice"), u(p, "ArraySize"), e.slices),
             plane(p, e),
         ),
         ("srv", 6) => (0..1, 0..1, 0..1),
-        ("srv", 7) => (0..1, span(u(p, "FirstArraySlice"), u(p, "ArraySize"), e.slices), 0..1),
-        ("srv", 10) => (
-            span(u(p, "MostDetailedMip"), u(p, "MipLevels"), e.mips),
-            span(u(p, "First2DArrayFace"), u(p, "NumCubes").saturating_mul(6), e.slices),
+        ("srv", 7) => (
+            0..1,
+            span(u(p, "FirstArraySlice"), u(p, "ArraySize"), e.slices),
             0..1,
         ),
-        ("srv", 9) => (span(u(p, "MostDetailedMip"), u(p, "MipLevels"), e.mips), 0..6.min(e.slices), 0..1),
+        ("srv", 10) => (
+            span(u(p, "MostDetailedMip"), u(p, "MipLevels"), e.mips),
+            span(
+                u(p, "First2DArrayFace"),
+                u(p, "NumCubes").saturating_mul(6),
+                e.slices,
+            ),
+            0..1,
+        ),
+        ("srv", 9) => (
+            span(u(p, "MostDetailedMip"), u(p, "MipLevels"), e.mips),
+            0..6.min(e.slices),
+            0..1,
+        ),
         ("rtv" | "uav", 2 | 4 | 8) => (span(u(p, "MipSlice"), 1, e.mips), 0..1, plane(p, e)),
         ("rtv" | "uav", 3 | 5) => (
             span(u(p, "MipSlice"), 1, e.mips),
@@ -349,7 +379,11 @@ pub fn subresources(kind: &str, desc: &Value, e: Extent) -> Vec<u32> {
             plane(p, e),
         ),
         ("rtv", 6) => (0..1, 0..1, 0..1),
-        ("rtv", 7) => (0..1, span(u(p, "FirstArraySlice"), u(p, "ArraySize"), e.slices), 0..1),
+        ("rtv", 7) => (
+            0..1,
+            span(u(p, "FirstArraySlice"), u(p, "ArraySize"), e.slices),
+            0..1,
+        ),
         // A depth-stencil view covers both planes.
         ("dsv", 1 | 3) => (span(u(p, "MipSlice"), 1, e.mips), 0..1, 0..e.planes),
         ("dsv", 2 | 4) => (
@@ -358,7 +392,11 @@ pub fn subresources(kind: &str, desc: &Value, e: Extent) -> Vec<u32> {
             0..e.planes,
         ),
         ("dsv", 5) => (0..1, 0..1, 0..e.planes),
-        ("dsv", 6) => (0..1, span(u(p, "FirstArraySlice"), u(p, "ArraySize"), e.slices), 0..e.planes),
+        ("dsv", 6) => (
+            0..1,
+            span(u(p, "FirstArraySlice"), u(p, "ArraySize"), e.slices),
+            0..e.planes,
+        ),
         _ => return all(),
     };
     let mut out = Vec::new();

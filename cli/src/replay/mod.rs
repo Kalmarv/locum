@@ -159,7 +159,11 @@ fn with_bound(c: &Capture, events: Vec<i64>, mut resources: BTreeSet<i64>) -> Pl
     // Everything a draw has bound, and the resource of every view an event names, in one query (one per event
     // scans the bindings once per event: minutes on a game's frame).
     let mut bound: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
-    let constants = if captured_constants(c) { "AND b.kind <> 'cb'" } else { "" };
+    let constants = if captured_constants(c) {
+        "AND b.kind <> 'cb'"
+    } else {
+        ""
+    };
     for (event, resource) in c.rows(
         &format!(
             "SELECT DISTINCT d.event, b.resource FROM bindings b JOIN draws d ON d.n = b.draw \
@@ -492,7 +496,11 @@ fn recorded(c: &Capture) -> HashMap<i64, Vec<Written>> {
     } else {
         "1"
     };
-    let sub = if columns.iter().any(|n| n == "sub") { "sub" } else { "NULL" };
+    let sub = if columns.iter().any(|n| n == "sub") {
+        "sub"
+    } else {
+        "NULL"
+    };
     for (event, w) in c.rows(
         &format!("SELECT event, resource, content, {ordered}, {sub} FROM results"),
         [],

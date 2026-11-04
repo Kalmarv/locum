@@ -37,8 +37,16 @@ pub fn list(dir: &Path) -> Vec<PathBuf> {
             .filter(|p| p.is_dir())
             .collect()
     };
-    let mut folders = vec![dir.join("captures"), dir.to_path_buf(), dir.join("locum-log").join("captures")];
-    folders.extend(subdirs(dir).into_iter().map(|run| run.join("locum-log").join("captures")));
+    let mut folders = vec![
+        dir.join("captures"),
+        dir.to_path_buf(),
+        dir.join("locum-log").join("captures"),
+    ];
+    folders.extend(
+        subdirs(dir)
+            .into_iter()
+            .map(|run| run.join("locum-log").join("captures")),
+    );
     let mut found: Vec<(std::time::SystemTime, PathBuf)> = folders
         .iter()
         .flat_map(|f| subdirs(f))
@@ -107,7 +115,11 @@ pub fn open(arg: &str, blobs: Option<&Path>) -> Result<Capture, String> {
         .filter(|found| !found.is_empty())
     {
         if found.len() > 1 {
-            return Err(format!("{arg} names {} captures; give one's path:{}", found.len(), listed(&found)));
+            return Err(format!(
+                "{arg} names {} captures; give one's path:{}",
+                found.len(),
+                listed(&found)
+            ));
         }
         found.into_iter().next().unwrap_or_default()
     } else if arg == "last" {

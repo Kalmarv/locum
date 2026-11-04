@@ -185,10 +185,10 @@ pub fn from_footprints(
         for z in 0..f.depth as usize {
             for y in 0..f.rows as usize {
                 let at = f.at(z, y);
-                out.extend_from_slice(
-                    data.get(at..at + f.row_bytes as usize)
-                        .ok_or(format!("subresource {index} lies past the copy's {} bytes", data.len()))?,
-                );
+                out.extend_from_slice(data.get(at..at + f.row_bytes as usize).ok_or(format!(
+                    "subresource {index} lies past the copy's {} bytes",
+                    data.len()
+                ))?);
             }
         }
         Ok((out, f.row_bytes))

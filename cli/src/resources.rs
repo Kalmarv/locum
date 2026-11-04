@@ -463,7 +463,9 @@ pub fn discarded(c: &Capture, call: &str, args: Option<&str>) -> Option<String> 
     let size = crate::describe::shape(c, args["resource"].as_i64()?).map(|s| s.bytes)?;
     Some(match wrote {
         0 => "wrote no bytes: what it holds is the pattern a discarding map starts as, not data".into(),
-        w if w < size => format!("wrote {w} of its {size} bytes: the rest is the pattern a discarding map starts as"),
+        w if w < size => {
+            format!("wrote {w} of its {size} bytes: the rest is the pattern a discarding map starts as")
+        }
         _ => return None,
     })
 }

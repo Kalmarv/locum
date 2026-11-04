@@ -282,14 +282,20 @@ pub fn smoke(root: &std::path::Path) {
 fn replay_checks(stage: &std::path::Path, pid: u32) {
     use std::process::Command;
     let log = stage.join("log");
-    let capture = |name: &str| log.join("captures").join(format!("{name}-{pid}")).display().to_string();
+    let capture = |name: &str| {
+        log.join("captures")
+            .join(format!("{name}-{pid}"))
+            .display()
+            .to_string()
+    };
     let run = |args: &[&str]| {
         let output = Command::new(stage.join("locum-cli.exe"))
             .args(args)
             .env("LOCUM_DIR", &log)
             .output()
             .unwrap_or_else(|e| panic!("locum-cli {args:?}: {e}"));
-        let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        let text =
+            String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
         println!("--- locum-cli {}\n{text}", args.join(" "));
         (output.status.success(), text)
     };
@@ -299,9 +305,21 @@ fn replay_checks(stage: &std::path::Path, pid: u32) {
         text.lines().nth(1).unwrap_or_default().trim().to_string()
     };
     // Every capture replays without an event, argument or descriptor kind it skips.
-    for name in ["journal", "graphics", "modern", "contents", "passes", "compute-first", "cb-copied", "results"] {
+    for name in [
+        "journal",
+        "graphics",
+        "modern",
+        "contents",
+        "passes",
+        "compute-first",
+        "cb-copied",
+        "results",
+    ] {
         let (_, text) = run(&["verify", "--warp", &capture(name)]);
-        assert!(!text.contains(" are not replayed"), "{name}: verify skipped something it should replay");
+        assert!(
+            !text.contains(" are not replayed"),
+            "{name}: verify skipped something it should replay"
+        );
         assert!(!text.contains("locum-cli: event "), "{name}: replay failed");
     }
     // What each dispatch and the clear wrote through UAVs, as replay makes it: the game's bytes, and the tickets the
@@ -319,14 +337,25 @@ fn replay_checks(stage: &std::path::Path, pid: u32) {
         .lines()
         .find_map(|l| l.strip_prefix("order-dependent shaders' outputs: "))
         .expect("results: the tickets' outputs compared");
-    let n: Vec<u32> = ordered.split(|c: char| !c.is_ascii_digit()).filter_map(|w| w.parse().ok()).collect();
-    assert!(n.len() == 3 && n[0] + n[1] == 2 && n[2] == 0, "results: the tickets' outputs: {ordered}");
+    let n: Vec<u32> = ordered
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|w| w.parse().ok())
+        .collect();
+    assert!(
+        n.len() == 3 && n[0] + n[1] == 2 && n[2] == 0,
+        "results: the tickets' outputs: {ordered}"
+    );
     println!("ok   D3D12 verify: what dispatches and a clear wrote through UAVs replays as the game's");
     // Passes' targets, drawn from root constants across lists, are the fixture's bit for bit.
     let (_, text) = run(&["verify", "--warp", &capture("passes")]);
     let identical = text.lines().find_map(|l| {
         let w: Vec<&str> = l.split_whitespace().collect();
-        (w.len() > 4 && w[1] == "of" && w[3] == "targets" && w[4] == "identical;" && w[0] == w[2] && w[0] != "0")
+        (w.len() > 4
+            && w[1] == "of"
+            && w[3] == "targets"
+            && w[4] == "identical;"
+            && w[0] == w[2]
+            && w[0] != "0")
             .then(|| w[0].to_string())
     });
     let targets = identical.expect("passes: every target identical on replay");
@@ -351,8 +380,13 @@ fn replay_checks(stage: &std::path::Path, pid: u32) {
     println!("ok   D3D12 replay: a rule on root constants changes every texel; without it, the game's");
 
     // What draw 6 left in its target, from the replay of the frame up to the event after it.
-    let event: i64 = sql("passes", "SELECT event FROM draws WHERE n = 6").parse().expect("draw 6's event");
-    let target = sql("passes", "SELECT resource FROM bindings WHERE draw = 6 AND kind = 'rtv'");
+    let event: i64 = sql("passes", "SELECT event FROM draws WHERE n = 6")
+        .parse()
+        .expect("draw 6's event");
+    let target = sql(
+        "passes",
+        "SELECT resource FROM bindings WHERE draw = 6 AND kind = 'rtv'",
+    );
     let raw = log.join("at.raw");
     let (ok, _) = run(&[
         "export",

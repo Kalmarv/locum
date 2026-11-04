@@ -62,14 +62,17 @@ fn dxil(bytecode: &[u8]) -> Result<Option<OrderDependence>, String> {
         .ok_or("no DXIL part")?;
     let mut counts: std::collections::BTreeMap<(u16, &'static str), usize> = Default::default();
     for f in &module.functions {
-        let used: std::collections::HashSet<_> = f.instructions.iter().flat_map(|i| i.op.operands()).collect();
+        let used: std::collections::HashSet<_> =
+            f.instructions.iter().flat_map(|i| i.op.operands()).collect();
         let constant = |id: dxil_reader::module::ValueId| {
             let value = match id.checked_sub(f.first) {
                 None => module.values.get(id),
                 Some(local) => f.locals.get(local),
             };
             match value {
-                Some(dxil_reader::module::Value::Constant(dxil_reader::module::Constant::Integer(i))) => Some(i),
+                Some(dxil_reader::module::Value::Constant(dxil_reader::module::Constant::Integer(i))) => {
+                    Some(i)
+                }
                 _ => None,
             }
         };
@@ -78,7 +81,9 @@ fn dxil(bytecode: &[u8]) -> Result<Option<OrderDependence>, String> {
                 continue;
             }
             let op = match &inst.op {
-                Op::Call { function, args } if module.name(*function).is_some_and(|n| n.starts_with("dx.op.")) => {
+                Op::Call { function, args }
+                    if module.name(*function).is_some_and(|n| n.starts_with("dx.op.")) =>
+                {
                     match args.first().and_then(|&a| constant(a)) {
                         Some(70) => (70, "bufferUpdateCounter"),
                         Some(78) => (78, "atomicBinOp"),
@@ -159,16 +164,29 @@ mod tests {
     /// InterlockedAdd(g, 1, s); b.Store(12, o + s); }`, and of one with only the `InterlockedOr` and a store of 7.
     #[test]
     fn dxil_atomics_count_where_their_results_are_used() {
-        let found = order_dependent(include_bytes!("testdata/dxil-atomics.cso")).unwrap().unwrap();
+        let found = order_dependent(include_bytes!("testdata/dxil-atomics.cso"))
+            .unwrap()
+            .unwrap();
         // InterlockedOr's atomicBinOp returns a value nothing reads.
         assert_eq!(
             found.ops,
             [
-                AtomicOp { opcode: 0, name: "atomicrmw", count: 1 },
-                AtomicOp { opcode: 78, name: "atomicBinOp", count: 1 }
+                AtomicOp {
+                    opcode: 0,
+                    name: "atomicrmw",
+                    count: 1
+                },
+                AtomicOp {
+                    opcode: 78,
+                    name: "atomicBinOp",
+                    count: 1
+                }
             ]
         );
-        assert_eq!(order_dependent(include_bytes!("testdata/dxil-plain.cso")), Ok(None));
+        assert_eq!(
+            order_dependent(include_bytes!("testdata/dxil-plain.cso")),
+            Ok(None)
+        );
         // Its one UAV, u0 in space 0, as its PSV0 part declares it.
         assert_eq!(
             crate::rdef::uav_registers(include_bytes!("testdata/dxil-atomics.cso")),

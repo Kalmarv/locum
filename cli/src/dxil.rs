@@ -116,7 +116,10 @@ pub fn compile(source: &str, profile: &str) -> Result<Vec<u8>, String> {
     let status = unsafe { result.GetStatus() }.map_err(|e| e.to_string())?;
     if status.is_err() {
         let errors = unsafe { result.GetErrorBuffer() }
-            .map(|b| String::from_utf8_lossy(&blob_bytes(&b.cast().expect("an error buffer is a blob"))).into_owned())
+            .map(|b| {
+                String::from_utf8_lossy(&blob_bytes(&b.cast().expect("an error buffer is a blob")))
+                    .into_owned()
+            })
             .unwrap_or_default();
         return Err(format!("{}: {}", status.message(), errors.trim_end_matches('\0')));
     }

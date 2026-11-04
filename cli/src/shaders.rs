@@ -90,7 +90,9 @@ pub fn shaders(c: &Capture, stage: Option<&str>, name: Option<&str>, bindings: b
         }
     }
     if shown == 0 && (stage.is_some() || name.is_some()) {
-        out!("no program matches (names come from the programs' debug names, or from the files an index names: --index)");
+        out!(
+            "no program matches (names come from the programs' debug names, or from the files an index names: --index)"
+        );
     }
     Ok(())
 }

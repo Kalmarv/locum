@@ -1087,8 +1087,15 @@ fn numbers(c: &Capture, which: &str) -> Result<Vec<i64>, String> {
 
 /// Keeps only the constants whose buffer's or word's name holds one of `name`'s `|`-separated parts (any case).
 fn keep_named(d: &mut Draw, name: &str) {
-    let parts: Vec<String> = name.split('|').map(str::to_lowercase).filter(|p| !p.is_empty()).collect();
-    let holds = |n: &Option<String>| n.as_ref().is_some_and(|n| parts.iter().any(|p| n.to_lowercase().contains(p)));
+    let parts: Vec<String> = name
+        .split('|')
+        .map(str::to_lowercase)
+        .filter(|p| !p.is_empty())
+        .collect();
+    let holds = |n: &Option<String>| {
+        n.as_ref()
+            .is_some_and(|n| parts.iter().any(|p| n.to_lowercase().contains(p)))
+    };
     d.constants.retain_mut(|k| {
         if !holds(&k.name) {
             k.words.retain(|w| holds(&w.name));

@@ -1093,12 +1093,28 @@ impl Pass {
             .map(|(_, access)| *access);
         let simultaneous = desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
         // A buffer has no layout: one an enhanced barrier moves is written with no state to leave.
-        let access = known.unwrap_or(if (buffer && self.enhanced) || (!buffer && layouts().contains(&w.resource)) {
-            Access::Layout(if simultaneous && !buffer { LAYOUT_COMMON } else { LAYOUT_UNORDERED_ACCESS })
-        } else {
-            Access::State(UNORDERED_ACCESS)
-        });
-        unsafe { output_into(&self.device, list, &real, &desc, w.sub, access, self.predication()) }
+        let access = known.unwrap_or(
+            if (buffer && self.enhanced) || (!buffer && layouts().contains(&w.resource)) {
+                Access::Layout(if simultaneous && !buffer {
+                    LAYOUT_COMMON
+                } else {
+                    LAYOUT_UNORDERED_ACCESS
+                })
+            } else {
+                Access::State(UNORDERED_ACCESS)
+            },
+        );
+        unsafe {
+            output_into(
+                &self.device,
+                list,
+                &real,
+                &desc,
+                w.sub,
+                access,
+                self.predication(),
+            )
+        }
     }
 }
 
@@ -1288,7 +1304,10 @@ unsafe fn copy_into(
     } else {
         D3D12_BARRIER_ACCESS_RENDER_TARGET
     };
-    let (to_copy, back) = (barriers(&t.real, &subs, true, common)?, barriers(&t.real, &subs, false, common)?);
+    let (to_copy, back) = (
+        barriers(&t.real, &subs, true, common)?,
+        barriers(&t.real, &subs, false, common)?,
+    );
     to_copy.possible(list)?;
     let mut footprints = Vec::new();
     let mut bytes = 0u64;
@@ -1412,7 +1431,11 @@ unsafe fn output_into(
     let (layout, footprints, bytes) = if buffer {
         let bytes = desc.Width;
         if bytes > OUTPUT_BYTES {
-            return Err(format!("a buffer of {} MiB, more than one output's {} MiB", bytes >> 20, OUTPUT_BYTES >> 20));
+            return Err(format!(
+                "a buffer of {} MiB, more than one output's {} MiB",
+                bytes >> 20,
+                OUTPUT_BYTES >> 20
+            ));
         }
         (locum_capture::layout::buffer(bytes as u32), Vec::new(), bytes)
     } else {
@@ -1462,10 +1485,17 @@ unsafe fn output_into(
         (layout, vec![(f, rows, row_bytes)], total)
     };
     // Buffers move as a whole.
-    let index = if buffer { ALL_SUBRESOURCES as u32 } else { sub.unwrap_or(0) };
+    let index = if buffer {
+        ALL_SUBRESOURCES as u32
+    } else {
+        sub.unwrap_or(0)
+    };
     let subs = [(index, access)];
     let written = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
-    let (to_copy, back) = (barriers(real, &subs, true, written)?, barriers(real, &subs, false, written)?);
+    let (to_copy, back) = (
+        barriers(real, &subs, true, written)?,
+        barriers(real, &subs, false, written)?,
+    );
     to_copy.possible(list)?;
     let readback = unsafe { readback_buffer(device, bytes, OUTPUT_BUDGET) }?;
     unsafe {
@@ -1486,7 +1516,9 @@ unsafe fn output_into(
             let src = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: borrowed(real),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: index,
+                },
             };
             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
         }
@@ -1708,7 +1740,11 @@ fn barriers(
             }
             Access::Layout(_) if buffer => {
                 let written = (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
-                let (before, after) = if to_copy { (written, (copy.0, copy.1)) } else { ((copy.0, copy.1), written) };
+                let (before, after) = if to_copy {
+                    (written, (copy.0, copy.1))
+                } else {
+                    ((copy.0, copy.1), written)
+                };
                 out.buffers.push(D3D12_BUFFER_BARRIER {
                     SyncBefore: before.0,
                     SyncAfter: after.0,
@@ -1731,7 +1767,11 @@ fn barriers(
                     _ => return Err(format!("layout {l} where the copy is made")),
                 };
                 // COMMON allows copying from it, and a texture made for simultaneous access has no other layout.
-                let copy_layout = if l == LAYOUT_COMMON { D3D12_BARRIER_LAYOUT(l) } else { copy.2 };
+                let copy_layout = if l == LAYOUT_COMMON {
+                    D3D12_BARRIER_LAYOUT(l)
+                } else {
+                    copy.2
+                };
                 let copy = (copy.0, copy.1, copy_layout);
                 let target = (D3D12_BARRIER_SYNC_ALL, access, D3D12_BARRIER_LAYOUT(l));
                 let (before, after) = if to_copy { (target, copy) } else { (copy, target) };

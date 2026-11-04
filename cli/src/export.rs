@@ -175,7 +175,8 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
             for w in &warnings {
                 told!(out_path, "warning: {w}");
             }
-            let source = format!("as event {event} saw it: replayed from the frame's start with {events} events");
+            let source =
+                format!("as event {event} saw it: replayed from the frame's start with {events} events");
             told!(out_path, "#{id} {source}");
             // The write it holds last: a discarding map that wrote little or nothing leaves locum's pattern.
             let last: Option<(i64, String, Option<String>)> = c.row(
@@ -236,7 +237,10 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
                 }
                 let (a, b) = (a.max(0) as usize, (b.max(0) as usize).min(bytes.len()));
                 if a >= b {
-                    return Err(format!("--bytes {a}..{b}: nothing of #{id}'s {} bytes", bytes.len()));
+                    return Err(format!(
+                        "--bytes {a}..{b}: nothing of #{id}'s {} bytes",
+                        bytes.len()
+                    ));
                 }
                 (a, b - a)
             } else if which.sub.is_some() || which.mip > 0 || which.slice > 0 {

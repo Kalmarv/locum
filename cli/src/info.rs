@@ -42,11 +42,7 @@ pub fn captures(dir: &Path, blobs: Option<&Path>) -> Result<(), String> {
                     counts["draws"],
                     c.count("SELECT count(*) FROM cb_data", []),
                     mib(counts["content_bytes"].as_u64().unwrap_or(0)),
-                    if c.meta("presented").is_some() {
-                        "yes"
-                    } else {
-                        "-"
-                    },
+                    if c.meta("presented").is_some() { "yes" } else { "-" },
                 );
             }
             Err(e) => out!("{name}\t{e}"),
@@ -207,10 +203,11 @@ pub fn info(c: &Capture) -> Result<(), String> {
 
     // What is missing.
     let mut missing = Vec::new();
-    let gaps: Vec<(String, Option<String>, i64)> =
-        c.rows("SELECT what, detail, count FROM gaps ORDER BY what, rowid", [], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        });
+    let gaps: Vec<(String, Option<String>, i64)> = c.rows(
+        "SELECT what, detail, count FROM gaps ORDER BY what, rowid",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    );
     // One line a kind of gap, with the first details: an older D3D12 locum recorded one row per draw and resource.
     let mut by_what: Vec<(String, Vec<(String, i64)>)> = Vec::new();
     for (what, detail, count) in gaps {

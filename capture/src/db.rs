@@ -590,7 +590,13 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
         }
         let mut s = tx.prepare("INSERT INTO results VALUES(?1,?2,?3,?4,?5)")?;
         for o in &capture.results {
-            s.execute(params![o.event as i64, o.resource as i64, o.content, o.ordered, o.sub])?;
+            s.execute(params![
+                o.event as i64,
+                o.resource as i64,
+                o.content,
+                o.ordered,
+                o.sub
+            ])?;
         }
         let mut s = tx.prepare("INSERT INTO gaps VALUES(?1,?2,?3)")?;
         for g in &capture.gaps {

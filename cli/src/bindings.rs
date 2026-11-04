@@ -122,16 +122,17 @@ pub fn bindings(c: &Capture, f: &Filter, json: bool) -> Result<(), String> {
             }
             let (name, read) = register(c, n, b, slots.as_deref(), &mut reflection);
             if f.read.is_some_and(|want| read != Some(want))
-                || name_part.as_ref().is_some_and(|p| {
-                    !name.as_ref().is_some_and(|n| n.to_lowercase().contains(p))
-                })
+                || name_part
+                    .as_ref()
+                    .is_some_and(|p| !name.as_ref().is_some_and(|n| n.to_lowercase().contains(p)))
             {
                 continue;
             }
             let file = file_of(c, b, &call, &args, &vbs);
-            if file_part.as_ref().is_some_and(|p| {
-                !file.as_ref().is_some_and(|f| f.to_lowercase().contains(p))
-            }) {
+            if file_part
+                .as_ref()
+                .is_some_and(|p| !file.as_ref().is_some_and(|f| f.to_lowercase().contains(p)))
+            {
                 continue;
             }
             let shape = b.resource.and_then(|r| {
@@ -141,7 +142,8 @@ pub fn bindings(c: &Capture, f: &Filter, json: bool) -> Result<(), String> {
                     .or_insert_with(|| {
                         shape(c, r).map(|s| {
                             let s = s.to_string();
-                            s.strip_prefix(&format!("#{r} ")).map_or(s.clone(), str::to_string)
+                            s.strip_prefix(&format!("#{r} "))
+                                .map_or(s.clone(), str::to_string)
                         })
                     })
                     .clone()

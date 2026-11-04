@@ -67,7 +67,17 @@ impl Filter {
 }
 
 /// One capture's matching words: (draw, pass, stage, slot, buffer, register, name, value text, hex).
-type Found = (i64, Option<i64>, String, u32, String, String, String, String, String);
+type Found = (
+    i64,
+    Option<i64>,
+    String,
+    u32,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 fn found(c: &Capture, f: &Filter) -> Result<(Vec<Found>, usize), String> {
     let (first, last) = f.draws.unwrap_or((i64::MIN, i64::MAX));
@@ -159,7 +169,11 @@ pub fn constants(
             // name -> (value, hex) -> draws reading it
             let mut by: BTreeMap<String, BTreeMap<(String, String), Vec<i64>>> = BTreeMap::new();
             for (draw, _, _, _, _, _, name, value, hex) in words {
-                by.entry(name).or_default().entry((value, hex)).or_default().push(draw);
+                by.entry(name)
+                    .or_default()
+                    .entry((value, hex))
+                    .or_default()
+                    .push(draw);
             }
             for (name, values) in by {
                 for ((value, hex), mut draws) in values {

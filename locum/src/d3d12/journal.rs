@@ -108,8 +108,19 @@ impl Data {
         self.keep(recording, checkpoints, pass.outputs());
     }
     /// Assigns copies made in the list to its generation.
-    fn keep(&self, recording: &mut model::Recording, checkpoints: Vec<model::Checkpoint>, outputs: Vec<model::Output>) {
-        super::passes::belong(self.id, checkpoints.iter().map(|c| c.id).chain(outputs.iter().map(|o| o.id)));
+    fn keep(
+        &self,
+        recording: &mut model::Recording,
+        checkpoints: Vec<model::Checkpoint>,
+        outputs: Vec<model::Output>,
+    ) {
+        super::passes::belong(
+            self.id,
+            checkpoints
+                .iter()
+                .map(|c| c.id)
+                .chain(outputs.iter().map(|o| o.id)),
+        );
         for c in checkpoints {
             recording.checkpoint(c);
         }

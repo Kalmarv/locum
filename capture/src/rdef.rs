@@ -205,7 +205,17 @@ pub fn uav_registers(code: &[u8]) -> Option<Vec<(u32, u32, u32)>> {
         bindings
             .into_iter()
             .filter(|b| b.class() == "uav")
-            .map(|b| (b.space, b.slot, if b.count == 0 { u32::MAX } else { b.slot + b.count - 1 }))
+            .map(|b| {
+                (
+                    b.space,
+                    b.slot,
+                    if b.count == 0 {
+                        u32::MAX
+                    } else {
+                        b.slot + b.count - 1
+                    },
+                )
+            })
             .collect(),
     )
 }
@@ -236,7 +246,11 @@ pub fn declared(code: &[u8]) -> Option<Vec<Binding>> {
             let (slot, count, space) = match range {
                 Some(r) => (
                     r.lower,
-                    if r.upper == u32::MAX { 0 } else { r.upper.saturating_sub(r.lower) + 1 },
+                    if r.upper == u32::MAX {
+                        0
+                    } else {
+                        r.upper.saturating_sub(r.lower) + 1
+                    },
                     r.space,
                 ),
                 None => (slot, 1, 0),

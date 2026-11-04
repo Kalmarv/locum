@@ -1046,12 +1046,20 @@ impl Projection {
             let why = if first {
                 o.gap.clone()
             } else {
-                Some("the list was executed again in the frame: its copies hold the first execution's outputs".into())
+                Some(
+                    "the list was executed again in the frame: its copies hold the first execution's outputs"
+                        .into(),
+                )
             };
             match (why, seqs.get(o.command)) {
                 (None, Some(&event)) => self.outputs.push((o.id, event, o.resource, o.sub)),
                 (Some(why), _) => *self.unrecorded.entry(why).or_default() += 1,
-                (None, None) => *self.unrecorded.entry("its command was not projected".into()).or_default() += 1,
+                (None, None) => {
+                    *self
+                        .unrecorded
+                        .entry("its command was not projected".into())
+                        .or_default() += 1
+                }
             }
         }
     }
