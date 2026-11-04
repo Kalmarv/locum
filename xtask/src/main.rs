@@ -1012,6 +1012,27 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
         ),
         (
             {
+                let bytes = |draw: &str| {
+                    Command::new(cli)
+                        .arg("target")
+                        .arg(&capture)
+                        .args([draw, "rt0", "-o", "-"])
+                        .env("LOCUM_DIR", log_dir)
+                        .output()
+                        .expect("run locum-cli")
+                        .stdout
+                };
+                let presented = bytes("presented");
+                run(&["info"]).contains("presented: #")
+                    && run(&["info"]).contains("read back (`target presented`)")
+                    && !presented.is_empty()
+                    && presented == bytes("1")
+            },
+            "locum-cli info names the back buffer the frame presented, and `target presented` gives its \
+             readback after draw 1, where the frame draws into it",
+        ),
+        (
+            {
                 let t = run(&["draw", "0"]);
                 t.contains("Frame.value")
                     && t.contains("1032")

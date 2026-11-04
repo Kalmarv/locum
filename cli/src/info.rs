@@ -162,6 +162,21 @@ pub fn info(c: &Capture) -> Result<(), String> {
             c.count("SELECT count(*) FROM targets", [])
         ),
     }
+    if let Some(id) = c.meta("presented") {
+        let read = c.count(
+            "SELECT count(*) FROM targets t JOIN bindings b ON b.draw = t.draw AND b.kind = 'rtv' \
+             AND 'rt' || b.slot = t.target WHERE b.resource = ?1 AND t.blob IS NOT NULL",
+            [&id],
+        );
+        out!(
+            "presented: #{id}, {}",
+            if read > 0 {
+                "read back (`target presented`)"
+            } else {
+                "not read back"
+            }
+        );
+    }
     out!(
         "shaders: {} used ({} with bytecode)",
         c.count("SELECT count(*) FROM shaders", []),

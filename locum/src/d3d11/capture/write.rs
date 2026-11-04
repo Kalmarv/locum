@@ -66,6 +66,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     let states = std::mem::take(&mut s.states);
     let staging = std::mem::take(&mut s.staging);
     let used_bytes = s.used;
+    let presented = s.presented.take();
     let counts = (
         s.lists_spliced,
         s.lists_before,
@@ -534,6 +535,9 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             .unwrap_or_default(),
     );
     capture.meta("pid", std::process::id());
+    if let Some(id) = presented {
+        capture.meta("presented", id);
+    }
     if !memory.is_null() {
         capture.meta("memory", memory.to_string());
     }

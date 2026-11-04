@@ -836,7 +836,8 @@ pub unsafe fn slice<'a, T>(pointer: *const T, len: usize) -> &'a [T] {
     }
 }
 
-pub fn present(frame_number: u64) {
+/// At each Present; `presented` is the back buffer it shows, looked up while a capture is armed.
+pub fn present(frame_number: u64, presented: Option<u64>) {
     static REPORT: OnceLock<Mutex<Instant>> = OnceLock::new();
     let mut last = REPORT
         .get_or_init(|| Mutex::new(Instant::now()))
@@ -915,6 +916,9 @@ pub fn present(frame_number: u64) {
         capture.meta("locum", env!("CARGO_PKG_VERSION"));
         capture.meta("frame", frame_number);
         capture.meta("pid", std::process::id());
+        if let Some(id) = presented {
+            capture.meta("presented", id);
+        }
         capture.meta(
             "exe",
             std::env::current_exe()

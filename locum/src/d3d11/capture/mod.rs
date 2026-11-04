@@ -255,6 +255,8 @@ struct State {
     tile_seen: BTreeMap<u64, (u64, u64)>,
     /// Where in the timeline the tile seeds whose copies are still in flight are.
     tile_seeds: Vec<usize>,
+    /// The back buffer the captured frame presented.
+    presented: Option<u64>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -294,6 +296,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     tile_packed_seeded: BTreeSet::new(),
     tile_seen: BTreeMap::new(),
     tile_seeds: Vec::new(),
+    presented: None,
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -338,6 +341,7 @@ impl State {
         self.tile_packed_seeded.clear();
         self.tile_seen.clear();
         self.tile_seeds.clear();
+        self.presented = None;
     }
 }
 
@@ -366,10 +370,13 @@ pub fn abandon(why: &str) {
 }
 
 /// At each present, before the real one (and after [`end_frame`]). Ends a frame being recorded.
-pub fn before_present() -> bool {
+pub fn before_present(presented: impl FnOnce() -> Option<u64>) -> bool {
+    // the back buffer is looked up only while a capture is armed, and before the state is locked
+    let presented = if armed() { presented() } else { None };
     let mut s = state();
     s.frame += 1;
     if s.phase == Phase::Recording {
+        s.presented = presented;
         ARMED.store(false, Ordering::Relaxed);
         s.phase = Phase::Idle;
         return true;

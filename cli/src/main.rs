@@ -299,8 +299,8 @@ enum Command {
     /// A target read back after a pass's last draw, as .png, .dds or raw (`-o -`: the raw bytes to stdout).
     Target {
         capture: String,
-        /// The draw the target was read after, or `last` for the frame's last readback of it (the presented picture,
-        /// for the back buffer's rt0).
+        /// The draw the target was read after, `last` for the frame's last readback of it, or `presented` for the last
+        /// readback of the back buffer the frame presented, whichever target it was (the name is then ignored).
         draw: String,
         /// rt0 to rt7, or depth.
         #[arg(default_value = "rt0")]
@@ -703,7 +703,23 @@ fn run(cli: Cli) -> Result<(), String> {
             picture,
         } => {
             let c = open(&capture)?;
+            let mut name = name;
             let draw = match draw.as_str() {
+                "presented" => {
+                    let id: i64 = c
+                        .meta("presented")
+                        .and_then(|v| v.parse().ok())
+                        .ok_or("the capture does not record which buffer it presented (locum before 2026-11-04 did                                 not); `last` gives the frame's last readback of a target")?;
+                    let (draw, target): (i64, String) = c
+                        .row(
+                            "SELECT t.draw, t.target FROM targets t JOIN bindings b ON b.draw = t.draw                              AND b.kind = 'rtv' AND 'rt' || b.slot = t.target                              WHERE b.resource = ?1 AND t.blob IS NOT NULL ORDER BY t.event DESC LIMIT 1",
+                            [id],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .ok_or_else(|| format!("the presented buffer #{id} was not read back"))?;
+                    name = target;
+                    draw
+                }
                 "last" => c
                     .row(
                         "SELECT draw FROM targets WHERE target = ?1 AND blob IS NOT NULL ORDER BY event DESC LIMIT 1",

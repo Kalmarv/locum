@@ -575,6 +575,39 @@ unsafe impl SwapChainMethods for SwapChain {
 }
 
 impl SwapChain {
+    /// The locum number of the back buffer a Direct3D 11 Present shows: buffer 0, which the runtime rotates.
+    fn d3d11_back_buffer(&self) -> Option<u64> {
+        use windows::Win32::Graphics::Direct3D11::ID3D11Resource;
+        let mut out = core::ptr::null_mut();
+        let hr = unsafe { real_swapchain::GetBuffer(self.inner(), 0, &ID3D11Resource::IID, &mut out) };
+        if hr.is_err() || out.is_null() {
+            return None;
+        }
+        let resource = unsafe { ID3D11Resource::from_raw(out) };
+        Some(crate::d3d11::registry::id_of(&resource))
+    }
+
+    /// The locum number of the back buffer a Direct3D 12 Present shows: the one at the swap chain's current index,
+    /// through the proxy the game holds for it.
+    fn d3d12_back_buffer(&self) -> Option<u64> {
+        use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
+        let inner = self.inner();
+        let chain = unsafe { IUnknown::from_raw_borrowed(&inner) }?
+            .cast::<IDXGISwapChain3>()
+            .ok()?;
+        let index = unsafe { chain.GetCurrentBackBufferIndex() };
+        let mut out = core::ptr::null_mut();
+        let hr = unsafe { real_swapchain::GetBuffer(inner, index, &ID3D12Resource::IID, &mut out) };
+        // the real buffer's proxy, with a reference added for this call
+        unsafe { crate::d3d12::wrap_output(hr, &ID3D12Resource::IID, &mut out) };
+        if hr.is_err() || out.is_null() {
+            return None;
+        }
+        let id = crate::d3d12::id(out);
+        drop(unsafe { IUnknown::from_raw(out) });
+        (id != 0).then_some(id)
+    }
+
     /// A present: the frame boundary for the frame counter and for captures. `TEST` presents show nothing and are
     /// passed straight through.
     fn present(&self, flags: DXGI_PRESENT, real: impl FnOnce() -> HRESULT) -> HRESULT {
@@ -586,13 +619,18 @@ impl SwapChain {
             if frame == 1 {
                 log!("D3D12 first proxied Present");
             }
-            crate::d3d12::journal::present(frame);
+            let presented = if crate::d3d12::passes::ARMED.load(Ordering::Acquire) {
+                self.d3d12_back_buffer()
+            } else {
+                None
+            };
+            crate::d3d12::journal::present(frame, presented);
             return real();
         };
         crate::d3d11::overrides::poll(frame);
         let immediate = unsafe { (*device).immediate() };
         capture::end_frame(immediate.real());
-        let finished = capture::before_present();
+        let finished = capture::before_present(|| self.d3d11_back_buffer());
         let hr = real();
         capture::after_present(finished, immediate.real());
         hr
