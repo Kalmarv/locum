@@ -6,15 +6,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use memmap2::Mmap;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, S_FALSE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, S_FALSE, WAIT_OBJECT_0};
 use windows::Win32::System::Diagnostics::Debug::{
-    MINIDUMP_CALLBACK_INFORMATION, MINIDUMP_CALLBACK_INPUT, MINIDUMP_CALLBACK_OUTPUT, MINIDUMP_TYPE,
-    MiniDumpIgnoreInaccessibleMemory, MiniDumpWithFullMemory, MiniDumpWithFullMemoryInfo,
-    MiniDumpWithThreadInfo, MiniDumpWithUnloadedModules, MiniDumpWriteDump,
+    EXCEPTION_POINTERS, MINIDUMP_CALLBACK_INFORMATION, MINIDUMP_CALLBACK_INPUT, MINIDUMP_CALLBACK_OUTPUT,
+    MINIDUMP_EXCEPTION_INFORMATION, MINIDUMP_TYPE, MiniDumpIgnoreInaccessibleMemory, MiniDumpWithFullMemory,
+    MiniDumpWithFullMemoryInfo, MiniDumpWithThreadInfo, MiniDumpWithUnloadedModules, MiniDumpWriteDump,
+    ReadProcessMemory,
 };
 use windows::Win32::System::Diagnostics::ProcessSnapshotting::*;
 use windows::Win32::System::Threading::{
-    EVENT_MODIFY_STATE, OpenEventW, OpenProcess, PROCESS_ALL_ACCESS, SetEvent,
+    EVENT_MODIFY_STATE, INFINITE, OpenEventW, OpenProcess, PROCESS_ALL_ACCESS, SYNCHRONIZATION_SYNCHRONIZE,
+    SetEvent, WaitForMultipleObjects,
 };
 use windows::core::{BOOL, HSTRING};
 
@@ -41,10 +43,79 @@ unsafe extern "system" fn snapshot_callback(
 
 /// Writes a full-memory minidump of process `pid` to `out` (as `out.part` until complete), from a snapshot; signals
 /// the event `signal` once the snapshot is taken, so the process can run on.
-pub fn dump(pid: u32, out: &Path, signal: Option<&str>) -> Result<(), String> {
-    let started = std::time::Instant::now();
+pub fn dump(
+    pid: u32,
+    out: &Path,
+    signal: Option<&str>,
+    wait_event: Option<&str>,
+    ready_event: Option<&str>,
+    exception_info: Option<usize>,
+) -> Result<(), String> {
     let process = unsafe { OpenProcess(PROCESS_ALL_ACCESS, false, pid) }
         .map_err(|e| format!("open process {pid}: {e}"))?;
+    let result = (|| {
+        if let Some(name) = wait_event {
+            let event = unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) }
+                .map_err(|e| format!("open crash request event: {e}"))?;
+            if let Some(name) = ready_event {
+                let ready = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(name)) };
+                let signalled = ready.and_then(|ready| {
+                    let result = unsafe { SetEvent(ready) };
+                    let _ = unsafe { CloseHandle(ready) };
+                    result
+                });
+                if let Err(e) = signalled {
+                    let _ = unsafe { CloseHandle(event) };
+                    return Err(format!("signal crash helper ready: {e}"));
+                }
+            }
+            let waited = unsafe { WaitForMultipleObjects(&[event, process], false, INFINITE) };
+            let _ = unsafe { CloseHandle(event) };
+            if waited.0 == WAIT_OBJECT_0.0 + 1 {
+                return Ok(()); // Normal exit: no dump and no lingering helper.
+            }
+            if waited != WAIT_OBJECT_0 {
+                return Err(format!("wait for crash: {waited:?}"));
+            }
+        }
+        let exception = exception_info
+            .map(|address| -> Result<MINIDUMP_EXCEPTION_INFORMATION, String> {
+                let mut words = [0usize; 2];
+                let mut read = 0;
+                unsafe {
+                    ReadProcessMemory(
+                        process,
+                        address as *const _,
+                        words.as_mut_ptr().cast(),
+                        size_of_val(&words),
+                        Some(&mut read),
+                    )
+                }
+                .map_err(|e| format!("read crash exception info: {e}"))?;
+                if read != size_of_val(&words) || words[0] == 0 || words[1] == 0 {
+                    return Err("incomplete crash exception info".into());
+                }
+                Ok(MINIDUMP_EXCEPTION_INFORMATION {
+                    ThreadId: u32::try_from(words[0]).map_err(|_| "invalid crash thread ID")?,
+                    ExceptionPointers: words[1] as *mut EXCEPTION_POINTERS,
+                    ClientPointers: BOOL(1),
+                })
+            })
+            .transpose()?;
+        dump_process(process, pid, out, signal, exception.as_ref())
+    })();
+    let _ = unsafe { CloseHandle(process) };
+    result
+}
+
+fn dump_process(
+    process: HANDLE,
+    pid: u32,
+    out: &Path,
+    signal: Option<&str>,
+    exception: Option<&MINIDUMP_EXCEPTION_INFORMATION>,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
     let mut snapshot = HPSS::default();
     // The set Microsoft's documentation gives for MiniDumpWriteDump on a snapshot.
     let flags = PSS_CAPTURE_VA_CLONE
@@ -72,9 +143,17 @@ pub fn dump(pid: u32, out: &Path, signal: Option<&str>) -> Result<(), String> {
     // Let the process go whatever happened: it waits for this.
     signal_now();
     if err != 0 {
-        let _ = unsafe { CloseHandle(process) };
         return Err(format!("PssCaptureSnapshot: error {err}"));
     }
+    struct Snapshot(HANDLE, HPSS);
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            unsafe {
+                PssFreeSnapshot(self.0, self.1);
+            }
+        }
+    }
+    let snapshot = Snapshot(process, snapshot);
     let snapshot_ms = started.elapsed().as_millis();
     let part = PathBuf::from(format!("{}.part", out.display()));
     let file = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
@@ -91,20 +170,17 @@ pub fn dump(pid: u32, out: &Path, signal: Option<&str>) -> Result<(), String> {
     );
     let written = unsafe {
         MiniDumpWriteDump(
-            HANDLE(snapshot.0),
+            HANDLE(snapshot.1.0),
             pid,
             HANDLE(std::os::windows::io::AsRawHandle::as_raw_handle(&file)),
             kind,
-            None,
+            exception.map(|e| e as *const _),
             None,
             Some(&callback),
         )
     };
     drop(file);
-    unsafe {
-        PssFreeSnapshot(process, snapshot);
-        let _ = CloseHandle(process);
-    }
+    drop(snapshot);
     written.map_err(|e| format!("MiniDumpWriteDump: {e}"))?;
     std::fs::rename(&part, out).map_err(|e| format!("{}: {e}", out.display()))?;
     let size = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);

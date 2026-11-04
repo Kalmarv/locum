@@ -279,6 +279,9 @@ unsafe impl Pso12Methods for crate::d3d12::Object {
     unsafe fn GetCachedBlob(&self, a0: *mut *mut core::ffi::c_void) -> windows::core::HRESULT {
         unsafe {
             let result = real::GetCachedBlob(self.real(), a0);
+            if result.is_ok() {
+                crate::d3d12::shaders::cached_blob(a0);
+            }
             result
         }
     }

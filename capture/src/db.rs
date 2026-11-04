@@ -12,6 +12,8 @@ use rusqlite::{Connection, params};
 
 /// Bumped when a table changes meaning.
 pub const SCHEMA_VERSION: u32 = 1;
+/// A D3D12 capture's: the same tables, plus the authoritative `d12_*` records.
+pub const D3D12_SCHEMA_VERSION: u32 = 2;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -283,6 +285,8 @@ pub struct Gap {
 /// Everything a capture puts in its database.
 #[derive(Default)]
 pub struct Capture {
+    /// Authoritative D3D12 records. Absent for schema-v1 D3D11 captures.
+    pub d3d12: Option<crate::d3d12::Prepared>,
     pub meta: Vec<(String, String)>,
     pub modules: Vec<Module>,
     pub stacks: Vec<(u64, Vec<u64>)>,
@@ -335,7 +339,14 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
     let tx = db.transaction()?;
     {
         let mut s = tx.prepare("INSERT INTO meta VALUES(?1, ?2)")?;
-        s.execute(params!["schema_version", SCHEMA_VERSION.to_string()])?;
+        s.execute(params![
+            "schema_version",
+            if capture.d3d12.is_some() {
+                D3D12_SCHEMA_VERSION
+            } else {
+                SCHEMA_VERSION
+            }
+        ])?;
         for (k, v) in &capture.meta {
             s.execute(params![k, v])?;
         }
@@ -547,6 +558,9 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
         for g in &capture.gaps {
             s.execute(params![g.what, g.detail, g.count as i64])?;
         }
+    }
+    if let Some(frame) = &capture.d3d12 {
+        frame.write(&tx)?;
     }
     tx.commit()?;
     drop(db);

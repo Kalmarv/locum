@@ -140,6 +140,12 @@ export class Capture {
       }
       this.handle = new Database(this.path, { readonly: true });
       this.handle.exec("PRAGMA query_only = ON");
+      const meta = Object.fromEntries((this.handle.query("SELECT key,value FROM meta WHERE key IN ('api','schema_version')").all() as Row[]).map(r => [r.key, r.value]));
+      if (!((meta.api === "d3d11" && meta.schema_version === "1") || (meta.api === "d3d12" && meta.schema_version === "2"))) {
+        this.handle.close();
+        this.handle = null;
+        throw new Error(`Capture API ${meta.api}, schema ${meta.schema_version} is not readable by this viewer`);
+      }
     }
     if (this.idle) clearTimeout(this.idle);
     this.idle = setTimeout(() => this.close(), IDLE_MS);
@@ -281,6 +287,9 @@ export class Capture {
         passes: this.count("SELECT count(*) FROM passes"),
       },
       lists: {
+        submissions: meta.api === "d3d12" ? this.count("SELECT count(*) FROM d12_submissions") : null,
+        executions: meta.api === "d3d12" ? this.count("SELECT count(*) FROM d12_executions") : null,
+        generations: meta.api === "d3d12" ? this.count("SELECT count(*) FROM d12_lists") : null,
         spliced: counts.lists_spliced ?? 0,
         recordedBefore: counts.lists_recorded_before ?? 0,
         unrecorded: counts.lists_unrecorded ?? 0,
@@ -454,6 +463,12 @@ export class Capture {
   }
 
   /** One event: its row, what it read and wrote, its stack, and its draw when it is one. */
+  private execution(seq: number): string | null {
+    if (this.meta().api !== "d3d12") return null;
+    const r = this.one("SELECT l.queue,l.execution,x.list,x.generation,l.command_index FROM d12_event_locations l JOIN d12_executions x ON x.id=l.execution WHERE l.event=?",seq);
+    return r ? `queue ${r.queue}, execution ${r.execution}, list ${r.list} generation ${r.generation}, command ${r.command_index}` : "D3D12 queue operation";
+  }
+
   event(seq: number) {
     const e = this.one("SELECT * FROM events WHERE seq = ?", seq);
     if (!e) return null;
@@ -472,6 +487,7 @@ export class Capture {
     }
     return {
       ...e,
+      execution: this.execution(seq),
       args,
       pass: row?.pass ?? null,
       group: row?.group ?? null,
@@ -590,7 +606,8 @@ export class Capture {
     const next = this.one("SELECT n, event FROM draws WHERE n > ? ORDER BY n LIMIT 1", n);
     return {
       n: d.n, event: d.event, call: d.call, args: json(d.args), pass: d.pass,
-      eventRow: event ? { ...event, args: json(event.args), stackFrames: this.stack(event.stack) } : null,
+      eventRow: event ? { ...event, execution: this.execution(d.event), args: json(event.args), stackFrames: this.stack(event.stack) } : null,
+      d3d12: this.meta().api === "d3d12" ? this.one("SELECT s.pso,s.graphics_root,s.compute_root,json(s.root_args_json) AS arguments,p.description AS pipeline FROM d12_draw_state s LEFT JOIN d12_psos p ON p.id=s.pso WHERE s.draw=?",n) : null,
       shaders,
       topology: d.topology,
       layout: state(d.layout), rasterizer: state(d.rasterizer), blend: state(d.blend),

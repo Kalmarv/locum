@@ -309,12 +309,78 @@ stretched from their smallest to largest value, float colour is tone-mapped, and
 
 A third DLL, `d3d12.dll`, passes every Direct3D 12 call through to the system's, as `d3d11.dll` does for Direct3D 11;
 it keeps the system DLL's exports by name and ordinal (Elden Ring imports `D3D12CreateDevice` by ordinal 101). Devices,
-queues, command lists and every other object a game gets are wrapped, and `locum.log` records which were made and
-used. It does not capture yet: a capture you can read with the CLI and the viewer comes next, then replay.
+queues, command lists and every other object a game gets are wrapped. The log records the first use of each interface
+and method, with periodic counts and journal timings. Object identities remain in memory and in captures.
+
+The inspection foundation records command lists continuously, so lists and bundles recorded before a capture request
+retain their original generations. A request arms at the next non-test Present and closes at the following Present.
+Captures use schema 2 with `api=d3d12`: queue submissions, list executions, fence values, descriptor versions, root
+signatures, root arguments and PSO inputs are authoritative records. The CLI and viewer project these into their
+draw, resource, binding and pipeline views. Display order across queues is not a GPU execution order; queue order
+and fence operations are retained separately. CPU-consumed descriptor definitions are frozen when recorded, while
+GPU descriptor tables use the versions present at submission.
+
+This milestone remains explicitly incomplete: GPU first-use snapshots, pass-end/output checkpoints and D3D12 replay
+are subsequent work. Upload buffers are copied at armed submissions; these CPU observations assume the application's
+host writes obey D3D12 synchronization and are not a substitute for GPU checkpoints. Captures retain the original
+shader bytes regardless of whether reflection succeeds. Resource reachability comes from API state and root
+signatures, not a single shader parser's conclusions.
+
+`LOCUM_D3D12_JOURNAL=off` disables the journal for cost comparisons using the same DLL. The default is on. Disarmed
+runs retain command/descriptor history but do not copy or hash upload-buffer contents. Ten-second log summaries
+measure recording, submission, lookup, resource destruction, upload and reset costs; nested lookup timings overlap
+recording and must not be added to it. Compare native, off and on on the same route, including game CPU time: a
+vsync-limited frame rate alone cannot establish CPU overhead.
+
+DXIL inspection uses pinned `dxcontainer`, `dxil-reader` and `iridia-dxil`, cross-checked with Microsoft's shader or
+library reflection. `LOCUM_DXCOMPILER` selects a `dxcompiler.dll`; otherwise the usual DLL search applies. The CLI
+records disagreements with the file, shader hash, crate revisions and both answers. Native disassembly and optional
+WGSL (iridia lifts DXIL and DXBC alike) are available without allowing display analysis to narrow capture coverage:
+
+```
+locum-cli shader last HASH -d --wgsl
+locum-cli shader-file shader.dxil --evidence comparison.json
+locum-cli cb last 120 ps 3 --space 7 --raw
+```
+
+Shader archival is independent of the journal. Successful graphics, compute and stream PSO creates and library loads
+save their original shader bytes under `shaders/<XXH3-128>.<stage>.dxbc` in `LOCUM_DIR`; this includes DXIL containers,
+mesh/amplification shaders and whole DXR libraries (`lib.dxbc`) from `CreateStateObject` and `AddToStateObject`.
+Reflection never filters these bytes. Opaque inputs to pipeline-library creation use `<hash>.pipeline-library.bin`;
+cached PSO inputs and `GetCachedBlob` outputs use `<hash>.cached-pso.bin`. Each distinct opaque blob logs its hash,
+size and path once per process. Serialize logs only the library identity and caller capacity; it does not inspect or archive the output.
+First observations write synchronously from borrowed bytes, with atomic file publication and retries after errors;
+repeated content only hashes and checks the in-memory index. Large new caches therefore incur first-seen hashing and
+disk I/O without an additional in-memory copy or unbounded writer queue.
+An unrecognized PSO stream type logs its first occurrence once per type per process.
 
 `cargo xtask smoke --api d3d12` runs a program through it on WARP with the debug layer on (copies, dispatches, fences,
 pipeline states and libraries, placed resources, barriers, swap chain present and resize); `cargo xtask smoke` stays
 the Direct3D 11 suite. The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
+
+## Crash investigation
+
+For a targeted crash investigation, `settings.txt` can opt into a full-memory dump at listed addresses relative to the exe:
+
+```text
+dumper C:/path/to/locum-cli.exe
+dumps C:/path/to/research/dumps
+crash-av-rva 0x1f64f4d, 0X1F64F56
+```
+
+The comma-separated list accepts hexadecimal RVAs with `0x`, `0X`, or no prefix. With this setting absent, no exception
+handlers or crash helper are installed. When enabled, locum prepares a hidden CLI helper and named events, then installs
+a vectored exception handler. The first access violation at a listed RVA requests a snapshot, even if the application
+subsequently handles that exception. Replacing the application's unhandled filter does not remove this observer.
+An unhandled-filter fallback also observes fatal access violations at any address, including Windows and driver DLLs,
+provided the application's exception chain reaches it. Listed first-chance faults and fallback faults share one dump
+request per process; after a handled fault consumes it, later faults do not produce another dump in that process.
+
+The faulting thread publishes its original exception pointers and waits up to 120 seconds for the snapshot. The vectored
+handler always continues exception search; the fallback chains the previous filter or continues search. Neither callback
+allocates, logs, or changes the exception context. The CLI uses the same PSS full-memory dump path as captures, with
+the original exception stream for `.ecxr`. Normal exit releases the waiting helper without a dump. An earlier vectored
+handler or debugger that consumes the exception can prevent observation; CPU fixtures do not establish game pickup.
 
 ## References
 

@@ -7,7 +7,7 @@ pub fn table(iid: &GUID) -> Option<(*const c_void, &'static str)> {
     if *iid == ID3D12Debug::IID {
         return Some((&D12_DEBUG_BASE as *const _ as *const c_void, "ID3D12Debug"));
     }
-    static D12_DEVICE: ID3D12Device5_Vtbl = super::d12_device::vtable::<crate::d3d12::Object>();
+    static D12_DEVICE: ID3D12Device7_Vtbl = super::d12_device::vtable::<crate::d3d12::Object>();
     if *iid == ID3D12Object::IID {
         return Some((&D12_DEVICE as *const _ as *const c_void, "ID3D12Object"));
     }
@@ -28,6 +28,12 @@ pub fn table(iid: &GUID) -> Option<(*const c_void, &'static str)> {
     }
     if *iid == ID3D12Device5::IID {
         return Some((&D12_DEVICE as *const _ as *const c_void, "ID3D12Device5"));
+    }
+    if *iid == ID3D12Device6::IID {
+        return Some((&D12_DEVICE as *const _ as *const c_void, "ID3D12Device6"));
+    }
+    if *iid == ID3D12Device7::IID {
+        return Some((&D12_DEVICE as *const _ as *const c_void, "ID3D12Device7"));
     }
     static D12_QUEUE: ID3D12CommandQueue_Vtbl = super::d12_queue::vtable::<crate::d3d12::Object>();
     if *iid == ID3D12DeviceChild::IID {

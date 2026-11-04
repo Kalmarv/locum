@@ -9,7 +9,7 @@ export interface Info {
   targetEvents: boolean;
   meta: Record<string, any>;
   timeline: { events: number; kinds: [string, number][]; draws: number; passes: number };
-  lists: { spliced: number; recordedBefore: number; unrecorded: number };
+  lists: { spliced: number; recordedBefore: number; unrecorded: number; submissions: number | null; executions: number | null; generations: number | null };
   constants: { distinct: number; failures: number };
   resources: { live: number; used: number; written: number; contents: number; contentBytes: number; sources: [string, number][] };
   uploads: { total: number; stored: number; hashOnly: number; none: number };
@@ -130,6 +130,7 @@ export interface Draw {
   args: any;
   pass: number | null;
   eventRow: any;
+  d3d12: { pso: number; graphics_root: number; compute_root: number; arguments: string; pipeline: string } | null;
   shaders: Record<string, string | null>;
   topology: number;
   layout: { id: number; json: any; signature: string | null } | null;
@@ -152,6 +153,7 @@ export interface Draw {
 }
 
 export interface EventDetail {
+  execution: string | null;
   seq: number;
   kind: string;
   call: string;

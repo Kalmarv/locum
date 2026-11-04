@@ -11,7 +11,7 @@ import {
 import { formatName } from "../server/format";
 
 const ROW = 20;
-const KINDS = ["draw", "dispatch", "clear", "copy", "update", "map", "map_read", "resolve", "mips"];
+const KINDS = ["draw", "dispatch", "indirect", "clear", "copy", "update", "map", "map_read", "resolve", "mips", "submit", "state", "barrier", "bundle"];
 
 interface Filter {
   kinds: string[] | null;
@@ -271,7 +271,7 @@ function EventView({ e }: { e: EventDetail }) {
     <div class="detail">
       <h2>{e.call} <span class="muted">{e.kind}, event {e.seq}</span></h2>
       <KV rows={[
-        ["context", e.deferred ? `deferred context ${e.context}, command list ${e.list} (placed where it was executed)` : `immediate (${e.context})`],
+        ["execution", e.execution ?? (e.deferred ? `deferred context ${e.context}, command list ${e.list} (placed where it was executed)` : `immediate (${e.context})`)],
         ["pass", e.pass ?? "-"],
         ["arguments", <code class="wrap">{typeof e.args === "string" ? e.args : JSON.stringify(e.args, null, 1)}</code>],
         ...(e.view ? [["view", <span>#{e.view.id} {e.view.kind} {e.view.format} of <ResLink r={e.view.resource} /></span>] as [string, any]] : []),
@@ -334,7 +334,7 @@ export function DrawView({ n }: { n: number }) {
             <span class="muted">
               event <EventLink seq={draw.event}>{draw.event}</EventLink>
               {draw.passRange ? <>, pass {draw.passRange.n} (draws {draw.passRange.first}–{draw.passRange.last}{draw.passRange.last === draw.n ? ", its last" : ""})</> : null}
-              {draw.eventRow?.deferred ? `, command list ${draw.eventRow.list} (recorded on context ${draw.eventRow.context})` : ", immediate context"}
+              {draw.eventRow?.execution ? `, ${draw.eventRow.execution}` : draw.eventRow?.deferred ? `, command list ${draw.eventRow.list} (recorded on context ${draw.eventRow.context})` : ", immediate context"}
             </span>
             {draw.next ? <a href={href(id, "pipeline", draw.next.event)}>draw {draw.next.n} →</a> : <span />}
           </div>
@@ -344,6 +344,11 @@ export function DrawView({ n }: { n: number }) {
           </Section>
 
           {!isCompute ? <PipelineState draw={draw} /> : null}
+          {draw.d3d12 ? <Section title="D3D12 pipeline and root arguments" open={false}>
+            <KV rows={[["PSO",draw.d3d12.pso],["graphics root",draw.d3d12.graphics_root],["compute root",draw.d3d12.compute_root]]} />
+            <pre>{JSON.stringify(JSON.parse(draw.d3d12.arguments),null,2)}</pre>
+            <pre>{JSON.stringify(JSON.parse(draw.d3d12.pipeline ?? "null"),null,2)}</pre>
+          </Section> : null}
 
           <Section title={`bindings (${draw.bindings.length})`}>
             <table class="bindings">

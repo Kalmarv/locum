@@ -175,8 +175,9 @@ pub fn find(c: &Capture, target: f64, tolerance: f64, int: bool) -> Result<(), S
         return Ok(());
     }
     let mut reflection = Reflection::default();
-    // (stage, slot, shader, offset, name) -> draws
-    let mut found: BTreeMap<(String, u32, String, u32, String), Vec<i64>> = BTreeMap::new();
+    // (stage, slot, space, shader, offset, name) -> draws
+    type ConstantLocation = (String, u32, u32, String, u32, String);
+    let mut found: BTreeMap<ConstantLocation, Vec<i64>> = BTreeMap::new();
     for (key, offsets) in &hits {
         let users: Vec<(i64, String, i64, i64)> = c.rows(
             "SELECT draw, stage, slot, space FROM bindings WHERE kind = 'cb' AND content = ?1",
@@ -191,26 +192,27 @@ pub fn find(c: &Capture, target: f64, tolerance: f64, int: bool) -> Result<(), S
                     .and_then(|cb| cb.name_at(o))
                     .unwrap_or_else(|| "?".into());
                 found
-                    .entry((stage.clone(), slot as u32, shader.clone(), o, name))
+                    .entry((stage.clone(), slot as u32, space as u32, shader.clone(), o, name))
                     .or_default()
                     .push(draw);
             }
         }
     }
     out!(
-        "{:<4} {:<5} {:<16} {:<10} {:<40} draws",
+        "{:<4} {:<5} {:<6} {:<16} {:<10} {:<40} draws",
         "stage",
         "slot",
+        "space",
         "shader",
         "register",
         "name"
     );
-    for ((stage, slot, shader, o, name), mut draws) in found {
+    for ((stage, slot, space, shader, o, name), mut draws) in found {
         draws.sort_unstable();
         draws.dedup();
         let listed: Vec<String> = draws.iter().take(12).map(i64::to_string).collect();
         out!(
-            "{stage:<5} b{slot:<4} {shader:<16} c{}.{:<8} {name:<40} {}{}",
+            "{stage:<5} b{slot:<4} {space:<6} {shader:<16} c{}.{:<8} {name:<40} {}{}",
             o / 16,
             ["x", "y", "z", "w"][(o % 16 / 4) as usize],
             listed.join(" "),

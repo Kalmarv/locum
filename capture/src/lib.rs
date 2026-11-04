@@ -5,6 +5,7 @@
 
 pub mod blobs;
 pub mod cost;
+pub mod d3d12;
 pub mod db;
 pub mod dds;
 pub mod dxbc;

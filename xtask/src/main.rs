@@ -12,6 +12,7 @@
 
 mod d3d11;
 mod d3d12;
+mod d3d12_capture;
 
 use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
@@ -40,7 +41,7 @@ const CLASSES: &[Class] = &[
     Class {
         module: "d12_device",
         trait_name: "Device12Methods",
-        interface: "ID3D12Device5",
+        interface: "ID3D12Device7",
         source: &["Win32", "Graphics", "Direct3D12"],
     },
     Class {
@@ -1075,6 +1076,9 @@ fn generate_all(root: &Path) {
     let mod_rs = out.join("mod.rs");
     std::fs::write(&mod_rs, mods).expect("write vtables/mod.rs");
     rustfmt(&mod_rs);
+    let portable = root.join("locum/src/d3d12/portable.rs");
+    std::fs::write(&portable, d3d12_capture::portable(&windows)).unwrap();
+    rustfmt(&portable);
     println!("windows features the generated vtables need:");
     for feature in features {
         println!("  {feature}");

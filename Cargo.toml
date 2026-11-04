@@ -12,6 +12,11 @@ repository = "https://github.com/Kalmarv/locum"
 [workspace.dependencies]
 windows = { version = "=0.62.2", default-features = false }
 dxbc-reader = { version = "0.4.0", git = "https://github.com/Kalmarv/dx", rev = "292b61605311a69921eff208b68795093daa5431" }
+dxcontainer = { version = "0.4.0", git = "https://github.com/Kalmarv/dx", rev = "292b61605311a69921eff208b68795093daa5431" }
+dxil-reader = { version = "0.4.0", git = "https://github.com/Kalmarv/dx", rev = "292b61605311a69921eff208b68795093daa5431" }
+iridia = { version = "0.4.1", git = "https://github.com/Kalmarv/iridia", rev = "08c03c77e803fb5f8f7c8b3a35c654d17b1d91a5" }
+iridia-dxbc = { version = "0.4.1", git = "https://github.com/Kalmarv/iridia", rev = "08c03c77e803fb5f8f7c8b3a35c654d17b1d91a5" }
+iridia-dxil = { version = "0.4.1", git = "https://github.com/Kalmarv/iridia", rev = "08c03c77e803fb5f8f7c8b3a35c654d17b1d91a5" }
 
 [profile.release]
 debug = "line-tables-only"

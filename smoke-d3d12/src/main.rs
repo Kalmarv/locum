@@ -6,6 +6,7 @@ use windows::Win32::Graphics::{Direct3D::*, Direct3D12::*, Dxgi::Common::*, Dxgi
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
+mod graphics;
 
 fn identity<T: Interface, U: Interface>(a: &T, b: &U) {
     assert_eq!(
@@ -54,6 +55,20 @@ unsafe fn buffer(
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
+}
+unsafe extern "system" fn debug_message(
+    _: D3D12_MESSAGE_CATEGORY,
+    severity: D3D12_MESSAGE_SEVERITY,
+    id: D3D12_MESSAGE_ID,
+    description: PCSTR,
+    _: *mut c_void,
+) {
+    if severity == D3D12_MESSAGE_SEVERITY_ERROR || severity == D3D12_MESSAGE_SEVERITY_CORRUPTION {
+        eprintln!(
+            "D3D12 debug {id:?}: {}",
+            unsafe { description.to_string() }.unwrap_or_default()
+        );
+    }
 }
 fn main() {
     unsafe {
@@ -110,6 +125,18 @@ unsafe fn run() {
         .ok()
         .unwrap();
         let device = ID3D12Device::from_raw(raw);
+        // Emit errors when they happen, including fatal validation during release.
+        let info = device.cast::<ID3D12InfoQueue1>().ok();
+        let mut cookie = 0;
+        if let Some(info) = &info {
+            info.RegisterMessageCallback(
+                Some(debug_message),
+                D3D12_MESSAGE_CALLBACK_FLAG_NONE,
+                core::ptr::null_mut(),
+                &mut cookie,
+            )
+            .unwrap();
+        }
         let device5 = device.cast::<ID3D12Device5>().unwrap();
         identity(&device, &device5);
         let bad = GUID::from_u128(0xdeadbeef_1111_2222_3333_444444444444);
@@ -419,7 +446,12 @@ unsafe fn run() {
         drop(again);
         chain.Present(0, DXGI_PRESENT_TEST).ok().unwrap();
         chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
-        finish(&queue, &fence, 6);
+        journal_capture(&device, &queue, &fence, &chain, &code);
+        finish(&queue, &fence, 9);
+        graphics::capture(&device, &queue, &fence, &chain);
+        // The fixture's closing Present queues backbuffer work after its readback
+        // fence. Complete that work before ResizeBuffers releases the buffers.
+        finish(&queue, &fence, 11);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();
@@ -458,7 +490,283 @@ unsafe fn run() {
         });
         debug_errors(&device);
         println!("concurrent identity queries and debug error census verified");
+        if let Some(info) = info {
+            info.UnregisterMessageCallback(cookie).unwrap();
+        }
     }
+}
+
+unsafe fn journal_capture(
+    device: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    fence: &ID3D12Fence,
+    chain: &IDXGISwapChain1,
+    code: &ID3DBlob,
+) {
+    unsafe {
+        let dir = std::path::PathBuf::from(std::env::var_os("LOCUM_DIR").expect("smoke LOCUM_DIR"));
+        let range = D3D12_DESCRIPTOR_RANGE {
+            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_CBV,
+            NumDescriptors: 1,
+            BaseShaderRegister: 3,
+            RegisterSpace: 7,
+            OffsetInDescriptorsFromTableStart: 0,
+        };
+        let parameters = [
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &range,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Constants: D3D12_ROOT_CONSTANTS {
+                        ShaderRegister: 4,
+                        RegisterSpace: 7,
+                        Num32BitValues: 4,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR {
+                        ShaderRegister: 5,
+                        RegisterSpace: 7,
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+        let root_desc = D3D12_ROOT_SIGNATURE_DESC {
+            NumParameters: parameters.len() as u32,
+            pParameters: parameters.as_ptr(),
+            ..Default::default()
+        };
+        let mut serialized = None;
+        D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut serialized, None).unwrap();
+        let serialized = serialized.unwrap();
+        let root: ID3D12RootSignature = device
+            .CreateRootSignature(
+                0,
+                core::slice::from_raw_parts(serialized.GetBufferPointer().cast(), serialized.GetBufferSize()),
+            )
+            .unwrap();
+        let mut pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: ManuallyDrop::new(Some(root.clone())),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: code.GetBufferPointer(),
+                BytecodeLength: code.GetBufferSize(),
+            },
+            ..Default::default()
+        };
+        let pso: ID3D12PipelineState = device.CreateComputePipelineState(&pso_desc).unwrap();
+        ManuallyDrop::drop(&mut pso_desc.pRootSignature);
+
+        let upload_a = buffer(device, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let upload_b = buffer(device, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+        let readback = buffer(device, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+        let mut host = core::ptr::null_mut();
+        upload_a.Map(0, None, Some(&mut host)).unwrap();
+        host.cast::<u8>().write_bytes(0x11, 256);
+        let mut other = core::ptr::null_mut();
+        upload_b.Map(0, None, Some(&mut other)).unwrap();
+        other.cast::<u8>().write_bytes(0x33, 256);
+        upload_b.Unmap(0, None);
+        let cpu_heap: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        let gpu_heap: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                NumDescriptors: 1,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                ..Default::default()
+            })
+            .unwrap();
+        let cpu = cpu_heap.GetCPUDescriptorHandleForHeapStart();
+        let gpu = gpu_heap.GetCPUDescriptorHandleForHeapStart();
+        device.CreateConstantBufferView(
+            Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: upload_a.GetGPUVirtualAddress(),
+                SizeInBytes: 256,
+            }),
+            cpu,
+        );
+        device.CopyDescriptorsSimple(1, gpu, cpu, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        // Overwriting the source must not retroactively change the copied destination.
+        device.CreateConstantBufferView(
+            Some(&D3D12_CONSTANT_BUFFER_VIEW_DESC {
+                BufferLocation: upload_b.GetGPUVirtualAddress(),
+                SizeInBytes: 256,
+            }),
+            cpu,
+        );
+        let allocator: ID3D12CommandAllocator = device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            .unwrap();
+        let list: ID3D12GraphicsCommandList = device
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso)
+            .unwrap();
+        // Record before the capture request: the test fails if capture relies on armed-only history.
+        list.SetDescriptorHeaps(&[Some(gpu_heap.clone())]);
+        list.SetDescriptorHeaps(&[Some(gpu_heap.clone())]);
+        list.SetComputeRootSignature(&root);
+        list.SetComputeRootDescriptorTable(0, gpu_heap.GetGPUDescriptorHandleForHeapStart());
+        list.SetComputeRoot32BitConstants(1, 2, [11u32, 12].as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(1, 2, [13u32, 14].as_ptr().cast(), 2);
+        list.SetComputeRootConstantBufferView(2, upload_a.GetGPUVirtualAddress());
+        list.Dispatch(2, 3, 1);
+        list.CopyBufferRegion(&readback, 0, &upload_a, 0, 256);
+        list.Close().unwrap();
+        let label = format!("journal-{}", std::process::id());
+        std::fs::write(dir.join("capture"), format!("label {label}\nskip memory\n")).unwrap();
+        chain.Present(0, DXGI_PRESENT_TEST).ok().unwrap();
+        assert!(
+            dir.join("capture").exists(),
+            "TEST present must not consume a capture"
+        );
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        finish(queue, fence, 6);
+        verify_fill(&readback, 0x11);
+        host.cast::<u8>().write_bytes(0x22, 256);
+        let count = 1;
+        device.CopyDescriptors(
+            1,
+            &gpu,
+            Some(&count),
+            1,
+            &cpu,
+            Some(&count),
+            D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+        );
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        finish(queue, fence, 7);
+        verify_fill(&readback, 0x22);
+        allocator.Reset().unwrap();
+        list.Reset(&allocator, &pso).unwrap();
+        list.SetDescriptorHeaps(&[Some(gpu_heap.clone())]);
+        list.SetComputeRootSignature(&root);
+        list.SetComputeRootDescriptorTable(0, gpu_heap.GetGPUDescriptorHandleForHeapStart());
+        list.SetComputeRoot32BitConstants(1, 2, [11u32, 12].as_ptr().cast(), 0);
+        list.SetComputeRoot32BitConstants(1, 2, [13u32, 14].as_ptr().cast(), 2);
+        list.SetComputeRootConstantBufferView(2, upload_a.GetGPUVirtualAddress());
+        list.Dispatch(7, 1, 1);
+        list.CopyBufferRegion(&readback, 0, &upload_a, 0, 256);
+        list.Close().unwrap();
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        finish(queue, fence, 8);
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        upload_a.Unmap(0, None);
+        let path = dir.join("captures").join(label).join("capture.db");
+        let until = Instant::now() + Duration::from_secs(15);
+        while !path.is_file() {
+            assert!(
+                Instant::now() < until,
+                "capture writer timeout: {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let db = rusqlite::Connection::open(&path).unwrap();
+        for (query, expected) in [
+            ("SELECT count(*) FROM d12_submissions", 3),
+            ("SELECT count(*) FROM d12_executions", 3),
+            ("SELECT count(*) FROM d12_lists", 2),
+            ("SELECT count(*) FROM draws WHERE call='Dispatch'", 3),
+            ("SELECT count(*) FROM draws WHERE args='[2,3,1]'", 2),
+            ("SELECT count(*) FROM draws WHERE args='[7,1,1]'", 1),
+            ("SELECT count(*) FROM pragma_foreign_key_check", 0),
+            ("SELECT count(*) FROM draws WHERE cs IS NOT NULL", 3),
+            (
+                "SELECT count(*) FROM bindings WHERE stage='cs' AND kind='cb' AND space=7",
+                9,
+            ),
+            (
+                "SELECT count(*) FROM bindings WHERE kind='cb' AND content IS NOT NULL",
+                9,
+            ),
+            (
+                "SELECT count(*) FROM d12_draw_state WHERE pso!=0 AND compute_root!=0",
+                3,
+            ),
+            (
+                "SELECT count(DISTINCT r.id) FROM d12_roots r JOIN d12_draw_state s ON s.compute_root=r.id WHERE json_array_length(r.decoded_json,'$.parameters')=3",
+                1,
+            ),
+            (
+                "SELECT count(*) FROM (SELECT heap FROM d12_descriptor_versions WHERE kind='cb' GROUP BY heap HAVING count(DISTINCT resource)=2)",
+                1,
+            ),
+        ] {
+            assert_eq!(
+                db.query_row(query, [], |r| r.get::<_, i64>(0)).unwrap(),
+                expected,
+                "{query}"
+            );
+        }
+        assert_eq!(
+            db.query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "2"
+        );
+        let blobs = locum_capture::blobs::Blobs::new(dir.join("blobs"));
+        let mut versions = std::collections::BTreeMap::<i64, Vec<u8>>::new();
+        let mut statement = db
+            .prepare("SELECT resource,content_json FROM d12_upload_versions ORDER BY submission")
+            .unwrap();
+        for row in statement
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+        {
+            let (resource, text) = row.unwrap();
+            let content: serde_json::Value = serde_json::from_str(&text).unwrap();
+            let bytes = blobs.get(content["blob"].as_str().unwrap()).unwrap();
+            versions.entry(resource).or_default().push(bytes[0]);
+        }
+        assert!(
+            versions.values().any(|v| v == &[0x11, 0x22, 0x22]),
+            "persistent upload writes must be distinct per submission: {versions:?}"
+        );
+        let mut statement = db.prepare("SELECT hash,blob FROM shaders").unwrap();
+        for row in statement
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .unwrap()
+        {
+            let (hash, key) = row.unwrap();
+            assert_eq!(locum_capture::hash::key(&blobs.get(&key).unwrap()), hash);
+        }
+        debug_errors(device);
+        println!(
+            "D3D12 capture: cached lists, reset generations, PSO/shader/root data, descriptor copies/reuse, persistent upload versions, GPU bytes and SQL links verified: {}",
+            path.display()
+        );
+    }
+}
+
+unsafe fn verify_fill(resource: &ID3D12Resource, value: u8) {
+    let mut pointer = core::ptr::null_mut();
+    unsafe { resource.Map(0, None, Some(&mut pointer)) }.unwrap();
+    assert!(
+        unsafe { core::slice::from_raw_parts(pointer.cast::<u8>(), 256) }
+            .iter()
+            .all(|&v| v == value)
+    );
+    unsafe { resource.Unmap(0, None) };
 }
 
 unsafe fn debug_errors(device: &ID3D12Device) {

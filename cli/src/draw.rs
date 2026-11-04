@@ -55,6 +55,16 @@ fn rows(c: &Capture, draw: i64) -> Vec<Row> {
     )
 }
 
+/// A D3D12 draw's place in the queue's work.
+#[derive(Serialize)]
+pub struct Queued {
+    pub queue: i64,
+    pub execution: i64,
+    pub list: i64,
+    pub generation: i64,
+    pub command: i64,
+}
+
 /// One draw or dispatch, as `draw` shows it.
 #[derive(Serialize)]
 pub struct Draw {
@@ -70,6 +80,8 @@ pub struct Draw {
     /// The command list it was recorded in, for a deferred context's.
     pub list: Option<i64>,
     pub context: i64,
+    /// Where a D3D12 capture's draw ran: its queue, the execution, and the command list and command within it.
+    pub queue: Option<Queued>,
     /// The call stack, innermost first.
     pub stack: Vec<String>,
     /// Shader hash by stage (vs, hs, ds, gs, ps, cs).
@@ -453,6 +465,7 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
         deferred,
         list,
         context,
+        queue: queued(c, event),
         stack: stack.map(|s| describe::stack(c, s)).unwrap_or_default(),
         shaders,
         topology_name: topology.map(states::topology),
@@ -542,12 +555,16 @@ fn constants_of(
 }
 
 fn print_constants(k: &Constants) {
+    let space = match k.space {
+        0 => String::new(),
+        s => format!(" space {s}"),
+    };
     if k.key.is_none() {
-        out!("{} b{}: contents not captured", k.stage, k.slot);
+        out!("{} b{}{space}: contents not captured", k.stage, k.slot);
         return;
     }
     out!(
-        "{} b{} ({}, {} bytes{}):",
+        "{} b{}{space} ({}, {} bytes{}):",
         k.stage,
         k.slot,
         k.name.as_deref().unwrap_or("no reflection"),
@@ -577,8 +594,32 @@ fn print_constants(k: &Constants) {
     }
 }
 
+fn queued(c: &Capture, event: i64) -> Option<Queued> {
+    if c.meta("api").as_deref() != Some("d3d12") {
+        return None;
+    }
+    c.row(
+        "SELECT l.queue, l.execution, x.list, x.generation, l.command_index FROM d12_event_locations l          JOIN d12_executions x ON x.id = l.execution WHERE l.event = ?1",
+        [event],
+        |r| {
+            Ok(Queued {
+                queue: r.get(0)?,
+                execution: r.get(1)?,
+                list: r.get(2)?,
+                generation: r.get(3)?,
+                command: r.get(4)?,
+            })
+        },
+    )
+}
+
 fn print(d: &Draw) {
-    let place = if d.deferred {
+    let place = if let Some(q) = &d.queue {
+        format!(
+            "queue {}, execution {}, list {} generation {}, command {}",
+            q.queue, q.execution, q.list, q.generation, q.command
+        )
+    } else if d.deferred {
         format!(
             "command list {} (recorded on context {})",
             d.list.map_or("?".into(), |l| l.to_string()),
@@ -782,11 +823,30 @@ pub fn draw(c: &Capture, which: &str, all_constants: bool, as_json: bool) -> Res
 }
 
 /// `cb`: a draw's constant buffer, every register, by name; or its bytes in hex; or as JSON.
-pub fn cb(c: &Capture, draw: i64, stage: &str, slot: u32, raw: bool, as_json: bool) -> Result<(), String> {
-    let b = rows(c, draw)
+pub fn cb(
+    c: &Capture,
+    draw: i64,
+    stage: &str,
+    slot: u32,
+    space: u32,
+    raw: bool,
+    as_json: bool,
+) -> Result<(), String> {
+    let (mut here, elsewhere): (Vec<_>, Vec<_>) = rows(c, draw)
         .into_iter()
-        .find(|b| b.kind == "cb" && b.stage == stage && b.slot == slot)
-        .ok_or_else(|| format!("draw {draw} has no {stage} b{slot}"))?;
+        .filter(|b| b.kind == "cb" && b.stage == stage && b.slot == slot)
+        .partition(|b| b.space == space);
+    let Some(b) = here.pop() else {
+        let spaces: Vec<String> = elsewhere.iter().map(|b| b.space.to_string()).collect();
+        return Err(if spaces.is_empty() {
+            format!("draw {draw} has no {stage} b{slot}")
+        } else {
+            format!(
+                "draw {draw} has no {stage} b{slot} in space {space}; --space {} has one",
+                spaces.join(" or ")
+            )
+        });
+    };
     if raw {
         let key = b.content.ok_or("contents not captured")?;
         let bytes: Vec<u8> = c

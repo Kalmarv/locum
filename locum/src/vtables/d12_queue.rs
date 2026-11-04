@@ -513,6 +513,8 @@ unsafe impl Queue12Methods for crate::d3d12::Object {
         a9: windows::Win32::Graphics::Direct3D12::D3D12_TILE_MAPPING_FLAGS,
     ) {
         unsafe {
+            let mut queue_order = self.data.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
+            *queue_order += 1;
             real::UpdateTileMappings(
                 self.real(),
                 crate::d3d12::unwrap(a0),
@@ -538,6 +540,8 @@ unsafe impl Queue12Methods for crate::d3d12::Object {
         a5: windows::Win32::Graphics::Direct3D12::D3D12_TILE_MAPPING_FLAGS,
     ) {
         unsafe {
+            let mut queue_order = self.data.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
+            *queue_order += 1;
             real::CopyTileMappings(
                 self.real(),
                 crate::d3d12::unwrap(a0),
@@ -553,6 +557,9 @@ unsafe impl Queue12Methods for crate::d3d12::Object {
         unsafe {
             let mapped1 = crate::d3d12::inputs::objects(a1, a0);
             self.called("ExecuteCommandLists");
+            let mut queue_order = self.data.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
+            *queue_order += 1;
+            crate::d3d12::journal::submit(&self.data, *queue_order, a0, a1);
             real::ExecuteCommandLists(self.real(), a0, mapped1.ptr());
         }
     }
@@ -573,13 +580,19 @@ unsafe impl Queue12Methods for crate::d3d12::Object {
     }
     unsafe fn Signal(&self, a0: *mut core::ffi::c_void, a1: u64) -> windows::core::HRESULT {
         unsafe {
+            let mut queue_order = self.data.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
+            *queue_order += 1;
             let result = real::Signal(self.real(), crate::d3d12::unwrap(a0), a1);
+            crate::d3d12::journal::sync(&self.data, *queue_order, "Signal", a0, a1, result);
             result
         }
     }
     unsafe fn Wait(&self, a0: *mut core::ffi::c_void, a1: u64) -> windows::core::HRESULT {
         unsafe {
+            let mut queue_order = self.data.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
+            *queue_order += 1;
             let result = real::Wait(self.real(), crate::d3d12::unwrap(a0), a1);
+            crate::d3d12::journal::sync(&self.data, *queue_order, "Wait", a0, a1, result);
             result
         }
     }

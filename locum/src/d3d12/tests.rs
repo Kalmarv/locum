@@ -71,6 +71,9 @@ fn base_interface_identity_and_final_release() {
         let key = out as usize;
         wrap_output(S_OK, &ID3D12Fence::IID, &mut out);
         assert!(is_wrapped(out));
+        let wrapped_id = id(out);
+        assert_ne!(wrapped_id, 0);
+        assert_eq!(id(out), wrapped_id);
         let fence = ID3D12Fence::from_raw(out);
         assert_eq!(fence.GetCompletedValue(), 7);
         assert!(fence.cast::<ID3D12Fence1>().is_err());
@@ -83,5 +86,6 @@ fn base_interface_identity_and_final_release() {
         drop(b);
         assert!(destroyed.load(Ordering::SeqCst));
         assert!(!lock().identities.contains_key(&key));
+        assert_eq!(id(out), 0, "last Release invalidates the cached pointer ID");
     }
 }

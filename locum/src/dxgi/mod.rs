@@ -504,8 +504,12 @@ unsafe impl SwapChainMethods for SwapChain {
     }
     unsafe fn GetBuffer(&self, index: u32, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
         let hr = unsafe { real_swapchain::GetBuffer(self.inner(), index, iid, out) };
-        if matches!(self.owner, SwapChainOwner::D3d12(_)) {
+        if let SwapChainOwner::D3d12(queue) = &self.owner {
             unsafe { crate::d3d12::wrap_output(hr, iid, out) };
+            if hr.is_ok() && crate::d3d12::journal::enabled() {
+                let device = crate::d3d12::journal::owner_device(crate::d3d12::id(queue.as_raw()));
+                unsafe { crate::d3d12::values::created_resource(device, out, 0, 0, 0) };
+            }
         }
         hr
     }
@@ -580,6 +584,7 @@ impl SwapChain {
             if frame == 1 {
                 log!("D3D12 first proxied Present");
             }
+            crate::d3d12::journal::present(frame);
             return real();
         };
         crate::d3d11::overrides::poll(frame);

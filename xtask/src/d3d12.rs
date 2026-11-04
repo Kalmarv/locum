@@ -129,6 +129,7 @@ pub fn implementation(c: &Class, levels: &[(String, &Vtbl)]) -> String {
                     | "ExecuteIndirect"
                     | "DispatchRays"
                     | "CreateStateObject"
+                    | "AddToStateObject"
                     | "CreatePipelineLibrary"
                     | "LoadPipeline"
                     | "LoadGraphicsPipeline"
@@ -137,6 +138,7 @@ pub fn implementation(c: &Class, levels: &[(String, &Vtbl)]) -> String {
                 writeln!(s, "self.called(\"{}\");", e.name).unwrap();
             }
             let has_ret = e.ret.is_some();
+            s.push_str(&super::d3d12_capture::before(c, e));
             writeln!(
                 s,
                 "{}real::{}(self.real(){}{});",
@@ -164,6 +166,7 @@ pub fn implementation(c: &Class, levels: &[(String, &Vtbl)]) -> String {
                     s.push_str("self.private_output(result, a0, a1, a2);\n");
                 }
             }
+            s.push_str(&super::d3d12_capture::after(c, e));
             if has_ret {
                 s.push_str("result\n");
             }
@@ -221,6 +224,23 @@ pub fn smoke(root: &std::path::Path) {
         result.status
     );
     let log = std::fs::read_to_string(old_log).unwrap();
+    assert!(
+        !log.contains("D3D12 object "),
+        "per-object logging must not return"
+    );
+    for method in ["Close", "Reset", "ExecuteCommandLists", "Dispatch"] {
+        assert_eq!(
+            log.lines()
+                .filter(|l| l.ends_with(&format!("D3D12 first {method}")))
+                .count(),
+            1,
+            "first method logged once: {method}"
+        );
+    }
+    assert!(
+        log.contains("D3D12 totals:"),
+        "capture must include aggregate counts"
+    );
     for proof in [
         "wrapped ID3D12Device",
         "wrapped ID3D12CommandQueue",

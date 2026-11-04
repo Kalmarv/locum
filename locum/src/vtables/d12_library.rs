@@ -436,6 +436,14 @@ unsafe impl Library12Methods for crate::d3d12::Object {
             self.called("LoadGraphicsPipeline");
             let result = real::LoadGraphicsPipeline(self.real(), a0, mapped1.ptr(), a2, a3);
             crate::d3d12::wrap_output(result, a2, a3);
+            if result.is_ok() {
+                crate::d3d12::shaders::graphics(a1);
+                crate::d3d12::pipelines::created(
+                    crate::d3d12::journal::owner_device(self.data.id),
+                    a3,
+                    || crate::d3d12::pipelines::graphics(a1),
+                );
+            }
             result
         }
     }
@@ -451,6 +459,14 @@ unsafe impl Library12Methods for crate::d3d12::Object {
             self.called("LoadComputePipeline");
             let result = real::LoadComputePipeline(self.real(), a0, mapped1.ptr(), a2, a3);
             crate::d3d12::wrap_output(result, a2, a3);
+            if result.is_ok() {
+                crate::d3d12::shaders::compute(a1);
+                crate::d3d12::pipelines::created(
+                    crate::d3d12::journal::owner_device(self.data.id),
+                    a3,
+                    || crate::d3d12::pipelines::compute(a1),
+                );
+            }
             result
         }
     }
@@ -463,6 +479,7 @@ unsafe impl Library12Methods for crate::d3d12::Object {
     unsafe fn Serialize(&self, a0: *mut core::ffi::c_void, a1: usize) -> windows::core::HRESULT {
         unsafe {
             let result = real::Serialize(self.real(), a0, a1);
+            crate::log::log!("D3D12 Serialize: library={} capacity={}", self.data.id, a1);
             result
         }
     }
@@ -478,6 +495,14 @@ unsafe impl Library12Methods for crate::d3d12::Object {
             self.called("LoadPipeline");
             let result = real::LoadPipeline(self.real(), a0, mapped1.ptr(), a2, a3);
             crate::d3d12::wrap_output(result, a2, a3);
+            if result.is_ok() {
+                crate::d3d12::shaders::stream(a1);
+                crate::d3d12::pipelines::created(
+                    crate::d3d12::journal::owner_device(self.data.id),
+                    a3,
+                    || crate::d3d12::pipelines::stream(a1),
+                );
+            }
             result
         }
     }

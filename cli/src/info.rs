@@ -72,12 +72,21 @@ pub fn info(c: &Capture) -> Result<(), String> {
         n("draws"),
         c.count("SELECT count(*) FROM passes", [])
     );
-    out!(
-        "command lists: {} spliced in ({} recorded the frame before), {} executed without a recording",
-        n("lists_spliced"),
-        n("lists_recorded_before"),
-        n("lists_unrecorded")
-    );
+    if c.meta("api").as_deref() == Some("d3d12") {
+        out!(
+            "command lists: {} submissions, {} executions, {} recorded generations; queue order is retained separately from display order",
+            c.count("SELECT count(*) FROM d12_submissions", []),
+            c.count("SELECT count(*) FROM d12_executions", []),
+            c.count("SELECT count(*) FROM d12_lists", [])
+        );
+    } else {
+        out!(
+            "command lists: {} spliced in ({} recorded the frame before), {} executed without a recording",
+            n("lists_spliced"),
+            n("lists_recorded_before"),
+            n("lists_unrecorded")
+        );
+    }
     out!(
         "constants: {} distinct buffer contents, {} copies failed",
         c.count("SELECT count(*) FROM cb_data", []),

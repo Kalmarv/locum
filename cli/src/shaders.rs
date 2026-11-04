@@ -1,6 +1,7 @@
 //! `shaders` and `shader`: the shaders the frame used, their constant buffers and disassembly.
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use locum_capture::rdef;
 use serde::Serialize;
@@ -121,7 +122,7 @@ fn letter(class: &str) -> &'static str {
     }
 }
 
-pub fn shader(c: &Capture, hash: &str, disassemble: bool, as_json: bool) -> Result<(), String> {
+pub fn shader(c: &Capture, hash: &str, disassemble: bool, wgsl: bool, as_json: bool) -> Result<(), String> {
     let (h, stage, key): (String, String, Option<String>) = c
         .row(
             "SELECT hash, stage, blob FROM shaders WHERE hash LIKE ?1 || '%' ORDER BY hash LIMIT 1",
@@ -131,15 +132,13 @@ pub fn shader(c: &Capture, hash: &str, disassemble: bool, as_json: bool) -> Resu
         .ok_or_else(|| format!("no shader {hash}"))?;
     let key = key.ok_or("its bytecode was not found when the capture was written")?;
     let code = c.blob(&key)?;
-    let bindings = rdef::bindings(&code);
-    let cbs = rdef::constant_buffers(&code);
     if as_json {
         let s = Shader {
             hash: h,
             stage,
             bytes: code.len(),
             blob: key,
-            bindings: bindings.map(|bs| {
+            bindings: rdef::bindings(&code).map(|bs| {
                 bs.into_iter()
                     .map(|b| Binding {
                         kind_name: input_kind(b.kind),
@@ -152,7 +151,7 @@ pub fn shader(c: &Capture, hash: &str, disassemble: bool, as_json: bool) -> Resu
                     })
                     .collect()
             }),
-            constant_buffers: cbs.map(|cbs| {
+            constant_buffers: rdef::constant_buffers(&code).map(|cbs| {
                 cbs.into_iter()
                     .map(|cb| Buffer {
                         leaves: (0..cb.size / 4)
@@ -187,7 +186,56 @@ pub fn shader(c: &Capture, hash: &str, disassemble: bool, as_json: bool) -> Resu
         return Ok(());
     }
     out!("{stage} {h}: {} bytes, blob {key}", code.len());
-    match cbs {
+    show(
+        &code,
+        &format!("{}:shader/{h}", c.path.display()),
+        disassemble,
+        wgsl,
+        None,
+    )
+}
+
+/// `shader-file`: the same for a shader on disk, with `--evidence` writing a DXIL program's evidence to a file.
+pub fn file(path: &Path, disassemble: bool, wgsl: bool, evidence: Option<&Path>) -> Result<(), String> {
+    let code = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    out!("{}: {} bytes", path.display(), code.len());
+    show(&code, &path.display().to_string(), disassemble, wgsl, evidence)
+}
+
+/// A program's interface: for DXIL, the reflection answers of dx, Microsoft's compiler and iridia side by side (also
+/// written to `evidence`); for DXBC, its constant buffers and bindings. Then its disassembly and WGSL when asked.
+fn show(
+    code: &[u8],
+    source: &str,
+    disassemble: bool,
+    wgsl: bool,
+    evidence: Option<&Path>,
+) -> Result<(), String> {
+    if crate::dxil::is_dxil(code) {
+        let report =
+            serde_json::to_string_pretty(&crate::dxil::evidence(code, source)).map_err(|e| e.to_string())?;
+        if let Some(path) = evidence {
+            std::fs::write(path, &report).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        out!("{report}");
+    } else if evidence.is_some() {
+        return Err(format!("{source} is DXBC: --evidence compares DXIL reflection"));
+    } else {
+        constant_buffers_and_bindings(code);
+    }
+    if disassemble {
+        out!("");
+        out!("{}", disassembly(code)?);
+    }
+    if wgsl {
+        out!("");
+        out!("{}", crate::dxil::wgsl(code)?);
+    }
+    Ok(())
+}
+
+fn constant_buffers_and_bindings(code: &[u8]) {
+    match rdef::constant_buffers(code) {
         Some(cbs) => {
             for cb in cbs {
                 out!(
@@ -216,7 +264,11 @@ pub fn shader(c: &Capture, hash: &str, disassemble: bool, as_json: bool) -> Resu
         None => out!("no reflection (RDEF) in its bytecode"),
     }
     // The resources it reads and writes other than constant buffers.
-    for b in bindings.unwrap_or_default().iter().filter(|b| b.class() != "cb") {
+    for b in rdef::bindings(code)
+        .unwrap_or_default()
+        .iter()
+        .filter(|b| b.class() != "cb")
+    {
         let count = match b.count {
             1 => String::new(),
             0 => "[]".into(),
@@ -235,15 +287,13 @@ pub fn shader(c: &Capture, hash: &str, disassemble: bool, as_json: bool) -> Resu
             b.slot
         );
     }
-    if disassemble {
-        out!("");
-        out!("{}", disassembly(&code)?);
-    }
-    Ok(())
 }
 
 /// The bytecode's disassembly, from the system's shader compiler.
 pub fn disassembly(code: &[u8]) -> Result<String, String> {
+    if crate::dxil::is_dxil(code) {
+        return crate::dxil::disassemble(code);
+    }
     let blob = unsafe { D3DDisassemble(code.as_ptr().cast(), code.len(), 0, None) }
         .map_err(|e| format!("D3DDisassemble: {e}"))?;
     let text =

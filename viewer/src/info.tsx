@@ -19,7 +19,9 @@ export function InfoPage({ info }: { info: Info }) {
       <div class="stats">
         <Stat label="events" value={info.timeline.events} sub={info.timeline.kinds.map(([k, n]) => `${k} ${n}`).join(", ")} />
         <Stat label="draws and dispatches" value={info.timeline.draws} sub={`in ${info.timeline.passes} passes`} />
-        <Stat label="command lists spliced" value={info.lists.spliced} sub={`${info.lists.recordedBefore} recorded the frame before, ${info.lists.unrecorded} executed without a recording`} />
+        {info.lists.executions != null ?
+          <Stat label="list executions" value={info.lists.executions} sub={`${info.lists.submissions} submissions, ${info.lists.generations} recorded generations`} /> :
+          <Stat label="command lists spliced" value={info.lists.spliced} sub={`${info.lists.recordedBefore} recorded the frame before, ${info.lists.unrecorded} executed without a recording`} />}
         <Stat label="constant buffer contents" value={info.constants.distinct} sub={`${info.constants.failures} copies failed`} />
         <Stat label="resources live" value={info.resources.live} sub={`${info.resources.used} used (${info.resources.written} written); contents for ${info.resources.contents} (${mib(info.resources.contentBytes)}): ${info.resources.sources.map(([s, n]) => `${s} ${n}`).join(", ")}`} />
         <Stat label="uploads" value={info.uploads.total} sub={`${info.uploads.stored} stored, ${info.uploads.hashOnly} hash only; ${info.uploads.none} have no upload hash`} />

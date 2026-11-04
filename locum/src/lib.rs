@@ -10,6 +10,7 @@
 
 mod com;
 mod cost;
+mod crash;
 mod d3d11;
 mod d3d12;
 mod dump;
@@ -46,6 +47,7 @@ fn hello() {
             env!("CARGO_PKG_VERSION"),
             std::process::id()
         );
+        crate::crash::install();
     });
 }
 

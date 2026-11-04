@@ -1,0 +1,585 @@
+//! Continuous list history and per-submission capture. No COM ownership is kept in
+//! the portable history; object IDs survive pointer and descriptor-slot reuse.
+use core::ffi::c_void;
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
+
+use super::cost::Counter;
+use locum_capture::{d3d12 as model, db, writer};
+use serde_json::{Value, json};
+use windows::Win32::Graphics::Direct3D12::{D3D12_RANGE, ID3D12Resource};
+use windows::core::{HRESULT, Interface};
+
+use crate::log::{folder, log};
+
+pub static RECORDING_COST: Counter = Counter::new(0);
+pub static SUBMISSION_COST: Counter = Counter::new(1);
+pub static ADDRESS_COST: Counter = Counter::new(2);
+pub static DESCRIPTOR_COST: Counter = Counter::new(3);
+pub static DESTROY_COST: Counter = Counter::new(4);
+pub static UPLOAD_COST: Counter = Counter::new(5);
+pub static RESET_COST: Counter = Counter::new(6);
+
+pub fn enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LOCUM_D3D12_JOURNAL").as_deref() != Ok("off"))
+}
+
+pub struct Data {
+    pub id: u64,
+    pub recording: Mutex<Option<model::Recording>>,
+    /// Held through the real queue operation so the recorded order is its actual CPU call order.
+    pub queue_seq: Mutex<u64>,
+}
+
+impl Data {
+    pub fn new(id: u64) -> Self {
+        Self {
+            id,
+            recording: Mutex::new(None),
+            queue_seq: Mutex::new(0),
+        }
+    }
+    pub fn record(&self, call: &'static str, build: impl FnOnce() -> Value) {
+        if !enabled() {
+            return;
+        }
+        let start = Instant::now();
+        let args = build();
+        let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(recording) = recording.as_mut() {
+            recording.record(model::Command {
+                call,
+                args,
+                bundle: None,
+                diagnostic: None,
+            });
+        }
+        RECORDING_COST.add(start, 0);
+    }
+    pub fn pending(&self, call: &'static str) {
+        if !enabled() {
+            return;
+        }
+        let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(recording) = recording.as_mut() {
+            recording.record(model::Command {
+                call,
+                args: Value::Null,
+                bundle: None,
+                diagnostic: Some("semantic capture implementation pending".into()),
+            });
+        }
+    }
+    pub fn bundle(&self, pointer: *mut c_void) {
+        if !enabled() {
+            return;
+        }
+        let bundle = super::data(pointer).and_then(|d| d.snapshot());
+        let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(recording) = recording.as_mut() {
+            let diagnostic = bundle
+                .is_none()
+                .then(|| "bundle has no recorded generation".into());
+            recording.record(model::Command {
+                call: "ExecuteBundle",
+                args: json!({"list":super::id(pointer)}),
+                bundle,
+                diagnostic,
+            });
+        }
+    }
+    pub fn snapshot(&self) -> Option<Arc<model::List>> {
+        self.recording
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|r| r.snapshot())
+    }
+    pub fn close(&self, hr: HRESULT) {
+        if hr.is_ok()
+            && let Some(r) = self.recording.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        {
+            r.close();
+        }
+    }
+    pub fn reset(&self, hr: HRESULT, allocator: *mut c_void, pso: *mut c_void) {
+        let start = Instant::now();
+        let (allocator, pso) = (super::id(allocator), super::id(pso));
+        if hr.is_ok()
+            && let Some(r) = self.recording.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        {
+            r.reset(allocator, pso);
+        }
+        RESET_COST.add(start, 0);
+    }
+}
+
+#[derive(Default)]
+struct State {
+    objects: BTreeMap<u64, model::Object>,
+    uploads: BTreeMap<u64, Upload>,
+    cpu_seq: u64,
+    next_submission: u64,
+    capture: Option<(PathBuf, model::Frame)>,
+}
+#[derive(Default)]
+struct Upload {
+    pointer: usize,
+    maps: u32,
+    bytes: usize,
+}
+fn state() -> MutexGuard<'static, State> {
+    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
+    STATE
+        .get_or_init(|| Mutex::new(State::default()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn register(id: u64, kind: &'static str) {
+    if !enabled() {
+        return;
+    }
+    state().objects.entry(id).or_insert_with(|| model::Object {
+        id,
+        kind,
+        device: 0,
+        description: json!({}),
+    });
+}
+pub fn describe(id: u64, device: u64, description: Value) {
+    let mut s = state();
+    if let Some(object) = s.objects.get_mut(&id) {
+        object.device = device;
+        object.description = description;
+        let object = object.clone();
+        if let Some((_, frame)) = s.capture.as_mut() {
+            frame.objects.retain(|o| o.id != id);
+            frame.objects.push(object);
+        }
+    }
+}
+pub fn owner_device(id: u64) -> u64 {
+    state().objects.get(&id).map_or(0, |o| o.device)
+}
+pub fn destroy(id: u64) {
+    let start = Instant::now();
+    {
+        let mut s = state();
+        s.objects.remove(&id);
+        s.uploads.remove(&id);
+    }
+    super::slots::destroy(id);
+    DESTROY_COST.add(start, 0);
+}
+pub fn resource_address(id: u64, address: u64, bytes: u64) {
+    super::slots::register_address(id, address, bytes);
+}
+pub fn descriptor_addresses(id: u64, cpu: u64, gpu: u64, count: u32, stride: u32) {
+    super::slots::register_heap(id, cpu, gpu, count, stride);
+}
+pub fn address(value: u64) -> Value {
+    if value == 0 {
+        return Value::Null;
+    }
+    let start = Instant::now();
+    let result = super::slots::address(value);
+    ADDRESS_COST.add(start, 0);
+    result
+}
+pub fn constant_buffer(address: u64, bytes: u32) -> super::descriptors::Description {
+    let start = Instant::now();
+    let result = if let Some((resource, offset)) = super::slots::unique_address(address) {
+        super::descriptors::Description::Cb {
+            resource,
+            offset,
+            bytes,
+        }
+    } else {
+        let buffer = if address == 0 {
+            Value::Null
+        } else {
+            super::slots::address(address)
+        };
+        super::descriptors::Description::Json(json!({"buffer":buffer,"bytes":bytes}))
+    };
+    ADDRESS_COST.add(start, 0);
+    result
+}
+pub fn descriptor(value: u64, gpu: bool) -> Value {
+    if value == 0 {
+        return Value::Null;
+    }
+    let start = Instant::now();
+    let result = super::slots::descriptor(value, gpu);
+    DESCRIPTOR_COST.add(start, 0);
+    result
+}
+pub fn set_descriptor(
+    handle: u64,
+    kind: &'static str,
+    resource: u64,
+    counter: u64,
+    description: super::descriptors::Description,
+) {
+    if !enabled() {
+        return;
+    }
+    let start = Instant::now();
+    super::slots::set(handle, kind, resource, counter, description);
+    DESCRIPTOR_COST.add(start, 0);
+}
+pub fn copy_descriptors(destinations: &[u64], sources: &[u64]) {
+    if !enabled() {
+        return;
+    }
+    let start = Instant::now();
+    super::slots::copy(destinations, sources);
+    DESCRIPTOR_COST.add(start, 0);
+}
+pub fn copy_descriptors_simple(count: u32, destination: u64, source: u64) {
+    if !enabled() {
+        return;
+    }
+    let start = Instant::now();
+    super::slots::copy_simple(count, destination, source);
+    DESCRIPTOR_COST.add(start, 0);
+}
+pub fn descriptor_stride(handle: u64) -> Option<u32> {
+    super::slots::stride(handle)
+}
+pub fn render_targets(
+    pointer: *const windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
+    count: u32,
+    contiguous: bool,
+) -> Value {
+    if count == 0 {
+        return json!([]);
+    }
+    if contiguous {
+        let Some(first) = (unsafe { pointer.as_ref() }) else {
+            return json!([]);
+        };
+        let Some(stride) = descriptor_stride(first.ptr as u64) else {
+            return json!({"diagnostic":"contiguous RTV heap is not registered","count":count});
+        };
+        json!(
+            (0..count)
+                .map(|i| descriptor(first.ptr as u64 + u64::from(i) * u64::from(stride), false))
+                .collect::<Vec<_>>()
+        )
+    } else {
+        json!(
+            unsafe { slice(pointer, count as usize) }
+                .iter()
+                .map(|h| descriptor(h.ptr as u64, false))
+                .collect::<Vec<_>>()
+        )
+    }
+}
+
+pub unsafe fn mapped(resource: u64, sub: u32, out: *mut *mut c_void) {
+    if !enabled() || sub != 0 {
+        return;
+    }
+    let mut s = state();
+    let Some(o) = s.objects.get(&resource) else {
+        return;
+    };
+    if o.description["dimension"] != 1 || o.description["heap_properties"]["type"] != 2 {
+        return;
+    }
+    let bytes = o.description["width"].as_u64().unwrap_or(0) as usize;
+    let u = s.uploads.entry(resource).or_insert_with(|| Upload {
+        bytes,
+        ..Upload::default()
+    });
+    u.maps += 1;
+    if !out.is_null() {
+        u.pointer = unsafe { *out } as usize;
+    }
+}
+pub fn unmap(resource: u64, sub: u32) {
+    if !enabled() || sub != 0 {
+        return;
+    }
+    let mut s = state();
+    if let Some(u) = s.uploads.get_mut(&resource) {
+        u.maps = u.maps.saturating_sub(1);
+        if u.maps == 0 {
+            u.pointer = 0;
+        }
+    }
+}
+
+pub unsafe fn created_list(
+    device: u64,
+    out: *mut *mut c_void,
+    kind: i32,
+    allocator: *mut c_void,
+    pso: *mut c_void,
+    closed: bool,
+) {
+    if !enabled() || out.is_null() {
+        return;
+    }
+    if let Some(data) = super::data(unsafe { *out }) {
+        let (allocator, pso) = (super::id(allocator), super::id(pso));
+        *data.recording.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(model::Recording::new(data.id, kind, allocator, pso, closed));
+        describe(
+            data.id,
+            device,
+            json!({"type":kind,"allocator":allocator,"initial_pso":pso}),
+        );
+    }
+}
+
+/// Called while the queue lock is held, immediately before forwarding ExecuteCommandLists.
+pub unsafe fn submit(queue: &Data, sequence: u64, count: u32, pointers: *const *mut c_void) {
+    if !enabled() {
+        return;
+    }
+    let start = Instant::now();
+    let mut s = state();
+    s.cpu_seq += 1;
+    s.next_submission += 1;
+    let (cpu_seq, id) = (s.cpu_seq, s.next_submission);
+    let uploads = if s.capture.is_some() {
+        s.uploads
+            .iter()
+            .map(|(&resource, u)| {
+                let start = Instant::now();
+                // Snapshot only an armed submission. Re-map an unmapped CPU-visible
+                // resource through its real interface; no disarmed copies, hashes or disk writes.
+                let content = if u.pointer != 0 {
+                    unsafe { super::pipelines::bytes(u.pointer as *const c_void, u.bytes) }
+                } else {
+                    match super::real(resource).and_then(|r| r.cast::<ID3D12Resource>().ok()) {
+                        Some(r) => {
+                            let mut p = std::ptr::null_mut();
+                            match unsafe {
+                                r.Map(
+                                    0,
+                                    Some(&D3D12_RANGE {
+                                        Begin: 0,
+                                        End: u.bytes,
+                                    }),
+                                    Some(&mut p),
+                                )
+                            } {
+                                Ok(()) => {
+                                    let content = unsafe { super::pipelines::bytes(p, u.bytes) };
+                                    unsafe { r.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
+                                    content
+                                }
+                                Err(e) => json!({"diagnostic":format!("upload snapshot Map: {e}")}),
+                            }
+                        }
+                        None => json!({"diagnostic":"upload resource identity expired before submission"}),
+                    }
+                };
+                UPLOAD_COST.add(start, u.bytes as u64);
+                (resource, content)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let descriptors = if s.capture.is_some() {
+        super::slots::snapshot()
+    } else {
+        Vec::new()
+    };
+    if let Some((_, frame)) = s.capture.as_mut() {
+        let mut lists = Vec::new();
+        for (ordinal, pointer) in unsafe { slice(pointers, count as usize) }.iter().enumerate() {
+            if let Some(data) = super::data(*pointer) {
+                lists.push(data.snapshot().unwrap_or_else(|| {
+                    Arc::new(model::List {
+                        id: data.id,
+                        ..model::List::default()
+                    })
+                }));
+            } else {
+                frame.diagnostics.push(format!(
+                    "submission {id} queue {}: list {ordinal} of {count} has no registered identity",
+                    queue.id
+                ));
+            }
+        }
+        frame.submissions.push(model::Submission {
+            id,
+            queue: queue.id,
+            queue_seq: sequence,
+            cpu_seq,
+            lists,
+            descriptors,
+            uploads,
+        });
+    }
+    SUBMISSION_COST.add(start, 0);
+}
+
+pub fn sync(queue: &Data, sequence: u64, kind: &'static str, fence: *mut c_void, value: u64, hr: HRESULT) {
+    if !enabled() || hr.is_err() {
+        return;
+    }
+    let fence = super::id(fence);
+    let mut s = state();
+    s.cpu_seq += 1;
+    let cpu_seq = s.cpu_seq;
+    if let Some((_, frame)) = s.capture.as_mut() {
+        frame.sync.push(model::Sync {
+            queue: queue.id,
+            queue_seq: sequence,
+            cpu_seq,
+            kind,
+            fence,
+            value,
+        });
+    }
+}
+
+/// No slices are constructed from null, including the API's conventional (null, 0).
+pub unsafe fn slice<'a, T>(pointer: *const T, len: usize) -> &'a [T] {
+    if pointer.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(pointer, len) }
+    }
+}
+
+pub fn present(frame_number: u64) {
+    static REPORT: OnceLock<Mutex<Instant>> = OnceLock::new();
+    let mut last = REPORT
+        .get_or_init(|| Mutex::new(Instant::now()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if last.elapsed().as_secs() >= 10 {
+        *last = Instant::now();
+        super::log_counts();
+        let [
+            recording,
+            submission,
+            address,
+            descriptor,
+            destruction,
+            upload,
+            reset,
+        ] = super::cost::take();
+        log!(
+            "D3D12 journal CPU: recording {}, submission {}",
+            recording,
+            submission
+        );
+        log!(
+            "D3D12 journal detail: VA {}, descriptor {}, destruction {}, upload {}, reset {}; frame {frame_number}",
+            address,
+            descriptor,
+            destruction,
+            upload,
+            reset
+        );
+        let s = state();
+        let (ranges, heaps, slots) = super::slots::counts();
+        log!(
+            "D3D12 journal live: objects {}, buffer ranges {}, descriptor heaps {}, descriptor slots {}, upload buffers {}",
+            s.objects.len(),
+            ranges,
+            heaps,
+            slots,
+            s.uploads.len()
+        );
+    }
+    drop(last);
+    if !enabled() {
+        return;
+    }
+    let Some(root) = folder() else {
+        return;
+    };
+    let finished = state().capture.take();
+    if let Some((path, frame)) = finished {
+        super::log_counts();
+        let mut capture = db::Capture::default();
+        capture.meta("api", "d3d12");
+        capture.meta("name", path.file_name().unwrap_or_default().to_string_lossy());
+        capture.meta("locum", env!("CARGO_PKG_VERSION"));
+        capture.meta("frame", frame_number);
+        capture.meta("pid", std::process::id());
+        capture.meta(
+            "exe",
+            std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        );
+        capture.meta("blobs", crate::settings::settings().blobs.root().display());
+        capture.meta("capture_status", "incomplete");
+        capture.meta(
+            "verification_scope",
+            "command history; resource checkpoints not yet implemented",
+        );
+        let prepared = frame.prepare(&mut capture);
+        capture.gap(
+            "d3d12-capture-development",
+            "GPU first-use/pass-end checkpoints and full pipeline inspection are in development",
+            1,
+        );
+        // The same "capture written" / "capture NOT written" lines as Direct3D 11's: runners wait for them.
+        writer::run(move || {
+            let t = std::time::Instant::now();
+            prepared.contents(&mut capture, &crate::settings::settings().blobs);
+            capture.d3d12 = Some(prepared);
+            let file = path.join("capture.db");
+            let result = std::fs::create_dir_all(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|()| db::write(&file, &capture).map_err(|e| e.to_string()));
+            match result {
+                Ok(()) => log!(
+                    "capture written: {} ({} events, {} draws, {} gaps; {:.1} s after the frame)",
+                    file.display(),
+                    capture.events.len(),
+                    capture.draws.len(),
+                    capture.gaps.len(),
+                    t.elapsed().as_secs_f64()
+                ),
+                Err(e) => log!("capture NOT written to {}: {e}", file.display()),
+            }
+        });
+    }
+    let request = root.join("capture");
+    if let Ok(text) = std::fs::read_to_string(&request) {
+        if let Err(e) = std::fs::remove_file(&request) {
+            log!("D3D12 capture request: {e}");
+            return;
+        }
+        let label = text.lines().find_map(|l| l.strip_prefix("label ")).unwrap_or("");
+        let label: String = label
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c))
+            .collect();
+        let label = if label.is_empty() {
+            format!("frame-{}", frame_number + 1)
+        } else {
+            label
+        };
+        let path = root.join("captures").join(label);
+        if path.exists() {
+            log!("D3D12 capture destination already exists: {}", path.display());
+            return;
+        }
+        let mut s = state();
+        s.capture = Some((
+            path,
+            model::Frame {
+                objects: s.objects.values().cloned().collect(),
+                ..model::Frame::default()
+            },
+        ));
+        log!("D3D12 capture armed at Present {frame_number}; cached list history retained");
+    }
+}

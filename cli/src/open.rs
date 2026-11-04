@@ -77,6 +77,24 @@ pub fn open(arg: &str, blobs: Option<&Path>) -> Result<Capture, String> {
     };
     let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    let api: String = db
+        .query_row("SELECT value FROM meta WHERE key='api'", [], |r| r.get(0))
+        .map_err(|e| format!("capture API: {e}"))?;
+    let version: String = db
+        .query_row("SELECT value FROM meta WHERE key='schema_version'", [], |r| {
+            r.get(0)
+        })
+        .map_err(|e| format!("capture schema: {e}"))?;
+    let readable = match api.as_str() {
+        "d3d11" => locum_capture::db::SCHEMA_VERSION,
+        "d3d12" => locum_capture::db::D3D12_SCHEMA_VERSION,
+        _ => 0,
+    };
+    if version != readable.to_string() {
+        return Err(format!(
+            "capture API {api:?}, schema {version:?} is not readable by this locum-cli"
+        ));
+    }
     let named: Option<String> = db
         .query_row("SELECT value FROM meta WHERE key = 'blobs'", [], |r| r.get(0))
         .ok();

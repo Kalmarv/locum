@@ -508,11 +508,15 @@ unsafe impl Resource12Methods for crate::d3d12::Object {
     ) -> windows::core::HRESULT {
         unsafe {
             let result = real::Map(self.real(), a0, a1, a2);
+            if result.is_ok() {
+                crate::d3d12::journal::mapped(self.data.id, a0, a2);
+            }
             result
         }
     }
     unsafe fn Unmap(&self, a0: u32, a1: *const windows::Win32::Graphics::Direct3D12::D3D12_RANGE) {
         unsafe {
+            crate::d3d12::journal::unmap(self.data.id, a0);
             real::Unmap(self.real(), a0, a1);
         }
     }

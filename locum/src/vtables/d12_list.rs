@@ -2213,6 +2213,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         unsafe {
             self.called("Close");
             let result = real::Close(self.real());
+            self.data.close(result);
             result
         }
     }
@@ -2220,29 +2221,50 @@ unsafe impl List12Methods for crate::d3d12::Object {
         unsafe {
             self.called("Reset");
             let result = real::Reset(self.real(), crate::d3d12::unwrap(a0), crate::d3d12::unwrap(a1));
+            self.data.reset(result, a0, a1);
             result
         }
     }
     unsafe fn ClearState(&self, a0: *mut core::ffi::c_void) {
         unsafe {
+            self.data.record("ClearState", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0)])
+            });
             real::ClearState(self.real(), crate::d3d12::unwrap(a0));
         }
     }
     unsafe fn DrawInstanced(&self, a0: u32, a1: u32, a2: u32, a3: u32) {
         unsafe {
             self.called("DrawInstanced");
+            self.data.record("DrawInstanced", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, a1, a2, a3])
+            });
             real::DrawInstanced(self.real(), a0, a1, a2, a3);
         }
     }
     unsafe fn DrawIndexedInstanced(&self, a0: u32, a1: u32, a2: u32, a3: i32, a4: u32) {
         unsafe {
             self.called("DrawIndexedInstanced");
+            self.data.record("DrawIndexedInstanced", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, a1, a2, a3, a4])
+            });
             real::DrawIndexedInstanced(self.real(), a0, a1, a2, a3, a4);
         }
     }
     unsafe fn Dispatch(&self, a0: u32, a1: u32, a2: u32) {
         unsafe {
             self.called("Dispatch");
+            self.data.record("Dispatch", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, a1, a2])
+            });
             real::Dispatch(self.real(), a0, a1, a2);
         }
     }
@@ -2255,6 +2277,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a4: u64,
     ) {
         unsafe {
+            self.data.record("CopyBufferRegion", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0), a1, id(a2), a3, a4])
+            });
             real::CopyBufferRegion(
                 self.real(),
                 crate::d3d12::unwrap(a0),
@@ -2277,11 +2304,21 @@ unsafe impl List12Methods for crate::d3d12::Object {
         unsafe {
             let mapped0 = crate::d3d12::inputs::texture_copy(a0);
             let mapped4 = crate::d3d12::inputs::texture_copy(a4);
+            self.data.record("CopyTextureRegion", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([texture_copy(a0), a1, a2, a3, texture_copy(a4), box_value(a5)])
+            });
             real::CopyTextureRegion(self.real(), mapped0.ptr(), a1, a2, a3, mapped4.ptr(), a5);
         }
     }
     unsafe fn CopyResource(&self, a0: *mut core::ffi::c_void, a1: *mut core::ffi::c_void) {
         unsafe {
+            self.data.record("CopyResource", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0), id(a1)])
+            });
             real::CopyResource(self.real(), crate::d3d12::unwrap(a0), crate::d3d12::unwrap(a1));
         }
     }
@@ -2295,6 +2332,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a5: windows::Win32::Graphics::Direct3D12::D3D12_TILE_COPY_FLAGS,
     ) {
         unsafe {
+            self.data.pending("CopyTiles");
             real::CopyTiles(
                 self.real(),
                 crate::d3d12::unwrap(a0),
@@ -2315,6 +2353,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a4: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     ) {
         unsafe {
+            self.data.record("ResolveSubresource", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0), a1, id(a2), a3, a4.0])
+            });
             real::ResolveSubresource(
                 self.real(),
                 crate::d3d12::unwrap(a0),
@@ -2327,6 +2370,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn IASetPrimitiveTopology(&self, a0: windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY) {
         unsafe {
+            self.data.record("IASetPrimitiveTopology", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0.0])
+            });
             real::IASetPrimitiveTopology(self.real(), a0);
         }
     }
@@ -2336,26 +2384,51 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a1: *const windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT,
     ) {
         unsafe {
+            self.data.record("RSSetViewports", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([viewports(a1, a0)])
+            });
             real::RSSetViewports(self.real(), a0, a1);
         }
     }
     unsafe fn RSSetScissorRects(&self, a0: u32, a1: *const windows::Win32::Foundation::RECT) {
         unsafe {
+            self.data.record("RSSetScissorRects", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([rects(a1, a0)])
+            });
             real::RSSetScissorRects(self.real(), a0, a1);
         }
     }
     unsafe fn OMSetBlendFactor(&self, a0: *const f32) {
         unsafe {
+            self.data.record("OMSetBlendFactor", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([slice(a0, 4)])
+            });
             real::OMSetBlendFactor(self.real(), a0);
         }
     }
     unsafe fn OMSetStencilRef(&self, a0: u32) {
         unsafe {
+            self.data.record("OMSetStencilRef", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0])
+            });
             real::OMSetStencilRef(self.real(), a0);
         }
     }
     unsafe fn SetPipelineState(&self, a0: *mut core::ffi::c_void) {
         unsafe {
+            self.data.record("SetPipelineState", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0)])
+            });
             real::SetPipelineState(self.real(), crate::d3d12::unwrap(a0));
         }
     }
@@ -2366,27 +2439,48 @@ unsafe impl List12Methods for crate::d3d12::Object {
     ) {
         unsafe {
             let mapped1 = crate::d3d12::inputs::barriers(a1, a0);
+            self.data.record("ResourceBarrier", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([barriers(a1, a0)])
+            });
             real::ResourceBarrier(self.real(), a0, mapped1.ptr());
         }
     }
     unsafe fn ExecuteBundle(&self, a0: *mut core::ffi::c_void) {
         unsafe {
+            self.data.bundle(a0);
             real::ExecuteBundle(self.real(), crate::d3d12::unwrap(a0));
         }
     }
     unsafe fn SetDescriptorHeaps(&self, a0: u32, a1: *const *mut core::ffi::c_void) {
         unsafe {
             let mapped1 = crate::d3d12::inputs::objects(a1, a0);
+            self.data.record("SetDescriptorHeaps", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([slice(a1, a0 as usize).iter().map(|p| id(*p)).collect::<Vec<_>>()])
+            });
             real::SetDescriptorHeaps(self.real(), a0, mapped1.ptr());
         }
     }
     unsafe fn SetComputeRootSignature(&self, a0: *mut core::ffi::c_void) {
         unsafe {
+            self.data.record("SetComputeRootSignature", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0)])
+            });
             real::SetComputeRootSignature(self.real(), crate::d3d12::unwrap(a0));
         }
     }
     unsafe fn SetGraphicsRootSignature(&self, a0: *mut core::ffi::c_void) {
         unsafe {
+            self.data.record("SetGraphicsRootSignature", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0)])
+            });
             real::SetGraphicsRootSignature(self.real(), crate::d3d12::unwrap(a0));
         }
     }
@@ -2396,6 +2490,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a1: windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
     ) {
         unsafe {
+            self.data.record("SetComputeRootDescriptorTable", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, descriptor(a1.ptr, true)])
+            });
             real::SetComputeRootDescriptorTable(self.real(), a0, a1);
         }
     }
@@ -2405,56 +2504,111 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a1: windows::Win32::Graphics::Direct3D12::D3D12_GPU_DESCRIPTOR_HANDLE,
     ) {
         unsafe {
+            self.data.record("SetGraphicsRootDescriptorTable", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, descriptor(a1.ptr, true)])
+            });
             real::SetGraphicsRootDescriptorTable(self.real(), a0, a1);
         }
     }
     unsafe fn SetComputeRoot32BitConstant(&self, a0: u32, a1: u32, a2: u32) {
         unsafe {
+            self.data.record("SetComputeRoot32BitConstant", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, a1, a2])
+            });
             real::SetComputeRoot32BitConstant(self.real(), a0, a1, a2);
         }
     }
     unsafe fn SetGraphicsRoot32BitConstant(&self, a0: u32, a1: u32, a2: u32) {
         unsafe {
+            self.data.record("SetGraphicsRoot32BitConstant", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, a1, a2])
+            });
             real::SetGraphicsRoot32BitConstant(self.real(), a0, a1, a2);
         }
     }
     unsafe fn SetComputeRoot32BitConstants(&self, a0: u32, a1: u32, a2: *const core::ffi::c_void, a3: u32) {
         unsafe {
+            self.data.record("SetComputeRoot32BitConstants", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, slice(a2.cast::<u32>(), a1 as usize), a3])
+            });
             real::SetComputeRoot32BitConstants(self.real(), a0, a1, a2, a3);
         }
     }
     unsafe fn SetGraphicsRoot32BitConstants(&self, a0: u32, a1: u32, a2: *const core::ffi::c_void, a3: u32) {
         unsafe {
+            self.data.record("SetGraphicsRoot32BitConstants", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, slice(a2.cast::<u32>(), a1 as usize), a3])
+            });
             real::SetGraphicsRoot32BitConstants(self.real(), a0, a1, a2, a3);
         }
     }
     unsafe fn SetComputeRootConstantBufferView(&self, a0: u32, a1: u64) {
         unsafe {
+            self.data.record("SetComputeRootConstantBufferView", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, address(a1)])
+            });
             real::SetComputeRootConstantBufferView(self.real(), a0, a1);
         }
     }
     unsafe fn SetGraphicsRootConstantBufferView(&self, a0: u32, a1: u64) {
         unsafe {
+            self.data.record("SetGraphicsRootConstantBufferView", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, address(a1)])
+            });
             real::SetGraphicsRootConstantBufferView(self.real(), a0, a1);
         }
     }
     unsafe fn SetComputeRootShaderResourceView(&self, a0: u32, a1: u64) {
         unsafe {
+            self.data.record("SetComputeRootShaderResourceView", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, address(a1)])
+            });
             real::SetComputeRootShaderResourceView(self.real(), a0, a1);
         }
     }
     unsafe fn SetGraphicsRootShaderResourceView(&self, a0: u32, a1: u64) {
         unsafe {
+            self.data.record("SetGraphicsRootShaderResourceView", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, address(a1)])
+            });
             real::SetGraphicsRootShaderResourceView(self.real(), a0, a1);
         }
     }
     unsafe fn SetComputeRootUnorderedAccessView(&self, a0: u32, a1: u64) {
         unsafe {
+            self.data.record("SetComputeRootUnorderedAccessView", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, address(a1)])
+            });
             real::SetComputeRootUnorderedAccessView(self.real(), a0, a1);
         }
     }
     unsafe fn SetGraphicsRootUnorderedAccessView(&self, a0: u32, a1: u64) {
         unsafe {
+            self.data.record("SetGraphicsRootUnorderedAccessView", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, address(a1)])
+            });
             real::SetGraphicsRootUnorderedAccessView(self.real(), a0, a1);
         }
     }
@@ -2463,6 +2617,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a0: *const windows::Win32::Graphics::Direct3D12::D3D12_INDEX_BUFFER_VIEW,
     ) {
         unsafe {
+            self.data.record("IASetIndexBuffer", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([index_buffer(a0)])
+            });
             real::IASetIndexBuffer(self.real(), a0);
         }
     }
@@ -2473,6 +2632,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: *const windows::Win32::Graphics::Direct3D12::D3D12_VERTEX_BUFFER_VIEW,
     ) {
         unsafe {
+            self.data.record("IASetVertexBuffers", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, vertex_buffers(a2, a1)])
+            });
             real::IASetVertexBuffers(self.real(), a0, a1, a2);
         }
     }
@@ -2483,6 +2647,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: *const windows::Win32::Graphics::Direct3D12::D3D12_STREAM_OUTPUT_BUFFER_VIEW,
     ) {
         unsafe {
+            self.data.record("SOSetTargets", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, stream_outputs(a2, a1)])
+            });
             real::SOSetTargets(self.real(), a0, a1, a2);
         }
     }
@@ -2494,6 +2663,14 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a3: *const windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
     ) {
         unsafe {
+            self.data.record("OMSetRenderTargets", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([
+                    render_targets(a1, a0, a2.as_bool()),
+                    a3.as_ref().map(|d| descriptor(d.ptr as u64, false))
+                ])
+            });
             real::OMSetRenderTargets(self.real(), a0, a1, a2, a3);
         }
     }
@@ -2507,6 +2684,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a5: *const windows::Win32::Foundation::RECT,
     ) {
         unsafe {
+            self.data.record("ClearDepthStencilView", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([descriptor(a0.ptr as u64, false), a1.0, a2, a3, rects(a5, a4)])
+            });
             real::ClearDepthStencilView(self.real(), a0, a1, a2, a3, a4, a5);
         }
     }
@@ -2518,6 +2700,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a3: *const windows::Win32::Foundation::RECT,
     ) {
         unsafe {
+            self.data.record("ClearRenderTargetView", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([descriptor(a0.ptr as u64, false), slice(a1, 4), rects(a3, a2)])
+            });
             real::ClearRenderTargetView(self.real(), a0, a1, a2, a3);
         }
     }
@@ -2531,6 +2718,17 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a5: *const windows::Win32::Foundation::RECT,
     ) {
         unsafe {
+            self.data.record("ClearUnorderedAccessViewUint", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([
+                    descriptor(a0.ptr, true),
+                    descriptor(a1.ptr as u64, false),
+                    id(a2),
+                    slice(a3, 4),
+                    rects(a5, a4)
+                ])
+            });
             real::ClearUnorderedAccessViewUint(self.real(), a0, a1, crate::d3d12::unwrap(a2), a3, a4, a5);
         }
     }
@@ -2544,6 +2742,17 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a5: *const windows::Win32::Foundation::RECT,
     ) {
         unsafe {
+            self.data.record("ClearUnorderedAccessViewFloat", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([
+                    descriptor(a0.ptr, true),
+                    descriptor(a1.ptr as u64, false),
+                    id(a2),
+                    slice(a3, 4),
+                    rects(a5, a4)
+                ])
+            });
             real::ClearUnorderedAccessViewFloat(self.real(), a0, a1, crate::d3d12::unwrap(a2), a3, a4, a5);
         }
     }
@@ -2553,6 +2762,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a1: *const windows::Win32::Graphics::Direct3D12::D3D12_DISCARD_REGION,
     ) {
         unsafe {
+            self.data.pending("DiscardResource");
             real::DiscardResource(self.real(), crate::d3d12::unwrap(a0), a1);
         }
     }
@@ -2563,6 +2773,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: u32,
     ) {
         unsafe {
+            self.data.record("BeginQuery", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0), a1.0, a2])
+            });
             real::BeginQuery(self.real(), crate::d3d12::unwrap(a0), a1, a2);
         }
     }
@@ -2573,6 +2788,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: u32,
     ) {
         unsafe {
+            self.data.record("EndQuery", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0), a1.0, a2])
+            });
             real::EndQuery(self.real(), crate::d3d12::unwrap(a0), a1, a2);
         }
     }
@@ -2586,6 +2806,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a5: u64,
     ) {
         unsafe {
+            self.data.record("ResolveQueryData", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0), a1.0, a2, a3, id(a4), a5])
+            });
             real::ResolveQueryData(
                 self.real(),
                 crate::d3d12::unwrap(a0),
@@ -2604,21 +2829,41 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: windows::Win32::Graphics::Direct3D12::D3D12_PREDICATION_OP,
     ) {
         unsafe {
+            self.data.record("SetPredication", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0), a1, a2.0])
+            });
             real::SetPredication(self.real(), crate::d3d12::unwrap(a0), a1, a2);
         }
     }
     unsafe fn SetMarker(&self, a0: u32, a1: *const core::ffi::c_void, a2: u32) {
         unsafe {
+            self.data.record("SetMarker", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, slice(a1.cast::<u8>(), a2 as usize)])
+            });
             real::SetMarker(self.real(), a0, a1, a2);
         }
     }
     unsafe fn BeginEvent(&self, a0: u32, a1: *const core::ffi::c_void, a2: u32) {
         unsafe {
+            self.data.record("BeginEvent", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, slice(a1.cast::<u8>(), a2 as usize)])
+            });
             real::BeginEvent(self.real(), a0, a1, a2);
         }
     }
     unsafe fn EndEvent(&self) {
         unsafe {
+            self.data.record("EndEvent", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([])
+            });
             real::EndEvent(self.real());
         }
     }
@@ -2633,6 +2878,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
     ) {
         unsafe {
             self.called("ExecuteIndirect");
+            self.data.record("ExecuteIndirect", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0), a1, id(a2), a3, id(a4), a5])
+            });
             real::ExecuteIndirect(
                 self.real(),
                 crate::d3d12::unwrap(a0),
@@ -2656,6 +2906,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     ) {
         unsafe {
             let mapped5 = crate::d3d12::inputs::objects(a5, a4);
+            self.data.pending("AtomicCopyBufferUINT");
             real::AtomicCopyBufferUINT(
                 self.real(),
                 crate::d3d12::unwrap(a0),
@@ -2680,6 +2931,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     ) {
         unsafe {
             let mapped5 = crate::d3d12::inputs::objects(a5, a4);
+            self.data.pending("AtomicCopyBufferUINT64");
             real::AtomicCopyBufferUINT64(
                 self.real(),
                 crate::d3d12::unwrap(a0),
@@ -2694,6 +2946,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn OMSetDepthBounds(&self, a0: f32, a1: f32) {
         unsafe {
+            self.data.record("OMSetDepthBounds", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0, a1])
+            });
             real::OMSetDepthBounds(self.real(), a0, a1);
         }
     }
@@ -2704,6 +2961,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: *const windows::Win32::Graphics::Direct3D12::D3D12_SAMPLE_POSITION,
     ) {
         unsafe {
+            self.data.pending("SetSamplePositions");
             real::SetSamplePositions(self.real(), a0, a1, a2);
         }
     }
@@ -2720,6 +2978,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a8: windows::Win32::Graphics::Direct3D12::D3D12_RESOLVE_MODE,
     ) {
         unsafe {
+            self.data.pending("ResolveSubresourceRegion");
             real::ResolveSubresourceRegion(
                 self.real(),
                 crate::d3d12::unwrap(a0),
@@ -2736,6 +2995,11 @@ unsafe impl List12Methods for crate::d3d12::Object {
     }
     unsafe fn SetViewInstanceMask(&self, a0: u32) {
         unsafe {
+            self.data.record("SetViewInstanceMask", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([a0])
+            });
             real::SetViewInstanceMask(self.real(), a0);
         }
     }
@@ -2746,11 +3010,17 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: *const windows::Win32::Graphics::Direct3D12::D3D12_WRITEBUFFERIMMEDIATE_MODE,
     ) {
         unsafe {
+            self.data.pending("WriteBufferImmediate");
             real::WriteBufferImmediate(self.real(), a0, a1, a2);
         }
     }
     unsafe fn SetProtectedResourceSession(&self, a0: *mut core::ffi::c_void) {
         unsafe {
+            self.data.record("SetProtectedResourceSession", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0)])
+            });
             real::SetProtectedResourceSession(self.real(), crate::d3d12::unwrap(a0));
         }
     }
@@ -2764,11 +3034,17 @@ unsafe impl List12Methods for crate::d3d12::Object {
         unsafe {
             let mapped1 = crate::d3d12::inputs::render_targets(a1, a0);
             let mapped2 = crate::d3d12::inputs::depth_stencil(a2);
+            self.data.pending("BeginRenderPass");
             real::BeginRenderPass(self.real(), a0, mapped1.ptr(), mapped2.ptr(), a3);
         }
     }
     unsafe fn EndRenderPass(&self) {
         unsafe {
+            self.data.record("EndRenderPass", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([])
+            });
             real::EndRenderPass(self.real());
         }
     }
@@ -2779,11 +3055,13 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: usize,
     ) {
         unsafe {
+            self.data.pending("InitializeMetaCommand");
             real::InitializeMetaCommand(self.real(), crate::d3d12::unwrap(a0), a1, a2);
         }
     }
     unsafe fn ExecuteMetaCommand(&self, a0: *mut core::ffi::c_void, a1: *const core::ffi::c_void, a2: usize) {
         unsafe {
+            self.data.pending("ExecuteMetaCommand");
             real::ExecuteMetaCommand(self.real(), crate::d3d12::unwrap(a0), a1, a2);
         }
     }
@@ -2794,6 +3072,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: * const windows :: Win32 :: Graphics :: Direct3D12 :: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC,
     ) {
         unsafe {
+            self.data.pending("BuildRaytracingAccelerationStructure");
             real::BuildRaytracingAccelerationStructure(self.real(), a0, a1, a2);
         }
     }
@@ -2804,6 +3083,8 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: *const u64,
     ) {
         unsafe {
+            self.data
+                .pending("EmitRaytracingAccelerationStructurePostbuildInfo");
             real::EmitRaytracingAccelerationStructurePostbuildInfo(self.real(), a0, a1, a2);
         }
     }
@@ -2814,17 +3095,24 @@ unsafe impl List12Methods for crate::d3d12::Object {
         a2: windows::Win32::Graphics::Direct3D12::D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE,
     ) {
         unsafe {
+            self.data.pending("CopyRaytracingAccelerationStructure");
             real::CopyRaytracingAccelerationStructure(self.real(), a0, a1, a2);
         }
     }
     unsafe fn SetPipelineState1(&self, a0: *mut core::ffi::c_void) {
         unsafe {
+            self.data.record("SetPipelineState1", || {
+                #[allow(unused_imports)]
+                use crate::d3d12::values::*;
+                serde_json::json!([id(a0)])
+            });
             real::SetPipelineState1(self.real(), crate::d3d12::unwrap(a0));
         }
     }
     unsafe fn DispatchRays(&self, a0: *const windows::Win32::Graphics::Direct3D12::D3D12_DISPATCH_RAYS_DESC) {
         unsafe {
             self.called("DispatchRays");
+            self.data.pending("DispatchRays");
             real::DispatchRays(self.real(), a0);
         }
     }

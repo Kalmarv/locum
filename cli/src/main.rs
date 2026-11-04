@@ -5,6 +5,7 @@ mod describe;
 mod diff;
 mod draw;
 mod draws;
+mod dxil;
 mod export;
 mod info;
 mod join;
@@ -91,6 +92,9 @@ enum Command {
         /// vs, hs, ds, gs, ps or cs.
         stage: String,
         slot: u32,
+        /// Register space (D3D12); zero for D3D11.
+        #[arg(long, default_value_t = 0)]
+        space: u32,
         /// Hex bytes instead.
         #[arg(long, conflicts_with = "json")]
         raw: bool,
@@ -162,10 +166,26 @@ enum Command {
         hash: String,
         #[arg(long, short, conflicts_with = "json")]
         disassemble: bool,
+        /// Readable WGSL through iridia (original bytecode remains authoritative).
+        #[arg(long, conflicts_with = "json")]
+        wgsl: bool,
         /// The reflection as JSON: every binding, and each constant buffer's variables and every 4-byte value by
         /// its full name.
         #[arg(long)]
         json: bool,
+    },
+    /// A shader file (.dxbc, .cso): a DXIL program's reflection by dx, Microsoft's compiler and iridia side by side,
+    /// or a DXBC program's constant buffers and bindings; with --disassemble its code, with --wgsl iridia's WGSL.
+    ShaderFile {
+        file: PathBuf,
+        #[arg(long, short)]
+        disassemble: bool,
+        /// Readable WGSL through iridia (original bytecode remains authoritative).
+        #[arg(long)]
+        wgsl: bool,
+        /// Write a DXIL program's independent answers, source path, hash and revisions as JSON.
+        #[arg(long)]
+        evidence: Option<PathBuf>,
     },
     /// A resource's contents as the frame began, or with --at as an event saw them: .dds (whole, or one
     /// subresource), .png (one subresource), or raw.
@@ -269,6 +289,15 @@ enum Command {
         /// An event to set once the snapshot is taken.
         #[arg(long)]
         signal: Option<String>,
+        /// Wait for this event or target exit before taking a crash snapshot.
+        #[arg(long)]
+        wait_event: Option<String>,
+        /// Signal after opening the target and crash-request event.
+        #[arg(long, requires = "wait_event")]
+        ready_event: Option<String>,
+        /// Remote address of two native-width words: fault thread ID and EXCEPTION_POINTERS.
+        #[arg(long, requires = "wait_event")]
+        exception_info: Option<usize>,
     },
     /// Searches a capture's memory dump (or a .dmp file) for a value: a float, an integer, bytes, or the registers of
     /// a constant buffer a draw had bound.
@@ -417,9 +446,10 @@ fn run(cli: Cli) -> Result<(), String> {
             draw,
             stage,
             slot,
+            space,
             raw,
             json,
-        } => draw::cb(&open(&capture)?, draw, &stage, slot, raw, json),
+        } => draw::cb(&open(&capture)?, draw, &stage, slot, space, raw, json),
         Command::Find {
             capture,
             value,
@@ -470,8 +500,15 @@ fn run(cli: Cli) -> Result<(), String> {
             capture,
             hash,
             disassemble,
+            wgsl,
             json,
-        } => shaders::shader(&open(&capture)?, &hash, disassemble, json),
+        } => shaders::shader(&open(&capture)?, &hash, disassemble, wgsl, json),
+        Command::ShaderFile {
+            file,
+            disassemble,
+            wgsl,
+            evidence,
+        } => shaders::file(&file, disassemble, wgsl, evidence.as_deref()),
         Command::Export {
             capture,
             id,
@@ -543,7 +580,21 @@ fn run(cli: Cli) -> Result<(), String> {
             limit,
             out,
         } => replay::verify(&open(&capture)?, warp, debug, limit, out.as_deref()),
-        Command::Dump { pid, out, signal } => memory::dump(pid, &out, signal.as_deref()),
+        Command::Dump {
+            pid,
+            out,
+            signal,
+            wait_event,
+            ready_event,
+            exception_info,
+        } => memory::dump(
+            pid,
+            &out,
+            signal.as_deref(),
+            wait_event.as_deref(),
+            ready_event.as_deref(),
+            exception_info,
+        ),
         Command::Memfind {
             target,
             float,

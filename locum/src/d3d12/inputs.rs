@@ -120,7 +120,7 @@ pub unsafe fn depth_stencil(
 fn align(n: usize, a: usize) -> usize {
     (n + a - 1) & !(a - 1)
 }
-fn payload(t: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) -> Option<(usize, usize)> {
+pub(super) fn payload(t: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) -> Option<(usize, usize)> {
     macro_rules! ty {
         ($t:ty) => {
             Some((size_of::<$t>(), align_of::<$t>()))
