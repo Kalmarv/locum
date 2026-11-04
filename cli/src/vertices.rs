@@ -149,6 +149,19 @@ impl Call {
     }
 }
 
+/// What a direct draw call reads of its index buffer (`kind` ib) or its vertex buffers (`vb`): `start=885904
+/// count=714` (indices for an indexed draw, vertices otherwise), with the base vertex an indexed draw adds; None for
+/// other bindings and calls (an indirect call's counts are in its argument buffer: `vertices` reads them).
+pub(crate) fn drawn(call: &str, args: &str, kind: &str) -> Option<String> {
+    let d = Call::of(call, args, |_, _| Err(String::new())).ok()?;
+    match (kind, d.indexed) {
+        ("ib", true) => Some(format!("start={} count={} base={}", d.start, d.count, d.base)),
+        ("vb", true) => Some(format!("base={}", d.base)),
+        ("vb", false) => Some(format!("start={} count={}", d.start, d.count)),
+        _ => None,
+    }
+}
+
 /// Where the bytes of a buffer the draw read came from.
 struct Bytes {
     bytes: Vec<u8>,

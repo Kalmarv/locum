@@ -51,6 +51,11 @@ struct Line {
     /// The last event before the draw that wrote the resource: its contents at the draw are not those the frame
     /// began with.
     written_before: Option<i64>,
+    /// The binding's format (an index buffer's, a view's).
+    format: Option<&'static str>,
+    /// What the draw reads of an index or vertex buffer: `start=885904 count=714 base=0` (indices of an indexed
+    /// draw, vertices of another).
+    drawn: Option<String>,
 }
 
 pub fn bindings(c: &Capture, f: &Filter, json: bool) -> Result<(), String> {
@@ -105,7 +110,7 @@ pub fn bindings(c: &Capture, f: &Filter, json: bool) -> Result<(), String> {
     let (name_part, file_part) = (lower(&f.name), lower(&f.file));
     if !json {
         out!(
-            "draw\tpass\tlist\tstage\tkind\tslot\tspace\tread\tname\tresource\tshape\tfile\toffset\tsize\tstride\twritten_before"
+            "draw\tpass\tlist\tstage\tkind\tslot\tspace\tread\tname\tresource\tshape\tfile\toffset\tsize\tstride\twritten_before\tformat\tdrawn"
         );
     }
     let mut shown = 0usize;
@@ -170,6 +175,8 @@ pub fn bindings(c: &Capture, f: &Filter, json: bool) -> Result<(), String> {
                 size: b.size,
                 stride: b.stride,
                 written_before,
+                format: b.format.map(|f| locum_capture::format::name(f as u32)),
+                drawn: crate::vertices::drawn(&call, &args, &b.kind),
             };
             shown += 1;
             if json {
@@ -178,7 +185,7 @@ pub fn bindings(c: &Capture, f: &Filter, json: bool) -> Result<(), String> {
                 let o = |v: Option<i64>| v.map_or("-".to_string(), |v| v.to_string());
                 let t = |v: &Option<String>| v.clone().unwrap_or_else(|| "-".into());
                 out!(
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     line.draw,
                     o(line.pass),
                     o(line.list),
@@ -198,7 +205,9 @@ pub fn bindings(c: &Capture, f: &Filter, json: bool) -> Result<(), String> {
                     o(line.offset),
                     o(line.size),
                     o(line.stride),
-                    o(line.written_before)
+                    o(line.written_before),
+                    line.format.unwrap_or("-"),
+                    t(&line.drawn)
                 );
             }
         }

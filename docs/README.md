@@ -232,7 +232,9 @@ locum-cli draws last --ps 9f2c --pass 3    # draws, filtered by shader, pass, --
 locum-cli draw last 120                    # one draw: state, everything bound, constants by name, targets after it
 locum-cli bindings last --name g_SSS       # every register the draws had bound, one row each: the program's name
                                            # for it, whether it reads it (--read), resource, shape, file, command
-                                           # list, the last write before the draw; --draws 100..200, --resource N,
+                                           # list, the last write before the draw, the format, and what the draw
+                                           # reads of an index or vertex buffer (start=, count=, base=: with an
+                                           # index naming face sets, the file is the face set); --draws 100..200, --resource N,
                                            # --kind, --stage, --file; --json for JSON lines
 locum-cli cb last 120 ps 3                 # a constant buffer, every register, named from the shader's reflection
 locum-cli constants m15 m16 --name SC_CameraPos --distinct  # named constants across draws and captures: a row
