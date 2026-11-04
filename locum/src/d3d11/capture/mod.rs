@@ -7,7 +7,9 @@
 //! - `skip targets`: no target readback at pass ends or clear-output checkpoints; `skip contents`: no resource contents;
 //! - `max_mb N`: the most memory the copies of targets, clears and what draws and dispatches wrote through UAVs may use
 //!   (default 4096);
-//! - `skip memory`: no memory dump of the process (see [`super::dump`]).
+//! - `skip memory`: no memory dump of the process (see [`super::dump`]);
+//! - `frames N`: the next N frames, each a capture of its own (`<label>-1` to `<label>-N`, or `frame-<n>` each), with
+//!   nothing between them: the frame after one capture's is the next one's (see [Series](#series)).
 //!
 //! A capture runs over two frames:
 //! - **before** (from the present that sees the file): deferred contexts record their work, so command lists
@@ -21,6 +23,16 @@
 //! `ExecuteCommandList` whose list touches it first. Nothing has touched it since the frame began, so the copy is
 //! exact whatever the frame does to it later, on whichever context, and however often a list runs. Immutable
 //! resources whose upload is stored are not copied: the upload is their contents.
+//!
+//! # Series
+//!
+//! With `frames N`, the present ending a captured frame starts the next one's recording: deferred contexts go on
+//! recording through it, and the command lists recorded so far (finished or not) are handed to the next capture with
+//! the views, states, hidden counters and resources their events refer to and the constant-buffer staging their copies
+//! write into, so a list recorded in one frame and executed in the next is complete in the next. Each capture is whole
+//! on its own: its resources' contents as its frame began, every event of its frame. A resource's number is the same
+//! in every capture of the process, so what one frame wrote can be followed into the next. The memory dump is taken at
+//! the first frame only.
 //!
 //! The state of each draw is read from the real context with its getters. Constant buffers are copied by the GPU on
 //! the draw's own context, so each draw's constants are the ones the GPU read. A pass ends where the targets in
@@ -79,7 +91,12 @@ struct Request {
     contents: bool,
     memory: bool,
     max_target_bytes: u64,
+    /// How many consecutive frames to capture, each its own capture.
+    frames: u32,
 }
+
+/// The most frames one request captures.
+const MAX_FRAMES: u32 = 64;
 
 impl Request {
     fn parse(text: &str) -> Request {
@@ -89,6 +106,7 @@ impl Request {
             contents: true,
             memory: true,
             max_target_bytes: 4096 << 20,
+            frames: 1,
         };
         for line in text.lines() {
             let mut words = line.split_whitespace();
@@ -108,6 +126,10 @@ impl Request {
                         r.max_target_bytes = n << 20;
                     }
                 }
+                (Some("frames"), Some(n)) => match n.parse::<u32>() {
+                    Ok(n @ 1..=MAX_FRAMES) => r.frames = n,
+                    _ => log!("capture request: frames {n:?} is not 1 to {MAX_FRAMES}; one frame"),
+                },
                 // Older requests asked for targets; they are on by default now.
                 (Some("targets"), None) => {}
                 (Some(other), _) => log!("capture request: unknown option {other:?} ignored"),
@@ -245,6 +267,8 @@ struct State {
     /// Contents read so far (key and subresource keys), or why there are none.
     contents: BTreeMap<u64, contents::Read>,
     counter_views: BTreeMap<u64, ID3D11UnorderedAccessView>,
+    /// Every view with a hidden counter this capture has described (`counter_views` loses each as it is copied).
+    counter_seen: BTreeMap<u64, ID3D11UnorderedAccessView>,
     counter_copies: BTreeMap<u64, Result<ID3D11Buffer, String>>,
     gaps: BTreeMap<(String, String), u64>,
     tile_initialized: BTreeSet<u64>,
@@ -257,6 +281,21 @@ struct State {
     tile_seeds: Vec<usize>,
     /// The back buffer the captured frame presented.
     presented: Option<u64>,
+    /// The captured frame's place in its series, from 1 (`frames N` in the request).
+    index: u32,
+}
+
+/// What one capture of a series hands the next: the deferred work recorded and not yet run, and everything its events
+/// refer to that the capture keeps (see [Series](self#series)).
+pub(super) struct Carried {
+    pending: BTreeMap<u32, Vec<Event>>,
+    lists: BTreeMap<usize, List>,
+    staging: Vec<ID3D11Buffer>,
+    used: u32,
+    views: Vec<db::View>,
+    states: Vec<db::State>,
+    counters: BTreeMap<u64, ID3D11UnorderedAccessView>,
+    resources: BTreeMap<u64, Tracked>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -268,6 +307,7 @@ static STATE: Mutex<State> = Mutex::new(State {
         contents: false,
         memory: false,
         max_target_bytes: 0,
+        frames: 1,
     },
     pending: BTreeMap::new(),
     lists: BTreeMap::new(),
@@ -289,6 +329,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     in_flight_bytes: 0,
     contents: BTreeMap::new(),
     counter_views: BTreeMap::new(),
+    counter_seen: BTreeMap::new(),
     counter_copies: BTreeMap::new(),
     gaps: BTreeMap::new(),
     tile_initialized: BTreeSet::new(),
@@ -297,6 +338,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     tile_seen: BTreeMap::new(),
     tile_seeds: Vec::new(),
     presented: None,
+    index: 0,
 });
 
 fn state() -> std::sync::MutexGuard<'static, State> {
@@ -334,6 +376,7 @@ impl State {
         self.in_flight_bytes = 0;
         self.contents.clear();
         self.counter_views.clear();
+        self.counter_seen.clear();
         self.counter_copies.clear();
         self.gaps.clear();
         self.tile_initialized.clear();
@@ -342,6 +385,65 @@ impl State {
         self.tile_seen.clear();
         self.tile_seeds.clear();
         self.presented = None;
+    }
+
+    /// Whether the frame being recorded or finished has another of its series after it.
+    fn continues(&self) -> bool {
+        self.index < self.request.frames
+    }
+
+    /// The deferred work recorded so far and what it refers to, for the next capture of the series: every list is
+    /// one recorded before that capture's frame, not yet executed in it.
+    fn carry(&mut self) -> Carried {
+        let pending = std::mem::take(&mut self.pending);
+        let mut lists = std::mem::take(&mut self.lists);
+        for l in lists.values_mut() {
+            l.before = true;
+            l.executions = 0;
+        }
+        let referred: BTreeSet<u64> = pending
+            .values()
+            .flatten()
+            .chain(lists.values().flat_map(|l| &l.events))
+            .flat_map(|e| e.reads.iter().chain(&e.writes).copied())
+            .collect();
+        let resources = referred
+            .iter()
+            .filter_map(|id| {
+                let t = self.resources.get(id)?;
+                Some((
+                    *id,
+                    Tracked {
+                        resource: t.resource.clone(),
+                        dims: t.dims.clone(),
+                        touched: false,
+                    },
+                ))
+            })
+            .collect();
+        Carried {
+            pending,
+            lists,
+            staging: self.staging.clone(),
+            used: self.used,
+            views: self.views.clone(),
+            states: self.states.clone(),
+            counters: self.counter_seen.clone(),
+            resources,
+        }
+    }
+
+    /// Takes on what the previous capture of the series carried (after [`State::reset`]).
+    fn take_on(&mut self, c: Carried) {
+        self.pending = c.pending;
+        self.lists = c.lists;
+        self.staging = c.staging;
+        self.used = c.used;
+        self.views = c.views;
+        self.states = c.states;
+        self.counter_views = c.counters.clone();
+        self.counter_seen = c.counters;
+        self.resources = c.resources;
     }
 }
 
@@ -377,8 +479,13 @@ pub fn before_present(presented: impl FnOnce() -> Option<u64>) -> bool {
     s.frame += 1;
     if s.phase == Phase::Recording {
         s.presented = presented;
-        ARMED.store(false, Ordering::Relaxed);
-        s.phase = Phase::Idle;
+        if s.continues() {
+            // Deferred contexts go on recording for the next frame of the series while this one is finished.
+            s.phase = Phase::Before;
+        } else {
+            ARMED.store(false, Ordering::Relaxed);
+            s.phase = Phase::Idle;
+        }
         return true;
     }
     false
@@ -389,6 +496,16 @@ pub fn before_present(presented: impl FnOnce() -> Option<u64>) -> bool {
 pub fn after_present(finished: bool, immediate: &ID3D11DeviceContext4) {
     if finished {
         write::finish(immediate);
+        // The next frame of a series is recorded from here, under the same epoch: a list recorded across the two
+        // frames is complete. Views and states are described again under the next capture's number.
+        let mut s = state();
+        if s.phase == Phase::Before {
+            s.index += 1;
+            s.captures += 1;
+            log!("capture: frame {} of {}", s.index, s.request.frames);
+            drop(s);
+            start();
+        }
         return;
     }
     let phase = state().phase;
@@ -410,6 +527,7 @@ pub fn after_present(finished: bool, immediate: &ID3D11DeviceContext4) {
             }
             s.reset();
             s.request = Request::parse(&text);
+            s.index = 1;
             s.phase = Phase::Before;
             s.captures += 1;
             EPOCH.store(s.captures, Ordering::Relaxed);

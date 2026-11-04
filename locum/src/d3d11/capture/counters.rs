@@ -13,7 +13,9 @@ pub(super) fn track(id: u64, view: &ID3D11UnorderedAccessView) {
             & (D3D11_BUFFER_UAV_FLAG_APPEND.0 | D3D11_BUFFER_UAV_FLAG_COUNTER.0) as u32
             != 0
     {
-        state().counter_views.insert(id, view.clone());
+        let mut s = state();
+        s.counter_views.insert(id, view.clone());
+        s.counter_seen.insert(id, view.clone());
     }
 }
 

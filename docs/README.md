@@ -31,7 +31,16 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
   - `skip targets`: no render and depth targets read back at pass ends, and no clear-output checkpoints;
   - `skip contents`: no resource contents (draws, state and constants only);
   - `max_mb N`: the most memory the copies of targets, clear outputs and what draws and dispatches wrote through UAVs may use
-    (default 4096); copies past it are skipped and counted.
+    (default 4096); copies past it are skipped and counted;
+  - `frames N` (1 to 64, both APIs): the next N frames, each a capture of its own (`<label>-1` to `<label>-N`, or
+    `frame-<n>` each without a label), with nothing between them: the present that ends one captured frame starts the
+    next's. Command lists recorded in one frame and executed in the next are whole in the next's capture (Direct3D
+    11 hands them on with what they refer to; Direct3D 12 keeps every list's history anyway), and each capture has its
+    resources' contents as its own frame began. A resource's number is the same in every capture of a process, so
+    what one frame wrote can be followed into the next (`resource CAPTURE ID` in each, `export`, `diff A B`). `meta.series` says each
+    capture's place (`{"label", "index", "frames"}`); the memory dump is taken at the first frame only. The game
+    waits while each capture is read back, so its clock jumps between the frames, though they are still the
+    consecutive ones it presented.
 - `blobs/`: the blob store, shared by every capture: resource contents, targets, the bytes each update and map wrote,
   and shader bytecode, each under the xxh3-128 hash of its bytes. They are appended to `packs/*.pack` (one per process
   writing), and `index.db` (table `blobs(key, pack, offset, size)`) says where each one is; stores from before packs

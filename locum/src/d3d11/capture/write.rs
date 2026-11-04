@@ -49,8 +49,18 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     let mut s = state();
     let frame = s.frame;
     let request = s.request.clone();
-    let name = request.label.clone().unwrap_or_else(|| format!("frame-{frame}"));
+    let index = s.index;
+    let name = match &request.label {
+        Some(label) if request.frames > 1 => format!("{label}-{index}"),
+        Some(label) => label.clone(),
+        None => format!("frame-{frame}"),
+    };
+    // The deferred work the next frame of a series will run, before this capture's parts are taken.
+    let carried = s.continues().then(|| s.carry());
     let Some(dir) = folder().map(|d| d.join("captures").join(&name)) else {
+        // Nowhere to write: the series ends here.
+        super::ARMED.store(false, std::sync::atomic::Ordering::Relaxed);
+        s.phase = super::Phase::Idle;
         s.reset();
         return;
     };
@@ -77,11 +87,18 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     );
     let mut gaps = std::mem::take(&mut s.gaps);
     s.reset();
+    let continuing = carried.is_some();
+    if let Some(c) = carried {
+        s.take_on(c);
+    }
     drop(s);
-    super::ops::reset();
+    // The bytes locum last wrote through each mapping stay what a following map starts from while a series goes on.
+    if !continuing {
+        super::ops::reset();
+    }
 
     // The process's memory, as close to the frame as can be: before anything is read back.
-    let memory = if request.memory {
+    let memory = if request.memory && index == 1 {
         match crate::dump::dump(&name, &dir) {
             Ok(d) => {
                 log!(
@@ -500,6 +517,13 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         }
     }
     drop(tracked);
+    // A series hands its views and states on, and the next capture describes again those it sees itself.
+    let mut views = views;
+    views.sort_by_key(|v| v.id);
+    views.dedup_by_key(|v| v.id);
+    let mut states = states;
+    states.sort_by_key(|s| s.id);
+    states.dedup_by_key(|s| s.id);
     capture.views = views;
     capture.states = states;
 
@@ -559,9 +583,15 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     capture.meta(
         "request",
         json!({"targets": request.targets, "contents": request.contents, "memory": request.memory,
-            "max_target_mb": request.max_target_bytes >> 20})
+            "max_target_mb": request.max_target_bytes >> 20, "frames": request.frames})
         .to_string(),
     );
+    if request.frames > 1 {
+        capture.meta(
+            "series",
+            json!({"label": request.label, "index": index, "frames": request.frames}).to_string(),
+        );
+    }
     capture.meta(
         "counts",
         json!({"events": capture.events.len(), "draws": draws, "lists_spliced": spliced,

@@ -853,6 +853,66 @@ unsafe fn journal_capture(
             let (hash, key) = row.unwrap();
             assert_eq!(locum_capture::hash::key(&blobs.get(&key).unwrap()), hash);
         }
+        // A series: the next two frames, each a capture of its own, with nothing between them. The list runs once in
+        // the first and twice in the second.
+        let series = format!("series-{}", std::process::id());
+        std::fs::write(
+            dir.join("capture"),
+            format!("label {series}\nframes 2\nskip memory\n"),
+        )
+        .unwrap();
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        finish(queue, fence, 9);
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        for value in [10, 11] {
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            finish(queue, fence, value);
+        }
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        let mut frames = Vec::new();
+        for (index, dispatches) in [(1, 1), (2, 2)] {
+            let path = dir
+                .join("captures")
+                .join(format!("{series}-{index}"))
+                .join("capture.db");
+            let until = Instant::now() + Duration::from_secs(15);
+            while !path.is_file() {
+                assert!(
+                    Instant::now() < until,
+                    "series capture writer timeout: {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let db = rusqlite::Connection::open(&path).unwrap();
+            let meta = |key: &str| -> String {
+                db.query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))
+                    .unwrap_or_default()
+            };
+            let series: serde_json::Value = serde_json::from_str(&meta("series")).unwrap();
+            assert_eq!(
+                (series["index"].as_u64(), series["frames"].as_u64()),
+                (Some(index), Some(2)),
+                "{}: its place in the series",
+                path.display()
+            );
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM draws WHERE call='Dispatch'", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                dispatches,
+                "{}: the dispatches of its own frame",
+                path.display()
+            );
+            frames.push(meta("frame").parse::<u64>().unwrap());
+        }
+        assert_eq!(
+            frames[1],
+            frames[0] + 1,
+            "the series' frames are consecutive: {frames:?}"
+        );
+        println!("D3D12 series: two consecutive frames, each its own capture with its own dispatches");
         debug_errors(device);
         println!(
             "D3D12 capture: cached lists, reset generations, PSO/shader/root data, descriptor copies/reuse, persistent upload versions, GPU bytes and SQL links verified: {}",

@@ -20,6 +20,7 @@ mod live_capture;
 mod partial_lists;
 mod recorder_bench;
 mod replay_rows;
+mod series;
 mod tiles;
 
 use std::process::ExitCode;
@@ -225,6 +226,7 @@ fn run(checks: &mut Checks) -> Result<()> {
     tiles::run(checks, &device, &immediate, &swapchain, "gpu")?;
     device_writes::run(checks, &device, &immediate, &swapchain, "gpu")?;
     partial_lists::run(checks, &device, &immediate, &swapchain)?;
+    series::run(checks, &device, &immediate, &swapchain)?;
     replay_rows::row16(checks, &device, &immediate, &deferred, &swapchain)?;
     replay_rows::row17(checks, &device, &immediate, &swapchain)?;
     replay_rows::row18(checks, &device, &immediate, &swapchain)?;

@@ -193,14 +193,31 @@ struct State {
     constant_buffers: BTreeMap<(u64, u32), (u64, u64, u64)>,
     /// Every texture's state as the next submission will find it.
     states: super::states::Tracker,
+    /// The series the armed frame belongs to (`frames N` in the request): the next frame is armed as it closes.
+    series: Option<Series>,
     /// Fence values each queue has been told to wait for and no submitted Signal is known to reach, by queue.
     waits: HashMap<u64, Vec<(u64, u64)>>,
     /// The highest value submitted to signal each fence, by fence.
     signals: HashMap<u64, u64>,
 }
 
+/// Consecutive frames one request asked for, each a capture of its own.
+#[derive(Clone, Debug)]
+struct Series {
+    /// The request's label: the captures are `<label>-1` to `<label>-N`; `frame-<n>` each without one.
+    label: Option<String>,
+    /// The armed frame's place in the series, from 1.
+    index: u32,
+    frames: u32,
+}
+
+/// The most frames one request captures.
+const MAX_FRAMES: u32 = 64;
+
 /// An armed frame: its history so far, projected as it is submitted, and the copies its submissions made.
 struct Live {
+    /// Its place in its series, when the request asked for more than one frame.
+    series: Option<Series>,
     path: PathBuf,
     frame: model::Frame,
     projection: model::Projection,
@@ -911,7 +928,10 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         return;
     };
     super::passes::sweep();
-    let finished = state().capture.take();
+    let (finished, series) = {
+        let mut s = state();
+        (s.capture.take(), s.series.take())
+    };
     if finished.is_some() {
         super::passes::ARMED.store(false, std::sync::atomic::Ordering::Release);
         log!(
@@ -925,11 +945,18 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         projection,
         mut capture,
         results,
+        series: of,
         ..
     }) = finished
     {
         super::log_counts();
         capture.meta("api", "d3d12");
+        if let Some(of) = &of {
+            capture.meta(
+                "series",
+                serde_json::json!({"label": of.label, "index": of.index, "frames": of.frames}).to_string(),
+            );
+        }
         capture.meta("name", path.file_name().unwrap_or_default().to_string_lossy());
         capture.meta("locum", env!("CARGO_PKG_VERSION"));
         capture.meta("frame", frame_number);
@@ -988,6 +1015,18 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
             })
         });
     }
+    // The next frame of a series is armed at the present that closed the one before it: nothing comes between them.
+    if let Some(series) = series.filter(|s| s.index < s.frames) {
+        arm(
+            &root,
+            frame_number,
+            Series {
+                index: series.index + 1,
+                ..series
+            },
+        );
+        return;
+    }
     let request = root.join("capture");
     if let Ok(text) = std::fs::read_to_string(&request) {
         if let Err(e) = std::fs::remove_file(&request) {
@@ -999,38 +1038,66 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c))
             .collect();
-        let label = if label.is_empty() {
-            format!("frame-{}", frame_number + 1)
-        } else {
-            label
-        };
-        let path = root.join("captures").join(label);
-        if path.exists() {
-            log!("D3D12 capture destination already exists: {}", path.display());
-            return;
-        }
-        let mut s = state();
-        s.descriptors.clear();
-        s.constant_buffers.clear();
-        let objects: Vec<_> = s.objects.values().cloned().collect();
-        s.capture = Some(Live {
-            path,
-            projection: model::Projection::new(&objects),
-            frame: model::Frame {
-                objects,
-                ..model::Frame::default()
+        let frames = match text.lines().find_map(|l| l.strip_prefix("frames ")) {
+            None => 1,
+            Some(n) => match n.trim().parse::<u32>() {
+                Ok(n @ 1..=MAX_FRAMES) => n,
+                _ => {
+                    log!("D3D12 capture request: frames {n:?} is not 1 to {MAX_FRAMES}; one frame");
+                    1
+                }
             },
-            capture: db::Capture::default(),
-            results: Default::default(),
-            used: HashSet::new(),
-            executed: HashSet::new(),
-        });
-        super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
-        log!(
-            "D3D12 capture armed at Present {frame_number}; cached list history retained; {} copies recorded so far",
-            super::passes::recorded()
+        };
+        arm(
+            &root,
+            frame_number,
+            Series {
+                label: (!label.is_empty()).then_some(label),
+                index: 1,
+                frames,
+            },
         );
     }
+}
+
+/// Arms the capture of the frame after Present `frame_number`, frame `series.index` of its series: written to
+/// `captures/<label>` (one frame), `captures/<label>-<index>` (a series) or `captures/frame-<n>` (no label).
+fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
+    let name = match &series.label {
+        Some(label) if series.frames > 1 => format!("{label}-{}", series.index),
+        Some(label) => label.clone(),
+        None => format!("frame-{}", frame_number + 1),
+    };
+    let path = root.join("captures").join(name);
+    if path.exists() {
+        log!("D3D12 capture destination already exists: {}", path.display());
+        return;
+    }
+    let mut s = state();
+    s.descriptors.clear();
+    s.constant_buffers.clear();
+    let objects: Vec<_> = s.objects.values().cloned().collect();
+    s.capture = Some(Live {
+        series: (series.frames > 1).then(|| series.clone()),
+        path,
+        projection: model::Projection::new(&objects),
+        frame: model::Frame {
+            objects,
+            ..model::Frame::default()
+        },
+        capture: db::Capture::default(),
+        results: Default::default(),
+        used: HashSet::new(),
+        executed: HashSet::new(),
+    });
+    s.series = Some(series.clone());
+    super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
+    log!(
+        "D3D12 capture armed at Present {frame_number} (frame {} of {}); cached list history retained; {} copies recorded so far",
+        series.index,
+        series.frames,
+        super::passes::recorded()
+    );
 }
 
 #[cfg(test)]
