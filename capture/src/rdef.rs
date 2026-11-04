@@ -178,6 +178,21 @@ pub fn bindings(code: &[u8]) -> Option<Vec<Binding>> {
     )
 }
 
+/// A program's debug name: the file stem of the PDB its DXIL compiler named in the `ILDN` part, so
+/// `...\GXLightAcc_DDirLightShadowed1.ppo.pdb` gives `GXLightAcc_DDirLightShadowed1`. FXC's DXBC has none.
+pub fn debug_name(code: &[u8]) -> Option<String> {
+    let parts = dxil_reader::parts(code).ok()?;
+    let data = parts.iter().find(|p| &p.kind == b"ILDN")?.data;
+    // u16 flags, u16 the name's length, then the name and a zero.
+    let len = u16::from_le_bytes(data.get(2..4)?.try_into().ok()?) as usize;
+    let name = std::str::from_utf8(data.get(4..4 + len)?).ok()?;
+    let file = name.rsplit(['\\', '/']).next()?;
+    file.split('.')
+        .next()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// A DXIL container's reflection module: the `STAT` part, which keeps the names and type annotations a stripped
 /// program lacks, else the program's own module.
 fn dxil(code: &[u8]) -> Option<dxil_reader::module::Module> {

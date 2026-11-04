@@ -88,6 +88,8 @@ pub struct Draw {
     pub stack: Vec<String>,
     /// Shader hash by stage (vs, hs, ds, gs, ps, cs).
     pub shaders: BTreeMap<&'static str, String>,
+    /// The debug name of each stage's program that has one (`rdef::debug_name`).
+    pub shader_names: BTreeMap<&'static str, String>,
     pub topology: Option<i64>,
     pub topology_name: Option<String>,
     /// Input layout, rasterizer, blend and depth-stencil state objects.
@@ -480,6 +482,10 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
         context,
         queue: queued(c, event),
         stack: stack.map(|s| describe::stack(c, s)).unwrap_or_default(),
+        shader_names: shaders
+            .iter()
+            .filter_map(|(s, h)| Some((*s, reflection.name(c, h)?.to_string())))
+            .collect(),
         shaders,
         topology_name: topology.map(states::topology),
         topology,
@@ -658,7 +664,12 @@ fn print(d: &Draw) {
     }
     let named: Vec<String> = ["vs", "hs", "ds", "gs", "ps", "cs"]
         .iter()
-        .filter_map(|s| d.shaders.get(s).map(|h| format!("{s} {h}")))
+        .filter_map(|s| {
+            d.shaders.get(s).map(|h| match d.shader_names.get(s) {
+                Some(name) => format!("{s} {h} ({name})"),
+                None => format!("{s} {h}"),
+            })
+        })
         .collect();
     out!("shaders: {}", named.join("  "));
     if let Some(t) = &d.topology_name {

@@ -165,6 +165,7 @@ pub fn stack(c: &Capture, id: i64) -> Vec<String> {
 pub struct Reflection {
     cache: HashMap<String, Option<Vec<ConstantBuffer>>>,
     bindings: HashMap<String, Option<Vec<rdef::Binding>>>,
+    names: HashMap<String, Option<String>>,
 }
 
 /// What a shader's reflection says of a register a draw bound.
@@ -178,6 +179,21 @@ pub enum Slot {
 }
 
 impl Reflection {
+    /// Shader `shader`'s debug name (`rdef::debug_name`), when its bytecode names one.
+    pub fn name(&mut self, c: &Capture, shader: &str) -> Option<&str> {
+        self.names
+            .entry(shader.to_string())
+            .or_insert_with(|| {
+                let key: String = c.row(
+                    "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
+                    [shader],
+                    |r| r.get(0),
+                )?;
+                rdef::debug_name(&c.blob(&key).ok()?)
+            })
+            .as_deref()
+    }
+
     /// What shader `shader` calls register `slot` (space `space`) of class `class` (`srv`, `uav`, `sampler`, `cb`).
     pub fn slot(&mut self, c: &Capture, shader: &str, class: &str, slot: u32, space: u32) -> Slot {
         let bindings = self.bindings.entry(shader.to_string()).or_insert_with(|| {

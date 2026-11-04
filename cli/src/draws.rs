@@ -19,6 +19,8 @@ pub struct Filter {
     pub target: Option<i64>,
     pub content: Option<String>,
     pub call: Option<String>,
+    /// A part of a program's debug name, matched in any case.
+    pub name: Option<String>,
 }
 
 const SHADER_COLUMNS: [&str; 6] = ["vs", "hs", "ds", "gs", "ps", "cs"];
@@ -69,7 +71,7 @@ pub fn draws(c: &Capture, f: &Filter) -> Result<(), String> {
         wh.push(format!("d.call LIKE {}", param(Value::Text(call.clone()))));
     }
     let sql = format!(
-        "SELECT d.n, d.pass, d.call, d.args, e.deferred, e.list, d.vs, d.ps, d.cs FROM draws d \
+        "SELECT d.n, d.pass, d.call, d.args, e.deferred, e.list, d.vs, d.hs, d.ds, d.gs, d.ps, d.cs FROM draws d \
          JOIN events e ON e.seq = d.event {} ORDER BY d.n",
         if wh.is_empty() {
             String::new()
@@ -84,7 +86,7 @@ pub fn draws(c: &Capture, f: &Filter) -> Result<(), String> {
         String,
         bool,
         Option<i64>,
-        [Option<String>; 3],
+        [Option<String>; 6],
     );
     let rows: Vec<Row> = c.rows(&sql, rusqlite::params_from_iter(params), |r| {
         Ok((
@@ -94,9 +96,29 @@ pub fn draws(c: &Capture, f: &Filter) -> Result<(), String> {
             r.get(3)?,
             r.get(4)?,
             r.get(5)?,
-            [r.get(6)?, r.get(7)?, r.get(8)?],
+            [r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?],
         ))
     });
+    // Each program's debug name, read once per program.
+    let mut reflection = Reflection::default();
+    let wanted = f.name.as_ref().map(|n| n.to_lowercase());
+    let rows: Vec<(Row, Vec<String>)> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let names: Vec<(&str, String)> = SHADER_COLUMNS
+                .iter()
+                .zip(&row.6)
+                .filter_map(|(stage, h)| Some((*stage, reflection.name(c, h.as_ref()?)?.to_string())))
+                .collect();
+            if let Some(w) = &wanted
+                && !names.iter().any(|(_, n)| n.to_lowercase().contains(w))
+            {
+                return None;
+            }
+            let names = names.into_iter().map(|(s, n)| format!("{s} {n}")).collect();
+            Some((row, names))
+        })
+        .collect();
     out!(
         "{:>5} {:>4} {:<26} {:<8} {:<16} {:<16} targets",
         "draw",
@@ -106,7 +128,7 @@ pub fn draws(c: &Capture, f: &Filter) -> Result<(), String> {
         "vs (cs)",
         "ps"
     );
-    for (n, pass, call, args, deferred, list, [vs, ps, cs]) in &rows {
+    for ((n, pass, call, args, deferred, list, [vs, _, _, _, ps, cs]), names) in &rows {
         let targets: Vec<String> = c.rows(
             "SELECT kind, slot, resource FROM bindings WHERE draw = ?1 AND kind IN ('rtv', 'dsv', 'uav') \
              ORDER BY kind DESC, slot",
@@ -128,12 +150,17 @@ pub fn draws(c: &Capture, f: &Filter) -> Result<(), String> {
         };
         let first = cs.as_ref().or(vs.as_ref());
         out!(
-            "{n:>5} {:>4} {:<26} {context:<8} {:<16} {:<16} {}",
+            "{n:>5} {:>4} {:<26} {context:<8} {:<16} {:<16} {}{}",
             pass.map_or("-".into(), |p| p.to_string()),
             format!("{call} {}", describe::call_args(call, args)),
             first.map_or("-", String::as_str),
             ps.as_deref().unwrap_or("-"),
-            targets.join(" ")
+            targets.join(" "),
+            if names.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", names.join(", "))
+            }
         );
     }
     out!("{} draws", rows.len());

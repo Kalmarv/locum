@@ -27,12 +27,20 @@ pub fn shaders(c: &Capture) -> Result<(), String> {
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     );
-    out!("{:<5} {:<16} {:>7} {:>6}", "stage", "hash", "bytes", "draws");
+    let mut reflection = crate::describe::Reflection::default();
+    out!(
+        "{:<5} {:<16} {:>7} {:>6}  name",
+        "stage",
+        "hash",
+        "bytes",
+        "draws"
+    );
     for (h, stage, size) in rows {
         out!(
-            "{stage:<5} {h:<16} {:>7} {:>6}",
+            "{stage:<5} {h:<16} {:>7} {:>6}  {}",
             size.map_or("-".into(), |s| s.to_string()),
-            uses.get(&h).copied().unwrap_or(0)
+            uses.get(&h).copied().unwrap_or(0),
+            reflection.name(c, &h).unwrap_or("-")
         );
     }
     Ok(())
@@ -122,7 +130,14 @@ fn letter(class: &str) -> &'static str {
     }
 }
 
-pub fn shader(c: &Capture, hash: &str, disassemble: bool, wgsl: bool, as_json: bool) -> Result<(), String> {
+pub fn shader(
+    c: &Capture,
+    hash: &str,
+    disassemble: bool,
+    wgsl: bool,
+    as_json: bool,
+    evidence: Option<&Path>,
+) -> Result<(), String> {
     let (h, stage, key): (String, String, Option<String>) = c
         .row(
             "SELECT hash, stage, blob FROM shaders WHERE hash LIKE ?1 || '%' ORDER BY hash LIMIT 1",
@@ -191,7 +206,7 @@ pub fn shader(c: &Capture, hash: &str, disassemble: bool, wgsl: bool, as_json: b
         &format!("{}:shader/{h}", c.path.display()),
         disassemble,
         wgsl,
-        None,
+        evidence,
     )
 }
 
@@ -211,13 +226,35 @@ fn show(
     wgsl: bool,
     evidence: Option<&Path>,
 ) -> Result<(), String> {
+    if let Some(name) = rdef::debug_name(code) {
+        out!("debug name: {name}");
+    }
     if crate::dxil::is_dxil(code) {
-        let report =
-            serde_json::to_string_pretty(&crate::dxil::evidence(code, source)).map_err(|e| e.to_string())?;
+        constant_buffers_and_bindings(code);
+        // The reflection above is dxil-reader's; Microsoft's and iridia's are checked against it.
+        let report = crate::dxil::evidence(code, source);
         if let Some(path) = evidence {
-            std::fs::write(path, &report).map_err(|e| format!("{}: {e}", path.display()))?;
+            let text = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+            std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))?;
         }
-        out!("{report}");
+        out!(
+            "reflection cross-check (dxil-reader, Microsoft's, iridia): {}{}",
+            report["comparison"].as_str().unwrap_or("?"),
+            if evidence.is_none() && report["comparison"] != "agree" {
+                " (--evidence FILE writes every answer)"
+            } else {
+                ""
+            }
+        );
+        for (key, who) in [
+            ("dxil_reader", "dxil-reader"),
+            ("microsoft", "Microsoft's"),
+            ("iridia", "iridia"),
+        ] {
+            if let Some(e) = report[key]["error"].as_str() {
+                out!("  {who}: {e}");
+            }
+        }
     } else if evidence.is_some() {
         return Err(format!("{source} is DXBC: --evidence compares DXIL reflection"));
     } else {
@@ -261,7 +298,7 @@ fn constant_buffers_and_bindings(code: &[u8]) {
                 }
             }
         }
-        None => out!("no reflection (RDEF) in its bytecode"),
+        None => out!("no reflection in its bytecode (DXBC RDEF, or DXIL STAT or DXIL)"),
     }
     // The resources it reads and writes other than constant buffers.
     for b in rdef::bindings(code)

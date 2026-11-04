@@ -15,12 +15,26 @@ fn create<T: Interface>(class: &GUID) -> Result<T, String> {
     static CREATE: OnceLock<Result<Create, String>> = OnceLock::new();
     let create = CREATE
         .get_or_init(|| {
-            let path = std::env::var_os("LOCUM_DXCOMPILER").unwrap_or_else(|| "dxcompiler.dll".into());
             use std::os::windows::ffi::OsStrExt;
-            let path: Vec<_> = path.encode_wide().chain(Some(0)).collect();
-            // Keep the module loaded for the process lifetime: COM vtables live in it.
-            let module = unsafe { LoadLibraryW(PCWSTR(path.as_ptr())) }
-                .map_err(|e| format!("load dxcompiler.dll (or LOCUM_DXCOMPILER): {e}"))?;
+            let load = |path: &std::ffi::OsStr| {
+                let wide: Vec<_> = path.encode_wide().chain(Some(0)).collect();
+                // Keep the module loaded for the process lifetime: COM vtables live in it.
+                unsafe { LoadLibraryW(PCWSTR(wide.as_ptr())) }.map_err(|e| e.to_string())
+            };
+            let module = match std::env::var_os("LOCUM_DXCOMPILER") {
+                Some(path) => load(&path).map_err(|e| format!("load LOCUM_DXCOMPILER {}: {e}", path.display()))?,
+                None => load("dxcompiler.dll".as_ref())
+                    .or_else(|e| match sdk_dxcompiler() {
+                        Some(path) => load(path.as_os_str()).map_err(|e| format!("load {}: {e}", path.display())),
+                        None => Err(e),
+                    })
+                    .map_err(|e| {
+                        format!(
+                            "no dxcompiler.dll: not on the DLL search path, and no Windows SDK has one ({e}); \
+                             set LOCUM_DXCOMPILER to its path"
+                        )
+                    })?,
+            };
             let address = unsafe { GetProcAddress(module, s!("DxcCreateInstance")) }
                 .ok_or("dxcompiler.dll has no DxcCreateInstance")?;
             let mut name = vec![0u16; 32768];
@@ -40,6 +54,28 @@ fn create<T: Interface>(class: &GUID) -> Result<T, String> {
         return Err("DxcCreateInstance returned null".into());
     }
     Ok(unsafe { T::from_raw(result) })
+}
+
+/// The newest Windows SDK's x64 `dxcompiler.dll` (`Windows Kits\10\bin\<version>\x64`), which the DLL search does
+/// not find by itself.
+fn sdk_dxcompiler() -> Option<std::path::PathBuf> {
+    let root = std::path::PathBuf::from(std::env::var_os("ProgramFiles(x86)")?).join(r"Windows Kits\10\bin");
+    std::fs::read_dir(&root)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let version: Vec<u32> = entry
+                .file_name()
+                .to_str()?
+                .split('.')
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .ok()?;
+            let dll = entry.path().join(r"x64\dxcompiler.dll");
+            dll.is_file().then_some((version, dll))
+        })
+        .max()
+        .map(|(_, dll)| dll)
 }
 
 fn buffer(code: &[u8]) -> DxcBuffer {

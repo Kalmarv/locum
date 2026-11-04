@@ -72,6 +72,9 @@ enum Command {
         /// The call (Draw, DrawIndexed, Dispatch, ...; % matches anything).
         #[arg(long)]
         call: Option<String>,
+        /// Draws whose program at any stage has this debug name, or a part of it (any case): `--name SsaoBlur`.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// One draw: its shaders, state, everything bound, its constants by name, and the targets read after it.
     Draw {
@@ -173,6 +176,9 @@ enum Command {
         /// its full name.
         #[arg(long)]
         json: bool,
+        /// For DXIL, write dxil-reader's, Microsoft's and iridia's reflection and how they compare to this file.
+        #[arg(long, conflicts_with = "json")]
+        evidence: Option<PathBuf>,
     },
     /// A shader file (.dxbc, .cso): a DXIL program's reflection by dx, Microsoft's compiler and iridia side by side,
     /// or a DXBC program's constant buffers and bindings; with --disassemble its code, with --wgsl iridia's WGSL.
@@ -421,6 +427,7 @@ fn run(cli: Cli) -> Result<(), String> {
             target,
             content,
             call,
+            name,
         } => draws::draws(
             &open(&capture)?,
             &draws::Filter {
@@ -433,6 +440,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 target,
                 content,
                 call,
+                name,
             },
         ),
         Command::Draw {
@@ -502,7 +510,15 @@ fn run(cli: Cli) -> Result<(), String> {
             disassemble,
             wgsl,
             json,
-        } => shaders::shader(&open(&capture)?, &hash, disassemble, wgsl, json),
+            evidence,
+        } => shaders::shader(
+            &open(&capture)?,
+            &hash,
+            disassemble,
+            wgsl,
+            json,
+            evidence.as_deref(),
+        ),
         Command::ShaderFile {
             file,
             disassemble,
