@@ -652,15 +652,27 @@ fn constants_of(
     let cb = shader
         .as_deref()
         .and_then(|s| reflection.cb(c, s, b.slot, b.space));
-    out.name = cb.map(|cb| cb.name.clone());
+    // a program built without names (Unreal's DXIL) declares the buffer and its size but no variables
+    out.name = cb.map(|cb| {
+        if cb.name.is_empty() {
+            "unnamed".to_string()
+        } else {
+            cb.name.clone()
+        }
+    });
     out.bytes = bytes.len();
+    // the bytes the program reads: its variables', or, when it lists none, all it declares
     let used: Vec<(u32, u32)> = cb
         .map(|cb| {
-            cb.variables
-                .iter()
-                .filter(|v| v.used)
-                .map(|v| (v.offset, v.offset + v.size))
-                .collect()
+            if cb.variables.is_empty() {
+                vec![(0, cb.size)]
+            } else {
+                cb.variables
+                    .iter()
+                    .filter(|v| v.used)
+                    .map(|v| (v.offset, v.offset + v.size))
+                    .collect()
+            }
         })
         .unwrap_or_default();
     for (r, reg) in bytes.chunks(16).enumerate() {

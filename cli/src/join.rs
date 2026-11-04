@@ -388,8 +388,8 @@ pub fn join(c: &Capture, all: bool, unnamed: bool, limit: usize) -> Result<(), S
         [],
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
     );
-    // Named and not, by kind: textures, buffers.
-    let mut tally: HashMap<&str, (usize, usize)> = HashMap::new();
+    // Named, not named, and not named for want of bytes (neither upload bytes nor contents recorded), by kind.
+    let mut tally: HashMap<&str, (usize, usize, usize)> = HashMap::new();
     let mut shown = 0;
     for (id, kind, draws) in &ids {
         let k = if kind == "buffer" { "buffer" } else { "texture" };
@@ -406,6 +406,16 @@ pub fn join(c: &Capture, all: bool, unnamed: bool, limit: usize) -> Result<(), S
             t.0 += 1;
         } else {
             t.1 += 1;
+            let bytes = c
+                .row(
+                    "SELECT upload IS NOT NULL OR content IS NOT NULL FROM resources WHERE id = ?1",
+                    [*id],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap_or(false);
+            if !bytes {
+                t.2 += 1;
+            }
         }
         if named == unnamed || shown >= limit {
             continue;
@@ -434,8 +444,13 @@ pub fn join(c: &Capture, all: bool, unnamed: bool, limit: usize) -> Result<(), S
     }
     let what = if all { "alive" } else { "the frame used" };
     for k in ["texture", "buffer"] {
-        if let Some((named, not)) = tally.get(k) {
-            out!("{k}s {what}: {named} of {} named", named + not);
+        if let Some((named, not, bytes_missing)) = tally.get(k) {
+            let missing = match bytes_missing {
+                0 => String::new(),
+                n if n == not => format!(" (none of the {n} others has bytes recorded to match)"),
+                n => format!(" ({n} of the {not} others have no bytes recorded to match)"),
+            };
+            out!("{k}s {what}: {named} of {} named{missing}", named + not);
         }
     }
     if shown >= limit {

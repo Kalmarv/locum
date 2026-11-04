@@ -356,9 +356,12 @@ separated by `;`) stands in for `--index`. A game's own extractor can add what i
 `locum_capture::index`, or list keys for `--keys`: fromsoft-formats' `flver_keys` example lists every FLVER's data
 block, vertex buffers and face sets in Sekiro's or Elden Ring's archives, and unity-formats' `mesh_keys` example every
 Mesh's vertex streams and index buffer in a Unity player (a SkateBIRD capture has 183 of its 209 buffers named so).
+`join`'s totals say how many of those not named have no bytes recorded to match (neither upload bytes nor contents), as
+in captures from before first-use contents.
 
 Constants are named from each shader's reflection (its `RDEF` part as `dxbc-reader` reads it, Shader Model 4.0 to 5.1,
-register spaces included), as `cbuffer.variable[index].component`. PNGs of depth and other one-channel images are
+register spaces included), as `cbuffer.variable[index].component`. A program built without names (Unreal's DXIL)
+declares its constant buffers' sizes but no variables: `cb` shows the registers within that size, unnamed. PNGs of depth and other one-channel images are
 stretched from their smallest to largest value, float colour is tone-mapped, and `--range LO:HI` sets the mapping.
 
 ## Direct3D 12 (in progress)
