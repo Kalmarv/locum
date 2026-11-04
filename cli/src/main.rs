@@ -631,6 +631,9 @@ enum Command {
         /// Say what it would change, and write nothing
         #[arg(long)]
         check: bool,
+        /// Upgrade a copy written here (a new .db file, its blobs still in the capture's store), not the capture
+        #[arg(short, long, conflicts_with = "check")]
+        out: Option<PathBuf>,
     },
 }
 
@@ -1139,7 +1142,19 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
-        Command::Upgrade { capture, check } => upgrade::upgrade(&open(&capture)?, check),
+        Command::Upgrade {
+            capture,
+            check,
+            out: None,
+        } => upgrade::upgrade(&open(&capture)?, check),
+        Command::Upgrade {
+            capture,
+            out: Some(out),
+            ..
+        } => {
+            upgrade::copy(&open(&capture)?, &out)?;
+            upgrade::upgrade(&open(&out.to_string_lossy())?, false)
+        }
     }
 }
 

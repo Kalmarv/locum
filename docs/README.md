@@ -290,6 +290,7 @@ locum-cli sql last "SELECT ..."            # anything else (`.tables` lists the 
 locum-cli hash FILE...                     # the D3D11 shader hash and the blob key locum would give a file's bytes
 locum-cli blob last 507b9612 > b.bin        # a blob's raw bytes by its key (-o FILE writes a file instead)
 locum-cli upgrade last --check             # what an older locum derived, brought up to this one (see below)
+locum-cli upgrade last -o new.db           # the same into a copy, leaving a capture others read as it is
 ```
 
 `draw` leaves out what the draw does not read (`--all` keeps it, marked): registers its programs' reflection does not

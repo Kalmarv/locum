@@ -16,6 +16,18 @@ use rusqlite::Connection;
 use crate::open::Capture;
 use crate::out;
 
+/// A copy of the capture's database at `out` (a capture of its own, its blobs still in the capture's store), for an
+/// upgrade that leaves the original as it is: one several readers share, say.
+pub fn copy(c: &Capture, out: &std::path::Path) -> Result<(), String> {
+    if out.exists() {
+        return Err(format!("{} exists: give a new file", out.display()));
+    }
+    c.db.execute("VACUUM INTO ?1", [out.to_string_lossy()])
+        .map_err(|e| format!("copying to {}: {e}", out.display()))?;
+    out!("{}: a copy of {}", out.display(), c.path.display());
+    Ok(())
+}
+
 /// A shader-stage binding as both projections name it: draw, stage, kind, register, space, view, resource, offset,
 /// and a sampler's description.
 type Key = (
