@@ -16,6 +16,7 @@ mod replay;
 mod resources;
 mod shaders;
 mod states;
+mod trace;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -218,10 +219,27 @@ enum Command {
     Stack { capture: String, id: i64 },
     /// The shaders the frame used, and how many draws used each.
     Shaders { capture: String },
-    /// A shader's constant buffers and, with --disassemble, its code.
+    /// What output lanes of a draw are made of: the texture channels, constants (by name, with the draw's values) and
+    /// vertex attributes (through the vertex program, by semantic, with the input-layout element) each comes from, and
+    /// how: as its value, only as an address (a texel coordinate, an index), or only through a condition.
+    Trace {
+        capture: String,
+        /// A draw number, or `last`.
+        draw: String,
+        /// SV_Target1.z, rt1 (every lane of target 1), o1.z (the DXBC register's lane), depth, TEXCOORD3.xy,
+        /// SV_Position.z (the vertex program's) or discard; none: every lane the pixel program writes.
+        lanes: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// A shader's constant buffers and, with --disassemble, its code; with --trace, what its output lanes are made of.
     Shader {
         capture: String,
         hash: String,
+        /// What these output lanes are made of, to the program's own inputs (as `trace` takes them; none: every lane
+        /// it writes). `trace` at a draw follows a pixel program's inputs into its vertex program.
+        #[arg(long, num_args = 0.., value_name = "LANE", conflicts_with_all = ["disassemble", "wgsl", "evidence"])]
+        trace: Option<Vec<String>>,
         #[arg(long, short, conflicts_with = "json")]
         disassemble: bool,
         /// Readable WGSL through iridia (original bytecode remains authoritative).
@@ -603,10 +621,24 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Shader {
             capture,
             hash,
+            trace: Some(lanes),
+            json,
+            ..
+        } => trace::program(&open(&capture)?, &hash, &lanes, json),
+        Command::Trace {
+            capture,
+            draw,
+            lanes,
+            json,
+        } => trace::draw(&open(&capture)?, &draw, &lanes, json),
+        Command::Shader {
+            capture,
+            hash,
             disassemble,
             wgsl,
             json,
             evidence,
+            trace: None,
         } => shaders::shader(
             &open(&capture)?,
             &hash,

@@ -228,6 +228,12 @@ locum-cli resources last --used --format BC7_UNORM
 locum-cli resource last 812                # where it was made (call stack), hashes, views, draws, events
 locum-cli events last --kind copy          # the timeline; --resource N for what touched one resource
 locum-cli shader last 9f2c -d              # constant buffers, textures and samplers by register, and disassembly
+locum-cli trace last 120 rt1.z            # what target 1's blue lane is made of: each texture channel, constant (by
+                                           # name, with the draw's value) and vertex attribute (through the vertex
+                                           # program, with its input-layout element), as its value, only as an
+                                           # address (a coordinate, an index) or only through a condition. Lanes:
+                                           # SV_Target1.z, rt1, o1.z, depth, SV_Position.z, discard; none: all
+locum-cli shader last 9f2c --trace o1.z   # the same for one program, to its own inputs
 locum-cli draw last all --json > d.jsonl   # every draw as JSON, one per line (also: draw N --json, cb --json,
                                            # shader --json with every constant by its full name)
 locum-cli export last 812 -o tex.dds       # contents as the frame began: .dds (all of it), .png (one mip), or raw

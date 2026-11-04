@@ -40,6 +40,7 @@ cargo build --release
 | `locum-cli draws last` | every draw and dispatch, in GPU order |
 | `locum-cli draw last 120` | one draw: state, everything bound, constants by name, targets after it |
 | `locum-cli shader last 9f2c -d` | a shader's constant buffers and disassembly |
+| `locum-cli trace last 120 rt1.z` | what a target lane is made of: textures by channel, constants by name and value, vertex attributes |
 | `locum-cli resource last 812` | a resource: where it was made, its contents, what the frame did with it |
 | `locum-cli export last 812 -o tex.dds` | a texture or buffer as the frame began |
 | `locum-cli pixel last 120:rt0 960 540` | one texel in every readback of a target: which passes changed it |

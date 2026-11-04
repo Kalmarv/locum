@@ -233,13 +233,17 @@ pub fn evidence(code: &[u8], source: &str) -> Value {
         "interface":answer(interface),"rdat_subobjects":rdat})
 }
 
-/// Readable WGSL of a DXIL or DXBC program, lifted through iridia.
-pub fn wgsl(code: &[u8]) -> Result<String, String> {
-    let program = if is_dxil(code) {
+/// A DXIL or DXBC program lifted through iridia.
+pub fn lift(code: &[u8]) -> Result<iridia::Program, String> {
+    if is_dxil(code) {
         iridia_dxil::lift(code)
     } else {
         iridia_dxbc::lift(code)
     }
-    .map_err(|e| e.to_string())?;
-    iridia::emit::wgsl(&program).map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())
+}
+
+/// Readable WGSL of a DXIL or DXBC program, lifted through iridia.
+pub fn wgsl(code: &[u8]) -> Result<String, String> {
+    iridia::emit::wgsl(&lift(code)?).map_err(|e| e.to_string())
 }

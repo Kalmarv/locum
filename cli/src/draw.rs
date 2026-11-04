@@ -247,7 +247,7 @@ fn state(c: &Capture, id: i64) -> Option<State> {
 }
 
 /// A 4-byte constant as its type says: a bool, an int, a uint or a float (float when unknown; null when not finite).
-fn number(bytes: [u8; 4], base: Option<u16>) -> Value {
+pub fn number(bytes: [u8; 4], base: Option<u16>) -> Value {
     match base {
         Some(1) => Value::from(u32::from_le_bytes(bytes) != 0),
         Some(2) => Value::from(i32::from_le_bytes(bytes)),

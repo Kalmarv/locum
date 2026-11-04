@@ -9,7 +9,6 @@ use locum_capture::layout;
 use locum_capture::rules::{self, Action, Rule};
 use serde_json::Value;
 use windows::Win32::Foundation::{HMODULE, RECT};
-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::*;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -453,7 +452,7 @@ impl D3d11 {
     fn replacement(&mut self, rule: &Rule) -> Option<ID3D11DeviceChild> {
         if !self.replaced.contains_key(&rule.text) {
             let code = match &rule.action {
-                Action::Solid(colour) => compile_ps(&rules::solid_source(colour)),
+                Action::Solid(colour) => crate::shaders::compile(&rules::solid_source(colour), c"ps_5_0"),
                 Action::Shader(code) => Ok(code.clone()),
                 _ => Err("not a shader rule".into()),
             };
@@ -900,36 +899,6 @@ unsafe fn set_stage(
             }
         }
     }
-}
-
-/// Compiles a ps_5_0 shader with the system's shader compiler.
-fn compile_ps(source: &str) -> Result<Vec<u8>, String> {
-    let (mut code, mut errors) = (None, None);
-    let r = unsafe {
-        D3DCompile(
-            source.as_ptr().cast(),
-            source.len(),
-            PCSTR(c"locum-replay".as_ptr().cast()),
-            None,
-            None::<&ID3DInclude>,
-            PCSTR(c"main".as_ptr().cast()),
-            PCSTR(c"ps_5_0".as_ptr().cast()),
-            0,
-            0,
-            &mut code,
-            Some(&mut errors),
-        )
-    };
-    let bytes = |b: &ID3DBlob| unsafe {
-        core::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec()
-    };
-    if let Err(e) = r {
-        let text = errors
-            .map(|e| String::from_utf8_lossy(&bytes(&e)).into_owned())
-            .unwrap_or_default();
-        return Err(format!("{e}: {text}"));
-    }
-    Ok(code.map(|c| bytes(&c)).unwrap_or_default())
 }
 
 fn json_u32(v: &Value, key: &str) -> u32 {

@@ -5,7 +5,9 @@ use std::path::Path;
 
 use locum_capture::rdef;
 use serde::Serialize;
-use windows::Win32::Graphics::Direct3D::Fxc::D3DDisassemble;
+use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DDisassemble};
+use windows::Win32::Graphics::Direct3D::{ID3DBlob, ID3DInclude};
+use windows::core::PCSTR;
 
 use crate::open::Capture;
 use crate::out;
@@ -336,4 +338,34 @@ pub fn disassembly(code: &[u8]) -> Result<String, String> {
     let text =
         unsafe { core::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()) };
     Ok(String::from_utf8_lossy(text).trim_end_matches('\0').to_string())
+}
+
+/// Compiles a shader for `target` (`ps_5_0`) with the system's shader compiler.
+pub fn compile(source: &str, target: &core::ffi::CStr) -> Result<Vec<u8>, String> {
+    let (mut code, mut errors) = (None, None);
+    let r = unsafe {
+        D3DCompile(
+            source.as_ptr().cast(),
+            source.len(),
+            PCSTR(c"locum-replay".as_ptr().cast()),
+            None,
+            None::<&ID3DInclude>,
+            PCSTR(c"main".as_ptr().cast()),
+            PCSTR(target.as_ptr().cast()),
+            0,
+            0,
+            &mut code,
+            Some(&mut errors),
+        )
+    };
+    let bytes = |b: &ID3DBlob| unsafe {
+        core::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()).to_vec()
+    };
+    if let Err(e) = r {
+        let text = errors
+            .map(|e| String::from_utf8_lossy(&bytes(&e)).into_owned())
+            .unwrap_or_default();
+        return Err(format!("{e}: {text}"));
+    }
+    Ok(code.map(|c| bytes(&c)).unwrap_or_default())
 }
