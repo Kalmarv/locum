@@ -68,6 +68,26 @@ impl Heap {
     }
 }
 
+/// A DRED breadcrumb's operation, as d3d12.h names it.
+fn operation(op: D3D12_AUTO_BREADCRUMB_OP) -> String {
+    const NAMES: [&str; 27] = [
+        "SetMarker", "BeginEvent", "EndEvent", "DrawInstanced", "DrawIndexedInstanced", "ExecuteIndirect",
+        "Dispatch", "CopyBufferRegion", "CopyTextureRegion", "CopyResource", "CopyTiles", "ResolveSubresource",
+        "ClearRenderTargetView", "ClearUnorderedAccessView", "ClearDepthStencilView", "ResourceBarrier",
+        "ExecuteBundle", "Present", "ResolveQueryData", "BeginSubmission", "EndSubmission", "DecodeFrame",
+        "ProcessFrames", "AtomicCopyBufferUint", "AtomicCopyBufferUint64", "ResolveSubresourceRegion",
+        "WriteBufferImmediate",
+    ];
+    NAMES.get(op.0 as usize).map_or_else(|| format!("operation {}", op.0), |n| n.to_string())
+}
+
+/// Names a replay object after what it stands for in the capture, so the debug layer's messages say which it is.
+fn name(object: &impl Interface, name: String) {
+    if let Ok(o) = object.cast::<ID3D12Object>() {
+        let _ = unsafe { o.SetName(&windows::core::HSTRING::from(name)) };
+    }
+}
+
 /// A call a command list made, by its event.
 struct ListCall {
     seq: i64,
@@ -261,6 +281,14 @@ impl D3d12 {
                     d1.SetEnableGPUBasedValidation(true);
                 }
             }
+            // If the device is removed, DRED says which address faulted and which resources were around it.
+            let mut dred: Option<ID3D12DeviceRemovedExtendedDataSettings> = None;
+            if D3D12GetDebugInterface(&mut dred).is_ok()
+                && let Some(dred) = dred
+            {
+                dred.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                dred.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            }
             let mut device: Option<ID3D12Device2> = None;
             if warp {
                 let factory: IDXGIFactory4 =
@@ -378,8 +406,55 @@ impl D3d12 {
                 .Reset(&self.allocator, None)
                 .map_err(|e| format!("command list Reset: {e}"))?;
         }
-        removed.map_err(|e| format!("the device was removed: {e}{}", self.validation()))?;
+        removed.map_err(|e| format!("the device was removed: {e}{}{}", self.removal(), self.validation()))?;
         ran.map_err(|e| format!("the command list did not run: {e}{}", self.validation()))
+    }
+
+    /// What DRED recorded of a device removal: the GPU's last operation, and for a page fault, its address and the
+    /// resources (named `#id`) at it or freed from it.
+    fn removal(&self) -> String {
+        let Ok(dred) = self.device.cast::<ID3D12DeviceRemovedExtendedData>() else {
+            return String::new();
+        };
+        let wide = |p: windows::core::PCWSTR| if p.is_null() { String::new() } else { unsafe { p.to_string() }.unwrap_or_default() };
+        let mut out = Vec::new();
+        unsafe {
+            if let Ok(crumbs) = dred.GetAutoBreadcrumbsOutput() {
+                let mut node = crumbs.pHeadAutoBreadcrumbNode;
+                while let Some(n) = node.as_ref() {
+                    let count = n.BreadcrumbCount as usize;
+                    let done = n.pLastBreadcrumbValue.as_ref().map_or(0, |v| *v as usize);
+                    // A list the GPU started and did not finish.
+                    if done < count && !n.pCommandHistory.is_null() {
+                        let history = std::slice::from_raw_parts(n.pCommandHistory, count);
+                        out.push(format!(
+                            "DRED: the GPU stopped at operation {done} of {count} ({}) of its list",
+                            operation(history[done])
+                        ));
+                    }
+                    node = n.pNext;
+                }
+            }
+            if let Ok(fault) = dred.GetPageFaultAllocationOutput()
+                && fault.PageFaultVA != 0
+            {
+                let names = |mut node: *const D3D12_DRED_ALLOCATION_NODE| {
+                    let mut names = Vec::new();
+                    while let Some(n) = node.as_ref() {
+                        names.push(wide(n.ObjectNameW));
+                        node = n.pNext;
+                    }
+                    names.join(" ")
+                };
+                out.push(format!(
+                    "DRED: page fault at {:#x}, in [{}], freed from [{}]",
+                    fault.PageFaultVA,
+                    names(fault.pHeadExistingAllocationNode),
+                    names(fault.pHeadRecentFreedAllocationNode)
+                ));
+            }
+        }
+        if out.is_empty() { String::new() } else { format!(" ({})", out.join("; ")) }
     }
 
     /// The validation layer's errors so far, for an error message (empty without `--debug`).
@@ -770,7 +845,10 @@ impl D3d12 {
                         .and_then(|(_, v)| v.as_i64());
                     match root.and_then(|r| self.root(c, r).map(|r| r.signature.clone())) {
                         Some(root) => match pipelines::make(c, &self.device, &desc, &root, replaced) {
-                            Ok(p) => Some(p),
+                            Ok(p) => {
+                                name(&p, format!("pipeline #{id}"));
+                                Some(p)
+                            }
                             Err(e) => {
                                 self.warn(format!("pipeline state #{id} could not be made: {e}{}", self.validation()));
                                 None
@@ -1701,6 +1779,7 @@ impl Backend for D3d12 {
             }
             Err(e) => return Err(e.to_string()),
         };
+        name(&resource, format!("#{id}"));
         let desc = unsafe { resource.GetDesc() };
         let planes = if locum_capture::format::is_depth_stencil(format) { 2 } else { 1 };
         let extent = Extent {

@@ -369,7 +369,8 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
             "(SELECT group_concat(DISTINCT access) FROM event_resources WHERE event = e.seq AND resource = ?{n})"
         );
     }
-    params.push(Value::Integer(f.limit));
+    // One past the limit, to say whether there are more.
+    params.push(Value::Integer(f.limit + 1));
     let sql = format!(
         "SELECT e.seq, e.kind, e.call, e.deferred, e.list, e.draw, e.args, e.data, \
          (SELECT group_concat(resource) FROM event_resources WHERE event = e.seq AND access = 'write'), {access} \
@@ -389,7 +390,7 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
         Option<String>,
         Option<String>,
     );
-    let rows: Vec<Row> = c.rows(&sql, rusqlite::params_from_iter(params), |r| {
+    let mut rows: Vec<Row> = c.rows(&sql, rusqlite::params_from_iter(params), |r| {
         Ok((
             r.get(0)?,
             r.get(1)?,
@@ -403,6 +404,9 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
             r.get(9)?,
         ))
     });
+    let more = rows.len() as i64 > f.limit;
+    rows.truncate(f.limit.max(0) as usize);
+    let next = rows.last().map(|r| r.0 + 1);
     for (seq, kind, call, deferred, list, draw, args, data, writes, access) in rows {
         let place = if deferred {
             format!("list {}", list.map_or("?".into(), |l| l.to_string()))
@@ -431,6 +435,9 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
                 .unwrap_or_default(),
             data.map(|d| format!("  data {}", short(&d))).unwrap_or_default()
         );
+    }
+    if more && let Some(next) = next {
+        out!("(stopped at --limit {}; --from {next} lists the next)", f.limit);
     }
     Ok(())
 }

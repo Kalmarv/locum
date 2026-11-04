@@ -126,9 +126,13 @@ fn history(c: &Capture, s: &Subject) -> Result<(String, Vec<Entry>), String> {
     Ok((title, entries))
 }
 
-fn value(image: &Image, x: u32, y: u32) -> Option<Vec<f32>> {
-    (x < image.width && y < image.height)
-        .then(|| image.texels[(y * image.width + x) as usize][..usize::from(image.channels.max(1))].to_vec())
+/// Texel (x, y): its channels, and its stencil for a depth-stencil format.
+fn value(image: &Image, x: u32, y: u32) -> Option<(Vec<f32>, Option<u8>)> {
+    let i = (x < image.width && y < image.height).then_some((y * image.width + x) as usize)?;
+    Some((
+        image.texels[i][..usize::from(image.channels.max(1))].to_vec(),
+        image.stencil.as_ref().map(|s| s[i]),
+    ))
 }
 
 fn bits(v: &[f32]) -> Vec<u32> {
@@ -169,8 +173,9 @@ pub fn pixel(
                     Err(e) => Err(e.clone()),
                 };
                 let (shown, note) = match &v {
-                    Ok(v) => {
-                        let now = bits(v);
+                    Ok((v, stencil)) => {
+                        let mut now = bits(v);
+                        now.extend(stencil.map(u32::from));
                         let note = match &last {
                             None => "first readback",
                             Some(l) if *l != now => "changed",
@@ -181,8 +186,12 @@ pub fn pixel(
                         if changed_only && !changed {
                             continue;
                         }
+                        let values = v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(" ");
                         (
-                            v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(" "),
+                            match stencil {
+                                Some(s) => format!("depth {values} stencil {s}"),
+                                None => values,
+                            },
                             note,
                         )
                     }
@@ -248,7 +257,8 @@ pub fn changes(c: &Capture, arg: &str, sub: Option<u32>, rect: Option<[u32; 4]>)
                         let differs = image.texels[i]
                             .iter()
                             .zip(&before.texels[i])
-                            .any(|(a, b)| a.to_bits() != b.to_bits());
+                            .any(|(a, b)| a.to_bits() != b.to_bits())
+                            || image.stencil.as_ref().map(|s| s[i]) != before.stencil.as_ref().map(|s| s[i]);
                         if differs {
                             n += 1;
                             bounds = [

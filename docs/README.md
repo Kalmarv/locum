@@ -268,6 +268,7 @@ locum-cli target last 120 rt3 -o a.png --channel a   # one channel as grey; the 
                                            # zero, for a sparse atlas) draw a part (export takes them too)
 locum-cli pixel last 120:rt0 960 540       # that texel in every readback of the target: which passes changed it
 locum-cli changes last 120:rt0 --rect 0,0,640,360  # texels each pass changed in a region, and where
+                                           # (a depth-stencil target's stencil counts, and pixel shows it)
 locum-cli cb last 120 vs 8 --name ViewProj # only the registers of matching variables (--reg 3,26 by number;
                                            # --name 'Scroll|waveTime' for several)
 locum-cli draw last 120 --section bound,cb # only those parts (state, bound, cb, targets)

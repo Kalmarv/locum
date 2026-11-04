@@ -12,6 +12,8 @@ pub struct Image {
     /// Whether the values are unbounded (float formats), not 0..1 or integers.
     pub float: bool,
     pub texels: Vec<[f32; 4]>,
+    /// A depth-stencil format's stencil, a byte a texel: the texels hold its depth.
+    pub stencil: Option<Vec<u8>>,
 }
 
 /// How values are mapped to 0..255 for a picture.
@@ -168,6 +170,16 @@ fn block_decoder(format: u32) -> Option<(BlockFn, u8)> {
 
 /// Decodes one subresource of `width` x `height` texels (one depth slice of a volume: pass its bytes only).
 pub fn decode(format: u32, width: u32, height: u32, bytes: &[u8]) -> Result<Image, String> {
+    // Where each texel's stencil byte is (see `format::texel`), before the format is read as its depth alone.
+    let stencil = match format {
+        19 | 20 => Some((8, 4)),
+        44 | 45 => Some((4, 3)),
+        _ => None,
+    }
+    .and_then(|(size, at)| {
+        let n = width as usize * height as usize;
+        (bytes.len() >= n * size).then(|| (0..n).map(|i| bytes[i * size + at]).collect())
+    });
     let format = format::readable(format);
     let layout = format::layout(format).ok_or_else(|| format!("{} has no layout", format::name(format)))?;
     let need = u64::from(layout.row_bytes(width)) * u64::from(layout.rows(height));
@@ -328,6 +340,7 @@ pub fn decode(format: u32, width: u32, height: u32, bytes: &[u8]) -> Result<Imag
         channels,
         float,
         texels,
+        stencil,
     })
 }
 
@@ -340,6 +353,7 @@ impl Image {
             channels: 1,
             float: self.float,
             texels: self.texels.iter().map(|t| [t[c.min(3)], 0.0, 0.0, 1.0]).collect(),
+            stencil: None,
         }
     }
 
@@ -351,9 +365,14 @@ impl Image {
             y.saturating_add(h).min(self.height),
         );
         let mut texels = Vec::with_capacity(((x1 - x0) * (y1 - y0)) as usize);
+        let mut stencil = self.stencil.as_ref().map(|_| Vec::new());
         for row in y0..y1 {
             let at = (row * self.width) as usize;
-            texels.extend_from_slice(&self.texels[at + x0 as usize..at + x1 as usize]);
+            let (a, b) = (at + x0 as usize, at + x1 as usize);
+            texels.extend_from_slice(&self.texels[a..b]);
+            if let (Some(out), Some(all)) = (&mut stencil, &self.stencil) {
+                out.extend_from_slice(&all[a..b]);
+            }
         }
         Image {
             width: x1 - x0,
@@ -361,6 +380,7 @@ impl Image {
             channels: self.channels,
             float: self.float,
             texels,
+            stencil,
         }
     }
 
@@ -471,6 +491,24 @@ mod tests {
         assert_eq!(depth.channels, 1);
         assert_eq!(depth.texels[1][0], 1.0);
         assert_eq!(depth.rgba8(Range::Auto), vec![0, 0, 0, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn depth_stencil_keeps_its_stencil() {
+        // D32_FLOAT_S8X24_UINT: the depth float, the stencil byte, three zero bytes.
+        let mut bytes = Vec::new();
+        for (depth, stencil) in [(0.5f32, 17u8), (1.0, 16)] {
+            bytes.extend_from_slice(&depth.to_le_bytes());
+            bytes.extend_from_slice(&[stencil, 0, 0, 0]);
+        }
+        let img = decode(20, 2, 1, &bytes).unwrap();
+        assert_eq!((img.channels, img.texels[0][0], img.texels[1][0]), (1, 0.5, 1.0));
+        assert_eq!(img.stencil.as_deref(), Some(&[17, 16][..]));
+        assert_eq!(img.crop([1, 0, 1, 1]).stencil.as_deref(), Some(&[16][..]));
+        // D24_UNORM_S8_UINT: the stencil in the top byte.
+        let img = decode(45, 1, 1, &[0xff, 0xff, 0xff, 5]).unwrap();
+        assert_eq!((img.texels[0][0], img.stencil.as_deref()), (1.0, Some(&[5][..])));
+        assert!(decode(46, 1, 1, &[0, 0, 0, 5]).unwrap().stencil.is_none());
     }
 
     #[test]
