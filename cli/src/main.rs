@@ -78,7 +78,7 @@ enum Command {
         capture: String,
         /// The draw's number, `last`, or `all` for every draw.
         n: String,
-        /// Every constant register, not only those the shader uses.
+        /// Every bound register and every constant register, not only those the shaders use.
         #[arg(long)]
         all: bool,
         /// As JSON: one object per draw, one per line.

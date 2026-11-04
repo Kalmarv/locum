@@ -70,6 +70,8 @@ pub struct Queued {
 pub struct Draw {
     pub draw: i64,
     pub event: i64,
+    /// Whether the capture's API can be replayed, so `export --at` can give what a draw saw.
+    pub replay: bool,
     pub call: String,
     /// The call's arguments as the API orders them.
     pub args: Value,
@@ -98,6 +100,9 @@ pub struct Draw {
     pub viewports: Vec<Viewport>,
     pub scissors: Vec<Scissor>,
     pub bindings: Vec<Binding>,
+    /// Bound registers left out because the shaders' reflection does not list them (`--all` keeps them): a D3D12
+    /// root table binds every descriptor of its ranges, whatever the program reads.
+    pub unused: usize,
     pub constants: Vec<Constants>,
     /// Targets read back after it (the last draw of a pass).
     pub targets: Vec<Target>,
@@ -150,7 +155,7 @@ pub struct Binding {
     pub kind: String,
     pub slot: u32,
     pub space: u32,
-    /// Its name in the shader's reflection (srv, uav and sampler slots).
+    /// Its name in the shader's reflection.
     pub name: Option<String>,
     /// Whether the shader uses the slot: false for one its reflection does not list, null when unknown.
     pub used: Option<bool>,
@@ -358,7 +363,7 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
     let rows = rows(c, n);
     let mut bindings = Vec::with_capacity(rows.len());
     for b in &rows {
-        let (name, used) = if matches!(b.kind.as_str(), "srv" | "uav" | "sampler")
+        let (name, used) = if matches!(b.kind.as_str(), "srv" | "uav" | "sampler" | "cb")
             && let Some(shader) = shader_of(c, n, &b.stage)
         {
             match reflection.slot(c, &shader, &b.kind, b.slot, b.space) {
@@ -437,9 +442,16 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
     }
 
     let mut constants = Vec::new();
-    for b in rows.iter().filter(|b| b.kind == "cb") {
-        constants.push(constants_of(c, reflection, n, b, all)?);
+    for (b, binding) in rows.iter().zip(&bindings).filter(|(b, _)| b.kind == "cb") {
+        if all || binding.used != Some(false) {
+            constants.push(constants_of(c, reflection, n, b, all)?);
+        }
     }
+    let before = bindings.len();
+    if !all {
+        bindings.retain(|b| b.used != Some(false));
+    }
+    let unused = before - bindings.len();
     let targets = c.rows(
         "SELECT target, blob, width, height, format FROM targets WHERE draw = ?1",
         [n],
@@ -458,6 +470,7 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
     Ok(Draw {
         draw: n,
         event,
+        replay: c.meta("api").as_deref() == Some("d3d11"),
         named_args: describe::call_args(&call, &args),
         args: serde_json::from_str(&args).unwrap_or(Value::String(args)),
         call,
@@ -483,6 +496,7 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
         viewports,
         scissors,
         bindings,
+        unused,
         constants,
         targets,
     })
@@ -754,10 +768,17 @@ fn print(d: &Draw) {
                 (Some(key), Some(e)) => {
                     line += &format!(
                         "  contents {} as the frame began ({}), not as this draw saw them: written since, last at \
-                         event {e} (export --at {} gives what it saw)",
+                         event {e} ({})",
                         short(key),
                         b.contents_source.as_deref().unwrap_or_default(),
-                        d.event
+                        if d.replay {
+                            format!("export --at {} gives what it saw", d.event)
+                        } else {
+                            format!(
+                                "no replay for this API yet; `events --resource {r}` lists what reads and writes it",
+                                r = b.resource.unwrap_or_default()
+                            )
+                        }
                     )
                 }
                 (Some(key), None) => {
@@ -775,6 +796,12 @@ fn print(d: &Draw) {
             }
         }
         out!("{line}");
+    }
+    if d.unused > 0 {
+        out!(
+            "  ({} bound registers the shaders do not use; --all shows them)",
+            d.unused
+        );
     }
     for k in &d.constants {
         print_constants(k);

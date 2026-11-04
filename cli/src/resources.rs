@@ -319,17 +319,22 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
         params.push(Value::Text(k.clone()));
         wh.push(format!("e.kind = ?{}", params.len()));
     }
+    // How each listed event touches the resource asked about: a reader's own writes are other resources.
+    let mut access = "NULL".to_string();
     if let Some(r) = f.resource {
         params.push(Value::Integer(r));
+        let n = params.len();
         wh.push(format!(
-            "e.seq IN (SELECT event FROM event_resources WHERE resource = ?{})",
-            params.len()
+            "e.seq IN (SELECT event FROM event_resources WHERE resource = ?{n})"
         ));
+        access = format!(
+            "(SELECT group_concat(DISTINCT access) FROM event_resources WHERE event = e.seq AND resource = ?{n})"
+        );
     }
     params.push(Value::Integer(f.limit));
     let sql = format!(
         "SELECT e.seq, e.kind, e.call, e.deferred, e.list, e.draw, e.args, e.data, \
-         (SELECT group_concat(resource) FROM event_resources WHERE event = e.seq AND access = 'write') \
+         (SELECT group_concat(resource) FROM event_resources WHERE event = e.seq AND access = 'write'), {access} \
          FROM events e WHERE {} ORDER BY e.seq LIMIT ?{}",
         wh.join(" AND "),
         params.len()
@@ -341,6 +346,7 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
         bool,
         Option<i64>,
         Option<i64>,
+        Option<String>,
         Option<String>,
         Option<String>,
         Option<String>,
@@ -356,16 +362,29 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
             r.get(6)?,
             r.get(7)?,
             r.get(8)?,
+            r.get(9)?,
         ))
     });
-    for (seq, kind, call, deferred, list, draw, args, data, writes) in rows {
+    for (seq, kind, call, deferred, list, draw, args, data, writes, access) in rows {
         let place = if deferred {
             format!("list {}", list.map_or("?".into(), |l| l.to_string()))
         } else {
             "imm".into()
         };
+        let touches = match (access.as_deref(), f.resource) {
+            (Some(a), Some(r)) => {
+                let read = a.split(',').any(|a| a == "read");
+                let write = a.split(',').any(|a| a == "write");
+                match (read, write) {
+                    (true, true) => format!("  reads and writes #{r}"),
+                    (true, false) => format!("  reads #{r}"),
+                    _ => String::new(),
+                }
+            }
+            _ => String::new(),
+        };
         out!(
-            "{seq:>6} {kind:<9} {call:<28} {place:<8} {}{}{}{}",
+            "{seq:>6} {kind:<9} {call:<28} {place:<8} {}{}{touches}{}{}",
             draw.map(|d| format!("draw {d} ")).unwrap_or_default(),
             args.unwrap_or_default(),
             writes

@@ -598,7 +598,8 @@ fn same_records(a: &[u8], b: &[u8], stride: usize) -> bool {
 fn backend(c: &Capture, warp: bool, debug: bool) -> Result<Box<dyn Backend>, String> {
     match c.meta("api").as_deref() {
         Some("d3d11") => Ok(Box::new(d3d11::D3d11::new(warp, debug)?)),
-        other => Err(format!("no replay for API {other:?}")),
+        Some(api) => Err(format!("no replay for {api} captures yet")),
+        None => Err("the capture names no API to replay".into()),
     }
 }
 

@@ -1,4 +1,5 @@
-//! Shader reflection from a DXBC container's `RDEF` part, as dx's `dxbc-reader` reads it: each constant buffer's name,
+//! Shader reflection from a DXBC container's `RDEF` part, as dx's `dxbc-reader` reads it, or a DXIL container's
+//! reflection module (`STAT`, else the program's own `DXIL`) as `dxil-reader` reads it: each constant buffer's name,
 //! register and variables, so a constant can be shown as `cbTexScroll.uvScale.x` instead of `b11 c0.x`, and the name
 //! and register of every resource the program reads or writes (`g_GBuffer2Texture` at t4).
 
@@ -149,17 +150,195 @@ fn binding(b: &dxbc_reader::RdefBinding) -> Binding {
     }
 }
 
-/// Every resource a shader binds (constant buffers, textures, buffers, samplers, UAVs), from its DXBC bytecode, in
-/// the reflection's order.
-pub fn bindings(dxbc: &[u8]) -> Option<Vec<Binding>> {
-    Some(rdef(dxbc)?.bindings.iter().map(binding).collect())
+/// Every resource a shader binds (constant buffers, textures, buffers, samplers, UAVs), from its DXBC or DXIL
+/// bytecode, in the reflection's order.
+pub fn bindings(code: &[u8]) -> Option<Vec<Binding>> {
+    if let Some(rdef) = rdef(code) {
+        return Some(rdef.bindings.iter().map(binding).collect());
+    }
+    let m = dxil(code)?;
+    let ranges = dxil_reader::reflection::ranges(&m).ok()?;
+    Some(
+        ranges
+            .into_iter()
+            .map(|(r, name, _)| Binding {
+                name,
+                // As D3D_SHADER_INPUT_TYPE, which `class` reads back.
+                kind: match r.class {
+                    1 => 4,
+                    2 => 0,
+                    3 => 3,
+                    _ => 2,
+                },
+                slot: r.lower,
+                count: if r.count == u32::MAX { 0 } else { r.count },
+                space: r.space,
+            })
+            .collect(),
+    )
+}
+
+/// A DXIL container's reflection module: the `STAT` part, which keeps the names and type annotations a stripped
+/// program lacks, else the program's own module.
+fn dxil(code: &[u8]) -> Option<dxil_reader::module::Module> {
+    let parts = dxil_reader::parts(code).ok()?;
+    let kind = if parts.iter().any(|p| &p.kind == b"STAT") {
+        b"STAT"
+    } else {
+        b"DXIL"
+    };
+    dxil_reader::module(&parts, kind).ok().flatten()
+}
+
+/// The constant buffers a DXIL program declares: each cbuffer range with its struct type's fields as
+/// `dx.typeAnnotations` states them.
+fn dxil_constant_buffers(code: &[u8]) -> Option<Vec<ConstantBuffer>> {
+    let m = dxil(code)?;
+    let ranges = dxil_reader::reflection::ranges(&m).ok()?;
+    Some(
+        ranges
+            .into_iter()
+            .filter(|(r, ..)| r.class == 2)
+            .map(|(r, name, ty)| {
+                let mut variables: Vec<Variable> = ty
+                    .map(|t| members(&m, t))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|member| Variable {
+                        name: member.name,
+                        offset: member.offset,
+                        size: 0,
+                        // DXIL does not say which variables the program reads.
+                        used: true,
+                        ty: member.ty,
+                    })
+                    .collect();
+                variables.sort_by_key(|v| v.offset);
+                // Each variable runs to the next one, the last to the buffer's end.
+                let ends: Vec<u32> = variables
+                    .iter()
+                    .skip(1)
+                    .map(|v| v.offset)
+                    .chain([r.extra])
+                    .collect();
+                for (v, end) in variables.iter_mut().zip(ends) {
+                    v.size = end.saturating_sub(v.offset);
+                }
+                ConstantBuffer {
+                    name,
+                    slot: Some(r.lower),
+                    space: r.space,
+                    size: r.extra,
+                    variables,
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The fields of a DXIL struct type, each with its offset and its type in the reflection's terms.
+fn members(m: &dxil_reader::module::Module, t: dxil_reader::module::TypeId) -> Vec<Member> {
+    use dxil_reader::module::Type as T;
+    let Some(T::Struct { elements, .. }) = m.types.get(t) else {
+        return Vec::new();
+    };
+    let fields = dxil_reader::reflection::fields(m, t).unwrap_or_default();
+    fields
+        .iter()
+        .zip(elements)
+        .map(|(f, &e)| Member {
+            name: f.name.clone(),
+            offset: f.offset,
+            ty: dxil_type(m, e, f),
+        })
+        .collect()
+}
+
+/// A field's type as `D3D_SHADER_VARIABLE_CLASS` and `_TYPE` would state it, from its LLVM type and annotation.
+fn dxil_type(
+    m: &dxil_reader::module::Module,
+    t: dxil_reader::module::TypeId,
+    f: &dxil_reader::reflection::FieldAnnotation,
+) -> Type {
+    use dxil_reader::module::Type as T;
+    // DxilComponentType: 1 i1, 2 i16, 3 u16, 4 i32, 5 u32, 6 i64, 7 u64, 8 f16, 9 f32, 10 f64.
+    let base = |t: Option<&T>| -> u16 {
+        match (f.component, t) {
+            (Some(1), _) | (None, Some(T::Integer(1))) => 1,
+            (Some(2 | 4 | 6), _) => 2,
+            (Some(3 | 5 | 7), _) | (None, Some(T::Integer(_))) => 19,
+            (Some(10), _) | (None, Some(T::Double)) => 39,
+            _ => 3,
+        }
+    };
+    // LLVM lowers a matrix to its lines (a struct holding an array of vectors); only the annotation says it is one.
+    if let Some((rows, columns, orientation)) = f.matrix {
+        let per = if orientation == 1 { rows } else { columns }.max(1);
+        let mut lines = 1u64;
+        let mut at = t;
+        loop {
+            match m.types.get(at) {
+                Some(T::Struct { elements, .. }) if elements.len() == 1 => at = elements[0],
+                Some(T::Array(n, inner)) => {
+                    lines *= n;
+                    at = *inner;
+                }
+                _ => break,
+            }
+        }
+        let scalar = match m.types.get(at) {
+            Some(T::Vector(_, s)) => m.types.get(*s),
+            other => other,
+        };
+        let count = lines / u64::from(per);
+        return Type {
+            class: if orientation == 1 { 2 } else { 3 },
+            base: base(scalar),
+            rows: rows as u16,
+            columns: columns as u16,
+            elements: if count > 1 { count as u16 } else { 0 },
+            members: Vec::new(),
+        };
+    }
+    match m.types.get(t) {
+        Some(T::Array(n, inner)) => Type {
+            elements: *n as u16,
+            ..dxil_type(m, *inner, f)
+        },
+        Some(T::Vector(n, s)) => Type {
+            class: 1,
+            base: base(m.types.get(*s)),
+            rows: 1,
+            columns: *n as u16,
+            elements: 0,
+            members: Vec::new(),
+        },
+        Some(T::Struct { .. }) => Type {
+            class: 5,
+            base: 0,
+            rows: 1,
+            columns: 1,
+            elements: 0,
+            members: members(m, t),
+        },
+        other => Type {
+            class: 0,
+            base: base(other),
+            rows: 1,
+            columns: 1,
+            elements: 0,
+            members: Vec::new(),
+        },
+    }
 }
 
 /// The constant buffers a shader declares, from its DXBC bytecode. The reflection also lays out tbuffers, interface
 /// pointers and each structured buffer's element as buffers; those are bound to t and u registers, not b, so they are
 /// left out.
 pub fn constant_buffers(dxbc: &[u8]) -> Option<Vec<ConstantBuffer>> {
-    let rdef = rdef(dxbc)?;
+    let Some(rdef) = rdef(dxbc) else {
+        return dxil_constant_buffers(dxbc);
+    };
     Some(
         rdef.buffers
             .iter()

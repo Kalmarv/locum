@@ -71,9 +71,20 @@ pub(super) fn project(
                 let start = base.saturating_add(offset);
                 let end = start.saturating_add(count);
                 let slot = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+                // A range reaches only descriptors of its own type: games point tables of different types at
+                // overlapping heap slots (Elden Ring's CBV table b0-b3 starts one slot before its SRV table t0-t3),
+                // and the slots holding the other type are not what the shader sees through this range.
+                let kind = match range["RangeType"].as_u64() {
+                    Some(0) => "srv",
+                    Some(1) => "uav",
+                    Some(2) => "cb",
+                    Some(3) => "sampler",
+                    _ => "",
+                };
                 for descriptor in descriptors
                     .range((heap, slot(start))..(heap, slot(end)))
                     .map(|(_, d)| d)
+                    .filter(|d| d.kind == kind)
                 {
                     let register = range["BaseShaderRegister"].as_u64().unwrap_or(0)
                         + (u64::from(descriptor.slot) - start);
@@ -271,4 +282,66 @@ fn display_view(d: &Descriptor, format: u32, dimension: u32, resource_kind: Opti
         }
     }
     json!({"format":format,"dimension":name,"range":range,"default":default,"native":d.description})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn descriptor(slot: u32, kind: &'static str, resource: u64) -> ((u64, u32), Descriptor) {
+        let d = Descriptor {
+            id: u64::from(slot) + 100,
+            heap: 9,
+            slot,
+            kind,
+            resource,
+            counter: 0,
+            description: json!({}),
+        };
+        ((9, slot), d)
+    }
+
+    #[test]
+    fn a_range_binds_only_descriptors_of_its_type() {
+        // Elden Ring's shape: a pixel CBV table b0-b1 at slot 10 and a pixel SRV table t0-t1 at slot 11, so slot
+        // 11 lies under both ranges and holds an SRV.
+        let range = |kind: u64, count: u64| {
+            json!([{"RangeType":kind,"BaseShaderRegister":0,"NumDescriptors":count,"RegisterSpace":0,
+                "OffsetInDescriptorsFromTableStart":0}])
+        };
+        let root = json!({"decoded":{"parameters":[
+            {"type":0,"visibility":5,"value":range(2, 2)},
+            {"type":0,"visibility":5,"value":range(0, 2)},
+        ],"samplers":[]}});
+        let objects = BTreeMap::from([(1, root)]);
+        let descriptors = BTreeMap::from([
+            descriptor(10, "cb", 50),
+            descriptor(11, "srv", 51),
+            descriptor(12, "srv", 52),
+        ]);
+        let pipeline = Pipeline {
+            graphics_root: 1,
+            graphics_args: BTreeMap::from([
+                (0, json!({"value":{"heap":9,"slot":10}})),
+                (1, json!({"value":{"heap":9,"slot":11}})),
+            ]),
+            ..Pipeline::default()
+        };
+        let mut capture = db::Capture::default();
+        project(&mut capture, 1, false, &pipeline, &objects, &descriptors);
+        let mut bound: Vec<_> = capture
+            .bindings
+            .iter()
+            .map(|b| (b.stage, b.kind, b.slot, b.resource))
+            .collect();
+        bound.sort();
+        assert_eq!(
+            bound,
+            [
+                ("ps", "cb", 0, Some(50)),
+                ("ps", "srv", 0, Some(51)),
+                ("ps", "srv", 1, Some(52))
+            ]
+        );
+    }
 }
