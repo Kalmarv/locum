@@ -1,6 +1,6 @@
 //! Owned, portable D3D12 command history. A list recording and an execution of that
 //! recording have different identities; resetting a list cannot change an earlier execution.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use rusqlite::{Transaction, params};
@@ -231,50 +231,64 @@ impl Prepared {
             .filter(|(_, v)| v["whole"] == true)
             .map(|(r, v)| (*r, v))
             .collect();
-        let draws: BTreeMap<_, _> = self
+        let draw_events: BTreeMap<_, _> = capture.draws.iter().map(|d| (d.n, d.event)).collect();
+        let executions: BTreeMap<_, _> = self
             .projection
-            .draw_states
+            .executions
             .iter()
-            .map(|(draw, submission, _)| (*draw, *submission))
+            .map(|x| (x.id, x.submission))
             .collect();
-        let mut gaps = Vec::new();
+        let mut written = BTreeMap::<u64, Vec<&db::Event>>::new();
+        for event in &capture.events {
+            for resource in &event.writes {
+                written.entry(*resource).or_default().push(event);
+            }
+        }
+        let composer = Composer {
+            runs: &runs,
+            blobs,
+            first_use: &self.first_use,
+            submissions: self
+                .projection
+                .locations
+                .iter()
+                .filter_map(|(seq, execution, ..)| Some((*seq, *executions.get(execution)?)))
+                .collect(),
+            written,
+        };
+        // A buffer's bytes before a draw depend only on the draw's submission (an upload buffer's bytes are as the GPU
+        // reached it) and the writes before it: one composition for the draws that share both.
+        type Key = (u64, u64, u64, Option<u64>, usize);
+        let mut composed = HashMap::<Key, Result<String, String>>::new();
+        let mut unread = BTreeMap::<String, u64>::new();
         for binding in &mut capture.bindings {
             if binding.kind != "cb" || binding.content.is_some() {
                 continue;
             }
-            let Some(resource) = binding.resource else {
-                continue;
-            };
-            let Some(submission) = draws.get(&binding.draw) else {
+            let (Some(resource), Some(event)) = (binding.resource, draw_events.get(&binding.draw)) else {
                 continue;
             };
             let offset = binding.offset.unwrap_or(0);
-            // The run beginning at or before the binding's offset; merged runs never overlap, so it is the only one
-            // that can cover it.
-            let Some((&(_, _, begin), content)) = runs
-                .range((*submission, resource, 0)..=(*submission, resource, offset))
-                .next_back()
-                .filter(|((_, _, begin), v)| offset < begin + v["size"].as_u64().unwrap_or(0))
-            else {
-                continue;
+            // Upload bytes run only as far as the submission read them: a root CBV's size is the most it can be.
+            let len = match (binding.size, composer.run_len(resource, offset, *event)) {
+                (Some(size), Some(run)) => size.min(run),
+                (Some(n), None) | (None, Some(n)) => n,
+                (None, None) => continue,
             };
-            let Some(key) = content["blob"].as_str() else {
-                continue;
-            };
-            // Only the binding's bytes: a run is megabytes, and Elden Ring has thousands of CB bindings per frame.
-            let start = offset - begin;
-            let rest = content["size"].as_u64().unwrap_or(0) - start;
-            let len = binding.size.map_or(rest, |size| size.min(rest));
-            match blobs.read(key, start, Some(len)) {
-                Ok(bytes) => {
-                    let key = crate::hash::key(&bytes);
-                    capture.cb_data.push((key.clone(), bytes));
-                    binding.content = Some(key);
-                }
-                Err(e) => gaps.push(format!(
-                    "draw {} resource {resource}: upload {key}: {e}",
-                    binding.draw
-                )),
+            let writes = composer.writes(resource, *event).len();
+            let submission = composer.submissions.get(event).copied();
+            let content = composed
+                .entry((resource, offset, len, submission, writes))
+                .or_insert_with(|| {
+                    composer.at(resource, offset, len, *event, 0).map(|bytes| {
+                        let key = crate::hash::key(&bytes);
+                        capture.cb_data.push((key.clone(), bytes));
+                        key
+                    })
+                });
+            match content {
+                Ok(key) => binding.content = Some(key.clone()),
+                Err(why) => *unread.entry(why.clone()).or_default() += 1,
             }
         }
         let descriptions: BTreeMap<_, _> = self
@@ -355,8 +369,8 @@ impl Prepared {
             .filter_map(|t| crate::layout::texture(t.format, t.width, t.height, 1, 1, 1))
             .map(|l| crate::layout::total(&l))
             .sum();
-        for gap in gaps {
-            capture.gap("d3d12-upload-content", gap, 1);
+        for (why, count) in unread {
+            capture.gap("d3d12-constant-content", why, count);
         }
         for (why, count) in missing {
             capture.gap("contents", why, count);
@@ -388,6 +402,120 @@ struct Execution {
     list: Arc<List>,
     ordinal: usize,
     parent: Option<u64>,
+}
+
+/// The bytes a buffer held at an event of the frame, for constant buffers: upload bytes as the GPU reached the event's
+/// submission, or the buffer as its first use found it with every earlier copy into it laid over in event order.
+struct Composer<'a> {
+    /// Per submission, runs of upload bytes keyed by where they begin.
+    runs: &'a BTreeMap<(u64, u64, u64), &'a Value>,
+    blobs: &'a crate::blobs::Blobs,
+    first_use: &'a BTreeMap<u64, FirstUse>,
+    /// Each event's submission.
+    submissions: HashMap<u64, u64>,
+    /// Each resource's writes, in event order.
+    written: BTreeMap<u64, Vec<&'a db::Event>>,
+}
+
+impl Composer<'_> {
+    /// Copies through more buffers than this are not followed.
+    const DEPTH: u32 = 8;
+
+    /// The upload run of `event`'s submission that covers `resource` at `offset`, as (where it begins, its value).
+    /// Merged runs never overlap, so the one beginning at or before the offset is the only one that can.
+    fn run(&self, resource: u64, offset: u64, event: u64) -> Option<(u64, &Value)> {
+        let submission = *self.submissions.get(&event)?;
+        self.runs
+            .range((submission, resource, 0)..=(submission, resource, offset))
+            .next_back()
+            .filter(|((_, _, begin), v)| offset < begin + v["size"].as_u64().unwrap_or(0))
+            .map(|(&(_, _, begin), v)| (begin, *v))
+    }
+
+    /// How far the covering upload run reaches past `offset`: a root CBV's size when nothing else gives it.
+    fn run_len(&self, resource: u64, offset: u64, event: u64) -> Option<u64> {
+        let (begin, run) = self.run(resource, offset, event)?;
+        Some(begin + run["size"].as_u64()? - offset)
+    }
+
+    /// `resource`'s writes before `event`.
+    fn writes(&self, resource: u64, event: u64) -> &[&db::Event] {
+        self.written
+            .get(&resource)
+            .map_or(&[], |w| &w[..w.partition_point(|e| e.seq < event)])
+    }
+
+    /// `resource`'s bytes `[offset, offset + len)` just before `event`, or why they are not known.
+    fn at(&self, resource: u64, offset: u64, len: u64, event: u64, depth: u32) -> Result<Vec<u8>, String> {
+        if depth > Self::DEPTH {
+            return Err(format!("copied through more than {} buffers", Self::DEPTH));
+        }
+        if let Some((begin, run)) = self.run(resource, offset, event) {
+            let key = run["blob"].as_str().ok_or("an upload run without bytes")?;
+            // Only these bytes: a run is megabytes, and Elden Ring has thousands of CB bindings per frame.
+            let rest = begin + run["size"].as_u64().unwrap_or(0) - offset;
+            if len <= rest {
+                return self
+                    .blobs
+                    .read(key, offset - begin, Some(len))
+                    .map_err(|e| format!("upload bytes: {e}"));
+            }
+        }
+        let size = usize::try_from(len).map_err(|_| "too large".to_string())?;
+        let mut bytes = vec![0u8; size];
+        let mut known = vec![false; size];
+        let mut base = None;
+        match self.first_use.get(&resource).map(|f| &f.content) {
+            Some(Ok((key, _))) => {
+                let read = self
+                    .blobs
+                    .read(key, offset, Some(len))
+                    .map_err(|e| format!("first-use bytes: {e}"))?;
+                let n = read.len().min(size);
+                bytes[..n].copy_from_slice(&read[..n]);
+                known[..n].fill(true);
+            }
+            Some(Err(why)) => base = Some(why.clone()),
+            None => base = Some("no copy of it was made before its first use".to_string()),
+        }
+        let address = |v: &Value| v["resource"].as_u64().or_else(|| v.as_u64());
+        for write in self.writes(resource, event) {
+            let a: Value = serde_json::from_str(&write.args).unwrap_or_default();
+            let (to, from, from_offset, n) = match write.call {
+                "CopyBufferRegion" => (a[1].as_u64(), address(&a[2]), a[3].as_u64(), a[4].as_u64()),
+                "CopyResource" => (Some(0), address(&a[1]), Some(0), Some(u64::MAX)),
+                call => {
+                    return Err(format!(
+                        "written in the frame by {call}, which locum does not follow"
+                    ));
+                }
+            };
+            let (Some(to), Some(from), Some(from_offset), Some(n)) = (to, from, from_offset, n) else {
+                return Err(format!(
+                    "a {} into it whose arguments locum cannot read",
+                    write.call
+                ));
+            };
+            let lo = offset.max(to);
+            let hi = (offset + len).min(to.saturating_add(n));
+            if lo >= hi {
+                continue;
+            }
+            let source = self
+                .at(from, from_offset + (lo - to), hi - lo, write.seq, depth + 1)
+                .map_err(|why| {
+                    format!("copied in the frame from a buffer whose bytes are not known ({why})")
+                })?;
+            let (lo, hi) = ((lo - offset) as usize, (hi - offset) as usize);
+            bytes[lo..hi].copy_from_slice(&source);
+            known[lo..hi].fill(true);
+        }
+        if known.iter().all(|k| *k) {
+            Ok(bytes)
+        } else {
+            Err(base.unwrap_or_else(|| "its first-use bytes end before the range".to_string()))
+        }
+    }
 }
 
 /// The frame's command history projected into the common tables, one submission at a time.

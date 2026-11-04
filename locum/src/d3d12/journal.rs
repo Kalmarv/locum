@@ -674,7 +674,8 @@ const CONSTANT_BUFFER_BYTES: u64 = 65536;
 
 /// The upload bytes an armed submission's work reads: every upload buffer whole at the frame's first submission
 /// (marked `whole`, the contents its resources began the frame with), then at each submission only the
-/// constant-buffer ranges its lists' root CBVs and the descriptor heaps' CBVs name, merged into runs per buffer.
+/// constant-buffer ranges its lists' root CBVs and the descriptor heaps' CBVs name, and the ranges its buffer copies
+/// read (a constant buffer in a default heap is filled that way), merged into runs per buffer.
 /// The GPU copies them (see [`super::readback`]). Runs closer than [`CONSTANT_BUFFER_BYTES`] are copied as one:
 /// Elden Ring's 128k CBVs left 23.7k runs of ~540 bytes per submission, which merge into about three.
 fn upload_copies<'a>(
@@ -696,7 +697,7 @@ fn upload_copies<'a>(
     }
     let mut ranges = Vec::new();
     for list in lists {
-        constant_ranges(list, uploads, &mut ranges);
+        read_ranges(list, uploads, &mut ranges);
     }
     ranges.extend(constant_buffers.filter(|(resource, _, _)| uploads.contains_key(resource)));
     for (resource, begin, end) in runs(ranges, CONSTANT_BUFFER_BYTES) {
@@ -713,12 +714,29 @@ fn upload_copies<'a>(
     out
 }
 
-/// Root constant-buffer views on upload buffers, in this list and the bundles it executes, as (resource, begin, end)
-/// at the largest size a constant buffer can have: the bytes a shader reads are not known until reflection.
-fn constant_ranges(list: &model::List, uploads: &BTreeMap<u64, Upload>, ranges: &mut Vec<(u64, u64, u64)>) {
+/// The upload bytes this list and the bundles it executes read, as (resource, begin, end): root constant-buffer
+/// views at the largest size a constant buffer can have (the bytes a shader reads are not known until reflection), and
+/// the sources of buffer copies.
+fn read_ranges(list: &model::List, uploads: &BTreeMap<u64, Upload>, ranges: &mut Vec<(u64, u64, u64)>) {
     for c in &list.commands {
         if let Some(bundle) = &c.bundle {
-            constant_ranges(bundle, uploads, ranges);
+            read_ranges(bundle, uploads, ranges);
+        }
+        let upload = |v: &Value| v.as_u64().filter(|r| uploads.contains_key(r));
+        match c.call {
+            "CopyBufferRegion" => {
+                if let (Some(resource), Some(offset), Some(bytes)) =
+                    (upload(&c.args[2]), c.args[3].as_u64(), c.args[4].as_u64())
+                {
+                    ranges.push((resource, offset, offset.saturating_add(bytes)));
+                }
+            }
+            "CopyResource" => {
+                if let Some(resource) = upload(&c.args[1]) {
+                    ranges.push((resource, 0, uploads[&resource].bytes as u64));
+                }
+            }
+            _ => {}
         }
         if matches!(
             c.call,
