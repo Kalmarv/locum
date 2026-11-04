@@ -370,12 +370,12 @@ shared light list and how many there are, so where each tile's lights land depen
 tiles. Such an output is taken as slices when the list is the game's records in another order, one word of each
 record differs from the game's (the start; or two, the start and the end), every other word is the game's, and each
 record's slice of the list holds the game's records in the game's order. A buffer without a structure is tried as
-records of 8 to 64 bytes, with any bytes past the last whole one the game's (Elden Ring's are 12: start, light count
-and spot count, then a 64-byte tail). Then verify puts the game's bytes in place and goes on from them, so everything
-after follows the game's order and can be compared exactly. None of these is a failure. Outputs that differ in more
-than that are listed as not compared, as when the shader writes what its atomics returned some other way: what
-verify proves is that every target is the game's given what those events wrote in the game. Rules do not change
-what such an event writes.
+records of 8 to 64 bytes, with any bytes past the last whole one the game's (Elden Ring's are 12: the start, the
+slice's length and a third word the game's on both sides, then a 64-byte tail). Then verify puts the game's bytes in
+place and goes on from them, so everything after follows the game's order and can be compared exactly. None of these
+is a failure. Outputs that differ in more than that are listed as not compared, as when the shader writes what its
+atomics returned some other way: what verify proves is that every target is the game's given what those events
+wrote in the game. Rules do not change what such an event writes.
 
 A draw is replayed with what it depends on: walking back from it, each earlier event that wrote a resource it (or an
 event already taken) reads or writes is taken too, and every resource starts with its contents as the frame began.
