@@ -68,7 +68,7 @@ pub(super) fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
 }
 
 /// Each subresource's bytes, tightly packed: a pattern that differs per subresource.
-fn pattern(subs: &[locum_capture::layout::Sub], seed: u8) -> Vec<Vec<u8>> {
+pub(super) fn pattern(subs: &[locum_capture::layout::Sub], seed: u8) -> Vec<Vec<u8>> {
     subs.iter()
         .map(|s| {
             (0..s.size)
@@ -82,7 +82,7 @@ fn pattern(subs: &[locum_capture::layout::Sub], seed: u8) -> Vec<Vec<u8>> {
 }
 
 /// Copies `data` (each subresource tightly packed) into `texture` through an upload buffer, kept alive in `keep`.
-unsafe fn fill(
+pub(super) unsafe fn fill(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,

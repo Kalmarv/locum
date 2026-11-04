@@ -337,8 +337,12 @@ use; `d12_first_use` keeps the submission and the state or layout of each subres
 makes all these copies, on the submitting queue just before the game's lists, into readback memory a background
 thread reads (at most 1 GiB waits at once): the CPU reads upload heaps at a few MB/s. A texture is transitioned to
 COPY_SOURCE and back from the state locum tracks for it, from its creation and every submitted barrier; the log's
-`D3D12 states` line counts barriers whose before-state differed from the tracked one. Multisampled and reserved
-resources, and a submission on a queue waiting for a fence nothing has signalled yet, are recorded gaps.
+`D3D12 states` line counts barriers whose before-state differed from the tracked one. A compute or copy queue's
+barriers cannot name every state (a compute list may not name PIXEL_SHADER_RESOURCE, and enhanced barriers may not
+name a subresource in a legacy state): such a resource is copied on a direct queue of locum's, after the work its
+queue was given so far, and the queue waits for that copy before the game's lists. Multisampled and reserved
+resources, and a submission on a queue waiting for a fence nothing has signalled yet, are recorded gaps; a resource
+only a stale descriptor names (destroyed before the submission) is noted as such.
 
 Lists reset or created while a capture is armed are instrumented: where a pass ends, locum records copies of its
 render and depth targets into the game's own list, so they run on the GPU right after the pass's last draw. A pass

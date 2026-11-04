@@ -25,6 +25,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
 use windows::core::Interface;
 
 use super::states::{Access, COMMON, COPY_SOURCE, UNDEFINED};
+use crate::log::log;
 
 /// One range of an upload buffer to copy: `whole` marks the copy of a whole upload buffer at the frame's first
 /// submission.
@@ -144,7 +145,63 @@ pub unsafe fn submit(
         }
     };
     let kind = unsafe { queue.GetDesc() }.Type;
-    // Place every item, finding each resource's real object and footprints.
+    let (here, direct): (Vec<_>, Vec<_>) = items.into_iter().partition(|item| match item {
+        Ok(_) => true,
+        Err(snapshot) => !needs_direct(snapshot, kind),
+    });
+    let start = Instant::now();
+    let chunks = unsafe { place(&device, kind, here, submission, &mut failed) };
+    unsafe {
+        run(
+            queue,
+            &device,
+            kind,
+            submission,
+            chunks,
+            start,
+            results,
+            &mut failed,
+        )
+    };
+    if !direct.is_empty() {
+        let chunks = unsafe {
+            place(
+                &device,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                direct,
+                submission,
+                &mut failed,
+            )
+        };
+        if !chunks.is_empty() {
+            unsafe { beside(queue, &device, submission, chunks, start, results, &mut failed) };
+        }
+    }
+    if !failed.uploads.is_empty() || !failed.contents.is_empty() {
+        results.lock().unwrap_or_else(|e| e.into_inner()).push(failed);
+    }
+}
+
+/// Whether a snapshot's states can be transitioned only on a direct queue, not on a queue of `kind`: a compute list
+/// may not name PIXEL_SHADER_RESOURCE, nor a copy list any read state but COPY_SOURCE.
+fn needs_direct(snapshot: &Snapshot, kind: D3D12_COMMAND_LIST_TYPE) -> bool {
+    kind != D3D12_COMMAND_LIST_TYPE_DIRECT
+        && snapshot.states.iter().any(|s| unreadable(*s, kind).is_some())
+        && snapshot
+            .states
+            .iter()
+            .all(|s| unreadable(*s, D3D12_COMMAND_LIST_TYPE_DIRECT).is_none())
+}
+
+/// Finds each item's real resource and footprints for lists of `kind`, and lays the items out in chunks of at most
+/// [`CHUNK`] bytes; items that cannot be copied go to `failed`.
+unsafe fn place(
+    device: &ID3D12Device,
+    kind: D3D12_COMMAND_LIST_TYPE,
+    items: Vec<Result<Copy, Snapshot>>,
+    submission: u64,
+    failed: &mut Batch,
+) -> Vec<Vec<Placed>> {
     let mut chunks: Vec<Vec<Placed>> = vec![Vec::new()];
     let mut chunk_bytes = 0;
     for item in items {
@@ -156,7 +213,7 @@ pub unsafe fn submit(
                 }
                 None => Err(Ok(copy)),
             },
-            Err(snapshot) => unsafe { contents(&device, kind, snapshot) }.map_err(Err),
+            Err(snapshot) => unsafe { contents(device, kind, snapshot) }.map_err(Err),
         };
         let (item, bytes) = match placed {
             Ok(placed) => placed,
@@ -182,8 +239,134 @@ pub unsafe fn submit(
         });
         chunk_bytes = (chunk_bytes + bytes).next_multiple_of(ALIGN);
     }
-    let start = Instant::now();
-    for placed in chunks.into_iter().filter(|c| !c.is_empty()) {
+    chunks.retain(|c| !c.is_empty());
+    chunks
+}
+
+/// A direct queue of locum's beside an application queue of another type, and the fences that order the two: the
+/// application's queue signals `ready` where its next work begins and waits for `done`, which the helper signals once
+/// its copies are made.
+struct Helper {
+    device: usize,
+    queue: ID3D12CommandQueue,
+    ready: ID3D12Fence,
+    done: ID3D12Fence,
+    next: u64,
+}
+
+// Free-threaded D3D12 objects; the map's lock serializes their use.
+unsafe impl Send for Helper {}
+
+/// Makes `chunks` on a direct queue of locum's, between the application queue's work submitted so far and the
+/// submission about to follow: the copies see what that submission will, and it waits for them. The helper queue and
+/// its fences live as long as the process, so no wait can outlive a fence.
+unsafe fn beside(
+    queue: &ID3D12CommandQueue,
+    device: &ID3D12Device,
+    submission: u64,
+    chunks: Vec<Vec<Placed>>,
+    start: Instant,
+    results: &Results,
+    failed: &mut Batch,
+) {
+    static HELPERS: OnceLock<Mutex<std::collections::HashMap<usize, Helper>>> = OnceLock::new();
+    let mut helpers = HELPERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let key = queue.as_raw() as usize;
+    let device_key = device.as_raw() as usize;
+    if helpers.get(&key).is_some_and(|h| h.device != device_key) {
+        // The application's queue was destroyed and another made at its address on another device.
+        helpers.remove(&key);
+    }
+    let helper = match helpers.entry(key) {
+        std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            unsafe { helper(device, device_key) }.map(|h| e.insert(h))
+        }
+    };
+    let helper = match helper {
+        Ok(h) => h,
+        Err(reason) => {
+            for p in chunks.into_iter().flatten() {
+                fail_item(failed, p.item, &reason);
+            }
+            return;
+        }
+    };
+    helper.next += 1;
+    let n = helper.next;
+    // Nothing is queued on either side unless the whole handshake can be: a wait left without its signal would hang a
+    // queue for good.
+    if let Err(e) = unsafe { queue.Signal(&helper.ready, n) } {
+        for p in chunks.into_iter().flatten() {
+            fail_item(failed, p.item, &format!("helper queue: Signal: {e}"));
+        }
+        return;
+    }
+    if let Err(e) = unsafe { helper.queue.Wait(&helper.ready, n) } {
+        for p in chunks.into_iter().flatten() {
+            fail_item(failed, p.item, &format!("helper queue: Wait: {e}"));
+        }
+        return;
+    }
+    unsafe {
+        run(
+            &helper.queue,
+            device,
+            D3D12_COMMAND_LIST_TYPE_DIRECT,
+            submission,
+            chunks,
+            start,
+            results,
+            failed,
+        )
+    };
+    // The application's queue waits only for a signal already queued.
+    if unsafe { helper.queue.Signal(&helper.done, n) }.is_ok() {
+        if let Err(e) = unsafe { queue.Wait(&helper.done, n) } {
+            log!("D3D12 helper queue: the application's queue could not wait for its copies: {e}");
+        }
+    } else {
+        log!(
+            "D3D12 helper queue: Signal after the copies failed; the application's queue does not wait for them"
+        );
+    }
+}
+
+unsafe fn helper(device: &ID3D12Device, device_key: usize) -> Result<Helper, String> {
+    let queue = unsafe {
+        device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ..Default::default()
+        })
+    }
+    .map_err(|e| format!("helper queue: CreateCommandQueue: {e}"))?;
+    let fence = || unsafe { device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) };
+    Ok(Helper {
+        device: device_key,
+        queue,
+        ready: fence().map_err(|e| format!("helper queue: CreateFence: {e}"))?,
+        done: fence().map_err(|e| format!("helper queue: CreateFence: {e}"))?,
+        next: 0,
+    })
+}
+
+/// Records and executes `chunks` on `queue` (lists of `kind`), each once the readback budget has room; the collector
+/// reads them into `results`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn run(
+    queue: &ID3D12CommandQueue,
+    device: &ID3D12Device,
+    kind: D3D12_COMMAND_LIST_TYPE,
+    submission: u64,
+    chunks: Vec<Vec<Placed>>,
+    start: Instant,
+    results: &Results,
+    failed: &mut Batch,
+) {
+    for placed in chunks {
         let bytes = placed.last().map_or(0, |p| p.at + p.bytes);
         // Wait for the collector to make room; past our patience, the chunk is given up.
         loop {
@@ -203,11 +386,11 @@ pub unsafe fn submit(
                 PATIENCE.as_secs()
             );
             for p in placed {
-                fail_item(&mut failed, p.item, &reason);
+                fail_item(failed, p.item, &reason);
             }
             continue;
         }
-        match unsafe { record(queue, &device, kind, submission, placed, bytes) } {
+        match unsafe { record(queue, device, kind, submission, placed, bytes) } {
             Ok(pending) => {
                 IN_FLIGHT.fetch_add(bytes, Ordering::AcqRel);
                 let results = results.clone();
@@ -219,13 +402,10 @@ pub unsafe fn submit(
             }
             Err((placed, reason)) => {
                 for p in placed {
-                    fail_item(&mut failed, p.item, &reason);
+                    fail_item(failed, p.item, &reason);
                 }
             }
         }
-    }
-    if !failed.uploads.is_empty() || !failed.contents.is_empty() {
-        results.lock().unwrap_or_else(|e| e.into_inner()).push(failed);
     }
 }
 
