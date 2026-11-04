@@ -460,6 +460,10 @@ enum Command {
         #[arg(short, long)]
         out: PathBuf,
         inputs: Vec<PathBuf>,
+        /// A list of buffer keys to add, one `key<TAB>bytes<TAB>name` a line, as a game's reader writes them for
+        /// what is inside its archives (fromsoft-formats' `flver_keys` example: FLVER vertex and index bytes).
+        #[arg(long)]
+        keys: Vec<PathBuf>,
     },
     /// What each resource the frame used was made from, by the indexes given (--index).
     Join {
@@ -822,7 +826,7 @@ fn run(cli: Cli) -> Result<(), String> {
             memory::memdiff(&a, &b, from, to, tolerance, limit)
         }
         Command::Diff { a, b, draws, limit } => diff::diff(&open(&a)?, &open(&b)?, draws, limit),
-        Command::Index { out, inputs } => join::index(&out, &inputs),
+        Command::Index { out, inputs, keys } => join::index(&out, &inputs, &keys),
         Command::Join {
             capture,
             all,

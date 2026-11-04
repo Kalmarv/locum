@@ -256,6 +256,43 @@ pub fn number(bytes: [u8; 4], base: Option<u16>) -> Value {
     }
 }
 
+/// What a vertex or index binding's bytes were made from when no file is the whole buffer: for indices, the ones the
+/// draw reads (a FLVER face set) before the bound range (its data block); for vertices, the bound range.
+fn range_name(c: &Capture, r: i64, b: &Row, call: &str, args: &str) -> Option<crate::join::Match> {
+    let (offset, size) = (u64::try_from(b.offset?).ok()?, u64::try_from(b.size?).ok()?);
+    match b.kind.as_str() {
+        "vb" => c.names.range(c, r, offset, size),
+        "ib" => {
+            let width: u64 = match b.format? {
+                57 => 2,
+                42 => 4,
+                _ => return c.names.range(c, r, offset, size),
+            };
+            let a: Vec<u64> = serde_json::from_str::<Vec<Value>>(args)
+                .unwrap_or_default()
+                .iter()
+                .map(|v| v.as_u64().unwrap_or(0))
+                .collect();
+            // DrawIndexed(count, start, base); DrawIndexedInstanced(count, instances, start, base, first instance)
+            let drawn = match call {
+                "DrawIndexed" => a.first().zip(a.get(1)),
+                "DrawIndexedInstanced" => a.first().zip(a.get(2)),
+                _ => None,
+            };
+            let drawn =
+                drawn.and_then(|(&count, &start)| c.names.range(c, r, offset + start * width, count * width));
+            let bound = c.names.range(c, r, offset, size);
+            // The one fewer files share: a face set's indices are often the same in models of one shape, the data
+            // block holding them seldom.
+            match (drawn, bound) {
+                (Some(d), Some(b)) if b.others < d.others => Some(b),
+                (d, b) => d.or(b),
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Draw `n` as `draw` shows it. Without `all`, only constant registers the shader uses.
 pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> Result<Draw, String> {
     type Head = (
@@ -408,8 +445,11 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
             shape: b.resource.and_then(|r| shape(c, r)).map(|s| s.to_string()),
             file: b
                 .resource
-                .and_then(|r| c.names.of(c, r))
-                .map(|m| m.file.name.clone()),
+                .and_then(|r| c.names.of(c, r).or_else(|| range_name(c, r, b, &call, &args)))
+                .map(|m| match m.others {
+                    0 => m.file.name.clone(),
+                    n => format!("{} (+{n} with the same bytes)", m.file.name),
+                }),
             offset: b.offset,
             size: b.size,
             stride: b.stride,

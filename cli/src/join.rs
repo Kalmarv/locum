@@ -5,7 +5,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
+use locum_capture::hash::key;
 use locum_capture::index::{File, Index, Like};
 
 use crate::describe::shape;
@@ -51,14 +53,46 @@ impl std::fmt::Display for Match {
 pub struct Names {
     indexes: Vec<Index>,
     cache: RefCell<HashMap<i64, Option<Match>>>,
+    /// Buffers' contents as the frame began, read once for the ranges named in them.
+    contents: RefCell<HashMap<i64, Option<Rc<Vec<u8>>>>>,
 }
 
 impl Names {
     pub fn open(paths: &[PathBuf]) -> Result<Names, String> {
         Ok(Names {
             indexes: paths.iter().map(|p| Index::open(p)).collect::<Result<_, _>>()?,
-            cache: RefCell::default(),
+            ..Names::default()
         })
+    }
+
+    /// What the `len` bytes at `offset` of buffer `id` (as the frame began) were made from, if an index knows: a
+    /// mesh's vertex or index bytes in a buffer that holds more (a pool, or a file's data block padded when uploaded).
+    pub fn range(&self, c: &Capture, id: i64, offset: u64, len: u64) -> Option<Match> {
+        if self.indexes.is_empty() || len == 0 {
+            return None;
+        }
+        let bytes = self.contents_of(c, id)?;
+        let end = offset.checked_add(len)?;
+        let part = bytes.get(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)?;
+        let (file, others) = self.whole(&key(part), &Like::Buffer)?;
+        Some(Match {
+            file,
+            how: format!("bytes {offset}..{end}"),
+            others,
+        })
+    }
+
+    fn contents_of(&self, c: &Capture, id: i64) -> Option<Rc<Vec<u8>>> {
+        self.contents
+            .borrow_mut()
+            .entry(id)
+            .or_insert_with(|| {
+                let key: String = c
+                    .row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))
+                    .flatten()?;
+                c.blob(&key).ok().map(Rc::new)
+            })
+            .clone()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -163,10 +197,34 @@ impl Names {
 }
 
 /// Adds every DDS file under each of `inputs` (or the file itself) to the index at `out`, named by its path from the
-/// input.
-pub fn index(out: &Path, inputs: &[PathBuf]) -> Result<(), String> {
+/// input, and the buffers each of `keys` lists: lines of `key<TAB>bytes<TAB>name`, as a game's reader writes them for
+/// what is inside its archives (fromsoft-formats' `flver_keys` for FLVER vertex and index bytes).
+pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf]) -> Result<(), String> {
     let mut index = Index::create(out)?;
     let (mut added, mut refused) = (0usize, Vec::new());
+    let mut keyed = 0usize;
+    for list in keys {
+        let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
+        for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+            let at = format!("{}:{}", list.display(), n + 1);
+            let mut parts = line.splitn(3, '\t');
+            let (Some(key), Some(bytes), Some(name)) = (parts.next(), parts.next(), parts.next()) else {
+                refused.push(format!("{at}: not key<TAB>bytes<TAB>name"));
+                continue;
+            };
+            let Ok(bytes) = bytes.parse::<u64>() else {
+                refused.push(format!("{at}: {bytes:?} is not a count of bytes"));
+                continue;
+            };
+            match index.add_buffer_key(name, bytes, key) {
+                Ok(()) => keyed += 1,
+                Err(e) => refused.push(format!("{at}: {e}")),
+            }
+            if keyed % 10000 == 9999 {
+                index.commit()?;
+            }
+        }
+    }
     for input in inputs {
         let mut stack = vec![input.clone()];
         while let Some(p) = stack.pop() {
@@ -200,7 +258,10 @@ pub fn index(out: &Path, inputs: &[PathBuf]) -> Result<(), String> {
         }
     }
     index.commit()?;
-    out!("{added} DDS files added to {}", out.display());
+    out!(
+        "{added} DDS files and {keyed} buffer keys added to {}",
+        out.display()
+    );
     if !refused.is_empty() {
         out!("{} refused:", refused.len());
         for r in refused.iter().take(20) {
@@ -217,6 +278,21 @@ pub fn index(out: &Path, inputs: &[PathBuf]) -> Result<(), String> {
         .collect();
     out!("the index holds {}", counts.join(", "));
     Ok(())
+}
+
+/// The distinct (offset, size) ranges the frame's draws bound buffer `id` at as vertices or indices, each with what
+/// an index names it.
+fn bound_ranges(c: &Capture, id: i64) -> Vec<((i64, i64), Option<Match>)> {
+    let ranges: Vec<(i64, i64)> = c.rows(
+        "SELECT DISTINCT offset, size FROM bindings WHERE resource = ?1 AND kind IN ('vb', 'ib') \
+         AND offset IS NOT NULL AND size > 0 ORDER BY offset, size",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    );
+    ranges
+        .into_iter()
+        .map(|(o, n)| ((o, n), c.names.range(c, id, o as u64, n as u64)))
+        .collect()
 }
 
 /// What each resource of `c` was made from: those the frame used (but its targets), or `all`.
@@ -244,13 +320,20 @@ pub fn join(c: &Capture, all: bool, unnamed: bool, limit: usize) -> Result<(), S
     for (id, kind, draws) in &ids {
         let k = if kind == "buffer" { "buffer" } else { "texture" };
         let m = c.names.of(c, *id);
+        // A buffer no file is whole: the vertex and index ranges the draws bound in it, each by its own file.
+        let ranges = if m.is_none() && k == "buffer" {
+            bound_ranges(c, *id)
+        } else {
+            Vec::new()
+        };
+        let named = m.is_some() || ranges.iter().any(|r| r.1.is_some());
         let t = tally.entry(k).or_default();
-        if m.is_some() {
+        if named {
             t.0 += 1;
         } else {
             t.1 += 1;
         }
-        if m.is_some() == unnamed || shown >= limit {
+        if named == unnamed || shown >= limit {
             continue;
         }
         shown += 1;
@@ -263,6 +346,16 @@ pub fn join(c: &Capture, all: bool, unnamed: bool, limit: usize) -> Result<(), S
         match m {
             Some(m) => out!("{s}{used}\n    {m}"),
             None => out!("{s}{used}"),
+        }
+        let found: Vec<&Match> = ranges.iter().filter_map(|r| r.1.as_ref()).collect();
+        if !ranges.is_empty() && !found.is_empty() {
+            out!("    {} of {} bound ranges named:", found.len(), ranges.len());
+            for m in found.iter().take(8) {
+                out!("    {m}");
+            }
+            if found.len() > 8 {
+                out!("    ... {} more", found.len() - 8);
+            }
         }
     }
     let what = if all { "alive" } else { "the frame used" };

@@ -205,9 +205,21 @@ impl Index {
 
     /// Adds a buffer's bytes under `name`.
     pub fn add_buffer(&mut self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.add_buffer_key(name, bytes.len() as u64, &key(bytes))
+    }
+
+    /// Adds a buffer of `bytes` bytes whose key (`hash::key`) another tool computed, under `name`.
+    pub fn add_buffer_key(&mut self, name: &str, bytes: u64, key: &str) -> Result<(), String> {
+        if key.len() != 32
+            || !key
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(format!("{key:?} is not a key: 32 lowercase hex digits"));
+        }
         self.db
             .prepare_cached("INSERT INTO files(name, kind, bytes, key) VALUES (?1, 'buffer', ?2, ?3)")
-            .and_then(|mut s| s.execute(params![name, bytes.len() as i64, key(bytes)]))
+            .and_then(|mut s| s.execute(params![name, bytes as i64, key]))
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -359,6 +371,26 @@ mod tests {
             index.counts(),
             vec![("buffer".to_string(), 1), ("texture".to_string(), 1)]
         );
+        drop(index);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_listed_key_names_a_buffer() {
+        let path = std::env::temp_dir().join(format!("locum-index-keys-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let bytes = b"a mesh's vertices";
+        {
+            let mut index = Index::create(&path).unwrap();
+            index
+                .add_buffer_key("m.flver#vb0", bytes.len() as u64, &key(bytes))
+                .unwrap();
+            assert!(index.add_buffer_key("bad", 1, "not a key").is_err());
+            assert!(index.add_buffer_key("upper", 1, &key(bytes).to_uppercase()).is_err());
+        }
+        let index = Index::open(&path).unwrap();
+        let (files, count) = index.whole(&key(bytes), &Like::Buffer, 10);
+        assert_eq!((files[0].name.as_str(), count), ("m.flver#vb0", 1));
         drop(index);
         let _ = std::fs::remove_file(&path);
     }

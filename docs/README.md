@@ -325,14 +325,19 @@ the way captures key contents (a texture's canonical layout is a DDS file's orde
 mip by mip as it is):
 
 ```
-locum-cli index files.db DIR...            # key every DDS file under each DIR
+locum-cli index -o files.db DIR...         # key every DDS file under each DIR
+locum-cli index -o files.db --keys k.tsv   # add buffer keys a game's reader listed (key<TAB>bytes<TAB>name lines)
 locum-cli --index files.db join last       # what each texture and buffer the frame used was made from
 locum-cli --index files.db draw last 120   # bound resources are shown with their file's name
 ```
 
 A resource is matched by its upload, its contents, or subresource by subresource (a texture made from fewer mips
-than its file holds, or from one face). `LOCUM_INDEX` (paths separated by `;`) stands in for `--index`. A game's own
-extractor can add what it reads from its archives through `locum_capture::index`.
+than its file holds, or from one face). A buffer no file is whole is matched range by range: each vertex range a
+draw binds, and for indices the ones the draw reads (a face set) or the bound range, whichever fewer files share; a
+game that uploads a model's data block padded, or many models into one pool, is named this way. `LOCUM_INDEX` (paths
+separated by `;`) stands in for `--index`. A game's own extractor can add what it reads from its archives through
+`locum_capture::index`, or list keys for `--keys`: fromsoft-formats' `flver_keys` example lists every FLVER's data
+block, vertex buffers and face sets in Sekiro's or Elden Ring's archives.
 
 Constants are named from each shader's reflection (its `RDEF` part as `dxbc-reader` reads it, Shader Model 4.0 to 5.1,
 register spaces included), as `cbuffer.variable[index].component`. PNGs of depth and other one-channel images are
