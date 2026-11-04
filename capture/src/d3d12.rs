@@ -134,6 +134,12 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    /// A submission's upload copies, read back after the frame.
+    pub fn set_uploads(&mut self, submission: u64, uploads: Vec<(u64, Value)>) {
+        if let Some(s) = self.frame.submissions.iter_mut().find(|s| s.id == submission) {
+            s.uploads = uploads;
+        }
+    }
     /// Populate CPU upload contents and per-draw constant bytes after queued blobs are durable.
     pub fn contents(&self, capture: &mut db::Capture, blobs: &crate::blobs::Blobs) {
         // Per submission, runs of upload bytes keyed by where they begin; and each upload buffer whole as the frame
@@ -187,23 +193,15 @@ impl Prepared {
             let Some(key) = content["blob"].as_str() else {
                 continue;
             };
-            match blobs.get(key) {
+            // Only the binding's bytes: a run is megabytes, and Elden Ring has thousands of CB bindings per frame.
+            let start = offset - begin;
+            let rest = content["size"].as_u64().unwrap_or(0) - start;
+            let len = binding.size.map_or(rest, |size| size.min(rest));
+            match blobs.read(key, start, Some(len)) {
                 Ok(bytes) => {
-                    let start = (offset - begin) as usize;
-                    let end = binding
-                        .size
-                        .and_then(|s| (s as usize).checked_add(start))
-                        .map_or(bytes.len(), |end| end.min(bytes.len()));
-                    if let Some(bytes) = bytes.get(start..end) {
-                        let key = crate::hash::key(bytes);
-                        capture.cb_data.push((key.clone(), bytes.to_vec()));
-                        binding.content = Some(key);
-                    } else {
-                        gaps.push(format!(
-                            "draw {} resource {resource}: CB range exceeds upload bytes",
-                            binding.draw
-                        ));
-                    }
+                    let key = crate::hash::key(&bytes);
+                    capture.cb_data.push((key.clone(), bytes));
+                    binding.content = Some(key);
                 }
                 Err(e) => gaps.push(format!(
                     "draw {} resource {resource}: upload {key}: {e}",
@@ -217,8 +215,9 @@ impl Prepared {
                 && blobs.has(key)
             {
                 resource.content = Some(key.into());
-                resource.content_source = Some("cpu-before-submit");
-                resource.content_note=Some("CPU upload bytes before the first captured submission; host writes must precede submission".into());
+                resource.content_source = Some("upload-at-first-submission");
+                resource.content_note =
+                    Some("upload bytes as the GPU reached the frame's first captured submission".into());
             }
         }
         for gap in gaps {

@@ -320,7 +320,8 @@ retain their original generations. A request arms at the next non-test Present a
 Captures use schema 4 with `api=d3d12`: queue submissions, list executions, fence values, descriptor versions, root
 signatures, root arguments and PSO inputs are authoritative records. Upload buffers are copied whole once, at the
 frame's first submission; each later submission keeps only the constant-buffer ranges its root and descriptor CBVs
-name, copying ranges less than 64 KiB apart as one. Each submission records the descriptor definitions that changed
+name, copying ranges less than 64 KiB apart as one. The GPU makes these copies, on the submitting queue just before
+the game's lists, into readback memory read after the frame: the CPU reads upload heaps at a few MB/s. Each submission records the descriptor definitions that changed
 since the previous one (all of them at the first; `empty` marks a slot emptied), so `d12_submission_descriptors`
 holds changes, not whole heaps. The CLI and viewer project these into their
 draw, resource, binding and pipeline views. Display order across queues is not a GPU execution order; queue order

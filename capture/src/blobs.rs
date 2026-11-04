@@ -319,6 +319,8 @@ mod tests {
     #[test]
     fn put_get() {
         let dir = std::env::temp_dir().join(format!("locum-blobs-test-{}", std::process::id()));
+        // Process ids are reused: a folder an earlier run left behind must not count as stored blobs.
+        let _ = std::fs::remove_dir_all(&dir);
         let blobs = Blobs::new(&dir);
         let key = crate::hash::key(b"abc");
         assert!(blobs.put(&key, b"abc").unwrap());
@@ -334,6 +336,7 @@ mod tests {
     #[test]
     fn append_flush_and_older_stores() {
         let dir = std::env::temp_dir().join(format!("locum-blobs-pack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
         let blobs = Blobs::new(&dir);
         let keys: Vec<String> = (0..100u32).map(|i| crate::hash::key(&i.to_le_bytes())).collect();
         for (i, k) in keys.iter().enumerate() {

@@ -559,7 +559,7 @@ unsafe impl Queue12Methods for crate::d3d12::Object {
             self.called("ExecuteCommandLists");
             let mut queue_order = self.data.queue_seq.lock().unwrap_or_else(|e| e.into_inner());
             *queue_order += 1;
-            crate::d3d12::journal::submit(&self.data, *queue_order, a0, a1);
+            crate::d3d12::journal::submit(&self.data, self.real(), *queue_order, a0, a1);
             real::ExecuteCommandLists(self.real(), a0, mapped1.ptr());
         }
     }

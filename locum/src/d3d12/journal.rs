@@ -9,8 +9,7 @@ use std::time::Instant;
 use super::cost::Counter;
 use locum_capture::{d3d12 as model, db, writer};
 use serde_json::{Value, json};
-use windows::Win32::Graphics::Direct3D12::{D3D12_RANGE, ID3D12Resource};
-use windows::core::{HRESULT, Interface};
+use windows::core::HRESULT;
 
 use crate::log::{folder, log};
 
@@ -114,6 +113,12 @@ struct State {
     descriptors: super::slots::Known,
     /// The armed frame's constant-buffer views as of its latest submission: (heap, slot) to (resource, begin, end).
     constant_buffers: BTreeMap<(u64, u32), (u64, u64, u64)>,
+    /// The armed frame's upload copies, by submission: on the GPU, or failed with their reason.
+    readbacks: Vec<(u64, Readback)>,
+}
+enum Readback {
+    Queued(super::readback::Pending),
+    Failed(Vec<(u64, Value)>),
 }
 #[derive(Default)]
 struct Upload {
@@ -328,8 +333,14 @@ pub unsafe fn created_list(
     }
 }
 
-/// Called while the queue lock is held, immediately before forwarding ExecuteCommandLists.
-pub unsafe fn submit(queue: &Data, sequence: u64, count: u32, pointers: *const *mut c_void) {
+/// Called while the queue lock is held, immediately before forwarding ExecuteCommandLists to `real`, the real queue.
+pub unsafe fn submit(
+    queue: &Data,
+    real: *mut c_void,
+    sequence: u64,
+    count: u32,
+    pointers: *const *mut c_void,
+) {
     if !enabled() {
         return;
     }
@@ -378,17 +389,23 @@ pub unsafe fn submit(queue: &Data, sequence: u64, count: u32, pointers: *const *
             }
         }
     }
-    let uploads = match s.capture.as_ref() {
-        Some((_, frame)) => unsafe {
-            upload_contents(
-                &s.uploads,
-                frame.submissions.is_empty(),
-                &lists,
-                s.constant_buffers.values(),
-            )
-        },
-        None => Vec::new(),
-    };
+    if let Some((_, frame)) = s.capture.as_ref() {
+        let start = Instant::now();
+        let copies = upload_copies(
+            &s.uploads,
+            frame.submissions.is_empty(),
+            &lists,
+            s.constant_buffers.values(),
+        );
+        if !copies.is_empty() {
+            let readback = match unsafe { super::readback::submit(real, copies) } {
+                Ok(pending) => Readback::Queued(pending),
+                Err((copies, reason)) => Readback::Failed(super::readback::failed(copies, &reason)),
+            };
+            s.readbacks.push((id, readback));
+        }
+        UPLOAD_COST.add(start, 0);
+    }
     if let Some((_, frame)) = s.capture.as_mut() {
         frame.diagnostics.extend(diagnostics);
         frame.submissions.push(model::Submission {
@@ -398,7 +415,8 @@ pub unsafe fn submit(queue: &Data, sequence: u64, count: u32, pointers: *const *
             cpu_seq,
             lists,
             descriptors,
-            uploads,
+            // Filled from the GPU's copies when the capture is written.
+            uploads: Vec::new(),
         });
     }
     SUBMISSION_COST.add(start, 0);
@@ -410,27 +428,23 @@ const CONSTANT_BUFFER_BYTES: u64 = 65536;
 /// The upload bytes an armed submission's work reads: every upload buffer whole at the frame's first submission
 /// (marked `whole`, the contents its resources began the frame with), then at each submission only the
 /// constant-buffer ranges its lists' root CBVs and the descriptor heaps' CBVs name, merged into runs per buffer.
-/// Copying every upload buffer whole at every submission cost seconds per submission on Elden Ring's persistent
-/// 323 MB ring, so the armed frame never reached its closing Present. Copying each range on its own cost as much:
-/// Elden Ring's 128k CBVs left 23.7k separate runs of ~540 bytes per submission, 36 s of per-copy overhead in one
-/// frame; runs closer than [`CONSTANT_BUFFER_BYTES`] are copied as one (81 copies for that frame, 629 MiB).
-///
-/// # Safety
-/// Mapped pointers in `uploads` are the application's live persistent maps.
-unsafe fn upload_contents<'a>(
+/// The GPU copies them (see [`super::readback`]). Runs closer than [`CONSTANT_BUFFER_BYTES`] are copied as one:
+/// Elden Ring's 128k CBVs left 23.7k runs of ~540 bytes per submission, which merge into about three.
+fn upload_copies<'a>(
     uploads: &BTreeMap<u64, Upload>,
     first: bool,
     lists: &[Arc<model::List>],
     constant_buffers: impl Iterator<Item = &'a (u64, u64, u64)>,
-) -> Vec<(u64, Value)> {
+) -> Vec<super::readback::Copy> {
     let mut out = Vec::new();
     if first {
         for (&resource, u) in uploads {
-            let mut content = unsafe { upload_range(resource, u, 0, u.bytes) };
-            if let Some(o) = content.as_object_mut() {
-                o.insert("whole".into(), json!(true));
-            }
-            out.push((resource, content));
+            out.push(super::readback::Copy {
+                resource,
+                offset: 0,
+                len: u.bytes as u64,
+                whole: true,
+            });
         }
     }
     let mut ranges = Vec::new();
@@ -439,12 +453,14 @@ unsafe fn upload_contents<'a>(
     }
     ranges.extend(constant_buffers.filter(|(resource, _, _)| uploads.contains_key(resource)));
     for (resource, begin, end) in runs(ranges, CONSTANT_BUFFER_BYTES) {
-        let u = &uploads[&resource];
-        let end = end.min(u.bytes as u64);
+        let end = end.min(uploads[&resource].bytes as u64);
         if begin < end {
-            out.push((resource, unsafe {
-                upload_range(resource, u, begin as usize, (end - begin) as usize)
-            }));
+            out.push(super::readback::Copy {
+                resource,
+                offset: begin,
+                len: end - begin,
+                whole: false,
+            });
         }
     }
     out
@@ -485,43 +501,6 @@ fn runs(mut ranges: Vec<(u64, u64, u64)>, gap: u64) -> Vec<(u64, u64, u64)> {
         }
     }
     merged
-}
-
-/// `len` bytes at `offset` of an upload buffer, through the application's persistent map or a map of our own.
-///
-/// # Safety
-/// A non-zero `u.pointer` is the application's live map of the resource.
-unsafe fn upload_range(resource: u64, u: &Upload, offset: usize, len: usize) -> Value {
-    let start = Instant::now();
-    let mut content = if u.pointer != 0 {
-        unsafe { super::pipelines::bytes((u.pointer + offset) as *const c_void, len) }
-    } else {
-        // Re-map an unmapped CPU-visible resource through its real interface, reading only the range.
-        match super::real(resource).and_then(|r| r.cast::<ID3D12Resource>().ok()) {
-            Some(r) => {
-                let mut p = std::ptr::null_mut();
-                let range = D3D12_RANGE {
-                    Begin: offset,
-                    End: offset + len,
-                };
-                match unsafe { r.Map(0, Some(&range), Some(&mut p)) } {
-                    Ok(()) => {
-                        let content =
-                            unsafe { super::pipelines::bytes(p.cast::<u8>().add(offset).cast(), len) };
-                        unsafe { r.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
-                        content
-                    }
-                    Err(e) => json!({"diagnostic":format!("upload snapshot Map: {e}")}),
-                }
-            }
-            None => json!({"diagnostic":"upload resource identity expired before submission"}),
-        }
-    };
-    if let Some(o) = content.as_object_mut() {
-        o.insert("offset".into(), json!(offset));
-    }
-    UPLOAD_COST.add(start, len as u64);
-    content
 }
 
 pub fn sync(queue: &Data, sequence: u64, kind: &'static str, fence: *mut c_void, value: u64, hr: HRESULT) {
@@ -602,7 +581,10 @@ pub fn present(frame_number: u64) {
     let Some(root) = folder() else {
         return;
     };
-    let finished = state().capture.take();
+    let (finished, readbacks) = {
+        let mut s = state();
+        (s.capture.take(), std::mem::take(&mut s.readbacks))
+    };
     if let Some((path, frame)) = finished {
         super::log_counts();
         let mut capture = db::Capture::default();
@@ -623,7 +605,7 @@ pub fn present(frame_number: u64) {
             "verification_scope",
             "command history; resource checkpoints not yet implemented",
         );
-        let prepared = frame.prepare(&mut capture);
+        let mut prepared = frame.prepare(&mut capture);
         capture.gap(
             "d3d12-capture-development",
             "GPU first-use/pass-end checkpoints and full pipeline inspection are in development",
@@ -632,6 +614,14 @@ pub fn present(frame_number: u64) {
         // The same "capture written" / "capture NOT written" lines as Direct3D 11's: runners wait for them.
         writer::run(move || {
             let t = std::time::Instant::now();
+            // The upload copies finish on the GPU soon after the frame; reading them waits here, off the game's threads.
+            for (submission, readback) in readbacks {
+                let uploads = match readback {
+                    Readback::Queued(pending) => super::readback::collect(pending),
+                    Readback::Failed(uploads) => uploads,
+                };
+                prepared.set_uploads(submission, uploads);
+            }
             prepared.contents(&mut capture, &crate::settings::settings().blobs);
             capture.d3d12 = Some(prepared);
             let file = path.join("capture.db");
@@ -675,6 +665,7 @@ pub fn present(frame_number: u64) {
         let mut s = state();
         s.descriptors.clear();
         s.constant_buffers.clear();
+        s.readbacks.clear();
         s.capture = Some((
             path,
             model::Frame {

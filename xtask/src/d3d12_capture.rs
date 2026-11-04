@@ -131,7 +131,7 @@ pub fn before(c: &Class, e: &Entry) -> String {
     {
         let mut s = "let mut queue_order = self.data.queue_seq.lock().unwrap_or_else(|e|e.into_inner());\n*queue_order += 1;\n".to_string();
         if n == "ExecuteCommandLists" {
-            s.push_str("crate::d3d12::journal::submit(&self.data,*queue_order,a0,a1);\n");
+            s.push_str("crate::d3d12::journal::submit(&self.data,self.real(),*queue_order,a0,a1);\n");
         }
         return s;
     }

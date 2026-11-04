@@ -10,6 +10,7 @@ pub mod journal;
 pub mod pipelines;
 mod portable;
 mod ranges;
+mod readback;
 pub mod shaders;
 mod slots;
 pub mod values;
