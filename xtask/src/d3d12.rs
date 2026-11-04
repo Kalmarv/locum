@@ -185,7 +185,7 @@ pub fn implementation(c: &Class, levels: &[(String, &Vtbl)]) -> String {
 }
 
 /// The D3D12 smoke on WARP, or with `hardware` what only a real GPU shows, on the default adapter.
-pub fn smoke(root: &std::path::Path, hardware: bool) {
+pub fn smoke(root: &std::path::Path, hardware: bool, debug: bool) {
     use std::process::Command;
     let status = Command::new(env!("CARGO"))
         .current_dir(root)
@@ -279,7 +279,7 @@ pub fn smoke(root: &std::path::Path, hardware: bool) {
         assert!(log.contains(proof), "missing wrapper proof: {proof}");
     }
     println!("D3D12 log proves proxied device, queue, resources, list execution and swapchain");
-    replay_checks(&stage, pid);
+    replay_checks(&stage, pid, debug);
 }
 
 /// The fixture's hardware scenarios on the default adapter, then their captures replayed there.
@@ -322,7 +322,7 @@ fn hardware_smoke(stage: &std::path::Path, log: &std::path::Path) {
 }
 
 /// Replays the fixture's captures with locum-cli on WARP: verify, a rule, and contents at an event.
-fn replay_checks(stage: &std::path::Path, pid: u32) {
+fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
     use std::process::Command;
     let log = stage.join("log");
     let capture = |name: &str| {
@@ -391,6 +391,27 @@ fn replay_checks(stage: &std::path::Path, pid: u32) {
         "results: the tickets' outputs: {ordered}"
     );
     println!("ok   D3D12 verify: what dispatches and a clear wrote through UAVs replays as the game's");
+    // Under the debug layer, with a pass under GPU-based validation of its own: the dispatches write a texture made
+    // for simultaneous access as a UAV, which that validation takes for an error the spec does not make it.
+    if debug {
+        let (ok, text) = run(&["verify", "--warp", "--debug", &capture("results")]);
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("validated in ") && l.ends_with(": 0 errors")),
+            "results: GPU-based validation found errors"
+        );
+        assert!(
+            !text.contains("D3D12 validation"),
+            "results: the debug layer found errors"
+        );
+        assert!(
+            ok && text.contains(
+                "what draws and dispatches wrote through UAVs: 9 identical to the game's, 0 different"
+            ),
+            "results: verify --debug compares as verify does"
+        );
+        println!("ok   D3D12 verify --debug: no validation errors, and the outputs compared as without it");
+    }
     // Passes' targets, drawn from root constants across lists, are the fixture's bit for bit.
     let (_, text) = run(&["verify", "--warp", &capture("passes")]);
     let identical = text.lines().find_map(|l| {

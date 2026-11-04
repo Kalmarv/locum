@@ -302,16 +302,19 @@ fn transition(r: &ID3D12Resource, sub: u32, before: i32, after: i32) -> D3D12_RE
 }
 
 impl D3d12 {
-    pub fn new(warp: bool, debug: bool) -> Result<D3d12, String> {
+    pub fn new(warp: bool, validation: super::Validation) -> Result<D3d12, String> {
+        let debug = validation != super::Validation::Off;
         unsafe {
             if debug {
                 let mut d: Option<ID3D12Debug> = None;
                 D3D12GetDebugInterface(&mut d).map_err(|e| format!("D3D12GetDebugInterface: {e}"))?;
                 let d = d.ok_or("no debug interface")?;
                 d.EnableDebugLayer();
-                // GPU-based validation as well: descriptors, resource states and bounds as the GPU uses them.
+                // The layer stays in the process once enabled: say each time whether shaders are patched too.
                 if let Ok(d1) = d.cast::<ID3D12Debug1>() {
-                    d1.SetEnableGPUBasedValidation(true);
+                    d1.SetEnableGPUBasedValidation(validation == super::Validation::Gpu);
+                } else if validation == super::Validation::Gpu {
+                    return Err("this runtime has no GPU-based validation (ID3D12Debug1)".into());
                 }
             }
             // If the device is removed, DRED says which address faulted and which resources were around it.
@@ -551,14 +554,34 @@ impl D3d12 {
                 ) {
                     let text =
                         std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength);
-                    out.push(format!(
-                        "D3D12 validation: {}",
-                        String::from_utf8_lossy(text).trim_end_matches('\0')
-                    ));
+                    let text = String::from_utf8_lossy(text);
+                    let text = text.trim_end_matches('\0');
+                    if !self.allowed_in_common(message.ID, text) {
+                        out.push(format!("D3D12 validation: {text}"));
+                    }
                 }
             }
         }
         out
+    }
+
+    /// Whether a message is GPU-based validation's about a texture made for simultaneous access: it takes such a
+    /// texture as in the COMMON layout, where only copies and shader reads are allowed. Simultaneous-access textures
+    /// are always in COMMON, and there they can be used as UAVs and render targets without barriers (the enhanced
+    /// barriers spec, "COMMON layout"). The message comes for any of them a shader writes as a UAV, after a barrier
+    /// to UNORDERED_ACCESS or not, on the GPU and on WARP alike; it is not an error.
+    fn allowed_in_common(&self, id: D3D12_MESSAGE_ID, text: &str) -> bool {
+        // Replay names each resource `#id`: "Resource: 0x...:'#2895', ...".
+        let named = text
+            .split_once("Resource: ")
+            .and_then(|(_, rest)| rest.split_once(":'#"))
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .and_then(|(n, _)| n.parse::<i64>().ok());
+        id == D3D12_MESSAGE_ID_GPU_BASED_VALIDATION_INCOMPATIBLE_TEXTURE_LAYOUT
+            && text.contains("Layout: D3D12_BARRIER_LAYOUT_COMMON")
+            && named
+                .and_then(|n| self.resources.get(&n))
+                .is_some_and(|m| m.desc.Flags.0 & SIMULTANEOUS != 0)
     }
 
     /// A committed buffer of `size` bytes on an upload or readback heap, mapped; kept until the open list completes.
@@ -2269,8 +2292,11 @@ impl Backend for D3d12 {
                 ids.join(" ")
             ));
         }
-        warnings.extend(self.messages());
         warnings.into_iter().collect()
+    }
+
+    fn validation(&self) -> Vec<String> {
+        self.messages()
     }
 }
 

@@ -387,7 +387,7 @@ pub fn within(c: &Capture, arg: &str, x: u32, y: u32, sub: Option<u32>, warp: bo
         &plan,
         &[],
         warp,
-        false,
+        crate::replay::Validation::Off,
         |seq, b| {
             if writers.contains(&seq) {
                 after.push((seq, b.read(s.resource).and_then(|bytes| texel(&bytes))));

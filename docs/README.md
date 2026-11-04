@@ -389,7 +389,20 @@ draw needs, so the game's own barriers are not replayed. Pipelines are rebuilt f
 root signatures from their bytes; root constants, root views and tables are set as each draw had them. Rules work
 as on Direct3D 11: a shader or solid rule compiles to DXIL (`ps_6_0`, with the SDK's dxcompiler) for a DXIL
 pipeline, and a constant rule rewrites a root constant, or a copy of the constant buffer a root view or table points
-at. Query resolves are not replayed. `--debug` adds GPU-based validation to the debug layer.
+at. Query resolves are not replayed.
+
+`verify --debug` replays a Direct3D 12 frame twice. The first time is under GPU-based validation, which checks
+descriptors, resource states and bounds as the shaders use them; only its errors count. It patches the shaders to do
+that, and patched shaders round some results otherwise than the game's. In Elden Ring an SSAO pixel shader with no
+UAVs left 7 of 921600 texels one step off, and later passes carried that on, so 44 of 184 targets differed. Patch
+mode NONE gives every target identical; STATE_TRACKING_ONLY gives the same 44. The second time is under the debug
+layer alone, which compares as verify does without it. `replay --debug` runs under GPU-based validation, so its
+images can differ from the game's in that way.
+
+GPU-based validation takes a texture made for simultaneous access as in the COMMON layout. It then reports any UAV
+use of it as "Incompatible texture barrier layout" (message 1358), barrier or not. The spec keeps those textures in
+COMMON and allows UAV and render-target access there without barriers. Replay makes textures for simultaneous access
+wherever it can, so it drops that message for them, and only for them.
 
 The memory dump ties what the GPU saw back to the game's memory:
 
@@ -638,7 +651,8 @@ An unrecognized PSO stream type logs its first occurrence once per type per proc
 `cargo xtask smoke --api d3d12` runs a program through it on WARP with the debug layer on (copies, dispatches, fences,
 pipeline states and libraries, placed resources, barriers, swap chain present and resize); `cargo xtask smoke --api
 d3d12 --hardware` runs what WARP cannot show on the default adapter, at the game's size (a copy's order against the
-list's next draw), and verifies the capture there; `cargo xtask smoke` stays the Direct3D 11 suite. The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
+list's next draw), and verifies the capture there; `--debug` also verifies the UAV fixture with `verify --debug` (no
+validation errors, outputs compared as without it); `cargo xtask smoke` stays the Direct3D 11 suite. The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
 
 ## Crash investigation
 

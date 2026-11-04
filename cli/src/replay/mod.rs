@@ -33,11 +33,28 @@ pub trait Backend {
     fn write(&mut self, c: &Capture, id: i64, contents: &[u8]) -> Result<(), String>;
     /// What it could not do as recorded, once each.
     fn warnings(&self) -> Vec<String>;
+    /// The errors the API's validation reported so far (none without it).
+    fn validation(&self) -> Vec<String> {
+        Vec::new()
+    }
     /// Brings what the API holds outside events up to just before event `seq` (a Direct3D 12 queue's changes to
     /// tile mappings, first-use contents waiting for their submission), where no event the plan ran has.
     fn reach(&mut self, _c: &Capture, _seq: i64) -> Result<(), String> {
         Ok(())
     }
+}
+
+/// The checks of the API a replay runs under.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Validation {
+    Off,
+    /// The debug layer: each call checked as it is made.
+    Layer,
+    /// The debug layer and, in Direct3D 12, GPU-based validation: descriptors, resource states and bounds checked as
+    /// the shaders use them, by shaders it patches. Patched shaders round some results otherwise than the game's (in
+    /// Elden Ring, an SSAO pixel shader with no UAVs left 7 of 921600 texels one step off), so what a replay under it
+    /// writes is not the game's to the bit.
+    Gpu,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -226,7 +243,7 @@ pub fn contents_at(
         sub: None,
         z: 0,
     };
-    let (mut bytes, warnings) = execute(c, &plan, &[], warp, false, &[out])?;
+    let (mut bytes, warnings) = execute(c, &plan, &[], warp, Validation::Off, &[out])?;
     let contents = bytes.remove(&id).ok_or("the replay did not read it back")?;
     Ok((contents, plan.events.len(), warnings))
 }
@@ -443,7 +460,7 @@ fn execute(
     plan: &Plan,
     rules: &[Rule],
     warp: bool,
-    debug: bool,
+    validation: Validation,
     outs: &[Output],
 ) -> Result<(ResourceBytes, Vec<String>), String> {
     let mut results = HashMap::new();
@@ -452,7 +469,7 @@ fn execute(
         plan,
         rules,
         warp,
-        debug,
+        validation,
         |_, _| Ok(()),
         |b| {
             for o in outs {
@@ -474,35 +491,11 @@ pub fn run(
     plan: &Plan,
     rules: &[Rule],
     warp: bool,
-    debug: bool,
+    validation: Validation,
     mut after: impl FnMut(i64, &mut dyn Backend) -> Result<(), String>,
     end: impl FnOnce(&mut dyn Backend) -> Result<(), String>,
 ) -> Result<Vec<String>, String> {
-    let mut b = backend(c, warp, debug)?;
-    let mut missing = 0;
-    for &id in &plan.resources {
-        let key: Option<String> = c
-            .row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))
-            .flatten();
-        let contents = match key {
-            Some(k) => Some(c.blob(&k)?),
-            None => {
-                let tiled: bool = c
-                    .row(
-                        "SELECT content_source = 'tile-events' FROM resources WHERE id=?1",
-                        [id],
-                        |r| r.get(0),
-                    )
-                    .unwrap_or(false);
-                if !tiled {
-                    missing += 1;
-                }
-                None
-            }
-        };
-        b.create(c, id, contents.as_deref())
-            .map_err(|e| format!("resource #{id}: {e}"))?;
-    }
+    let (mut b, missing) = made(c, plan, warp, validation)?;
     // Only order-dependent outputs are put back: the game's bytes for any other would undo what a rule changed.
     let written = recorded(c);
     let mut settled = 0;
@@ -521,6 +514,7 @@ pub fn run(
     }
     end(b.as_mut())?;
     let mut warnings = b.warnings();
+    warnings.extend(b.validation());
     if missing > 0 {
         warnings.push(format!(
             "{missing} resources had no contents in the capture and started empty"
@@ -532,6 +526,42 @@ pub fn run(
         ));
     }
     Ok(warnings)
+}
+
+/// A backend holding the plan's resources with their contents as the frame began, and how many of them had no
+/// contents in the capture (tiled resources made of their tile events aside).
+fn made(
+    c: &Capture,
+    plan: &Plan,
+    warp: bool,
+    validation: Validation,
+) -> Result<(Box<dyn Backend>, usize), String> {
+    let mut b = backend(c, warp, validation)?;
+    let mut missing = 0;
+    for &id in &plan.resources {
+        let key: Option<String> = c
+            .row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))
+            .flatten();
+        let contents = match key {
+            Some(k) => Some(c.blob(&k)?),
+            None => {
+                let tiled: bool = c
+                    .row(
+                        "SELECT coalesce(content_source, '') = 'tile-events' FROM resources WHERE id = ?1",
+                        [id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(false);
+                if !tiled {
+                    missing += 1;
+                }
+                None
+            }
+        };
+        b.create(c, id, contents.as_deref())
+            .map_err(|e| format!("resource #{id}: {e}"))?;
+    }
+    Ok((b, missing))
 }
 
 /// A resource checkpoint after a draw/dispatch UAV write or a clear.
@@ -709,10 +739,10 @@ fn same_records(a: &[u8], b: &[u8], stride: usize) -> bool {
     x == y
 }
 
-fn backend(c: &Capture, warp: bool, debug: bool) -> Result<Box<dyn Backend>, String> {
+fn backend(c: &Capture, warp: bool, validation: Validation) -> Result<Box<dyn Backend>, String> {
     match c.meta("api").as_deref() {
-        Some("d3d11") => Ok(Box::new(d3d11::D3d11::new(warp, debug)?)),
-        Some("d3d12") => Ok(Box::new(d3d12::D3d12::new(warp, debug)?)),
+        Some("d3d11") => Ok(Box::new(d3d11::D3d11::new(warp, validation != Validation::Off)?)),
+        Some("d3d12") => Ok(Box::new(d3d12::D3d12::new(warp, validation)?)),
         Some(api) => Err(format!("no replay for {api} captures yet")),
         None => Err("the capture names no API to replay".into()),
     }
@@ -735,7 +765,7 @@ pub struct Options {
     pub rules: Vec<String>,
     pub rules_file: Option<PathBuf>,
     pub warp: bool,
-    pub debug: bool,
+    pub validation: Validation,
     pub out: PathBuf,
     pub range: Range,
 }
@@ -819,7 +849,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     }
     std::fs::create_dir_all(&o.out).map_err(|e| format!("{}: {e}", o.out.display()))?;
     let t = std::time::Instant::now();
-    let (base, warnings) = execute(c, &plan, &[], o.warp, o.debug, &outs)?;
+    let (base, warnings) = execute(c, &plan, &[], o.warp, o.validation, &outs)?;
     out!("  replayed in {:.2} s", t.elapsed().as_secs_f64());
     for w in &warnings {
         out!("  warning: {w}");
@@ -827,7 +857,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     let edited = if parsed.is_empty() {
         None
     } else {
-        let (after, _) = execute(c, &plan, &parsed, o.warp, o.debug, &outs)?;
+        let (after, _) = execute(c, &plan, &parsed, o.warp, o.validation, &outs)?;
         Some(after)
     };
     // Captured targets after this draw, to compare the replay against.
@@ -977,19 +1007,35 @@ pub fn verify(
         plan.resources.len(),
         checks.len()
     );
-    let started = std::time::Instant::now();
-    let mut b = backend(c, warp, debug)?;
-    for &id in &plan.resources {
-        let key: Option<String> = c
-            .row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))
-            .flatten();
-        let contents = match key {
-            Some(k) => Some(c.blob(&k)?),
-            None => None,
-        };
-        b.create(c, id, contents.as_deref())
-            .map_err(|e| format!("resource #{id}: {e}"))?;
+    // GPU-based validation patches the shaders, and patched shaders do not round as the game's did: it runs a pass of
+    // its own, for its errors, and the pass that compares runs under the debug layer alone.
+    let mut validated = BTreeSet::new();
+    if debug && c.meta("api").as_deref() == Some("d3d12") {
+        out!(
+            "validating: the frame under GPU-based validation, its errors only (its patched shaders round otherwise)"
+        );
+        let started = std::time::Instant::now();
+        run(
+            c,
+            &plan,
+            &[],
+            warp,
+            Validation::Gpu,
+            |_, _| Ok(()),
+            |b| {
+                validated.extend(b.validation());
+                Ok(())
+            },
+        )?;
+        out!(
+            "validated in {:.1} s: {} errors",
+            started.elapsed().as_secs_f64(),
+            validated.len()
+        );
     }
+    let started = std::time::Instant::now();
+    let validation = if debug { Validation::Layer } else { Validation::Off };
+    let (mut b, _) = made(c, &plan, warp, validation)?;
     out!(
         "planned in {:.1} s; device and resources made in {:.1} s",
         planned.as_secs_f64(),
@@ -1177,6 +1223,8 @@ pub fn verify(
         ));
     }
     incomplete.extend(b.warnings().into_iter().map(|w| format!("replay: {w}")));
+    validated.extend(b.validation());
+    incomplete.extend(validated.into_iter().map(|w| format!("replay: {w}")));
     for i in &incomplete {
         out!("incomplete: {i}");
     }

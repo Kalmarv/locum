@@ -504,7 +504,8 @@ enum Command {
         /// Run on WARP, the software rasterizer, instead of the GPU.
         #[arg(long)]
         warp: bool,
-        /// Enable the D3D11 or D3D12 debug layer (D3D12: with GPU-based validation); errors make verification fail.
+        /// Enable the D3D11 or D3D12 debug layer (D3D12: with GPU-based validation, whose patched shaders can round
+        /// otherwise than the game's); errors are reported.
         #[arg(long)]
         debug: bool,
         #[arg(short, long, default_value = "replay")]
@@ -517,7 +518,8 @@ enum Command {
         capture: String,
         #[arg(long)]
         warp: bool,
-        /// Enable the D3D11 or D3D12 debug layer (D3D12: with GPU-based validation); errors make verification fail.
+        /// Enable the D3D11 or D3D12 debug layer; errors make verification fail. D3D12 also replays the frame under
+        /// GPU-based validation first, for its errors only: its patched shaders round otherwise than the game's.
         #[arg(long)]
         debug: bool,
         /// Compare at most this many targets.
@@ -1073,7 +1075,11 @@ fn run(cli: Cli) -> Result<(), String> {
                     rules: rule,
                     rules_file: rules,
                     warp,
-                    debug,
+                    validation: if debug {
+                        replay::Validation::Gpu
+                    } else {
+                        replay::Validation::Off
+                    },
                     out,
                     range: range(&r)?,
                 },

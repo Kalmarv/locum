@@ -1354,7 +1354,11 @@ impl Backend for D3d11 {
     }
 
     fn warnings(&self) -> Vec<String> {
-        let mut warnings = self.warnings.clone();
+        self.warnings.iter().cloned().collect()
+    }
+
+    fn validation(&self) -> Vec<String> {
+        let mut warnings = BTreeSet::new();
         if let Some(queue) = &self.debug {
             unsafe {
                 if queue.GetNumMessagesDiscardedByMessageCountLimit() != 0 {
