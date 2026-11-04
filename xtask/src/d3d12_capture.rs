@@ -203,7 +203,33 @@ pub fn before(c: &Class, e: &Entry) -> String {
         "ExecuteIndirect" => "[id(a0),a1,id(a2),a3,id(a4),a5]",
         "SetMarker" | "BeginEvent" => "[a0,slice(a1.cast::<u8>(),a2 as usize)]",
         "EndEvent" | "EndRenderPass" => "[]",
-        _ => return format!("self.data.pending(\"{n}\");\n"),
+        "WriteBufferImmediate" => "[write_immediate(a1,a2,a0)]",
+        "DiscardResource" => "[id(a0),discard_region(a1)]",
+        "CopyTiles" => "[id(a0),tile_coordinate(a1),tile_region(a2),id(a3),a4,a5.0]",
+        "AtomicCopyBufferUINT" | "AtomicCopyBufferUINT64" => {
+            "[id(a0),a1,id(a2),a3,dependent_resources(a5,a6,a4)]"
+        }
+        "SetSamplePositions" => "[a0,a1,sample_positions(a2,a0,a1)]",
+        "ResolveSubresourceRegion" => {
+            "[id(a0),a1,a2,a3,id(a4),a5,rects(a6,u32::from(!a6.is_null())),a7.0,a8.0]"
+        }
+        "BeginRenderPass" => "[render_pass_targets(a1,a0),render_pass_depth(a2),a3.0]",
+        "InitializeMetaCommand" | "ExecuteMetaCommand" => "[id(a0),slice(a1.cast::<u8>(),a2)]",
+        "BuildRaytracingAccelerationStructure" => "[acceleration_structure_build(a0),postbuild_info(a2,a1)]",
+        "EmitRaytracingAccelerationStructurePostbuildInfo" => "[postbuild_info(a0,1),addresses(a2,a1)]",
+        "CopyRaytracingAccelerationStructure" => "[address(a0),address(a1),a2.0]",
+        "DispatchRays" => "[dispatch_rays(a0)]",
+        "RSSetShadingRate" => "[a0.0,slice(a1,2).iter().map(|c|c.0).collect::<Vec<_>>()]",
+        "RSSetShadingRateImage" => "[id(a0)]",
+        "DispatchMesh" => "[a0,a1,a2]",
+        "Barrier" => "[barrier_groups(a1,a0)]",
+        "OMSetFrontAndBackStencilRef" => "[a0,a1]",
+        "RSSetDepthBias" => "[a0,a1,a2]",
+        "IASetIndexBufferStripCutValue" => "[a0.0]",
+        "SetProgram" => "[set_program(a0)]",
+        "DispatchGraph" => "[dispatch_graph(a0)]",
+        // Every list method is represented: one without an entry fails generation rather than recording blindly.
+        _ => panic!("no capture entry for command list method {n}"),
     };
     format!(
         "self.data.record(\"{n}\", || {{ #[allow(unused_imports)] use crate::d3d12::values::*; serde_json::json!({expr}) }});\n"
@@ -283,19 +309,41 @@ pub fn after(c: &Class, e: &Entry) -> String {
             "if result.is_ok() { crate::d3d12::values::created_descriptor_heap(self.data.id,a2); }"
         }
         ("d12_device", "CreateCommittedResource") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,a3.0,0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,crate::d3d12::values::Initial::State(a3.0),0,0); }"
         }
         ("d12_device", "CreateCommittedResource1") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a7,a3.0,0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a7,crate::d3d12::values::Initial::State(a3.0),0,0); }"
         }
         ("d12_device", "CreatePlacedResource") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,a3.0,crate::d3d12::id(a0),a1); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,crate::d3d12::values::Initial::State(a3.0),crate::d3d12::id(a0),a1); }"
         }
         ("d12_device", "CreateReservedResource") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a4,a1.0,0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a4,crate::d3d12::values::Initial::State(a1.0),0,0); }"
         }
         ("d12_device", "CreateReservedResource1") => {
-            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a5,a1.0,0,0); }"
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a5,crate::d3d12::values::Initial::State(a1.0),0,0); }"
+        }
+        ("d12_device", "CreateCommittedResource2") => {
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a7,crate::d3d12::values::Initial::State(a3.0),0,0); }"
+        }
+        ("d12_device", "CreatePlacedResource1") => {
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a6,crate::d3d12::values::Initial::State(a3.0),crate::d3d12::id(a0),a1); }"
+        }
+        ("d12_device", "CreateCommittedResource3") => {
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a9,crate::d3d12::values::Initial::Layout(a3.0),0,0); }"
+        }
+        ("d12_device", "CreatePlacedResource2") => {
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a8,crate::d3d12::values::Initial::Layout(a3.0),crate::d3d12::id(a0),a1); }"
+        }
+        ("d12_device", "CreateReservedResource2") => {
+            "if result.is_ok() { crate::d3d12::values::created_resource(self.data.id,a7,crate::d3d12::values::Initial::Layout(a1.0),0,0); }"
+        }
+        ("d12_device", "CreateCommandQueue1") => {
+            "if result.is_ok() { crate::d3d12::values::created_queue(self.data.id,a3,a0); }"
+        }
+        ("d12_device", "CreateSampler2") => "crate::d3d12::descriptors::sampler2(a0,a1);",
+        ("d12_device", "CreateSamplerFeedbackUnorderedAccessView") => {
+            "crate::d3d12::descriptors::sampler_feedback(a0,a1,a2);"
         }
         _ => return String::new(),
     };

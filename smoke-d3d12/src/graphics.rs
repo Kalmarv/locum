@@ -22,7 +22,7 @@ unsafe fn compile(source: &[u8], target: PCSTR) -> ID3DBlob {
     .unwrap();
     code.unwrap()
 }
-unsafe fn transition(
+pub(super) unsafe fn transition(
     list: &ID3D12GraphicsCommandList,
     r: &ID3D12Resource,
     from: D3D12_RESOURCE_STATES,

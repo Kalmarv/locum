@@ -7,6 +7,7 @@ use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
 mod graphics;
+mod modern;
 
 fn identity<T: Interface, U: Interface>(a: &T, b: &U) {
     assert_eq!(
@@ -452,6 +453,8 @@ unsafe fn run() {
         // The fixture's closing Present queues backbuffer work after its readback
         // fence. Complete that work before ResizeBuffers releases the buffers.
         finish(&queue, &fence, 11);
+        modern::capture(&device, &queue, &fence, &chain);
+        finish(&queue, &fence, 13);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

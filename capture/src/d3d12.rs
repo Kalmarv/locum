@@ -673,12 +673,30 @@ impl Projection {
         for (index, command) in list.commands.iter().enumerate() {
             pipeline.apply(command);
             let seq = capture.events.len() as u64 + 1;
+            // The event kinds D3D11 captures use, so both APIs browse alike.
             let kind = match command.call {
-                "DrawInstanced" | "DrawIndexedInstanced" => "draw",
-                "Dispatch" => "dispatch",
+                "DrawInstanced" | "DrawIndexedInstanced" | "DispatchMesh" => "draw",
+                // Ray and graph dispatches bind through the compute root signature, as a dispatch does.
+                "Dispatch" | "DispatchRays" | "DispatchGraph" => "dispatch",
                 "ExecuteIndirect" => "indirect",
-                "CopyBufferRegion" | "CopyTextureRegion" | "CopyResource" | "CopyTiles" => "copy",
-                "ResourceBarrier" => "barrier",
+                "CopyBufferRegion"
+                | "CopyTextureRegion"
+                | "CopyResource"
+                | "CopyTiles"
+                | "AtomicCopyBufferUINT"
+                | "AtomicCopyBufferUINT64"
+                | "CopyRaytracingAccelerationStructure"
+                | "BuildRaytracingAccelerationStructure"
+                | "EmitRaytracingAccelerationStructurePostbuildInfo"
+                | "ResolveQueryData" => "copy",
+                "ClearRenderTargetView"
+                | "ClearDepthStencilView"
+                | "ClearUnorderedAccessViewUint"
+                | "ClearUnorderedAccessViewFloat" => "clear",
+                "ResolveSubresource" | "ResolveSubresourceRegion" => "resolve",
+                "DiscardResource" => "discard",
+                "WriteBufferImmediate" => "update",
+                "ResourceBarrier" | "Barrier" => "barrier",
                 "ExecuteBundle" => "bundle",
                 _ => "state",
             };

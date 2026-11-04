@@ -59,20 +59,6 @@ impl Data {
         }
         RECORDING_COST.add(start, 0);
     }
-    pub fn pending(&self, call: &'static str) {
-        if !enabled() {
-            return;
-        }
-        let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(recording) = recording.as_mut() {
-            recording.record(model::Command {
-                call,
-                args: Value::Null,
-                bundle: None,
-                diagnostic: Some("semantic capture implementation pending".into()),
-            });
-        }
-    }
     pub fn bundle(&self, pointer: *mut c_void) {
         if !enabled() {
             return;

@@ -82,7 +82,7 @@ macro_rules! unknown {
 }
 #[repr(C)]
 struct Device {
-    table: *const ID3D12Device7_Vtbl,
+    table: *const ID3D12Device14_Vtbl,
     grow_from: *mut c_void,
 }
 unsafe impl Device12Methods for Device {

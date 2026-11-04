@@ -277,3 +277,46 @@ pub unsafe fn state_object(p: *const D3D12_STATE_OBJECT_DESC) -> StateObject {
         _associations: associations,
     }
 }
+/// Enhanced-barrier groups with their texture and buffer barriers' resources unwrapped. The inner arrays are owned
+/// here; their heap buffers stay put when this value moves, so the group pointers into them remain valid.
+pub struct BarrierGroups {
+    groups: Input<D3D12_BARRIER_GROUP>,
+    _textures: Vec<Input<D3D12_TEXTURE_BARRIER>>,
+    _buffers: Vec<Input<D3D12_BUFFER_BARRIER>>,
+}
+impl BarrierGroups {
+    pub fn ptr(&self) -> *const D3D12_BARRIER_GROUP {
+        self.groups.ptr()
+    }
+}
+pub unsafe fn barrier_groups(p: *const D3D12_BARRIER_GROUP, count: u32) -> BarrierGroups {
+    let mut groups = unsafe { copy(p, count as usize) };
+    let (mut textures, mut buffers) = (Vec::new(), Vec::new());
+    for g in &mut groups.values {
+        let n = g.NumBarriers as usize;
+        match g.Type {
+            D3D12_BARRIER_TYPE_TEXTURE => {
+                let mut inner = unsafe { copy(g.Anonymous.pTextureBarriers, n) };
+                for b in &mut inner.values {
+                    unsafe { field(&mut b.pResource) };
+                }
+                g.Anonymous.pTextureBarriers = inner.ptr();
+                textures.push(inner);
+            }
+            D3D12_BARRIER_TYPE_BUFFER => {
+                let mut inner = unsafe { copy(g.Anonymous.pBufferBarriers, n) };
+                for b in &mut inner.values {
+                    unsafe { field(&mut b.pResource) };
+                }
+                g.Anonymous.pBufferBarriers = inner.ptr();
+                buffers.push(inner);
+            }
+            _ => {}
+        }
+    }
+    BarrierGroups {
+        groups,
+        _textures: textures,
+        _buffers: buffers,
+    }
+}

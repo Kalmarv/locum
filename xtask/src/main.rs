@@ -35,13 +35,13 @@ const CLASSES: &[Class] = &[
     Class {
         module: "d12_debug_base",
         trait_name: "DebugBase12Methods",
-        interface: "ID3D12Debug",
+        interface: "ID3D12Debug6",
         source: &["Win32", "Graphics", "Direct3D12"],
     },
     Class {
         module: "d12_device",
         trait_name: "Device12Methods",
-        interface: "ID3D12Device7",
+        interface: "ID3D12Device14",
         source: &["Win32", "Graphics", "Direct3D12"],
     },
     Class {
@@ -53,7 +53,7 @@ const CLASSES: &[Class] = &[
     Class {
         module: "d12_list",
         trait_name: "List12Methods",
-        interface: "ID3D12GraphicsCommandList4",
+        interface: "ID3D12GraphicsCommandList10",
         source: &["Win32", "Graphics", "Direct3D12"],
     },
     Class {
@@ -125,7 +125,7 @@ const CLASSES: &[Class] = &[
     Class {
         module: "d12_properties",
         trait_name: "Properties12Methods",
-        interface: "ID3D12StateObjectProperties",
+        interface: "ID3D12StateObjectProperties1",
         source: &["Win32", "Graphics", "Direct3D12"],
     },
     Class {
@@ -137,19 +137,139 @@ const CLASSES: &[Class] = &[
     Class {
         module: "d12_info",
         trait_name: "Info12Methods",
-        interface: "ID3D12InfoQueue",
+        interface: "ID3D12InfoQueue1",
         source: &["Win32", "Graphics", "Direct3D12"],
     },
     Class {
         module: "d12_protected",
         trait_name: "Protected12Methods",
-        interface: "ID3D12ProtectedResourceSession",
+        interface: "ID3D12ProtectedResourceSession1",
         source: &["Win32", "Graphics", "Direct3D12"],
     },
     Class {
         module: "d12_meta",
         trait_name: "Meta12Methods",
         interface: "ID3D12MetaCommand",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_cache",
+        trait_name: "Cache12Methods",
+        interface: "ID3D12ShaderCacheSession",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_work_graph",
+        trait_name: "WorkGraph12Methods",
+        interface: "ID3D12WorkGraphProperties",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_debug2",
+        trait_name: "Debug2_12Methods",
+        interface: "ID3D12Debug2",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_debug_device",
+        trait_name: "DebugDevice12Methods",
+        interface: "ID3D12DebugDevice2",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_debug_device1",
+        trait_name: "DebugDevice1_12Methods",
+        interface: "ID3D12DebugDevice1",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_debug_queue",
+        trait_name: "DebugQueue12Methods",
+        interface: "ID3D12DebugCommandQueue1",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_debug_list",
+        trait_name: "DebugList12Methods",
+        interface: "ID3D12DebugCommandList3",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_debug_list1",
+        trait_name: "DebugList1_12Methods",
+        interface: "ID3D12DebugCommandList1",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_dred",
+        trait_name: "Dred12Methods",
+        interface: "ID3D12DeviceRemovedExtendedData2",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_dred_settings",
+        trait_name: "DredSettings12Methods",
+        interface: "ID3D12DeviceRemovedExtendedDataSettings2",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_sdk",
+        trait_name: "Sdk12Methods",
+        interface: "ID3D12SDKConfiguration1",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_factory",
+        trait_name: "Factory12Methods",
+        interface: "ID3D12DeviceFactory",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_configuration",
+        trait_name: "Configuration12Methods",
+        interface: "ID3D12DeviceConfiguration1",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_tools",
+        trait_name: "Tools12Methods",
+        interface: "ID3D12Tools",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_sharing",
+        trait_name: "Sharing12Methods",
+        interface: "ID3D12SharingContract",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_gbv",
+        trait_name: "Gbv12Methods",
+        interface: "ID3D12GBVDiagnostics",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_write_tracking",
+        trait_name: "WriteTracking12Methods",
+        interface: "ID3D12ManualWriteTrackingResource",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_assistant",
+        trait_name: "Assistant12Methods",
+        interface: "ID3D12SwapChainAssistant",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_guest",
+        trait_name: "Guest12Methods",
+        interface: "ID3D12VirtualizationGuestDevice",
+        source: &["Win32", "Graphics", "Direct3D12"],
+    },
+    Class {
+        module: "d12_lifetime_owner",
+        trait_name: "LifetimeOwner12Methods",
+        interface: "ID3D12LifetimeOwner",
         source: &["Win32", "Graphics", "Direct3D12"],
     },
     Class {

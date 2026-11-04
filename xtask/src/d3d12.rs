@@ -105,6 +105,9 @@ pub fn implementation(c: &Class, levels: &[(String, &Vtbl)]) -> String {
                     "*constwindows::Win32::Graphics::Direct3D12::D3D12_STATE_OBJECT_DESC" => {
                         Some(("state_object", None))
                     }
+                    "*constwindows::Win32::Graphics::Direct3D12::D3D12_BARRIER_GROUP" => {
+                        Some(("barrier_groups", Some(0)))
+                    }
                     _ => None,
                 };
                 if let Some((helper, count)) = helper {

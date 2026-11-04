@@ -72,6 +72,18 @@ impl State {
                 self.rtvs = a[0].clone();
                 self.dsv = a[1].clone();
             }
+            // A native render pass binds its attachments' views, as OMSetRenderTargets does, and starts a pass.
+            "BeginRenderPass" => {
+                self.rtvs = Value::Array(
+                    a[0].as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|t| t["view"].clone())
+                        .collect(),
+                );
+                self.dsv = a[1]["view"].clone();
+                self.pass = None;
+            }
             "RSSetViewports" => self.viewports = a[0].clone(),
             "RSSetScissorRects" => self.scissors = a[0].clone(),
             "OMSetBlendFactor" => self.blend_factor = a[0].clone(),

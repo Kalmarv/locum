@@ -220,3 +220,35 @@ fn dsv_json(d: &D3D12_DEPTH_STENCIL_VIEW_DESC) -> Value {
     };
     json!({"format":d.Format.0,"dimension":d.ViewDimension.0,"payload":payload,"flags":d.Flags.0})
 }
+/// A sampler whose border colour is float or integer, as its flags say.
+pub unsafe fn sampler2(p: *const D3D12_SAMPLER_DESC2, handle: D3D12_CPU_DESCRIPTOR_HANDLE) {
+    if !journal::enabled() {
+        return;
+    }
+    let desc = unsafe { p.as_ref() }.map_or(Description::Null, |d| {
+        let border = if d.Flags.0 & D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR.0 != 0 {
+            json!(unsafe { d.Anonymous.UintBorderColor })
+        } else {
+            json!(unsafe { d.Anonymous.FloatBorderColor })
+        };
+        Description::Json(
+            json!({"Filter":d.Filter.0,"AddressU":d.AddressU.0,"AddressV":d.AddressV.0,
+            "AddressW":d.AddressW.0,"MipLODBias":d.MipLODBias,"MaxAnisotropy":d.MaxAnisotropy,
+            "ComparisonFunc":d.ComparisonFunc.0,"BorderColor":border,"MinLOD":d.MinLOD,"MaxLOD":d.MaxLOD,
+            "Flags":d.Flags.0}),
+        )
+    });
+    journal::set_descriptor(handle.ptr as u64, "sampler", 0, 0, desc);
+}
+/// A sampler-feedback UAV: the feedback map it writes, for the resource whose sampling it records.
+pub unsafe fn sampler_feedback(
+    target: *mut c_void,
+    feedback: *mut c_void,
+    handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+) {
+    if !journal::enabled() {
+        return;
+    }
+    let desc = Description::Json(json!({"sampler_feedback":{"target":id(target)}}));
+    journal::set_descriptor(handle.ptr as u64, "uav", id(feedback), 0, desc);
+}

@@ -55,12 +55,17 @@ fn lock() -> std::sync::MutexGuard<'static, Registry> {
     registry().lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The real object behind one of our wrappers: a D3D12 object, or a DXGI adapter (device factories take one).
 pub fn unwrap(p: *mut c_void) -> *mut c_void {
+    if p.is_null() {
+        return p;
+    }
     let r = lock();
     if r.pointers.contains_key(&(p as usize)) {
         unsafe { (*(p as *const Object)).real() }
     } else {
-        p
+        drop(r);
+        crate::dxgi::Adapter::unwrap_raw(p)
     }
 }
 pub fn is_wrapped(p: *mut c_void) -> bool {

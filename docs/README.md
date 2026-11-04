@@ -309,7 +309,10 @@ stretched from their smallest to largest value, float colour is tone-mapped, and
 
 A third DLL, `d3d12.dll`, passes every Direct3D 12 call through to the system's, as `d3d11.dll` does for Direct3D 11;
 it keeps the system DLL's exports by name and ordinal (Elden Ring imports `D3D12CreateDevice` by ordinal 101). Devices,
-queues, command lists and every other object a game gets are wrapped. The log records the first use of each interface
+queues, command lists and every other object a game gets are wrapped, up to `ID3D12Device14` and
+`ID3D12GraphicsCommandList10`, with the debug, DRED, SDK-configuration and device-factory interfaces. An interface
+locum does not wrap is logged as `D3D12 interface escape {IID}`. Every command-list method is recorded with its
+arguments; `cargo xtask gen` fails for a method that has no capture entry. The log records the first use of each interface
 and method, with periodic counts and journal timings. Object identities remain in memory and in captures.
 
 The inspection foundation records command lists continuously, so lists and bundles recorded before a capture request

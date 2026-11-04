@@ -29,7 +29,12 @@ pub unsafe fn created_queue(device: u64, out: *mut *mut c_void, desc: *const D3D
     }
 }
 
-pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, state: i32, heap: u64, offset: u64) {
+/// How a resource begins: in a legacy resource state, or (created through the enhanced-barrier creators) in a layout.
+pub enum Initial {
+    State(i32),
+    Layout(i32),
+}
+pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, initial: Initial, heap: u64, offset: u64) {
     let Some(resource) = (unsafe { output::<ID3D12Resource>(out) }) else {
         return;
     };
@@ -42,8 +47,13 @@ pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, state: i32, h
             "creation_node_mask":properties.CreationNodeMask,"visible_node_mask":properties.VisibleNodeMask,"flags":flags.0}));
     let description = json!({"dimension":d.Dimension.0,"alignment":d.Alignment,"width":d.Width,"height":d.Height,
         "depth_or_array_size":d.DepthOrArraySize,"mips":d.MipLevels,"format":d.Format.0,"sample_count":d.SampleDesc.Count,
-        "sample_quality":d.SampleDesc.Quality,"layout":d.Layout.0,"flags":d.Flags.0,"initial_state":state,
+        "sample_quality":d.SampleDesc.Quality,"layout":d.Layout.0,"flags":d.Flags.0,
         "heap":heap,"heap_offset":offset,"heap_properties":heap_properties});
+    let mut description = description;
+    match initial {
+        Initial::State(s) => description["initial_state"] = json!(s),
+        Initial::Layout(l) => description["initial_layout"] = json!(l),
+    }
     if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
         super::journal::resource_address(id, unsafe { resource.GetGPUVirtualAddress() }, d.Width);
     }
@@ -144,4 +154,267 @@ pub unsafe fn barriers(p: *const D3D12_RESOURCE_BARRIER, n: u32) -> Value {
         };
         json!({"type":v.Type.0,"flags":v.Flags.0,"payload":payload})
     }).collect::<Vec<_>>())
+}
+pub unsafe fn write_immediate(
+    p: *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER,
+    modes: *const D3D12_WRITEBUFFERIMMEDIATE_MODE,
+    n: u32,
+) -> Value {
+    // A null mode array means DEFAULT for every write.
+    let modes = (!modes.is_null()).then(|| unsafe { slice(modes, n as usize) });
+    json!(
+        unsafe { slice(p, n as usize) }
+            .iter()
+            .enumerate()
+            .map(
+                |(i, w)| json!({"address":address(w.Dest),"value":w.Value,"mode":modes.map_or(0, |m| m[i].0)})
+            )
+            .collect::<Vec<_>>()
+    )
+}
+pub unsafe fn discard_region(p: *const D3D12_DISCARD_REGION) -> Value {
+    unsafe { p.as_ref() }.map_or(Value::Null, |r| {
+        json!({"rects":unsafe { rects(r.pRects, r.NumRects) },"first_subresource":r.FirstSubresource,
+            "subresources":r.NumSubresources})
+    })
+}
+pub unsafe fn tile_coordinate(p: *const D3D12_TILED_RESOURCE_COORDINATE) -> Value {
+    unsafe { p.as_ref() }.map_or(
+        Value::Null,
+        |c| json!({"x":c.X,"y":c.Y,"z":c.Z,"subresource":c.Subresource}),
+    )
+}
+pub unsafe fn tile_region(p: *const D3D12_TILE_REGION_SIZE) -> Value {
+    unsafe { p.as_ref() }.map_or(Value::Null, |r| {
+        json!({"tiles":r.NumTiles,"use_box":r.UseBox.as_bool(),"width":r.Width,"height":r.Height,"depth":r.Depth})
+    })
+}
+pub unsafe fn dependent_resources(
+    resources: *const *mut c_void,
+    ranges: *const D3D12_SUBRESOURCE_RANGE_UINT64,
+    n: u32,
+) -> Value {
+    let resources = unsafe { slice(resources, n as usize) };
+    let ranges = unsafe { slice(ranges, n as usize) };
+    json!(resources
+        .iter()
+        .zip(ranges)
+        .map(|(r, s)| json!({"resource":id(*r),"subresource":s.Subresource,"begin":s.Range.Begin,"end":s.Range.End}))
+        .collect::<Vec<_>>())
+}
+pub unsafe fn sample_positions(p: *const D3D12_SAMPLE_POSITION, samples: u32, pixels: u32) -> Value {
+    json!(
+        unsafe { slice(p, (samples * pixels) as usize) }
+            .iter()
+            .map(|s| [s.X, s.Y])
+            .collect::<Vec<_>>()
+    )
+}
+unsafe fn clear_value(v: &D3D12_CLEAR_VALUE, depth: bool) -> Value {
+    if depth {
+        let d = unsafe { v.Anonymous.DepthStencil };
+        json!({"format":v.Format.0,"depth":d.Depth,"stencil":d.Stencil})
+    } else {
+        json!({"format":v.Format.0,"color":unsafe { v.Anonymous.Color }})
+    }
+}
+unsafe fn beginning(b: &D3D12_RENDER_PASS_BEGINNING_ACCESS, depth: bool) -> Value {
+    if b.Type == D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR {
+        json!({"type":b.Type.0,"clear":unsafe { clear_value(&b.Anonymous.Clear.ClearValue, depth) }})
+    } else {
+        json!({"type":b.Type.0})
+    }
+}
+unsafe fn ending_access(e: &D3D12_RENDER_PASS_ENDING_ACCESS) -> Value {
+    if e.Type != D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE {
+        return json!({"type":e.Type.0});
+    }
+    let r = unsafe { &*e.Anonymous.Resolve };
+    let resource = |r: &Option<ID3D12Resource>| r.as_ref().map_or(0, |r| id(r.as_raw()));
+    let subresources: Vec<_> = unsafe { slice(r.pSubresourceParameters, r.SubresourceCount as usize) }
+        .iter()
+        .map(|s| {
+            json!({"src":s.SrcSubresource,"dst":s.DstSubresource,"x":s.DstX,"y":s.DstY,
+                "rect":[s.SrcRect.left,s.SrcRect.top,s.SrcRect.right,s.SrcRect.bottom]})
+        })
+        .collect();
+    json!({"type":e.Type.0,"resolve":{"src":resource(&r.pSrcResource),"dst":resource(&r.pDstResource),
+        "subresources":subresources,"format":r.Format.0,"mode":r.ResolveMode.0,"preserve_source":r.PreserveResolveSource.as_bool()}})
+}
+pub unsafe fn render_pass_targets(p: *const D3D12_RENDER_PASS_RENDER_TARGET_DESC, n: u32) -> Value {
+    json!(unsafe { slice(p, n as usize) }
+        .iter()
+        .map(|t| {
+            json!({"view":descriptor(t.cpuDescriptor.ptr as u64,false),
+                "begin":unsafe { beginning(&t.BeginningAccess, false) },"end":unsafe { ending_access(&t.EndingAccess) }})
+        })
+        .collect::<Vec<_>>())
+}
+pub unsafe fn render_pass_depth(p: *const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC) -> Value {
+    unsafe { p.as_ref() }.map_or(Value::Null, |d| {
+        json!({"view":descriptor(d.cpuDescriptor.ptr as u64,false),
+            "depth_begin":unsafe { beginning(&d.DepthBeginningAccess, true) },
+            "stencil_begin":unsafe { beginning(&d.StencilBeginningAccess, true) },
+            "depth_end":unsafe { ending_access(&d.DepthEndingAccess) },
+            "stencil_end":unsafe { ending_access(&d.StencilEndingAccess) }})
+    })
+}
+fn strided(v: &D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE) -> Value {
+    json!({"address":address(v.StartAddress),"stride":v.StrideInBytes})
+}
+unsafe fn geometry(g: &D3D12_RAYTRACING_GEOMETRY_DESC) -> Value {
+    let shape = if g.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES {
+        let t = unsafe { &g.Anonymous.Triangles };
+        json!({"transform":address(t.Transform3x4),"index_format":t.IndexFormat.0,"vertex_format":t.VertexFormat.0,
+            "indices":t.IndexCount,"vertices":t.VertexCount,"index_buffer":address(t.IndexBuffer),
+            "vertex_buffer":strided(&t.VertexBuffer)})
+    } else if g.Type == D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS {
+        let a = unsafe { &g.Anonymous.AABBs };
+        json!({"aabbs":a.AABBCount,"buffer":strided(&a.AABBs)})
+    } else {
+        json!({"diagnostic":"geometry type not represented"})
+    };
+    json!({"type":g.Type.0,"flags":g.Flags.0,"shape":shape})
+}
+/// A build's inputs: a top-level build's instance array address, or a bottom-level build's geometry, read from
+/// either layout.
+pub unsafe fn acceleration_structure_inputs(
+    i: &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS,
+) -> Value {
+    let n = i.NumDescs as usize;
+    let content = if i.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL {
+        json!({"instances":address(unsafe { i.Anonymous.InstanceDescs })})
+    } else if i.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY {
+        let g = unsafe { slice(i.Anonymous.pGeometryDescs, n) };
+        json!({"geometry":g.iter().map(|g| unsafe { geometry(g) }).collect::<Vec<_>>()})
+    } else {
+        let g = unsafe { slice(i.Anonymous.ppGeometryDescs, n) };
+        json!({"geometry":g.iter().map(|g| unsafe { g.as_ref() }.map_or(Value::Null, |g| unsafe { geometry(g) })).collect::<Vec<_>>()})
+    };
+    json!({"type":i.Type.0,"flags":i.Flags.0,"count":i.NumDescs,"layout":i.DescsLayout.0,"content":content})
+}
+pub unsafe fn acceleration_structure_build(
+    p: *const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC,
+) -> Value {
+    unsafe { p.as_ref() }.map_or(Value::Null, |d| {
+        json!({"dest":address(d.DestAccelerationStructureData),"source":address(d.SourceAccelerationStructureData),
+            "scratch":address(d.ScratchAccelerationStructureData),"inputs":unsafe { acceleration_structure_inputs(&d.Inputs) }})
+    })
+}
+pub unsafe fn postbuild_info(
+    p: *const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC,
+    n: u32,
+) -> Value {
+    json!(
+        unsafe { slice(p, n as usize) }
+            .iter()
+            .map(|d| json!({"dest":address(d.DestBuffer),"info":d.InfoType.0}))
+            .collect::<Vec<_>>()
+    )
+}
+pub unsafe fn addresses(p: *const u64, n: u32) -> Value {
+    json!(
+        unsafe { slice(p, n as usize) }
+            .iter()
+            .map(|&a| address(a))
+            .collect::<Vec<_>>()
+    )
+}
+pub unsafe fn dispatch_rays(p: *const D3D12_DISPATCH_RAYS_DESC) -> Value {
+    let table = |t: &D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE| json!({"address":address(t.StartAddress),"bytes":t.SizeInBytes,"stride":t.StrideInBytes});
+    unsafe { p.as_ref() }.map_or(Value::Null, |d| {
+        let r = &d.RayGenerationShaderRecord;
+        json!({"ray_generation":{"address":address(r.StartAddress),"bytes":r.SizeInBytes},
+            "miss":table(&d.MissShaderTable),"hit_groups":table(&d.HitGroupTable),"callable":table(&d.CallableShaderTable),
+            "size":[d.Width,d.Height,d.Depth]})
+    })
+}
+/// Enhanced barriers, by group: global, texture (with subresource range and layouts) or buffer (with range).
+pub unsafe fn barrier_groups(p: *const D3D12_BARRIER_GROUP, n: u32) -> Value {
+    json!(unsafe { slice(p, n as usize) }
+        .iter()
+        .map(|g| {
+            let count = g.NumBarriers as usize;
+            let barriers: Vec<Value> = match g.Type {
+                D3D12_BARRIER_TYPE_GLOBAL => unsafe { slice(g.Anonymous.pGlobalBarriers, count) }
+                    .iter()
+                    .map(|b| json!({"sync":[b.SyncBefore.0,b.SyncAfter.0],"access":[b.AccessBefore.0,b.AccessAfter.0]}))
+                    .collect(),
+                D3D12_BARRIER_TYPE_TEXTURE => unsafe { slice(g.Anonymous.pTextureBarriers, count) }
+                    .iter()
+                    .map(|b| {
+                        let s = &b.Subresources;
+                        json!({"resource":b.pResource.as_ref().map_or(0, |r| id(r.as_raw())),
+                            "sync":[b.SyncBefore.0,b.SyncAfter.0],"access":[b.AccessBefore.0,b.AccessAfter.0],
+                            "layout":[b.LayoutBefore.0,b.LayoutAfter.0],
+                            "subresources":{"index_or_first_mip":s.IndexOrFirstMipLevel,"mips":s.NumMipLevels,
+                                "first_slice":s.FirstArraySlice,"slices":s.NumArraySlices,"first_plane":s.FirstPlane,
+                                "planes":s.NumPlanes},"flags":b.Flags.0})
+                    })
+                    .collect(),
+                D3D12_BARRIER_TYPE_BUFFER => unsafe { slice(g.Anonymous.pBufferBarriers, count) }
+                    .iter()
+                    .map(|b| {
+                        json!({"resource":b.pResource.as_ref().map_or(0, |r| id(r.as_raw())),
+                            "sync":[b.SyncBefore.0,b.SyncAfter.0],"access":[b.AccessBefore.0,b.AccessAfter.0],
+                            "offset":b.Offset,"size":b.Size})
+                    })
+                    .collect(),
+                _ => vec![json!({"diagnostic":"invalid barrier group type"})],
+            };
+            json!({"type":g.Type.0,"barriers":barriers})
+        })
+        .collect::<Vec<_>>())
+}
+pub unsafe fn set_program(p: *const D3D12_SET_PROGRAM_DESC) -> Value {
+    unsafe { p.as_ref() }.map_or(Value::Null, |d| unsafe {
+        match d.Type {
+            D3D12_PROGRAM_TYPE_GENERIC_PIPELINE => {
+                json!({"type":d.Type.0,"program":d.Anonymous.GenericPipeline.ProgramIdentifier.OpaqueData})
+            }
+            D3D12_PROGRAM_TYPE_RAYTRACING_PIPELINE => {
+                json!({"type":d.Type.0,"program":d.Anonymous.RaytracingPipeline.ProgramIdentifier.OpaqueData})
+            }
+            D3D12_PROGRAM_TYPE_WORK_GRAPH => {
+                let w = &d.Anonymous.WorkGraph;
+                let t = &w.NodeLocalRootArgumentsTable;
+                json!({"type":d.Type.0,"program":w.ProgramIdentifier.OpaqueData,"flags":w.Flags.0,
+                    "backing":{"address":address(w.BackingMemory.StartAddress),"bytes":w.BackingMemory.SizeInBytes},
+                    "local_root_arguments":{"address":address(t.StartAddress),"bytes":t.SizeInBytes,"stride":t.StrideInBytes}})
+            }
+            _ => json!({"type":d.Type.0,"diagnostic":"program type not represented"}),
+        }
+    })
+}
+unsafe fn node_cpu_input(n: &D3D12_NODE_CPU_INPUT) -> Value {
+    let bytes = (n.NumRecords as usize).saturating_mul(n.RecordStrideInBytes as usize);
+    json!({"entrypoint":n.EntrypointIndex,"records":n.NumRecords,"stride":n.RecordStrideInBytes,
+        "data":unsafe { slice(n.pRecords.cast::<u8>(), bytes) }})
+}
+/// A graph dispatch's inputs: CPU records are copied as bytes, GPU inputs are addresses.
+pub unsafe fn dispatch_graph(p: *const D3D12_DISPATCH_GRAPH_DESC) -> Value {
+    unsafe { p.as_ref() }.map_or(Value::Null, |d| unsafe {
+        let input = match d.Mode {
+            D3D12_DISPATCH_MODE_NODE_CPU_INPUT => node_cpu_input(&d.Anonymous.NodeCPUInput),
+            D3D12_DISPATCH_MODE_NODE_GPU_INPUT => json!({"address":address(d.Anonymous.NodeGPUInput)}),
+            D3D12_DISPATCH_MODE_MULTI_NODE_CPU_INPUT => {
+                let m = &d.Anonymous.MultiNodeCPUInput;
+                let base = m.pNodeInputs.cast::<u8>();
+                let nodes: Vec<Value> = (0..m.NumNodeInputs as usize)
+                    .filter_map(|i| {
+                        base.add(i * m.NodeInputStrideInBytes as usize)
+                            .cast::<D3D12_NODE_CPU_INPUT>()
+                            .as_ref()
+                    })
+                    .map(|n| node_cpu_input(n))
+                    .collect();
+                json!({"nodes":nodes})
+            }
+            D3D12_DISPATCH_MODE_MULTI_NODE_GPU_INPUT => {
+                json!({"address":address(d.Anonymous.MultiNodeGPUInput)})
+            }
+            _ => json!({"diagnostic":"dispatch mode not represented"}),
+        };
+        json!({"mode":d.Mode.0,"input":input})
+    })
 }
