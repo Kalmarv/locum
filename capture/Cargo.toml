@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+dxbc-reader.workspace = true
 rusqlite = { version = "0.41", features = ["bundled"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 windows = { workspace = true, features = [

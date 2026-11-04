@@ -136,6 +136,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
+name = "dxbc-reader"
+version = "0.4.0"
+source = "git+https://github.com/Kalmarv/dx?rev=292b61605311a69921eff208b68795093daa5431#292b61605311a69921eff208b68795093daa5431"
+dependencies = [
+ "dxcontainer",
+ "thiserror",
+]
+
+[[package]]
+name = "dxcontainer"
+version = "0.4.0"
+source = "git+https://github.com/Kalmarv/dx?rev=292b61605311a69921eff208b68795093daa5431#292b61605311a69921eff208b68795093daa5431"
+dependencies = [
+ "primase-foundations",
+ "thiserror",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,6 +202,17 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "half"
+version = "2.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ea2d84b969582b4b1864a92dc5d27cd2b77b622a8d79306834f1be5ba20d84b"
+dependencies = [
+ "cfg-if",
+ "crunchy",
+ "zerocopy",
+]
 
 [[package]]
 name = "hashbrown"
@@ -247,6 +282,7 @@ dependencies = [
 name = "locum-capture"
 version = "0.1.0"
 dependencies = [
+ "dxbc-reader",
  "rusqlite",
  "texture2ddecoder",
  "windows",
@@ -379,6 +415,16 @@ dependencies = [
  "fdeflate",
  "flate2",
  "miniz_oxide 0.8.9",
+]
+
+[[package]]
+name = "primase-foundations"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8f1ac54cab06733f0b3398524582727077c55ed3495dca565f29df560abd409"
+dependencies = [
+ "half",
+ "thiserror",
 ]
 
 [[package]]
@@ -702,6 +748,26 @@ name = "xxhash-rust"
 version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
+
+[[package]]
+name = "zerocopy"
+version = "0.8.63"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
+dependencies = [
+ "zerocopy-derive",
+]
+
+[[package]]
+name = "zerocopy-derive"
+version = "0.8.63"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
 
 [[package]]
 name = "zlib-rs"

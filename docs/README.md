@@ -95,9 +95,10 @@ contents. locum's own copies run whatever predicate the game has set.
 
 Some shaders write different bytes depending on the order the GPU happens to run their threads: a thread that takes
 the next free slot of a buffer with an atomic add (particles, light lists) puts its record wherever it lands, and the
-GPU never runs the threads in the same order twice. locum reads every shader's bytecode as it is made and flags those
-that use an atomic that returns a value (`imm_atomic_*`, `atomic_cmp_store`; `locum_capture::dxbc`), and the log
-names them. During a capture, every draw or dispatch has everything bound to it as a UAV copied right after it runs,
+GPU never runs the threads in the same order twice. locum decodes every shader's bytecode as it is made (with dx's
+`dxbc-reader`) and flags those that use an atomic that returns a value (`imm_atomic_*`, `atomic_cmp_store`;
+`locum_capture::dxbc`), and the log names them, and any program it cannot decode with the word where reading
+stopped. During a capture, every draw or dispatch has everything bound to it as a UAV copied right after it runs,
 into `results`, flagged when its shader is order-dependent.
 
 A shader can also depend on the order without an atomic, when its thread groups write the same records: whichever
@@ -265,9 +266,9 @@ A resource is matched by its upload, its contents, or subresource by subresource
 than its file holds, or from one face). `LOCUM_INDEX` (paths separated by `;`) stands in for `--index`. A game's own
 extractor can add what it reads from its archives through `locum_capture::index`.
 
-Constants are named from each shader's reflection, as `cbuffer.variable[index].component`. PNGs of depth and other
-one-channel images are stretched from their smallest to largest value, float colour is tone-mapped, and `--range
-LO:HI` sets the mapping.
+Constants are named from each shader's reflection (its `RDEF` part as `dxbc-reader` reads it, Shader Model 4.0 to 5.1,
+register spaces included), as `cbuffer.variable[index].component`. PNGs of depth and other one-channel images are
+stretched from their smallest to largest value, float colour is tone-mapped, and `--range LO:HI` sets the mapping.
 
 ## Direct3D 12 (in progress)
 

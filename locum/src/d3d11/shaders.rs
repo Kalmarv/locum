@@ -81,22 +81,29 @@ pub unsafe fn created(stage: Stage, code: *const c_void, len: usize, hr: HRESULT
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashSet::new)
         .insert(h);
-    if new && let Ok(Some(o)) = locum_capture::dxbc::order_dependent(bytes) {
-        let ops: Vec<String> = o
-            .ops
-            .iter()
-            .map(|op| format!("{} x{}", op.name, op.count))
-            .collect();
-        log!(
-            "shader {h:016x} ({}): what it writes depends on the order the GPU runs its threads ({})",
-            stage.short(),
-            ops.join(", ")
-        );
-        ORDER_DEPENDENT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get_or_insert_with(HashSet::new)
-            .insert(h);
+    match new.then(|| locum_capture::dxbc::order_dependent(bytes)) {
+        Some(Ok(Some(o))) => {
+            let ops: Vec<String> = o
+                .ops
+                .iter()
+                .map(|op| format!("{} x{}", op.name, op.count))
+                .collect();
+            log!(
+                "shader {h:016x} ({}): what it writes depends on the order the GPU runs its threads ({})",
+                stage.short(),
+                ops.join(", ")
+            );
+            ORDER_DEPENDENT
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(HashSet::new)
+                .insert(h);
+        }
+        Some(Err(e)) => log!(
+            "shader {h:016x} ({}): its program could not be read for order-dependent atomics: {e}",
+            stage.short()
+        ),
+        Some(Ok(None)) | None => {}
     }
     if new && let Some(dir) = folder().map(|d| d.join("shaders")) {
         let _ = std::fs::create_dir_all(&dir);
