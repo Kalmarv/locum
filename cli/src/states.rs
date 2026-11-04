@@ -282,7 +282,11 @@ fn sampler(j: &Value) -> Option<String> {
     }
     let (min, max) = (j["min_lod"].as_f64()?, j["max_lod"].as_f64()?);
     if min != 0.0 || max < f32::MAX as f64 {
-        s += &format!("; lod {min}..{max}");
+        s += &format!(
+            "; lod {}..{}",
+            crate::describe::float(min as f32),
+            crate::describe::float(max as f32)
+        );
     }
     if address.iter().any(|a| a == "border") {
         s += &format!("; border {}", j["border"]);

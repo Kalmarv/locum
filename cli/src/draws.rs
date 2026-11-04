@@ -110,7 +110,7 @@ pub fn draws(c: &Capture, f: &Filter) -> Result<(), String> {
             let names: Vec<(&str, String)> = SHADER_COLUMNS
                 .iter()
                 .zip(&row.6)
-                .filter_map(|(stage, h)| Some((*stage, reflection.name(c, h.as_ref()?)?.to_string())))
+                .filter_map(|(stage, h)| Some((*stage, reflection.name(c, h.as_ref()?)?)))
                 .collect();
             if let Some(w) = &wanted
                 && !names.iter().any(|(_, n)| n.to_lowercase().contains(w))

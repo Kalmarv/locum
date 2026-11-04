@@ -46,10 +46,7 @@ fn draw_columns(c: &Capture, n: i64, with: &[String], reflection: &mut Reflectio
             }
             "file" => mesh_file(c, n).unwrap_or_else(|| "-".into()),
             stage => match shader_of(c, n, stage) {
-                Some(h) => match reflection.name(c, &h) {
-                    Some(name) => name.to_string(),
-                    None => short(&h).to_string(),
-                },
+                Some(h) => reflection.name(c, &h).unwrap_or_else(|| short(&h).to_string()),
                 None => "-".into(),
             },
         })

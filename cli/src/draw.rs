@@ -736,7 +736,7 @@ pub fn describe(
         stack: stack.map(|s| describe::stack(c, s)).unwrap_or_default(),
         shader_names: shaders
             .iter()
-            .filter_map(|(s, h)| Some((*s, reflection.name(c, h)?.to_string())))
+            .filter_map(|(s, h)| Some((*s, reflection.name(c, h)?)))
             .collect(),
         shaders,
         topology_name: topology.map(states::topology),

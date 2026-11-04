@@ -615,6 +615,12 @@ enum Command {
         /// TPF packages under some archive paths). Named by their paths in the stream.
         #[arg(long)]
         tar: Vec<PathBuf>,
+        /// A list of programs' reflections to add, one JSON object a line (`key`, `bytes`, `name`,
+        /// `constant_buffers`, `bindings`, the last two as `shader --json` has them), as a game's reader writes them
+        /// for programs built without their own (unity-formats' `program_keys` example: every D3D11 variant of a
+        /// Unity player's Shaders). The commands name such programs, their constants and resources by it.
+        #[arg(long)]
+        programs: Vec<PathBuf>,
     },
     /// What each resource the frame used was made from, by the indexes given (--index).
     Join {
@@ -1146,7 +1152,8 @@ fn run(cli: Cli) -> Result<(), String> {
             inputs,
             keys,
             tar,
-        } => join::index(&out, &inputs, &keys, &tar),
+            programs,
+        } => join::index(&out, &inputs, &keys, &tar, &programs),
         Command::Join {
             capture,
             all,

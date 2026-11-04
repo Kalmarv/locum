@@ -3,13 +3,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use locum_capture::rdef;
 use serde::Serialize;
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DDisassemble};
 use windows::Win32::Graphics::Direct3D::{ID3DBlob, ID3DInclude};
 use windows::core::PCSTR;
 
-use crate::describe::short;
+use crate::describe::{Program, reflected, short};
 use crate::open::Capture;
 use crate::out;
 
@@ -47,7 +46,7 @@ pub fn shaders(c: &Capture, stage: Option<&str>, name: Option<&str>, bindings: b
         if stage.is_some_and(|s| s != stage_of) {
             continue;
         }
-        let named = reflection.name(c, &h).map(str::to_string);
+        let named = reflection.name(c, &h);
         if wanted
             .as_ref()
             .is_some_and(|w| !named.as_ref().is_some_and(|n| n.to_lowercase().contains(w)))
@@ -79,7 +78,7 @@ pub fn shaders(c: &Capture, stage: Option<&str>, name: Option<&str>, bindings: b
                     |r| r.get::<_, String>(0),
                 )
                 .and_then(|key| c.blob(&key).ok())
-                .and_then(|code| locum_capture::rdef::bindings(&code));
+                .and_then(|code| reflected(&c.names, &code).bindings);
             match declared {
                 Some(list) if !list.is_empty() => {
                     for b in list {
@@ -119,6 +118,11 @@ struct Shader {
     /// The key of its code alone (`locum_capture::dxbc::code_key`): equal for programs that differ only in names,
     /// reflection or debug parts.
     code: Option<String>,
+    /// Its name: its bytecode's debug name, or what an index's record calls it.
+    name: Option<String>,
+    /// Where its names come from: `bytecode`, `index` (`index --programs`) or `registers` (none: named by
+    /// register).
+    reflection: &'static str,
     /// Every resource it binds, constant buffers included; null without reflection.
     bindings: Option<Vec<Binding>>,
     constant_buffers: Option<Vec<Buffer>>,
@@ -213,6 +217,7 @@ pub fn shader(
         .ok_or_else(|| format!("no shader {hash}"))?;
     let key = key.ok_or("its bytecode was not found when the capture was written")?;
     let code = c.blob(&key)?;
+    let program = reflected(&c.names, &code);
     if as_json {
         let s = Shader {
             hash: h,
@@ -220,7 +225,9 @@ pub fn shader(
             bytes: code.len(),
             blob: key,
             code: locum_capture::dxbc::code_key(&code),
-            bindings: rdef::bindings(&code).map(|bs| {
+            name: program.name,
+            reflection: program.source,
+            bindings: program.bindings.map(|bs| {
                 bs.into_iter()
                     .map(|b| Binding {
                         kind_name: input_kind(b.kind),
@@ -233,7 +240,7 @@ pub fn shader(
                     })
                     .collect()
             }),
-            constant_buffers: rdef::constant_buffers(&code).map(|cbs| {
+            constant_buffers: program.constant_buffers.map(|cbs| {
                 cbs.into_iter()
                     .map(|cb| Buffer {
                         leaves: (0..cb.size / 4)
@@ -274,6 +281,7 @@ pub fn shader(
     );
     show(
         &code,
+        &program,
         &format!("{}:shader/{h}", c.path.display()),
         disassemble,
         wgsl,
@@ -285,23 +293,34 @@ pub fn shader(
 pub fn file(path: &Path, disassemble: bool, wgsl: bool, evidence: Option<&Path>) -> Result<(), String> {
     let code = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     out!("{}: {} bytes", path.display(), code.len());
-    show(&code, &path.display().to_string(), disassemble, wgsl, evidence)
+    let program = reflected(&crate::join::Names::default(), &code);
+    show(
+        &code,
+        &program,
+        &path.display().to_string(),
+        disassemble,
+        wgsl,
+        evidence,
+    )
 }
 
 /// A program's interface: for DXIL, the reflection answers of dx, Microsoft's compiler and iridia side by side (also
 /// written to `evidence`); for DXBC, its constant buffers and bindings. Then its disassembly and WGSL when asked.
 fn show(
     code: &[u8],
+    program: &Program,
     source: &str,
     disassemble: bool,
     wgsl: bool,
     evidence: Option<&Path>,
 ) -> Result<(), String> {
-    if let Some(name) = rdef::debug_name(code) {
-        out!("debug name: {name}");
+    match (&program.name, program.source) {
+        (Some(name), "index") => out!("name: {name} (from the index; its bytecode has no reflection)"),
+        (Some(name), _) => out!("debug name: {name}"),
+        _ => {}
     }
     if crate::dxil::is_dxil(code) {
-        constant_buffers_and_bindings(code);
+        constant_buffers_and_bindings(program);
         // The reflection above is dxil-reader's; Microsoft's and iridia's are checked against it.
         let report = crate::dxil::evidence(code, source);
         if let Some(path) = evidence {
@@ -329,7 +348,7 @@ fn show(
     } else if evidence.is_some() {
         return Err(format!("{source} is DXBC: --evidence compares DXIL reflection"));
     } else {
-        constant_buffers_and_bindings(code);
+        constant_buffers_and_bindings(program);
     }
     if disassemble {
         out!("");
@@ -342,8 +361,8 @@ fn show(
     Ok(())
 }
 
-fn constant_buffers_and_bindings(code: &[u8]) {
-    match rdef::constant_buffers(code) {
+fn constant_buffers_and_bindings(program: &Program) {
+    match &program.constant_buffers {
         Some(cbs) => {
             for cb in cbs {
                 out!(
@@ -369,14 +388,13 @@ fn constant_buffers_and_bindings(code: &[u8]) {
                 }
             }
         }
-        None => out!("no reflection in its bytecode (DXBC RDEF, or DXIL STAT or DXIL)"),
+        None => out!(
+            "no reflection in its bytecode (DXBC RDEF, or DXIL STAT or DXIL), nor in an index (--index of `index \
+             --programs`)"
+        ),
     }
     // The resources it reads and writes other than constant buffers.
-    for b in rdef::bindings(code)
-        .unwrap_or_default()
-        .iter()
-        .filter(|b| b.class() != "cb")
-    {
+    for b in program.bindings.iter().flatten().filter(|b| b.class() != "cb") {
         let count = match b.count {
             1 => String::new(),
             0 => "[]".into(),

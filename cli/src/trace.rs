@@ -99,21 +99,27 @@ impl Stage {
                 short(hash)
             )
         })?;
-        Stage::of_code(&c.blob(&key)?, hash, name)
+        Stage::of_code(&c.blob(&key)?, &c.names, hash, name)
     }
 
-    fn of_code(code: &[u8], hash: &str, name: &'static str) -> Result<Stage, String> {
+    fn of_code(
+        code: &[u8],
+        names: &crate::join::Names,
+        hash: &str,
+        name: &'static str,
+    ) -> Result<Stage, String> {
         let program = crate::dxil::lift(code)
             .map_err(|e| format!("{name} {}: iridia cannot lift it: {e}", short(hash)))?;
         let values = Values::of_program(&program)
             .map_err(|e| format!("{name} {}: iridia cannot follow it: {e}", short(hash)))?;
+        let reflected = crate::describe::reflected(names, code);
         Ok(Stage {
             name,
             hash: hash.to_string(),
             program,
             values,
-            cbs: rdef::constant_buffers(code).unwrap_or_default(),
-            debug_name: rdef::debug_name(code),
+            cbs: reflected.constant_buffers.unwrap_or_default(),
+            debug_name: reflected.name,
         })
     }
 
@@ -1092,8 +1098,8 @@ O main(float4 pos : SV_Position, float2 uv : TEXCOORD0, float shade : TEXCOORD1)
         let vs = crate::shaders::compile(VS, c"vs_5_0").unwrap();
         let ps = crate::shaders::compile(PS, c"ps_5_0").unwrap();
         vec![
-            Stage::of_code(&vs, "vs", "vs").unwrap(),
-            Stage::of_code(&ps, "ps", "ps").unwrap(),
+            Stage::of_code(&vs, &Default::default(), "vs", "vs").unwrap(),
+            Stage::of_code(&ps, &Default::default(), "ps", "ps").unwrap(),
         ]
     }
 

@@ -3,7 +3,7 @@
 //! register and variables, so a constant can be shown as `cbTexScroll.uvScale.x` instead of `b11 c0.x`, and the name
 //! and register of every resource the program reads or writes (`g_GBuffer2Texture` at t4).
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Type {
     /// D3D_SHADER_VARIABLE_CLASS: 0 scalar, 1 vector, 2 row-major matrix, 3 column-major matrix, 4 object, 5 struct.
     pub class: u16,
@@ -13,31 +13,35 @@ pub struct Type {
     pub columns: u16,
     /// Array length, 0 when not an array.
     pub elements: u16,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<Member>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Member {
     pub name: String,
     pub offset: u32,
+    #[serde(rename = "type")]
     pub ty: Type,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Variable {
     pub name: String,
     pub offset: u32,
     pub size: u32,
     /// Whether the shader reads it.
     pub used: bool,
+    #[serde(rename = "type")]
     pub ty: Type,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ConstantBuffer {
     pub name: String,
     /// The register (`b<slot>`), when the shader binds it.
     pub slot: Option<u32>,
+    #[serde(default)]
     pub space: u32,
     pub size: u32,
     pub variables: Vec<Variable>,
@@ -99,7 +103,7 @@ impl From<&dxbc_reader::RdefType> for Type {
 }
 
 /// A resource the program binds: what the reflection's binding record (`D3D11_SHADER_INPUT_BIND_DESC`) says.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Binding {
     pub name: String,
     /// `D3D_SHADER_INPUT_TYPE`: 0 cbuffer, 1 tbuffer, 2 texture, 3 sampler, 4 to 13 the buffer and UAV kinds.
@@ -108,6 +112,7 @@ pub struct Binding {
     pub slot: u32,
     /// How many registers it takes (an array); 0 for an array of unbounded size.
     pub count: u32,
+    #[serde(default)]
     pub space: u32,
 }
 
@@ -132,6 +137,27 @@ impl Binding {
             _ => None,
         }
     }
+}
+
+/// A program's reflection kept outside its bytecode: what a game's own files say of a program built without it
+/// (Unity strips `RDEF` from player programs and keeps their names in its Shader objects). `locum-cli index
+/// --programs` adds one per line of JSON, with the program's key; the CLI reads it for programs whose bytecode
+/// reflects nothing.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Reflected {
+    /// The program's name in the game (`Shader/Name pass 0 fragment [KEYWORD]`).
+    pub name: String,
+    #[serde(default)]
+    pub constant_buffers: Vec<ConstantBuffer>,
+    #[serde(default)]
+    pub bindings: Vec<Binding>,
+}
+
+/// Whether a program's bytecode carries its own reflection: an `RDEF` part, or DXIL (whose module declares its
+/// resources).
+pub fn reflects(code: &[u8]) -> bool {
+    rdef(code).is_some()
+        || dxil_reader::parts(code).is_ok_and(|parts| parts.iter().any(|p| &p.kind == b"DXIL"))
 }
 
 /// The container's `RDEF` part as dx reads it; none where the container has none (a DXIL program, stripped

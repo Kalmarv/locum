@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY, name TEXT NOT NULL, kin
 -- Each subresource of a texture, in the canonical layout.
 CREATE TABLE IF NOT EXISTS subs(key TEXT NOT NULL, file INTEGER NOT NULL, sub INTEGER NOT NULL, mip INTEGER,
   slice INTEGER, width INTEGER, height INTEGER, bytes INTEGER NOT NULL);
+-- A program's reflection kept outside its bytecode (`rdef::Reflected`, as JSON), by the program's key.
+CREATE TABLE IF NOT EXISTS reflections(key TEXT PRIMARY KEY, json TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS files_key ON files(key);
 CREATE INDEX IF NOT EXISTS subs_key ON subs(key);
 ";
@@ -104,6 +106,18 @@ impl Like {
             }
         }
     }
+}
+
+/// Whether `key` is a key as `hash::key` writes them.
+fn check_key(key: &str) -> Result<(), String> {
+    if key.len() != 32
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(format!("{key:?} is not a key: 32 lowercase hex digits"));
+    }
+    Ok(())
 }
 
 const FILE_COLUMNS: &str = "f.id, f.name, f.kind, f.format, f.width, f.height, f.mips, f.array";
@@ -221,15 +235,42 @@ impl Index {
             .map_err(|e| e.to_string())
     }
 
+    /// Adds a program of `bytes` bytes whose key another tool computed, with its reflection kept outside its bytecode:
+    /// named `reflected.name`. Programs with the same bytes (variants compiled to the same code) are each a file; the
+    /// first one's reflection is kept.
+    pub fn add_reflected(
+        &mut self,
+        key: &str,
+        bytes: u64,
+        reflected: &crate::rdef::Reflected,
+    ) -> Result<(), String> {
+        check_key(key)?;
+        let json = serde_json::to_string(reflected).map_err(|e| e.to_string())?;
+        let e = |e: rusqlite::Error| e.to_string();
+        self.db
+            .prepare_cached("INSERT INTO files(name, kind, bytes, key) VALUES (?1, 'program', ?2, ?3)")
+            .and_then(|mut s| s.execute(params![reflected.name, bytes as i64, key]))
+            .map_err(e)?;
+        self.db
+            .prepare_cached("INSERT OR IGNORE INTO reflections(key, json) VALUES (?1, ?2)")
+            .and_then(|mut s| s.execute(params![key, json]))
+            .map(|_| ())
+            .map_err(e)
+    }
+
+    /// The reflection the index keeps for the program whose bytes have `key`; None for an index made before it kept
+    /// any.
+    pub fn reflection(&self, key: &str) -> Option<crate::rdef::Reflected> {
+        let json: String = self
+            .db
+            .query_row("SELECT json FROM reflections WHERE key = ?1", [key], |r| r.get(0))
+            .ok()?;
+        serde_json::from_str(&json).ok()
+    }
+
     /// Adds a buffer of `bytes` bytes whose key (`hash::key`) another tool computed, under `name`.
     pub fn add_buffer_key(&mut self, name: &str, bytes: u64, key: &str) -> Result<(), String> {
-        if key.len() != 32
-            || !key
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
-            return Err(format!("{key:?} is not a key: 32 lowercase hex digits"));
-        }
+        check_key(key)?;
         self.db
             .prepare_cached("INSERT INTO files(name, kind, bytes, key) VALUES (?1, 'buffer', ?2, ?3)")
             .and_then(|mut s| s.execute(params![name, bytes as i64, key]))
@@ -419,6 +460,41 @@ mod tests {
         let index = Index::open(&path).unwrap();
         let (files, count) = index.whole(&key(bytes), &Like::Buffer, 10);
         assert_eq!((files[0].name.as_str(), count), ("m.flver#vb0", 1));
+        drop(index);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_reflection_kept_outside_the_bytecode_is_read_back_by_key() {
+        let path = std::env::temp_dir().join(format!("locum-index-programs-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let code = b"DXBC a program stripped of RDEF";
+        // a line as unity-formats' program_keys writes it, `space` left out
+        let line = r#"{"name": "Standard 0.0 fragment [_NORMALMAP]",
+            "constant_buffers": [{"name": "UnityPerDraw", "slot": 3, "size": 176, "variables": [{"name":
+                "unity_ObjectToWorld", "offset": 0, "size": 64, "used": true, "type": {"class": 1, "base": 3,
+                "rows": 1, "columns": 4, "elements": 4}}]}],
+            "bindings": [{"name": "_BumpMap", "kind": 2, "slot": 3, "count": 1}]}"#;
+        let reflected: crate::rdef::Reflected = serde_json::from_str(line).unwrap();
+        {
+            let mut index = Index::create(&path).unwrap();
+            index
+                .add_reflected(&key(code), code.len() as u64, &reflected)
+                .unwrap();
+            index.commit().unwrap();
+        }
+        let index = Index::open(&path).unwrap();
+        let back = index.reflection(&key(code)).unwrap();
+        assert_eq!(back, reflected);
+        let cb = &back.constant_buffers[0];
+        assert_eq!(
+            (cb.slot, cb.space, cb.variables[0].ty.name()),
+            (Some(3), 0, "float4[4]".to_string())
+        );
+        assert_eq!(back.bindings[0].name_at(3).as_deref(), Some("_BumpMap"));
+        assert!(index.reflection(&key(b"another program")).is_none());
+        let (files, _) = index.whole(&key(code), &Like::Program, 10);
+        assert_eq!(files[0].name, "Standard 0.0 fragment [_NORMALMAP]");
         drop(index);
         let _ = std::fs::remove_file(&path);
     }

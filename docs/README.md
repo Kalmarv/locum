@@ -453,6 +453,27 @@ takes the name of the file an index holds with the same bytecode, so `shaders --
 find and show it by the game's own file names: index the members of the game's shader archives (Sekiro's
 `.ppo`/`.vpo` files from `shader/*.shaderbnd.dcx`) and give `--index`.
 
+A program built without reflection can be named by what the game's own files say of it. Unity strips `RDEF` from a
+player's programs and keeps their names in its Shader objects; unity-formats' `program_keys` example lists every
+D3D11 variant of a player's Shaders as a line of JSON (its key, its name `<shader> <subshader>.<pass> <stage>
+[<keywords>]`, its constant buffers and bindings), and `index --programs` adds them:
+
+```
+cargo run --release --example program_keys -- <game>_Data typetrees.tpk > programs.jsonl   # in unity-formats
+locum-cli index -o programs.db --programs programs.jsonl
+locum-cli --index programs.db shaders last     # Standard 0.0 fragment [DIRECTIONAL LIGHTPROBE_SH _NORMALMAP]
+locum-cli --index programs.db draw last 442    # ps srv3 _BumpMap, vs cb3 UnityPerDraw
+```
+
+`shaders`, `shader`, `draw`, `draws`, `cb`, `constants` and `trace` then name the program, its constant buffers,
+constants, textures and samplers as they would from `RDEF`; `shader --json` says where the names came from
+(`reflection`: `bytecode`, `index` or `registers`). A register the record leaves out (a UAV, an inline sampler state)
+keeps its register's name. Unity's records keep no matrix packing order, so a matrix is named by register
+(`unity_ObjectToWorld[3]` is its fourth register, not its fourth row). A SkateBIRD title frame has 90 of its 93
+programs named so; the others are the Steam overlay's blit and a ComputeShader, which the example does not read.
+Any reader can write such a list: each line is `{"key", "bytes", "name", "constant_buffers", "bindings"}`, the last
+two in the shape of `locum_capture::rdef`'s `ConstantBuffer` and `Binding`.
+
 Constants are named from each shader's reflection (its `RDEF` part as `dxbc-reader` reads it, Shader Model 4.0 to 5.1,
 register spaces included), as `cbuffer.variable[index].component`. A matrix element is named as HLSL indexes it,
 `m[row][column]`: a column-major matrix (HLSL's default) keeps a column in each register, so `c0.w` of a `float4x3

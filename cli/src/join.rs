@@ -188,6 +188,11 @@ impl Names {
         })
     }
 
+    /// The reflection an index keeps for the program whose bytecode has blob key `key` (`index --programs`).
+    pub fn reflection(&self, key: &str) -> Option<locum_capture::rdef::Reflected> {
+        self.indexes.iter().find_map(|i| i.reflection(key))
+    }
+
     /// What resource `id` of `c` was made from, if an index knows.
     pub fn of(&self, c: &Capture, id: i64) -> Option<Match> {
         if self.indexes.is_empty() {
@@ -291,10 +296,44 @@ impl Names {
 /// of `keys` lists: lines of `key<TAB>bytes<TAB>name`, as a game's reader writes them for
 /// what is inside its archives (fromsoft-formats' `flver_keys` for FLVER vertex and index bytes, unity-formats'
 /// `mesh_keys` for a Unity player's Mesh vertex streams and index buffers).
-pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf], tars: &[PathBuf]) -> Result<(), String> {
+pub fn index(
+    out: &Path,
+    inputs: &[PathBuf],
+    keys: &[PathBuf],
+    tars: &[PathBuf],
+    reflections: &[PathBuf],
+) -> Result<(), String> {
     let mut index = Index::create(out)?;
     let (mut added, mut programs, mut refused) = (0usize, 0usize, Vec::new());
-    let mut keyed = 0usize;
+    let (mut keyed, mut reflected) = (0usize, 0usize);
+    /// A line of a program list: the program's key and size, and its reflection.
+    #[derive(serde::Deserialize)]
+    struct Line {
+        key: String,
+        bytes: u64,
+        #[serde(flatten)]
+        reflected: locum_capture::rdef::Reflected,
+    }
+    for list in reflections {
+        let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
+        for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+            let at = format!("{}:{}", list.display(), n + 1);
+            let line: Line = match serde_json::from_str(line) {
+                Ok(l) => l,
+                Err(e) => {
+                    refused.push(format!("{at}: {e}"));
+                    continue;
+                }
+            };
+            match index.add_reflected(&line.key, line.bytes, &line.reflected) {
+                Ok(()) => reflected += 1,
+                Err(e) => refused.push(format!("{at}: {e}")),
+            }
+            if reflected % 10000 == 9999 {
+                index.commit()?;
+            }
+        }
+    }
     for list in keys {
         let text = std::fs::read_to_string(list).map_err(|e| format!("{}: {e}", list.display()))?;
         for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
@@ -391,7 +430,7 @@ pub fn index(out: &Path, inputs: &[PathBuf], keys: &[PathBuf], tars: &[PathBuf])
     }
     index.commit()?;
     out!(
-        "{added} DDS files, {programs} programs and {keyed} buffer keys added to {}",
+        "{added} DDS files, {programs} programs, {keyed} buffer keys and {reflected} programs' reflections added to {}",
         out.display()
     );
     if !refused.is_empty() {

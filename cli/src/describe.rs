@@ -160,12 +160,60 @@ pub fn stack(c: &Capture, id: i64) -> Vec<String> {
         .collect()
 }
 
+/// What a program's reflection says, wherever it is kept.
+pub struct Program {
+    /// Its name: its bytecode's debug name, or the name the index's record gives it.
+    pub name: Option<String>,
+    pub constant_buffers: Option<Vec<ConstantBuffer>>,
+    pub bindings: Option<Vec<rdef::Binding>>,
+    /// Where the names come from: `bytecode`, `index` (a game's own record of a program built without reflection,
+    /// `index --programs`) or `registers` (none: the registers its code declares, named by register).
+    pub source: &'static str,
+}
+
+/// Program `code`'s reflection: its bytecode's own (DXBC `RDEF`, DXIL), else what an index of `names` keeps for its
+/// key over the registers its code declares (the record names those it knows; a register it leaves out keeps its
+/// register's name), else those registers alone.
+pub fn reflected(names: &crate::join::Names, code: &[u8]) -> Program {
+    let own = rdef::reflects(code);
+    let key = locum_capture::hash::key(code);
+    if !own && let Some(r) = names.reflection(&key) {
+        let mut bindings = r.bindings;
+        for d in rdef::declared(code).unwrap_or_default() {
+            let named = bindings
+                .iter()
+                .any(|b| b.class() == d.class() && b.space == d.space && b.name_at(d.slot).is_some());
+            if !named {
+                bindings.push(d);
+            }
+        }
+        // Variants compiled to the same code are each named in the index: the first, and how many more.
+        let name = match names.program(&key) {
+            Some(m) if m.others > 0 => format!("{} (+{} with the same bytes)", m.file.name, m.others),
+            Some(m) => m.file.name,
+            None => r.name,
+        };
+        return Program {
+            name: Some(name),
+            constant_buffers: Some(r.constant_buffers),
+            bindings: Some(bindings),
+            source: "index",
+        };
+    }
+    Program {
+        name: rdef::debug_name(code),
+        constant_buffers: rdef::constant_buffers(code),
+        bindings: rdef::bindings(code),
+        source: if own { "bytecode" } else { "registers" },
+    }
+}
+
 /// Shader reflection by shader hash, read once.
 #[derive(Default)]
 pub struct Reflection {
-    cache: HashMap<String, Option<Vec<ConstantBuffer>>>,
-    bindings: HashMap<String, Option<Vec<rdef::Binding>>>,
-    names: HashMap<String, Option<String>>,
+    programs: HashMap<String, Option<Program>>,
+    /// The file an index names a program's bytecode by, when its reflection gives no name.
+    files: HashMap<String, Option<String>>,
 }
 
 /// What a shader's reflection says of a register a draw bound.
@@ -178,53 +226,46 @@ pub enum Slot {
     Unknown,
 }
 
+/// The blob key of shader `shader`'s bytecode, when the capture kept it.
+fn blob_key(c: &Capture, shader: &str) -> Option<String> {
+    c.row(
+        "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
+        [shader],
+        |r| r.get(0),
+    )
+}
+
 impl Reflection {
-    /// Whether shader `shader` declares a resource or constant buffer called `name` (any case).
-    pub fn declares(&mut self, c: &Capture, shader: &str, name: &str) -> bool {
-        let bindings = self.bindings.entry(shader.to_string()).or_insert_with(|| {
-            let key: String = c.row(
-                "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
-                [shader],
-                |r| r.get(0),
-            )?;
-            rdef::bindings(&c.blob(&key).ok()?)
-        });
-        bindings
-            .iter()
-            .flatten()
-            .any(|b| b.name.eq_ignore_ascii_case(name))
+    /// Shader `shader`'s reflection (`reflected`).
+    pub fn program<'a>(&'a mut self, c: &Capture, shader: &str) -> Option<&'a Program> {
+        self.programs
+            .entry(shader.to_string())
+            .or_insert_with(|| Some(reflected(&c.names, &c.blob(&blob_key(c, shader)?).ok()?)))
+            .as_ref()
     }
 
-    /// Shader `shader`'s name: its debug name (`rdef::debug_name`) when its bytecode names one, or else the file an
+    /// Whether shader `shader` declares a resource or constant buffer called `name` (any case).
+    pub fn declares(&mut self, c: &Capture, shader: &str, name: &str) -> bool {
+        self.program(c, shader)
+            .and_then(|p| p.bindings.as_ref())
+            .is_some_and(|bs| bs.iter().any(|b| b.name.eq_ignore_ascii_case(name)))
+    }
+
+    /// Shader `shader`'s name: its reflection's (`reflected`: a debug name, or an index's record), or else the file an
     /// index (`--index`) says the same bytecode was read from.
-    pub fn name(&mut self, c: &Capture, shader: &str) -> Option<&str> {
-        self.names
+    pub fn name(&mut self, c: &Capture, shader: &str) -> Option<String> {
+        if let Some(name) = self.program(c, shader).and_then(|p| p.name.clone()) {
+            return Some(name);
+        }
+        self.files
             .entry(shader.to_string())
-            .or_insert_with(|| {
-                let key: String = c.row(
-                    "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
-                    [shader],
-                    |r| r.get(0),
-                )?;
-                c.blob(&key)
-                    .ok()
-                    .and_then(|code| rdef::debug_name(&code))
-                    .or_else(|| c.names.program(&key).map(|m| m.file.name))
-            })
-            .as_deref()
+            .or_insert_with(|| c.names.program(&blob_key(c, shader)?).map(|m| m.file.name))
+            .clone()
     }
 
     /// What shader `shader` calls register `slot` (space `space`) of class `class` (`srv`, `uav`, `sampler`, `cb`).
     pub fn slot(&mut self, c: &Capture, shader: &str, class: &str, slot: u32, space: u32) -> Slot {
-        let bindings = self.bindings.entry(shader.to_string()).or_insert_with(|| {
-            let key: String = c.row(
-                "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
-                [shader],
-                |r| r.get(0),
-            )?;
-            rdef::bindings(&c.blob(&key).ok()?)
-        });
-        let Some(bindings) = bindings else {
+        let Some(bindings) = self.program(c, shader).and_then(|p| p.bindings.as_ref()) else {
             return Slot::Unknown;
         };
         bindings
@@ -236,17 +277,7 @@ impl Reflection {
 
     /// The constant buffers a shader declares.
     fn cbs<'a>(&'a mut self, c: &Capture, shader: &str) -> Option<&'a Vec<ConstantBuffer>> {
-        self.cache
-            .entry(shader.to_string())
-            .or_insert_with(|| {
-                let key: String = c.row(
-                    "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
-                    [shader],
-                    |r| r.get(0),
-                )?;
-                rdef::constant_buffers(&c.blob(&key).ok()?)
-            })
-            .as_ref()
+        self.program(c, shader)?.constant_buffers.as_ref()
     }
 
     /// The constant buffer a shader declares at register `slot` (space `space`).
