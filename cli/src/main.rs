@@ -37,6 +37,9 @@ struct Cli {
     /// LOCUM_INDEX, paths separated by ';').
     #[arg(long, global = true)]
     index: Vec<PathBuf>,
+    /// `export` and `target`: say nothing of what was written (warnings still), for piping `-o -`.
+    #[arg(long, short, global = true)]
+    quiet: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -180,7 +183,7 @@ enum Command {
     /// One draw: its shaders, state, everything bound, its constants by name, and the targets read after it.
     Draw {
         capture: String,
-        /// The draw's number, `last`, or `all` for every draw.
+        /// The draw's number, `last`, `all` for every draw, or several: `120-180`, `5,9,200-last`.
         n: String,
         /// Every bound register and every constant register, not only those the shaders use.
         #[arg(long)]
@@ -188,9 +191,13 @@ enum Command {
         /// As JSON: one object per draw, one per line.
         #[arg(long)]
         json: bool,
-        /// Only these parts after the call and shaders: state, bound, cb, targets (`--section bound,cb`).
+        /// Only these parts after the call and shaders: state, bound, cb, targets (`--section bound,cb`); JSON too.
         #[arg(long, value_delimiter = ',', value_parser = clap::builder::PossibleValuesParser::new(draw::SECTIONS))]
         section: Vec<String>,
+        /// Only the constants whose name (the buffer's, the variable's or a member's) holds this, any case; several
+        /// parts with `|`: `--name 'g_LightColor|envData'`.
+        #[arg(long)]
+        name: Option<String>,
     },
     /// A draw's constant buffer, every register, with names from the shader.
     Cb {
@@ -639,6 +646,7 @@ fn sql(c: &open::Capture, query: &str) -> Result<(), String> {
 }
 
 fn run(cli: Cli) -> Result<(), String> {
+    export::QUIET.store(cli.quiet, std::sync::atomic::Ordering::Relaxed);
     let blobs = cli.blobs.as_deref();
     let indexes = join::paths(&cli.index);
     let open = |name: &str| open::open(name, blobs)?.named(&indexes);
@@ -715,7 +723,8 @@ fn run(cli: Cli) -> Result<(), String> {
             all,
             json,
             section,
-        } => draw::draw(&open(&capture)?, &n, all, json, &section),
+            name,
+        } => draw::draw(&open(&capture)?, &n, all, json, &section, name.as_deref()),
         Command::Cb {
             capture,
             draw,

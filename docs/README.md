@@ -271,7 +271,10 @@ locum-cli changes last 120:rt0 --rect 0,0,640,360  # texels each pass changed in
                                            # (a depth-stencil target's stencil counts, and pixel shows it)
 locum-cli cb last 120 vs 8 --name ViewProj # only the registers of matching variables (--reg 3,26 by number;
                                            # --name 'Scroll|waveTime' for several)
-locum-cli draw last 120 --section bound,cb # only those parts (state, bound, cb, targets)
+locum-cli draw last 120 --section bound,cb # only those parts (state, bound, cb, targets); with --json too, so
+                                           # `draw last all --json --section bound` is a tenth of the whole
+locum-cli draw last 120-180,200 --section cb --name 'envData|g_LightColor'
+                                           # several draws; only the constants whose names hold a part
 locum-cli sql last "SELECT ..."            # anything else (`.tables` lists the tables, `.schema results` one's columns;
                                            # capture/src/db.rs explains each)
 locum-cli hash FILE...                     # the D3D11 shader hash and the blob key locum would give a file's bytes
@@ -401,6 +404,10 @@ block, vertex buffers and face sets in Sekiro's or Elden Ring's archives, and un
 Mesh's vertex streams and index buffer in a Unity player (a SkateBIRD capture has 183 of its 209 buffers named so).
 `join`'s totals say how many of those not named have no bytes recorded to match (neither upload bytes nor contents), as
 in captures from before first-use contents.
+
+A DXBC program stripped of its reflection (no `RDEF`; some of Elden Ring's) is read from the declarations in its
+code: its registers are listed under their own names (`cb1`, `t0`, `u0`), and `bindings`, `draw` and Direct3D 12's
+UAV outputs find them as they would named ones.
 
 Programs are named the same way. A program built without a debug name (Sekiro's DXBC, older Elden Ring captures)
 takes the name of the file an index holds with the same bytecode, so `shaders --name`, `draws --name` and `draw`

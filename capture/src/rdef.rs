@@ -151,12 +151,15 @@ fn binding(b: &dxbc_reader::RdefBinding) -> Binding {
 }
 
 /// Every resource a shader binds (constant buffers, textures, buffers, samplers, UAVs), from its DXBC or DXIL
-/// bytecode, in the reflection's order.
+/// bytecode, in the reflection's order. A DXBC program stripped of its reflection is read from its declarations,
+/// each named by its register (`t3`, `cb0`).
 pub fn bindings(code: &[u8]) -> Option<Vec<Binding>> {
     if let Some(rdef) = rdef(code) {
         return Some(rdef.bindings.iter().map(binding).collect());
     }
-    let m = dxil(code)?;
+    let Some(m) = dxil(code) else {
+        return declared(code);
+    };
     let ranges = dxil_reader::reflection::ranges(&m).ok()?;
     Some(
         ranges
@@ -194,15 +197,64 @@ pub fn uav_registers(code: &[u8]) -> Option<Vec<(u32, u32, u32)>> {
                 .collect(),
         );
     }
-    let rdef = rdef(code)?;
+    let bindings = match rdef(code) {
+        Some(rdef) => rdef.bindings.iter().map(binding).collect(),
+        None => declared(code)?,
+    };
     Some(
-        rdef.bindings
-            .iter()
-            .map(binding)
+        bindings
+            .into_iter()
             .filter(|b| b.class() == "uav")
             .map(|b| (b.space, b.slot, if b.count == 0 { u32::MAX } else { b.slot + b.count - 1 }))
             .collect(),
     )
+}
+
+/// A DXBC program's registers from the declarations in its code, for a program stripped of its reflection: each
+/// named by its register (`cb0`, `t3`, `s1`, `u0`; `t3 space 1` in Shader Model 5.1), in the order declared. None
+/// for a container with no DXBC code.
+pub fn declared(code: &[u8]) -> Option<Vec<Binding>> {
+    use dxbc_reader::Declared as D;
+    let words = dxbc_reader::code(code).ok()?;
+    let program = dxbc_reader::decode(&words).ok()?;
+    let out = program
+        .declarations
+        .iter()
+        .filter_map(|d| {
+            // D3D_SHADER_INPUT_TYPE, the register's letter, the Shader Model 5.0 register, the 5.1 range.
+            let (kind, letter, slot, range) = match &d.kind {
+                D::ConstantBuffer { slot, range, .. } => (0, "cb", *slot, range),
+                D::Sampler { slot, range, .. } => (3, "s", *slot, range),
+                D::Resource { slot, range, .. } => (2, "t", *slot, range),
+                D::ResourceRaw { slot, range } => (7, "t", *slot, range),
+                D::ResourceStructured { slot, range, .. } => (5, "t", *slot, range),
+                D::UavTyped { slot, range, .. } => (4, "u", *slot, range),
+                D::UavRaw { slot, range, .. } => (8, "u", *slot, range),
+                D::UavStructured { slot, range, .. } => (6, "u", *slot, range),
+                _ => return None,
+            };
+            let (slot, count, space) = match range {
+                Some(r) => (
+                    r.lower,
+                    if r.upper == u32::MAX { 0 } else { r.upper.saturating_sub(r.lower) + 1 },
+                    r.space,
+                ),
+                None => (slot, 1, 0),
+            };
+            let name = match space {
+                0 => format!("{letter}{slot}"),
+                s => format!("{letter}{slot} space {s}"),
+            };
+            Some(Binding {
+                name,
+                kind,
+                slot,
+                count,
+                space,
+            })
+        })
+        .collect();
+    Some(out)
 }
 
 /// A program's debug name: the file stem of the PDB its DXIL compiler named in the `ILDN` part, so
@@ -512,6 +564,33 @@ mod tests {
             elements,
             members: Vec::new(),
         }
+    }
+
+    /// `testdata/dxbc-stripped.cso`: FXC's cs_5_0 with `/Qstrip_reflect` (no RDEF) of a program declaring b2, t3, s1,
+    /// a structured u0 and a raw u4 (`scratch/locum-dx12/dxbc-stripped/stripped.hlsl`).
+    #[test]
+    fn a_stripped_program_is_read_from_its_declarations() {
+        let code = include_bytes!("testdata/dxbc-stripped.cso");
+        assert!(rdef(code).is_none(), "the fixture has no reflection");
+        let mut found: Vec<(String, &str, u32, u32)> = bindings(code)
+            .expect("its declarations")
+            .into_iter()
+            .map(|b| (b.name.clone(), b.class(), b.slot, b.count))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("cb2".to_string(), "cb", 2, 1),
+                ("s1".to_string(), "sampler", 1, 1),
+                ("t3".to_string(), "srv", 3, 1),
+                ("u0".to_string(), "uav", 0, 1),
+                ("u4".to_string(), "uav", 4, 1),
+            ]
+        );
+        let mut uavs = uav_registers(code).expect("its UAVs");
+        uavs.sort();
+        assert_eq!(uavs, [(0, 0, 0), (0, 4, 4)]);
     }
 
     #[test]

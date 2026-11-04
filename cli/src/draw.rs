@@ -747,17 +747,18 @@ fn print_constants(k: &Constants) {
         k.bytes,
         k.buffer.map_or(String::new(), |r| format!(", buffer #{r}"))
     );
-    for register in k.words.chunks(4) {
-        let mut names: [Option<String>; 4] = Default::default();
-        for (i, w) in register.iter().enumerate() {
-            names[i] = w.name.clone();
-        }
-        let r = register[0].offset / 16;
+    // One row per register, each word under its component: `--name` can leave some of a register's words out.
+    let mut rows: BTreeMap<u32, [Option<&Word>; 4]> = BTreeMap::new();
+    for w in &k.words {
+        rows.entry(w.offset / 16).or_default()[(w.offset % 16 / 4) as usize] = Some(w);
+    }
+    for (r, register) in rows {
+        let names: [Option<String>; 4] = register.map(|w| w.and_then(|w| w.name.clone()));
         out!(
             "  c{r:<4}{:<53}  {}",
             register
                 .iter()
-                .map(|w| format!(" {:>12}", w.text))
+                .map(|w| format!(" {:>12}", w.map_or("", |w| w.text.as_str())))
                 .collect::<String>(),
             register_name(&names)
         );
@@ -1026,36 +1027,112 @@ fn json<T: Serialize>(v: &T) -> Result<(), String> {
     Ok(())
 }
 
-/// `draw`: one draw (a number or `last`), or with `all` every draw, as text or JSON (one object per line).
+/// `draw`: one draw (a number or `last`), several (`120-180`, `5,9,200-last`), or with `all` every draw, as text or
+/// JSON (one object per line); with `sections`, only those parts; with `name`, only the constants so named.
 pub fn draw(
     c: &Capture,
     which: &str,
     all_constants: bool,
     as_json: bool,
     sections: &[String],
+    name: Option<&str>,
 ) -> Result<(), String> {
     let mut reflection = Reflection::default();
-    if which == "all" {
-        let numbers: Vec<i64> = c.rows("SELECT n FROM draws ORDER BY n", [], |r| r.get(0));
-        for n in numbers {
-            let d = describe(c, n, all_constants, &mut reflection)?;
-            if as_json {
-                json(&d)?;
-            } else {
-                print(&d, sections);
+    let numbers = numbers(c, which)?;
+    let several = numbers.len() > 1;
+    for n in numbers {
+        let mut d = describe(c, n, all_constants, &mut reflection)?;
+        if let Some(name) = name {
+            keep_named(&mut d, name);
+        }
+        if as_json {
+            json(&sectioned(&d, sections)?)?;
+        } else {
+            print(&d, sections);
+            if several {
                 out!("");
             }
         }
-        return Ok(());
     }
-    let n = crate::replay::draw_number(c, which)?;
-    let d = describe(c, n, all_constants, &mut reflection)?;
-    if as_json {
-        json(&d)
-    } else {
-        print(&d, sections);
-        Ok(())
+    Ok(())
+}
+
+/// The draws `which` names: `all`, or items separated by `,`, each a number, `last`, or a range `A-B` (either end
+/// `last`), in the order given.
+fn numbers(c: &Capture, which: &str) -> Result<Vec<i64>, String> {
+    if which == "all" {
+        return Ok(c.rows("SELECT n FROM draws ORDER BY n", [], |r| r.get(0)));
     }
+    let mut out = Vec::new();
+    for item in which.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+        match item.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (
+                    crate::replay::draw_number(c, a)?,
+                    crate::replay::draw_number(c, b)?,
+                );
+                if a > b {
+                    return Err(format!("{item}: the range runs backwards"));
+                }
+                out.extend(a..=b);
+            }
+            None => out.push(crate::replay::draw_number(c, item)?),
+        }
+    }
+    if out.is_empty() {
+        return Err(format!("{which:?} names no draw"));
+    }
+    Ok(out)
+}
+
+/// Keeps only the constants whose buffer's or word's name holds one of `name`'s `|`-separated parts (any case).
+fn keep_named(d: &mut Draw, name: &str) {
+    let parts: Vec<String> = name.split('|').map(str::to_lowercase).filter(|p| !p.is_empty()).collect();
+    let holds = |n: &Option<String>| n.as_ref().is_some_and(|n| parts.iter().any(|p| n.to_lowercase().contains(p)));
+    d.constants.retain_mut(|k| {
+        if !holds(&k.name) {
+            k.words.retain(|w| holds(&w.name));
+        }
+        !k.words.is_empty()
+    });
+}
+
+/// The draw as JSON, with only `sections` (all when empty) of what follows the call and its shaders.
+fn sectioned(d: &Draw, sections: &[String]) -> Result<Value, String> {
+    let mut v = serde_json::to_value(d).map_err(|e| e.to_string())?;
+    if sections.is_empty() {
+        return Ok(v);
+    }
+    const PARTS: [(&str, &[&str]); 4] = [
+        (
+            "state",
+            &[
+                "topology",
+                "topology_name",
+                "states",
+                "blend_factor",
+                "sample_mask",
+                "stencil_ref",
+                "predicate",
+                "predicate_value",
+                "viewports",
+                "scissors",
+            ],
+        ),
+        ("bound", &["bindings", "unused", "unread_slots", "doubled"]),
+        ("cb", &["constants"]),
+        ("targets", &["targets"]),
+    ];
+    if let Some(o) = v.as_object_mut() {
+        for (section, keys) in PARTS {
+            if !sections.iter().any(|s| s == section) {
+                for k in keys {
+                    o.remove(*k);
+                }
+            }
+        }
+    }
+    Ok(v)
 }
 
 /// `cb`: a draw's constant buffer, every register, by name; or its bytes in hex; or as JSON.

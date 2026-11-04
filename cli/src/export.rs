@@ -68,15 +68,21 @@ fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
         })
 }
 
-/// What was written where: on stderr when the bytes went to stdout.
+/// `--quiet`: say nothing of what was written, only warnings.
+pub static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What was written where: on stderr when the bytes went to stdout; with `--quiet`, warnings only.
 macro_rules! told {
-    ($path:expr, $($arg:tt)*) => {
-        if stdout($path) {
-            eprintln!($($arg)*);
-        } else {
-            out!($($arg)*);
+    ($path:expr, $($arg:tt)*) => {{
+        let line = format!($($arg)*);
+        if !QUIET.load(std::sync::atomic::Ordering::Relaxed) || line.starts_with("warning") {
+            if stdout($path) {
+                eprintln!("{line}");
+            } else {
+                out!("{line}");
+            }
         }
-    };
+    }};
 }
 
 /// How a PNG is drawn: the value mapping, one channel as grey, and a part of the image.
