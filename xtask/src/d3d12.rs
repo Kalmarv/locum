@@ -142,6 +142,10 @@ pub fn implementation(c: &Class, levels: &[(String, &Vtbl)]) -> String {
             }
             let has_ret = e.ret.is_some();
             s.push_str(&super::d3d12_capture::before(c, e));
+            if c.module == "d12_queue" && e.name == "ExecuteCommandLists" {
+                // The array `before` arranged: the application's lists with locum's.
+                args = vec!["count".into(), "lists".into()];
+            }
             writeln!(
                 s,
                 "{}real::{}(self.real(){}{});",

@@ -12,11 +12,17 @@
 //!
 //! The readback memory lives as long as the GPU may run the list: until the list is reset or destroyed and a fence
 //! locum signals after its last execution has completed.
+//!
+//! A pass still open when its list closes is decided where the list is submitted. Games split one pass over several
+//! lists submitted together (Elden Ring's G-buffer goes over 13 to 15): if the next list of the same submission that
+//! names the target draws to it before naming it any other way, the pass continues there and nothing is copied.
+//! Otherwise locum records a list of its own that copies the target, and submits it right after the closed list in
+//! the same ExecuteCommandLists call. Its memory is freed once the copy is read, not held for the list's life.
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use locum_capture::d3d12 as model;
 use locum_capture::layout::Sub;
@@ -42,13 +48,45 @@ const RENDER_TARGET: i32 = 0x4;
 const DEPTH_WRITE: i32 = 0x10;
 const ALL_SUBRESOURCES: u64 = 0xFFFF_FFFF;
 
-/// One target's copy, alive while the GPU may still write it.
-struct Copy {
+/// The readback memory of one target's copy; dropping the last reference gives its bytes back to the budget.
+struct Readback {
     readback: ID3D12Resource,
     footprints: Vec<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)>,
     layout: Vec<Sub>,
     joined: Option<u32>,
     bytes: u64,
+}
+// Free-threaded D3D12 objects.
+unsafe impl Send for Readback {}
+unsafe impl Sync for Readback {}
+
+impl Drop for Readback {
+    fn drop(&mut self) {
+        BYTES.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+impl Readback {
+    /// The target's bytes in canonical layout, once the GPU has made the copy.
+    unsafe fn read(&self) -> Result<Vec<u8>, String> {
+        let mut p = core::ptr::null_mut();
+        let whole = D3D12_RANGE {
+            Begin: 0,
+            End: self.bytes as usize,
+        };
+        unsafe { self.readback.Map(0, Some(&whole), Some(&mut p)) }
+            .map_err(|e| format!("checkpoint Map: {e}"))?;
+        let out = unsafe {
+            super::readback::canonical(&self.layout, self.joined, &self.footprints, p.cast(), self.bytes)
+        };
+        unsafe { self.readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
+        out
+    }
+}
+
+/// One target's copy inside an application list, alive while the GPU may still write it.
+struct Copy {
+    data: Arc<Readback>,
     list: u64,
     /// The fence value locum signalled after the list's latest execution.
     last: Option<(ID3D12Fence, u64)>,
@@ -57,6 +95,25 @@ struct Copy {
 }
 // Free-threaded D3D12 objects.
 unsafe impl Send for Copy {}
+
+/// A pass its list's Close left open: the target, and the state each plane is in where the list ends.
+struct Pending {
+    list: u64,
+    device: ID3D12Device,
+    target: Bound,
+    states: Vec<Access>,
+}
+// Free-threaded D3D12 objects.
+unsafe impl Send for Pending {}
+
+/// The pending ends of closed lists not yet submitted, by checkpoint.
+fn pending() -> MutexGuard<'static, HashMap<u64, Pending>> {
+    static PENDING: OnceLock<Mutex<HashMap<u64, Pending>>> = OnceLock::new();
+    PENDING
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 fn copies() -> MutexGuard<'static, HashMap<u64, Copy>> {
     static COPIES: OnceLock<Mutex<HashMap<u64, Copy>>> = OnceLock::new();
@@ -89,30 +146,160 @@ pub fn retire(list: u64) {
     for c in copies().values_mut().filter(|c| c.list == list) {
         c.retired = true;
     }
+    pending().retain(|_, p| p.list != list);
 }
 
 /// Frees the copies of retired lists whose last execution has completed.
 pub fn sweep() {
     copies().retain(|_, c| {
-        let done = c.retired
+        !(c.retired
             && c.last
                 .as_ref()
-                .is_none_or(|(f, v)| unsafe { f.GetCompletedValue() } >= *v);
-        if done {
-            BYTES.fetch_sub(c.bytes, Ordering::AcqRel);
-        }
-        !done
+                .is_none_or(|(f, v)| unsafe { f.GetCompletedValue() } >= *v))
     });
 }
 
-/// A submission's executions of instrumented lists: every checkpoint they copy into, and those whose bytes the
-/// armed capture reads.
+/// A submission's executions of instrumented lists: every checkpoint they copy into, those whose bytes the armed
+/// capture reads, and the lists locum adds after closed lists to copy the passes they left open.
 #[derive(Default)]
 pub struct Submitted {
     pub all: Vec<u64>,
     pub read: Vec<u64>,
     pub results: Option<super::readback::Results>,
     pub submission: u64,
+    /// Locum's copy lists, each with the position in the application's array of the list it follows.
+    inserted: Vec<(usize, ID3D12GraphicsCommandList)>,
+    allocator: Option<ID3D12CommandAllocator>,
+    /// The copies those lists make, and the pending ends they could not copy, by checkpoint.
+    reads: Vec<(u64, Arc<Readback>)>,
+    gaps: Vec<(u64, String)>,
+    /// The array submitted when locum's lists are added to the application's.
+    array: Vec<*mut c_void>,
+}
+
+impl Submitted {
+    pub fn new(submission: u64) -> Submitted {
+        Submitted {
+            submission,
+            ..Default::default()
+        }
+    }
+
+    /// The lists to submit for the application's `count` lists at `lists`: its own, with locum's copy lists after
+    /// the lists they follow. The array lives as long as this submission.
+    ///
+    /// # Safety
+    /// `lists` points at `count` list pointers.
+    pub unsafe fn arrange(&mut self, count: u32, lists: *const *mut c_void) -> (u32, *const *mut c_void) {
+        if self.inserted.is_empty() || lists.is_null() {
+            return (count, lists);
+        }
+        let mut inserted = self.inserted.iter().peekable();
+        for (i, list) in unsafe { core::slice::from_raw_parts(lists, count as usize) }
+            .iter()
+            .enumerate()
+        {
+            self.array.push(*list);
+            while let Some((_, l)) = inserted.next_if(|(at, _)| *at == i) {
+                self.array.push(l.as_raw());
+            }
+        }
+        (self.array.len() as u32, self.array.as_ptr())
+    }
+
+    /// Whether the capture has anything to read from this submission's copies.
+    pub fn reads(&self) -> bool {
+        !self.read.is_empty() || !self.reads.is_empty() || !self.gaps.is_empty()
+    }
+}
+
+/// One list of a submission, at `at` in the application's array, and whether this is its generation's first
+/// execution while the capture is armed.
+pub struct Executed<'a> {
+    pub at: usize,
+    pub list: &'a model::List,
+    pub first: bool,
+}
+
+/// Decides the pending ends of a submission's lists (see the module's documentation), recording locum's copy lists
+/// into `s`. Returns the checkpoints whose pass the next list continues. Ends of lists not executed for the first
+/// time while armed are dropped: their copies would not be read.
+///
+/// # Safety
+/// Called from ExecuteCommandLists on the application's direct queue, before the lists are submitted.
+pub unsafe fn ends(s: &mut Submitted, lists: &[Executed]) -> Vec<u64> {
+    let mut continued = Vec::new();
+    for (i, e) in lists.iter().enumerate() {
+        let ends: Vec<(u64, Pending)> = {
+            let mut p = pending();
+            e.list
+                .checkpoints
+                .iter()
+                .filter_map(|c| p.remove(&c.id).map(|end| (c.id, end)))
+                .collect()
+        };
+        if !e.first {
+            continue;
+        }
+        let mut list: Option<ID3D12GraphicsCommandList> = None;
+        let mut reads = Vec::new();
+        for (id, end) in ends {
+            let key = (end.target.resource, end.target.subs[0]);
+            let next = lists[i + 1..]
+                .iter()
+                .find(|n| n.list.continues.contains(&key) || n.list.named.contains(&key.0));
+            if next.is_some_and(|n| n.first && n.list.continues.contains(&key)) {
+                continued.push(id);
+                continue;
+            }
+            let recorded = unsafe { s.recorder(&end.device, &mut list) }
+                .and_then(|l| unsafe { copy_into(&end.device, l, &end.target, &end.states, None) });
+            match recorded {
+                Ok(readback) => reads.push((id, Arc::new(readback))),
+                Err(why) => s.gaps.push((id, why)),
+            }
+        }
+        let Some(list) = list else {
+            continue;
+        };
+        match unsafe { list.Close() } {
+            Ok(()) if !reads.is_empty() => {
+                s.inserted.push((e.at, list));
+                s.reads.extend(reads);
+            }
+            Ok(()) => {}
+            Err(why) => s.gaps.extend(
+                reads
+                    .into_iter()
+                    .map(|(id, _)| (id, format!("copy list Close: {why}"))),
+            ),
+        }
+    }
+    continued
+}
+
+impl Submitted {
+    /// A new direct list of locum's for copies after one application list, on the submission's own allocator.
+    unsafe fn recorder<'a>(
+        &mut self,
+        device: &ID3D12Device,
+        list: &'a mut Option<ID3D12GraphicsCommandList>,
+    ) -> Result<&'a ID3D12GraphicsCommandList, String> {
+        if list.is_none() {
+            if self.allocator.is_none() {
+                self.allocator = Some(
+                    unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }
+                        .map_err(|e| format!("copy allocator: {e}"))?,
+                );
+            }
+            let allocator = self.allocator.as_ref().expect("made above");
+            *list = Some(
+                unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator, None) }
+                    .map_err(|e| format!("copy list: {e}"))?,
+            );
+        }
+        Ok(list.as_ref().expect("made above"))
+    }
 }
 
 /// After the application's lists were submitted to the real queue `queue`: locum's fence marks their completion,
@@ -121,7 +308,7 @@ pub struct Submitted {
 /// # Safety
 /// `queue` is the real queue the lists were executed on.
 pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
-    if s.all.is_empty() {
+    if s.all.is_empty() && s.inserted.is_empty() {
         return;
     }
     static FENCES: OnceLock<Mutex<HashMap<u64, (ID3D12Fence, u64)>>> = OnceLock::new();
@@ -141,6 +328,8 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
                 .and_then(|()| unsafe { device?.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) }.ok());
             let Some(fence) = fence else {
                 crate::log::log!("D3D12 checkpoints: no fence for queue {queue_id}; their copies are kept");
+                // The GPU may still run locum's copy lists.
+                std::mem::forget(s);
                 return;
             };
             e.insert((fence, 0))
@@ -150,43 +339,64 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
     let (fence, value) = (fence.clone(), *value);
     drop(fences);
     if unsafe { queue.Signal(&fence, value) }.is_err() {
+        crate::log::log!("D3D12 checkpoints: Signal failed on queue {queue_id}; their copies are kept");
+        std::mem::forget(s);
         return;
     }
+    let Submitted {
+        all,
+        read: wanted,
+        results,
+        submission,
+        inserted,
+        allocator,
+        reads,
+        gaps,
+        ..
+    } = s;
     let mut read = Vec::new();
     {
         let mut c = copies();
-        for id in &s.all {
+        for id in &all {
             if let Some(copy) = c.get_mut(id) {
                 copy.last = Some((fence.clone(), value));
             }
         }
-        for id in &s.read {
+        for id in &wanted {
             if let Some(copy) = c.get(id) {
-                read.push((
-                    *id,
-                    copy.readback.clone(),
-                    copy.footprints.clone(),
-                    copy.layout.clone(),
-                    copy.joined,
-                    copy.bytes,
-                ));
+                read.push((*id, copy.data.clone()));
             }
         }
     }
-    let (Some(results), false) = (s.results, read.is_empty()) else {
+    read.extend(reads);
+    let idle = inserted.is_empty();
+    // Locum's lists and allocator live until the GPU has run them.
+    let lists = Lists {
+        _lists: inserted,
+        _allocator: allocator,
+    };
+    let Some(results) = results.filter(|_| !read.is_empty() || !gaps.is_empty()) else {
+        if !idle {
+            super::readback::collector(Box::new(move || {
+                let _ = unsafe {
+                    fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default())
+                };
+                drop(lists);
+            }));
+        }
         return;
     };
-    let submission = s.submission;
     super::readback::collector(Box::new(move || {
         let wait =
             unsafe { fence.SetEventOnCompletion(value, windows::Win32::Foundation::HANDLE::default()) };
+        drop(lists);
         let checkpoints = read
             .into_iter()
-            .map(|(id, readback, footprints, layout, joined, bytes)| {
+            .map(|(id, readback)| {
                 let content = wait
                     .as_ref()
                     .map_err(|e| format!("checkpoint wait: {e}"))
-                    .and_then(|()| unsafe { bytes_of(&readback, &footprints, &layout, joined, bytes) })
+                    .and_then(|()| unsafe { readback.read() })
                     .map(|data| {
                         let key = locum_capture::hash::key(&data);
                         locum_capture::writer::blob(
@@ -199,6 +409,7 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
                     });
                 (id, content)
             })
+            .chain(gaps.into_iter().map(|(id, why)| (id, Err(why))))
             .collect();
         results
             .lock()
@@ -211,29 +422,13 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
     }));
 }
 
-unsafe fn bytes_of(
-    readback: &ID3D12Resource,
-    footprints: &[(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)],
-    layout: &[Sub],
-    joined: Option<u32>,
-    bytes: u64,
-) -> Result<Vec<u8>, String> {
-    let mut p = core::ptr::null_mut();
-    unsafe {
-        readback.Map(
-            0,
-            Some(&D3D12_RANGE {
-                Begin: 0,
-                End: bytes as usize,
-            }),
-            Some(&mut p),
-        )
-    }
-    .map_err(|e| format!("checkpoint Map: {e}"))?;
-    let out = unsafe { super::readback::canonical(layout, joined, footprints, p.cast(), bytes) };
-    unsafe { readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 })) };
-    out
+/// Locum's copy lists of a submission and their allocator, moved to the collector.
+struct Lists {
+    _lists: Vec<(usize, ID3D12GraphicsCommandList)>,
+    _allocator: Option<ID3D12CommandAllocator>,
 }
+// Free-threaded D3D12 objects, dropped once the GPU is done with them.
+unsafe impl Send for Lists {}
 
 /// A target bound in a pass.
 #[derive(Clone)]
@@ -331,6 +526,11 @@ pub struct Pass {
     predicate: Option<(u64, u64, i32)>,
     /// The states and layouts this list's own barriers left resources in, by resource, latest last.
     known: HashMap<u64, Vec<(Range, Access)>>,
+    /// The targets (resource, first plane's subresource) drawn to before the list named them any other way: a pass
+    /// an earlier list left open continues here.
+    continues: HashSet<(u64, u32)>,
+    /// The resources the list names other than as bound targets: barriers, clears, discards, copies.
+    named: HashSet<u64>,
 }
 // Free-threaded D3D12 objects; a list's pass is used by whoever records the list, one at a time.
 unsafe impl Send for Pass {}
@@ -359,7 +559,17 @@ impl Pass {
             suspending: false,
             predicate: None,
             known: HashMap::new(),
+            continues: HashSet::new(),
+            named: HashSet::new(),
         })
+    }
+
+    /// What the list's continuing draws and namings were, for the submissions that decide pending ends.
+    pub fn touches(&mut self) -> (Vec<(u64, u32)>, Vec<u64>) {
+        (
+            std::mem::take(&mut self.continues).into_iter().collect(),
+            std::mem::take(&mut self.named).into_iter().collect(),
+        )
     }
 
     /// Called before the command `call` with recorded arguments `a` is forwarded to the real list, `at` commands
@@ -381,6 +591,7 @@ impl Pass {
         if let Some(suspended) = self.ended.take() {
             unsafe { self.end_pass(list, at, suspended, &mut out) };
         }
+        self.name(call, a);
         match call {
             "OMSetRenderTargets" => {
                 let mut targets: Vec<Bound> = a[0]
@@ -432,6 +643,9 @@ impl Pass {
             | "ExecuteBundle" => {
                 for t in &mut self.targets {
                     t.drawn = true;
+                    if !self.named.contains(&t.resource) {
+                        self.continues.insert((t.resource, t.subs[0]));
+                    }
                 }
             }
             // What a clear or discard overwrites ends its pass first.
@@ -500,17 +714,91 @@ impl Pass {
         out
     }
 
-    /// Before Close: a pass still open ends here.
-    ///
-    /// # Safety
-    /// As [`Pass::before`].
-    pub unsafe fn closing(&mut self, real: *mut c_void, at: usize) -> Vec<model::Checkpoint> {
+    /// Before Close, `at` commands into the list: a pass still open is pending, decided where the list is submitted.
+    pub fn closing(&mut self, at: usize) -> Vec<model::Checkpoint> {
+        let suspended = self.ended.take().unwrap_or(self.suspending);
         let mut out = Vec::new();
-        if let Some(list) = unsafe { ID3D12GraphicsCommandList::from_raw_borrowed(&real) } {
-            let suspended = self.ended.take().unwrap_or(self.suspending);
-            unsafe { self.end_pass(list, at, suspended, &mut out) };
+        for t in std::mem::take(&mut self.targets)
+            .into_iter()
+            .filter(|t| t.drawn && !t.reads_only())
+        {
+            if suspended {
+                out.push(checkpoint(
+                    &t,
+                    at,
+                    Some("its render pass suspends into another list: not copied yet"),
+                ));
+                continue;
+            }
+            let states = (0..t.subs.len()).map(|p| self.state(&t, p)).collect();
+            let c = checkpoint(&t, at, None);
+            pending().insert(
+                c.id,
+                Pending {
+                    list: 0,
+                    device: self.device.clone(),
+                    target: t,
+                    states,
+                },
+            );
+            out.push(c);
         }
         out
+    }
+
+    /// Notes the resources a command names other than as bound targets.
+    fn name(&mut self, call: &str, a: &Value) {
+        let resource = |v: &Value| v["resource"].as_u64().or_else(|| v.as_u64()).filter(|r| *r != 0);
+        let mut named = Vec::new();
+        match call {
+            "ClearRenderTargetView" | "ClearDepthStencilView" => named.extend(resource(&a[0]["definition"])),
+            "DiscardResource" => named.extend(resource(&a[0])),
+            "ResourceBarrier" => {
+                for b in a[0].as_array().into_iter().flatten() {
+                    let p = &b["payload"];
+                    match b["type"].as_u64() {
+                        Some(0) => named.extend(resource(p)),
+                        Some(1) => named.extend(resource(&p["after"])),
+                        _ => {}
+                    }
+                }
+            }
+            "Barrier" => {
+                for g in a[0].as_array().into_iter().flatten().filter(|g| g["type"] == 1) {
+                    // D3D12_TEXTURE_BARRIER_FLAG_DISCARD (1).
+                    let changes = |b: &&Value| {
+                        b["layout"][0] != b["layout"][1] || b["flags"].as_u64().unwrap_or(0) & 1 != 0
+                    };
+                    for b in g["barriers"].as_array().into_iter().flatten().filter(changes) {
+                        named.extend(resource(b));
+                    }
+                }
+            }
+            // Source and destination: a copy that reads the target is a consumer of the pass, which has ended.
+            "CopyResource" => named.extend([&a[0], &a[1]].into_iter().filter_map(resource)),
+            "CopyTextureRegion" | "ResolveSubresourceRegion" => {
+                named.extend([&a[0], &a[4]].into_iter().filter_map(resource));
+            }
+            "ResolveSubresource" => named.extend([&a[0], &a[2]].into_iter().filter_map(resource)),
+            "BeginRenderPass" => {
+                // A beginning access that discards (0) or clears (2) overwrites the attachment.
+                let overwrites = |b: &Value| matches!(b["type"].as_u64(), Some(0 | 2));
+                for t in a[0]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|t| overwrites(&t["begin"]))
+                {
+                    named.extend(resource(&t["view"]["definition"]));
+                }
+                let d = &a[1];
+                if overwrites(&d["depth_begin"]) || overwrites(&d["stencil_begin"]) {
+                    named.extend(resource(&d["view"]["definition"]));
+                }
+            }
+            _ => {}
+        }
+        self.named.extend(named);
     }
 
     fn learn(&mut self, resource: u64, range: Range, access: Access) {
@@ -633,148 +921,155 @@ impl Pass {
             return;
         }
         let mut c = checkpoint(t, at, None);
-        c.gap = unsafe { self.record(list, t, states, c.id) }.err();
-        out.push(c);
-    }
-
-    unsafe fn record(
-        &self,
-        list: &ID3D12GraphicsCommandList,
-        t: &Bound,
-        states: &[Access],
-        id: u64,
-    ) -> Result<(), String> {
-        if t.discard {
-            return Err("discarded where its render pass ended: undefined".into());
-        }
-        let desc = unsafe { t.real.GetDesc() };
-        if desc.SampleDesc.Count > 1 {
-            return Err("multisampled target: copying samples out is not supported yet".into());
-        }
-        let format = desc.Format.0 as u32;
-        let joined =
-            (t.subs.len() == 2).then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes));
-        let layout = locum_capture::layout::texture(format, t.width, t.height, 1, 1, 1)
-            .ok_or_else(|| format!("format {format} has no canonical layout"))?;
-        let volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
-        let subs: Vec<(u32, Access)> = t.subs.iter().copied().zip(states.iter().copied()).collect();
-        let (to_copy, back) = (barriers(&t.real, &subs, true)?, barriers(&t.real, &subs, false)?);
-        if !to_copy.enhanced.is_empty() && list.cast::<ID3D12GraphicsCommandList7>().is_err() {
-            return Err("layout barriers need ID3D12GraphicsCommandList7".into());
-        }
-        let mut footprints = Vec::new();
-        let mut bytes = 0u64;
-        for &sub in &t.subs {
-            let (mut f, mut rows, mut row_bytes) =
-                (D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), 0u32, 0u64);
-            unsafe {
-                self.device.GetCopyableFootprints(
-                    &desc,
-                    sub,
-                    1,
-                    bytes,
-                    Some(&mut f),
-                    Some(&mut rows),
-                    Some(&mut row_bytes),
-                    None,
-                )
-            };
-            if row_bytes == u64::MAX {
-                return Err(format!("GetCopyableFootprints refused subresource {sub}"));
-            }
-            // One depth slice of a volume.
-            f.Footprint.Depth = 1;
-            bytes = (f.Offset + u64::from(f.Footprint.RowPitch) * u64::from(rows))
-                .next_multiple_of(u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT));
-            footprints.push((f, rows, row_bytes));
-        }
-        if BYTES.fetch_add(bytes, Ordering::AcqRel) + bytes > BUDGET {
-            BYTES.fetch_sub(bytes, Ordering::AcqRel);
-            return Err(format!("checkpoint budget of {} GiB spent", BUDGET >> 30));
-        }
-        let mut readback: Option<ID3D12Resource> = None;
-        let created = unsafe {
-            self.device.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_READBACK,
-                    ..Default::default()
-                },
-                D3D12_HEAP_FLAG_NONE,
-                &D3D12_RESOURCE_DESC {
-                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                    Width: bytes,
-                    Height: 1,
-                    DepthOrArraySize: 1,
-                    MipLevels: 1,
-                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                    ..Default::default()
-                },
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut readback,
-            )
-        };
-        let readback = match (created, readback) {
-            (Ok(()), Some(r)) => r,
-            (e, _) => {
-                BYTES.fetch_sub(bytes, Ordering::AcqRel);
-                return Err(format!("readback buffer of {bytes} bytes: {e:?}"));
-            }
-        };
         let predicate = self.predicate.and_then(|(r, offset, op)| {
             super::real(r)
                 .and_then(|r| r.cast::<ID3D12Resource>().ok())
                 .map(|r| (r, offset, op))
         });
-        unsafe {
-            if predicate.is_some() {
-                list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
-            }
-            to_copy.issue(list);
-            for (&sub, (f, _, _)) in t.subs.iter().zip(&footprints) {
-                let dst = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: borrowed(&readback),
-                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *f },
-                };
-                let src = D3D12_TEXTURE_COPY_LOCATION {
-                    pResource: borrowed(&t.real),
-                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                        SubresourceIndex: sub,
+        match unsafe { copy_into(&self.device, list, t, states, predicate) } {
+            Ok(readback) => {
+                copies().insert(
+                    c.id,
+                    Copy {
+                        data: Arc::new(readback),
+                        list: 0,
+                        last: None,
+                        retired: false,
                     },
-                };
-                let slice = D3D12_BOX {
-                    left: 0,
-                    top: 0,
-                    front: t.z,
-                    right: t.width,
-                    bottom: t.height,
-                    back: t.z + 1,
-                };
-                list.CopyTextureRegion(&dst, 0, 0, 0, &src, volume.then_some(&slice as *const _));
+                );
             }
-            back.issue(list);
-            if let Some((r, offset, op)) = &predicate {
-                list.SetPredication(r, *offset, D3D12_PREDICATION_OP(*op));
-            }
+            Err(why) => c.gap = Some(why),
         }
-        copies().insert(
-            id,
-            Copy {
-                readback,
-                footprints,
-                layout,
-                joined,
-                bytes,
-                list: 0,
-                last: None,
-                retired: false,
-            },
-        );
-        Ok(())
+        out.push(c);
     }
+}
+
+/// Records into `list` the copy of target `t` from `states` (one per plane) into new readback memory, suspending
+/// the list's predication `predicate` around it.
+unsafe fn copy_into(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    t: &Bound,
+    states: &[Access],
+    predicate: Option<(ID3D12Resource, u64, i32)>,
+) -> Result<Readback, String> {
+    if t.discard {
+        return Err("discarded where its render pass ended: undefined".into());
+    }
+    let desc = unsafe { t.real.GetDesc() };
+    if desc.SampleDesc.Count > 1 {
+        return Err("multisampled target: copying samples out is not supported yet".into());
+    }
+    let format = desc.Format.0 as u32;
+    let joined =
+        (t.subs.len() == 2).then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes));
+    let layout = locum_capture::layout::texture(format, t.width, t.height, 1, 1, 1)
+        .ok_or_else(|| format!("format {format} has no canonical layout"))?;
+    let volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let subs: Vec<(u32, Access)> = t.subs.iter().copied().zip(states.iter().copied()).collect();
+    let (to_copy, back) = (barriers(&t.real, &subs, true)?, barriers(&t.real, &subs, false)?);
+    if !to_copy.enhanced.is_empty() && list.cast::<ID3D12GraphicsCommandList7>().is_err() {
+        return Err("layout barriers need ID3D12GraphicsCommandList7".into());
+    }
+    let mut footprints = Vec::new();
+    let mut bytes = 0u64;
+    for &sub in &t.subs {
+        let (mut f, mut rows, mut row_bytes) = (D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), 0u32, 0u64);
+        unsafe {
+            device.GetCopyableFootprints(
+                &desc,
+                sub,
+                1,
+                bytes,
+                Some(&mut f),
+                Some(&mut rows),
+                Some(&mut row_bytes),
+                None,
+            )
+        };
+        if row_bytes == u64::MAX {
+            return Err(format!("GetCopyableFootprints refused subresource {sub}"));
+        }
+        // One depth slice of a volume.
+        f.Footprint.Depth = 1;
+        bytes = (f.Offset + u64::from(f.Footprint.RowPitch) * u64::from(rows))
+            .next_multiple_of(u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT));
+        footprints.push((f, rows, row_bytes));
+    }
+    if BYTES.fetch_add(bytes, Ordering::AcqRel) + bytes > BUDGET {
+        BYTES.fetch_sub(bytes, Ordering::AcqRel);
+        return Err(format!("checkpoint budget of {} GiB spent", BUDGET >> 30));
+    }
+    let mut readback: Option<ID3D12Resource> = None;
+    let created = unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: bytes,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut readback,
+        )
+    };
+    let readback = match (created, readback) {
+        (Ok(()), Some(r)) => r,
+        (e, _) => {
+            BYTES.fetch_sub(bytes, Ordering::AcqRel);
+            return Err(format!("readback buffer of {bytes} bytes: {e:?}"));
+        }
+    };
+    unsafe {
+        if predicate.is_some() {
+            list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        }
+        to_copy.issue(list);
+        for (&sub, (f, _, _)) in t.subs.iter().zip(&footprints) {
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: borrowed(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *f },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: borrowed(&t.real),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: sub,
+                },
+            };
+            let slice = D3D12_BOX {
+                left: 0,
+                top: 0,
+                front: t.z,
+                right: t.width,
+                bottom: t.height,
+                back: t.z + 1,
+            };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, volume.then_some(&slice as *const _));
+        }
+        back.issue(list);
+        if let Some((r, offset, op)) = &predicate {
+            list.SetPredication(r, *offset, D3D12_PREDICATION_OP(*op));
+        }
+    }
+    Ok(Readback {
+        readback,
+        footprints,
+        layout,
+        joined,
+        bytes,
+    })
 }
 
 /// A checkpoint of a bound target before command `at`, with a new id.
@@ -796,10 +1091,13 @@ fn checkpoint(t: &Bound, at: usize, gap: Option<&str>) -> model::Checkpoint {
 
 /// Assigns the copies made in a list generation to that list, which retires them when it is reset or destroyed.
 pub fn belong(list: u64, checkpoints: &[model::Checkpoint]) {
-    let mut c = copies();
+    let (mut c, mut p) = (copies(), pending());
     for k in checkpoints {
         if let Some(copy) = c.get_mut(&k.id) {
             copy.list = list;
+        }
+        if let Some(end) = p.get_mut(&k.id) {
+            end.list = list;
         }
     }
 }

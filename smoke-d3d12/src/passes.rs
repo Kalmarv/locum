@@ -1,7 +1,8 @@
 //! Pass-end targets: render and depth targets copied inside the application's own lists where each pass ends, and
 //! read back as the frame's draws left them, under the debug layer, which validates the copies' transitions. Passes
-//! end at a barrier, a rebind, a clear, Close, a native render pass's end and an enhanced barrier; the targets are a
-//! depth-stencil buffer (both planes), a mip of an array slice and a texture made in a layout.
+//! end at a barrier, a rebind, a clear, Close, a native render pass's end and an enhanced barrier, or go on in the
+//! next list submitted with theirs; the targets are a depth-stencil buffer (both planes), a mip of an array slice and
+//! a texture made in a layout.
 use super::contents::{buffer_desc, committed, desc, layout_barrier, read};
 use super::graphics::{compile, transition};
 use super::*;
@@ -404,7 +405,22 @@ pub(super) unsafe fn capture(
         );
         draw(&list2, (16, 8), white, 0.);
         list2.Close().unwrap();
-        queue.ExecuteCommandLists(&[Some(list.cast().unwrap()), Some(list2.cast().unwrap())]);
+        // Draw 8: a third list continues t1's pass, drawing to it before naming it any other way, as Elden Ring's
+        // G-buffer goes on over lists submitted together: no copy where list2 closed, one where list3 does. Where
+        // the first list closed (draw 4), no later list draws to the mip: it is copied by a list of locum's after it.
+        let list3: ID3D12GraphicsCommandList = device
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator2, &colour_only)
+            .unwrap();
+        list3.SetGraphicsRootSignature(&root);
+        list3.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list3.OMSetRenderTargets(1, Some(&rtv(0)), true, None);
+        draw(&list3, (16, 8), green, 0.);
+        list3.Close().unwrap();
+        queue.ExecuteCommandLists(&[
+            Some(list.cast().unwrap()),
+            Some(list2.cast().unwrap()),
+            Some(list3.cast().unwrap()),
+        ]);
         finish(queue, fence, 17);
         chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
 
@@ -463,7 +479,7 @@ pub(super) unsafe fn capture(
                 (4, "rt0", 2, 2, 3),
                 (5, "rt0", 16, 8, 0),
                 (6, "rt0", 8, 8, 0),
-                (7, "rt0", 16, 8, 0),
+                (8, "rt0", 16, 8, 0),
             ],
             "{rows:?}"
         );
@@ -492,10 +508,14 @@ pub(super) unsafe fn capture(
         colour(5, [255, 255, 0, 255]);
         colour(6, [255, 0, 255, 255]);
         colour(7, [0, 255, 255, 255]);
-        colour(8, [255, 255, 255, 255]);
+        colour(8, [0, 255, 0, 255]);
         for (sql, n) in [
             ("SELECT count(*) FROM gaps WHERE what='d3d12-targets'", 0),
-            ("SELECT count(*) FROM draws", 7),
+            ("SELECT count(*) FROM draws", 8),
+            (
+                "SELECT json_extract(value, '$.continued') FROM meta WHERE key='pass_ends'",
+                1,
+            ),
             (
                 "SELECT json_extract(value, '$.targets') FROM meta WHERE key='counts'",
                 9,
@@ -510,6 +530,6 @@ pub(super) unsafe fn capture(
         debug_errors(device);
     }
     println!(
-        "D3D12 pass-end targets verified: barrier, rebind, clear, Close, render pass and enhanced-barrier ends; a target moved into RENDER_TARGET after binding; depth and stencil, array mip, layout target"
+        "D3D12 pass-end targets verified: barrier, rebind, clear, Close, render pass and enhanced-barrier ends; a target moved into RENDER_TARGET after binding; a pass continued in the next list; depth and stencil, array mip, layout target"
     );
 }

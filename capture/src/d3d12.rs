@@ -1,6 +1,6 @@
 //! Owned, portable D3D12 command history. A list recording and an execution of that
 //! recording have different identities; resetting a list cannot change an earlier execution.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use rusqlite::{Transaction, params};
@@ -34,9 +34,17 @@ pub struct List {
     /// Whether this generation was recorded while a capture was armed, so its pass ends were copied.
     #[serde(skip)]
     pub instrumented: bool,
-    /// The targets copied inside this generation where its passes ended.
+    /// The targets copied inside this generation where its passes ended, and those its Close left with a pass
+    /// open, copied after it where it is submitted unless the next list continues the pass.
     #[serde(skip)]
     pub checkpoints: Vec<Checkpoint>,
+    /// The targets (resource, subresource) this generation draws to before naming them any other way: where an
+    /// earlier list closed with their pass open, this one continues it.
+    #[serde(skip)]
+    pub continues: Vec<(u64, u32)>,
+    /// The resources it names other than by drawing to them as bound targets (barriers, clears, discards, copies).
+    #[serde(skip)]
+    pub named: Vec<u64>,
 }
 
 /// A render or depth target copied inside a list where a pass ended, before the command at `at` (after all the
@@ -102,6 +110,13 @@ impl Recording {
 
     pub fn checkpoint(&mut self, checkpoint: Checkpoint) {
         Arc::make_mut(&mut self.current).checkpoints.push(checkpoint);
+    }
+
+    /// What the generation's pass tracking learned of the targets it continues and the resources it names.
+    pub fn touches(&mut self, continues: Vec<(u64, u32)>, named: Vec<u64>) {
+        let current = Arc::make_mut(&mut self.current);
+        current.continues = continues;
+        current.named = named;
     }
 
     /// Commands recorded so far.
@@ -179,6 +194,8 @@ pub struct Prepared {
     first_use: BTreeMap<u64, FirstUse>,
     /// Checkpoint copies read back: the key of each target's bytes, or why there are none.
     checkpoints: BTreeMap<u64, Result<String, String>>,
+    /// Checkpoints a list's Close made whose pass the next list submitted with it continued: no copy, and no gap.
+    continued: BTreeSet<u64>,
 }
 
 /// A resource's contents as its first use in the frame found them, copied on the GPU just before the submission that
@@ -197,6 +214,10 @@ impl Prepared {
     /// A checkpoint's bytes, read back after the GPU ran its list.
     pub fn set_checkpoint(&mut self, id: u64, content: Result<String, String>) {
         self.checkpoints.insert(id, content);
+    }
+    /// A checkpoint whose pass the next list continued, so it ended later.
+    pub fn set_continued(&mut self, id: u64) {
+        self.continued.insert(id);
     }
     /// A resource's contents before its first use.
     pub fn set_first_use(&mut self, resource: u64, first_use: FirstUse) {
@@ -348,7 +369,12 @@ impl Prepared {
         }
         capture.subresources.extend(subresources);
         let mut uncopied = BTreeMap::<String, u64>::new();
+        let mut continued = 0;
         for (id, target) in &self.projection.targets {
+            if self.continued.contains(id) {
+                continued += 1;
+                continue;
+            }
             match self.checkpoints.get(id) {
                 Some(Ok(key)) => capture.targets.push(db::Target {
                     blob: Some(key.clone()),
@@ -386,10 +412,10 @@ impl Prepared {
             "executions":self.projection.executions.len(),
             "targets":capture.targets.len(), "target_bytes":target_bytes, "targets_skipped":skipped
         }));
-        capture.meta(
-            "pass_ends",
-            serde_json::to_value(self.projection.pass_ends).unwrap_or_default(),
-        );
+        let mut pass_ends = serde_json::to_value(self.projection.pass_ends).unwrap_or_default();
+        // Lists that closed with a pass open which the next list submitted with them continued.
+        pass_ends["continued"] = continued.into();
+        capture.meta("pass_ends", pass_ends);
     }
     pub fn write(&self, tx: &Transaction<'_>) -> rusqlite::Result<()> {
         self.frame.write(tx, &self.projection, &self.first_use)
@@ -729,6 +755,7 @@ impl Frame {
             projection,
             first_use: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
+            continued: Default::default(),
         }
     }
 

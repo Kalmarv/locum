@@ -110,16 +110,23 @@ impl Data {
             recording.checkpoint(c);
         }
     }
-    /// Before Close is forwarded to the real list `real`: a pass still open ends.
-    pub fn closing(&self, real: *mut c_void) {
+    /// Before Close is forwarded to the real list: a pass still open is pending, and the generation keeps what its
+    /// pass tracking learned of the targets it continues and the resources it names.
+    pub fn closing(&self) {
         if !enabled() {
             return;
         }
         let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(recording) = recording.as_mut() {
-            self.checkpoints(recording, |pass, at| unsafe { pass.closing(real, at) });
+        let pass = self.pass.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let (Some(recording), Some(mut pass)) = (recording.as_mut(), pass) {
+            let checkpoints = pass.closing(recording.len());
+            super::passes::belong(self.id, &checkpoints);
+            for c in checkpoints {
+                recording.checkpoint(c);
+            }
+            let (continues, named) = pass.touches();
+            recording.touches(continues, named);
         }
-        *self.pass.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
     pub fn close(&self, hr: HRESULT) {
         if hr.is_ok()
@@ -460,9 +467,11 @@ pub unsafe fn submit(
     };
     // Every submission's lists, armed or not: the state tracker follows them all.
     let mut lists = Vec::new();
+    let mut ordinals = Vec::new();
     let mut diagnostics = Vec::new();
     for (ordinal, pointer) in unsafe { slice(pointers, count as usize) }.iter().enumerate() {
         if let Some(data) = super::data(*pointer) {
+            ordinals.push(ordinal);
             lists.push(data.snapshot().unwrap_or_else(|| {
                 Arc::new(model::List {
                     id: data.id,
@@ -517,23 +526,34 @@ pub unsafe fn submit(
     }
     // The copies run before these lists, which change states for the next submission.
     states.execute(&lists, queue_type);
-    let mut submitted = super::passes::Submitted {
-        submission: id,
-        ..Default::default()
-    };
-    for list in lists.iter().filter(|l| l.instrumented) {
+    let mut submitted = super::passes::Submitted::new(id);
+    let mut executed = Vec::new();
+    for (at, list) in ordinals.into_iter().zip(&lists).filter(|(_, l)| l.instrumented) {
         let copied = list.checkpoints.iter().filter(|c| c.gap.is_none()).map(|c| c.id);
         submitted.all.extend(copied.clone());
-        if let Some(live) = capture.as_mut()
-            && live.executed.insert((list.id, list.generation))
-        {
+        let first = capture
+            .as_mut()
+            .is_some_and(|live| live.executed.insert((list.id, list.generation)));
+        if first {
             submitted.read.extend(copied);
         }
+        executed.push(super::passes::Executed { at, list, first });
     }
-    if let Some(live) = capture.as_ref()
-        && !submitted.read.is_empty()
-    {
-        submitted.results = Some(live.results.clone());
+    let continued = unsafe { super::passes::ends(&mut submitted, &executed) };
+    if let Some(live) = capture.as_ref() {
+        if submitted.reads() {
+            submitted.results = Some(live.results.clone());
+        }
+        if !continued.is_empty() {
+            live.results
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(super::readback::Batch {
+                    submission: id,
+                    continued,
+                    ..Default::default()
+                });
+        }
     }
     SUBMISSION_COST.add(start, 0);
     submitted
@@ -926,6 +946,9 @@ pub fn present(frame_number: u64) {
                     }
                     for (id, content) in batch.checkpoints {
                         prepared.set_checkpoint(id, content);
+                    }
+                    for id in batch.continued {
+                        prepared.set_continued(id);
                     }
                 }
                 prepared.contents(&mut capture, &crate::settings::settings().blobs);

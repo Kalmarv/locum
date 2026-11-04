@@ -2850,7 +2850,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
     unsafe fn Close(&self) -> windows::core::HRESULT {
         unsafe {
             self.called("Close");
-            self.data.closing(self.real());
+            self.data.closing();
             let result = real::Close(self.real());
             self.data.close(result);
             result

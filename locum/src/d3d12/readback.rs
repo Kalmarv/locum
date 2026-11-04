@@ -58,6 +58,8 @@ pub struct Batch {
     pub contents: Vec<(u64, FirstUse)>,
     /// Pass-end checkpoints read back (see [`super::passes`]).
     pub checkpoints: Vec<(u64, Result<String, String>)>,
+    /// Checkpoints whose pass the next list continued.
+    pub continued: Vec<u64>,
 }
 
 /// A capture's batches, filled by the collector.
