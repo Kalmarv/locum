@@ -231,6 +231,10 @@ enum Command {
         /// with (`FC_DirLight[2]` on to `[224]`), so `--name 'FC_DirLight[100].'` picks one record.
         #[arg(long)]
         extend: bool,
+        /// Name the registers as the capture's programs declare the constant buffer of this name (`cbSceneParam`):
+        /// for a buffer bound where the draw's own programs declare none, or another.
+        #[arg(long = "as")]
+        layout: Option<String>,
     },
     /// What a draw fed its vertex shader: each vertex it reads, in order, its attributes decoded through the input
     /// layout from the bound vertex buffers as the draw saw them (a buffer the frame wrote before the draw is
@@ -782,6 +786,7 @@ fn run(cli: Cli) -> Result<(), String> {
             reg,
             name,
             extend,
+            layout,
         } => draw::cb(
             &open(&capture)?,
             draw,
@@ -794,6 +799,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 registers: reg,
                 name,
                 extend,
+                layout,
             },
         ),
         Command::Vertices {

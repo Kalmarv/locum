@@ -1,6 +1,7 @@
 //! `draw` and `cb`: one draw or dispatch, everything it had bound and its constants by name, as text or as JSON
 //! (`--json`; with `all`, one object per line for every draw, so a census over a frame is one process).
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 use locum_capture::format;
@@ -212,6 +213,100 @@ pub struct Constants {
     /// The program's last variable, an array, run on over the bound range (`--extend`); or, without `--extend`, how
     /// far it would run.
     pub extended: Option<Extended>,
+    /// The program whose declaration names the words, when not the draw's own (`cb --as`).
+    pub layout_from: Option<String>,
+    /// Where the bytes came from when the capture recorded none for the binding (`unrecorded`).
+    pub source: Option<String>,
+}
+
+/// How a constant buffer's words are found and named beyond what the capture recorded for the binding.
+#[derive(Default)]
+pub struct Lookup {
+    /// The registers past the declared size as further elements of the buffer's last array.
+    pub extend: bool,
+    /// Another program's declaration of a buffer, and that program: for a buffer the draw's programs do not declare.
+    pub layout: Option<(locum_capture::rdef::ConstantBuffer, String)>,
+    /// Buffers rebuilt by replay for bindings the capture recorded no bytes for, by the buffer and the last event
+    /// before the draw that wrote it (every draw until its next write sees the same bytes).
+    replayed: RefCell<HashMap<(i64, i64), Replayed>>,
+}
+
+/// A buffer's bytes rebuilt by replay and where they came from, or why they could not be.
+type Replayed = Result<(Vec<u8>, String), String>;
+
+impl Lookup {
+    pub fn new(extend: bool, layout: Option<(locum_capture::rdef::ConstantBuffer, String)>) -> Lookup {
+        Lookup {
+            extend,
+            layout,
+            replayed: RefCell::default(),
+        }
+    }
+}
+
+/// The bytes of a constant-buffer binding the capture recorded none for (Direct3D 12 captures from before each
+/// draw's constants were copied, where the frame wrote the buffer on the GPU), from the buffer itself: its contents
+/// as the frame began when nothing wrote it before the draw, else rebuilt by replaying what did, as `export --at`.
+/// With where they came from.
+fn unrecorded(c: &Capture, b: &Row, draw: i64, lookup: &Lookup) -> Result<(Vec<u8>, String), String> {
+    let r = b.resource.ok_or("no buffer is bound")?;
+    let event: i64 = c
+        .row("SELECT event FROM draws WHERE n = ?1", [draw], |r| r.get(0))
+        .ok_or_else(|| format!("no draw {draw}"))?;
+    let last: Option<i64> = c
+        .row(
+            "SELECT max(event) FROM event_resources WHERE resource = ?1 AND access = 'write' AND event < ?2",
+            [r, event],
+            |r| r.get(0),
+        )
+        .flatten();
+    let (bytes, source) = match last {
+        None => {
+            let key: String = c
+                .row("SELECT content FROM resources WHERE id = ?1", [r], |r| {
+                    r.get::<_, Option<String>>(0)
+                })
+                .flatten()
+                .ok_or_else(|| format!("#{r} has no contents in the capture either"))?;
+            let caveat = describe::later_upload(c, r, event)
+                .map(|w| format!("; {w}"))
+                .unwrap_or_default();
+            (
+                c.blob(&key)?,
+                format!("#{r}'s contents as the frame began ({}){caveat}", short(&key)),
+            )
+        }
+        Some(w) => lookup
+            .replayed
+            .borrow_mut()
+            .entry((r, w))
+            .or_insert_with(|| {
+                crate::replay::contents_at(c, r, event, false).map(|(bytes, events, warnings)| {
+                    let warned = if warnings.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; {}", warnings.join("; "))
+                    };
+                    (
+                        bytes,
+                        format!("#{r} replayed to its last write before the draw (event {w}), {events} events{warned}"),
+                    )
+                })
+            })
+            .clone()?,
+    };
+    let from = b.offset.unwrap_or(0).max(0) as usize;
+    let to = b
+        .size
+        .map_or(bytes.len(), |s| from + s.max(0) as usize)
+        .min(bytes.len());
+    let bytes = bytes.get(from..to).filter(|s| !s.is_empty()).ok_or_else(|| {
+        format!(
+            "#{r} holds {} bytes, none from the binding's offset {from}",
+            bytes.len()
+        )
+    })?;
+    Ok((bytes.to_vec(), source))
 }
 
 /// An array a constant buffer ends with, named past its declared length over the bytes bound.
@@ -385,7 +480,13 @@ pub(crate) fn file_of(c: &Capture, b: &Row, call: &str, args: &str, vbs: &[Vb]) 
 }
 
 /// Draw `n` as `draw` shows it. Without `all`, only constant registers the shader uses.
-pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> Result<Draw, String> {
+pub fn describe(
+    c: &Capture,
+    n: i64,
+    all: bool,
+    reflection: &mut Reflection,
+    lookup: &Lookup,
+) -> Result<Draw, String> {
     type Head = (
         i64,
         String,
@@ -548,7 +649,10 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
             ) {
                 binding.contents = key;
                 binding.contents_source = source;
-                binding.contents_note = note;
+                binding.contents_note = match (note, describe::later_upload(c, r, event)) {
+                    (Some(n), Some(w)) => Some(format!("{n}; {w}")),
+                    (n, w) => n.or(w),
+                };
             }
             // Written earlier in the frame: its contents at this draw are not those of the frame's start.
             binding.written_before = c
@@ -565,7 +669,7 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
     let mut constants = Vec::new();
     for (b, binding) in rows.iter().zip(&bindings).filter(|(b, _)| b.kind == "cb") {
         if all || binding.used != Some(false) {
-            constants.push(constants_of(c, reflection, n, b, all, false)?);
+            constants.push(constants_of(c, reflection, n, b, all, lookup)?);
         }
     }
     let unread = |b: &Binding| b.used == Some(false);
@@ -663,7 +767,7 @@ pub(crate) fn constants_of(
     draw: i64,
     b: &Row,
     all: bool,
-    extend: bool,
+    lookup: &Lookup,
 ) -> Result<Constants, String> {
     let mut out = Constants {
         stage: b.stage.clone(),
@@ -678,18 +782,32 @@ pub(crate) fn constants_of(
         skipped: 0,
         why: None,
         extended: None,
+        layout_from: lookup.layout.as_ref().map(|(_, from)| from.clone()),
+        source: None,
     };
-    let Some(key) = &b.content else {
-        out.why = Some(uncaptured(c));
-        return Ok(out);
+    let bytes: Vec<u8> = match &b.content {
+        Some(key) => c
+            .row("SELECT bytes FROM cb_data WHERE hash = ?1", [key], |r| r.get(0))
+            .ok_or_else(|| format!("constant buffer contents {key} missing"))?,
+        None => match unrecorded(c, b, draw, lookup) {
+            Ok((bytes, source)) => {
+                out.source = Some(source);
+                bytes
+            }
+            Err(e) => {
+                out.why = Some(format!("{}; from the buffer: {e}", uncaptured(c)));
+                return Ok(out);
+            }
+        },
     };
-    let bytes: Vec<u8> = c
-        .row("SELECT bytes FROM cb_data WHERE hash = ?1", [key], |r| r.get(0))
-        .ok_or_else(|| format!("constant buffer contents {key} missing"))?;
     let shader = shader_of(c, draw, &b.stage);
-    let cb = shader
-        .as_deref()
-        .and_then(|s| reflection.cb(c, s, b.slot, b.space));
+    let extend = lookup.extend;
+    let cb = match &lookup.layout {
+        Some((layout, _)) => Some(layout),
+        None => shader
+            .as_deref()
+            .and_then(|s| reflection.cb(c, s, b.slot, b.space)),
+    };
     out.declared = cb.map(|cb| cb.size);
     let wide = cb.and_then(|cb| cb.extended(u32::try_from(bytes.len()).unwrap_or(u32::MAX)));
     out.extended = wide.as_ref().map(|(_, variable, declared, elements)| Extended {
@@ -755,7 +873,7 @@ fn print_constants(k: &Constants) {
         0 => String::new(),
         s => format!(" space {s}"),
     };
-    if k.key.is_none() {
+    if k.why.is_some() {
         let why = k.why.as_deref().map(|w| format!(": {w}")).unwrap_or_default();
         out!("{} b{}{space}: contents not captured{why}", k.stage, k.slot);
         return;
@@ -782,13 +900,20 @@ fn print_constants(k: &Constants) {
         None => String::new(),
     };
     out!(
-        "{} b{}{space} ({}, {} bytes{declared}{}{extended}):",
+        "{} b{}{space} ({}{}, {} bytes{declared}{}{extended}):",
         k.stage,
         k.slot,
         k.name.as_deref().unwrap_or("no reflection"),
+        k.layout_from
+            .as_deref()
+            .map(|p| format!(" as program {} declares it, not the draw's", short(p)))
+            .unwrap_or_default(),
         k.bytes,
         k.buffer.map_or(String::new(), |r| format!(", buffer #{r}"))
     );
+    if let Some(source) = &k.source {
+        out!("  (no bytes recorded for this binding; read from the buffer: {source})");
+    }
     // One row per register, each word under its component: `--name` can leave some of a register's words out.
     let mut rows: BTreeMap<u32, [Option<&Word>; 4]> = BTreeMap::new();
     for w in &k.words {
@@ -1080,10 +1205,11 @@ pub fn draw(
     name: Option<&str>,
 ) -> Result<(), String> {
     let mut reflection = Reflection::default();
+    let lookup = Lookup::default();
     let numbers = numbers(c, which)?;
     let several = numbers.len() > 1;
     for n in numbers {
-        let mut d = describe(c, n, all_constants, &mut reflection)?;
+        let mut d = describe(c, n, all_constants, &mut reflection, &lookup)?;
         if let Some(name) = name {
             keep_named(&mut d, name);
         }
@@ -1192,6 +1318,8 @@ pub struct Only {
     pub name: Option<String>,
     /// Name the registers past the program's declared size as further elements of its last array.
     pub extend: bool,
+    /// Name them as the capture's programs declare the constant buffer of this name, not as the draw's does.
+    pub layout: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1262,7 +1390,16 @@ fn constants_at(c: &Capture, draw: i64, b: Row, raw: bool, as_json: bool, only: 
         }
         return Ok(());
     }
-    let mut k = constants_of(c, &mut Reflection::default(), draw, &b, true, only.extend)?;
+    let mut reflection = Reflection::default();
+    let layout =
+        match &only.layout {
+            Some(name) => Some(reflection.declared_as(c, name).ok_or_else(|| {
+                format!("no program of the capture declares a constant buffer called {name}")
+            })?),
+            None => None,
+        };
+    let lookup = Lookup::new(only.extend, layout);
+    let mut k = constants_of(c, &mut reflection, draw, &b, true, &lookup)?;
     if !only.registers.is_empty() || only.name.is_some() {
         // parts separated by `|`, any of which a name may hold
         let wanted: Vec<String> = only

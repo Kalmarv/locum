@@ -277,6 +277,8 @@ locum-cli changes last 120:rt0 --rect 0,0,640,360  # texels each pass changed in
                                            # (a depth-stencil target's stencil counts, and pixel shows it)
 locum-cli cb last 120 vs 8 --name ViewProj # only the registers of matching variables (--reg 3,26 by number;
                                            # --name 'Scroll|waveTime' for several)
+locum-cli cb last 120 vs 8 --as cbSceneParam  # the registers named as the capture's programs declare that
+                                           # buffer, for one bound where the draw's own programs declare none
 locum-cli draw last 120 --section bound,cb # only those parts (state, bound, cb, targets); with --json too, so
                                            # `draw last all --json --section bound` is a tenth of the whole
 locum-cli draw last 120-180,200 --section cb --name 'envData|g_LightColor'
@@ -441,6 +443,14 @@ elements (`FC_DirLight[2]` on to `[224]`), so `cb ... --extend --name 'FC_DirLig
 one fits whole; what the program reads stays the declared part. Instance data a draw indexes at run time (Elden
 Ring's `VC_InstanceIdxOffset` into `g_InstanceIndexBuffer`) is not in the bound range at all: the buffer holds the
 first records, and `trace` marks a constant the program reads at a run-time index (`[run-time index]`).
+
+A constant-buffer binding the capture recorded no bytes for (Direct3D 12 captures from before each draw's constants
+were copied, m10 to m14, where the game wrote the buffer with a copy on the GPU) is read from the buffer itself: its
+contents as the frame began when nothing wrote it before the draw, else replayed to just before the draw as `export
+--at` does (once per write: m10's 31 cloth draws reading `cbSceneParam` from six such buffers take six replays).
+`cb`, `draw` and `constants` say so above the registers. Contents a Direct3D 12 capture took from an upload heap
+(`upload-at-first-submission`) are what the CPU had written as the GPU reached the frame's first submission; `draw`
+and `vertices` say when a draw ran in a later one, which can read what the CPU wrote since.
 
 PNGs of depth and other one-channel images are stretched from their smallest to largest value, float colour is
 tone-mapped, and `--range LO:HI` sets the mapping.

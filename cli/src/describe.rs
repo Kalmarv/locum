@@ -234,6 +234,21 @@ impl Reflection {
             .map_or(Slot::Unused, Slot::Named)
     }
 
+    /// The constant buffers a shader declares.
+    fn cbs<'a>(&'a mut self, c: &Capture, shader: &str) -> Option<&'a Vec<ConstantBuffer>> {
+        self.cache
+            .entry(shader.to_string())
+            .or_insert_with(|| {
+                let key: String = c.row(
+                    "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
+                    [shader],
+                    |r| r.get(0),
+                )?;
+                rdef::constant_buffers(&c.blob(&key).ok()?)
+            })
+            .as_ref()
+    }
+
     /// The constant buffer a shader declares at register `slot` (space `space`).
     pub fn cb<'a>(
         &'a mut self,
@@ -242,17 +257,31 @@ impl Reflection {
         slot: u32,
         space: u32,
     ) -> Option<&'a ConstantBuffer> {
-        let cbs = self.cache.entry(shader.to_string()).or_insert_with(|| {
-            let key: String = c.row(
-                "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
-                [shader],
-                |r| r.get(0),
-            )?;
-            rdef::constant_buffers(&c.blob(&key).ok()?)
-        });
-        cbs.as_ref()?
+        self.cbs(c, shader)?
             .iter()
             .find(|b| b.slot == Some(slot) && b.space == space)
+    }
+
+    /// The constant buffer called `name` (any case) as the capture's programs declare it, and the program it is
+    /// taken from: of those declaring it, the one declaring the most bytes.
+    pub fn declared_as(&mut self, c: &Capture, name: &str) -> Option<(ConstantBuffer, String)> {
+        let shaders: Vec<String> = c.rows(
+            "SELECT hash FROM shaders WHERE blob IS NOT NULL ORDER BY hash",
+            [],
+            |r| r.get(0),
+        );
+        let mut best: Option<(ConstantBuffer, String)> = None;
+        for shader in shaders {
+            let Some(cbs) = self.cbs(c, &shader) else {
+                continue;
+            };
+            for cb in cbs.iter().filter(|cb| cb.name.eq_ignore_ascii_case(name)) {
+                if best.as_ref().is_none_or(|(b, _)| cb.size > b.size) {
+                    best = Some((cb.clone(), shader.clone()));
+                }
+            }
+        }
+        best
     }
 }
 
@@ -341,6 +370,37 @@ fn matrix_line(names: &[Option<String>; 4]) -> Option<String> {
         return Some(format!("{base} row {r0} ([{r0}][{c0}..{}])", last.2));
     }
     None
+}
+
+/// What a Direct3D 12 buffer's contents may lack for event `event`: contents taken from an upload heap as the GPU
+/// reached the frame's first captured submission hold what the CPU had written by then, and an event of a later
+/// submission can read what it wrote since (a ring of per-frame data). None for other contents and the first
+/// submission's events.
+pub fn later_upload(c: &Capture, resource: i64, event: i64) -> Option<String> {
+    let source: String = c
+        .row(
+            "SELECT content_source FROM resources WHERE id = ?1",
+            [resource],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .flatten()?;
+    if source != "upload-at-first-submission" {
+        return None;
+    }
+    let (submission, first, nth, all): (i64, i64, i64, i64) = c.row(
+        "SELECT x.submission, (SELECT min(submission) FROM d12_executions), \
+         (SELECT count(DISTINCT submission) FROM d12_executions WHERE submission <= x.submission), \
+         (SELECT count(DISTINCT submission) FROM d12_executions) \
+         FROM d12_event_locations l JOIN d12_executions x ON x.id = l.execution WHERE l.event = ?1",
+        [event],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
+    (submission != first).then(|| {
+        format!(
+            "taken from the upload heap as the GPU reached the frame's first submission, and event {event} ran in \
+             submission {nth} of {all}: what the CPU wrote to the buffer in between is not in them"
+        )
+    })
 }
 
 /// Short key for tables.

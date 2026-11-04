@@ -218,6 +218,9 @@ fn bytes_at(
     if let Some(last) = written {
         source += &format!(", not as the draw saw them: written since, last at event {last}");
     }
+    if let Some(caveat) = crate::describe::later_upload(c, id, event) {
+        source += &format!("; {caveat}");
+    }
     Ok(Bytes {
         bytes: c.blob(&key)?,
         source,

@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use locum_capture::rdef::{ConstantBuffer, Type};
 
 use crate::describe::Reflection;
-use crate::draw::{constants_of, rows};
+use crate::draw::{Lookup, constants_of, rows};
 use crate::draws::shader_of;
 use crate::open::Capture;
 use crate::out;
@@ -96,6 +96,7 @@ fn found(c: &Capture, f: &Filter) -> Result<(Vec<Found>, usize), String> {
         |r| Ok((r.get(0)?, r.get(1)?)),
     );
     let mut reflection = Reflection::default();
+    let lookup = Lookup::new(f.extend, None);
     let mut out = Vec::new();
     let mut uncaptured = 0;
     for (n, pass) in draws {
@@ -113,11 +114,11 @@ fn found(c: &Capture, f: &Filter) -> Result<(Vec<Found>, usize), String> {
             if !f.may_match(cb) {
                 continue;
             }
-            if b.content.is_none() {
+            let k = constants_of(c, &mut reflection, n, b, false, &lookup)?;
+            if k.why.is_some() {
                 uncaptured += 1;
                 continue;
             }
-            let k = constants_of(c, &mut reflection, n, b, false, f.extend)?;
             let buffer = k.name.clone().unwrap_or_default();
             for w in k.words {
                 let Some(name) = w.name.filter(|name| f.matches(name)) else {
