@@ -233,6 +233,7 @@ locum-cli draw last all --json > d.jsonl   # every draw as JSON, one per line (a
 locum-cli export last 812 -o tex.dds       # contents as the frame began: .dds (all of it), .png (one mip), or raw
 locum-cli export last 812 --at 3301 -o t.dds  # as event 3301 saw them, replayed with the events that wrote them
 locum-cli target last 120 rt0 -o gbuf0.png # a target read back after a pass (-o - writes the raw bytes to stdout)
+locum-cli target last last rt0 -o frame.png # the frame's last readback of rt0: the presented picture
 locum-cli target last 120 rt3 -o a.png --channel a   # one channel as grey; the mapping used is printed. PNGs are
                                            # opaque unless --alpha; --rect X,Y,W,H or --crop (to the texels not
                                            # zero, for a sparse atlas) draw a part (export takes them too)

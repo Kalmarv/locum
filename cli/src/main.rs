@@ -280,7 +280,9 @@ enum Command {
     /// A target read back after a pass's last draw, as .png, .dds or raw (`-o -`: the raw bytes to stdout).
     Target {
         capture: String,
-        draw: i64,
+        /// The draw the target was read after, or `last` for the frame's last readback of it (the presented picture,
+        /// for the back buffer's rt0).
+        draw: String,
         /// rt0 to rt7, or depth.
         #[arg(default_value = "rt0")]
         name: String,
@@ -652,7 +654,20 @@ fn run(cli: Cli) -> Result<(), String> {
             name,
             out,
             picture,
-        } => export::target(&open(&capture)?, draw, &name, &out, &picture.picture()?),
+        } => {
+            let c = open(&capture)?;
+            let draw = match draw.as_str() {
+                "last" => c
+                    .row(
+                        "SELECT draw FROM targets WHERE target = ?1 AND blob IS NOT NULL ORDER BY event DESC LIMIT 1",
+                        [&name],
+                        |r| r.get(0),
+                    )
+                    .ok_or_else(|| format!("no {name} was read back"))?,
+                n => n.parse().map_err(|_| format!("{n}: not a draw number or `last`"))?,
+            };
+            export::target(&c, draw, &name, &out, &picture.picture()?)
+        }
         Command::Pixel {
             capture,
             target,
