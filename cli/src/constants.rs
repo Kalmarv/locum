@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use locum_capture::rdef::{ConstantBuffer, Type};
 
 use crate::describe::Reflection;
-use crate::draw::{Lookup, constants_of, rows};
+use crate::describe::short;
+use crate::draw::{Lookup, constants_of, file_of, layout_slots, read_vertices, rows};
 use crate::draws::shader_of;
 use crate::open::Capture;
 use crate::out;
@@ -23,6 +24,58 @@ pub struct Filter {
     pub distinct: bool,
     /// Name ranges bound larger than declared as further elements of the buffer's last array.
     pub extend: bool,
+    /// Columns of the draw to add to each row (and, with `distinct`, to group by): `WITH`.
+    pub with: Vec<String>,
+}
+
+/// What `--with` can add: a stage's program, the stencil reference, the topology, the file the draw's mesh was made
+/// from.
+pub const WITH: [&str; 9] = ["vs", "hs", "ds", "gs", "ps", "cs", "stencil", "topology", "file"];
+
+/// The `with` columns of draw `n`: a program by its name (or hash), the rest as `draw` shows them; `-` for none.
+fn draw_columns(c: &Capture, n: i64, with: &[String], reflection: &mut Reflection) -> Vec<String> {
+    with.iter()
+        .map(|w| match w.as_str() {
+            "stencil" | "topology" => {
+                let column = if w == "stencil" { "stencil_ref" } else { "topology" };
+                c.row(&format!("SELECT {column} FROM draws WHERE n = ?1"), [n], |r| {
+                    r.get::<_, Option<i64>>(0)
+                })
+                .flatten()
+                .map_or("-".into(), |v| v.to_string())
+            }
+            "file" => mesh_file(c, n).unwrap_or_else(|| "-".into()),
+            stage => match shader_of(c, n, stage) {
+                Some(h) => match reflection.name(c, &h) {
+                    Some(name) => name.to_string(),
+                    None => short(&h).to_string(),
+                },
+                None => "-".into(),
+            },
+        })
+        .collect()
+}
+
+/// The file draw `n`'s mesh was made from, by the indexes given: its index buffer's range, else the first vertex
+/// buffer its layout reads.
+fn mesh_file(c: &Capture, n: i64) -> Option<String> {
+    let (call, args, layout): (String, String, Option<i64>) = c.row(
+        "SELECT call, coalesce(args, ''), layout FROM draws WHERE n = ?1",
+        [n],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let bound = rows(c, n);
+    let slots = layout_slots(c, layout);
+    let vbs = read_vertices(&bound, slots.as_deref());
+    bound
+        .iter()
+        .filter(|b| b.kind == "ib")
+        .chain(
+            bound
+                .iter()
+                .filter(|b| b.kind == "vb" && slots.as_ref().is_none_or(|s| s.contains(&b.slot))),
+        )
+        .find_map(|b| file_of(c, b, &call, &args, &vbs))
 }
 
 impl Filter {
@@ -32,6 +85,7 @@ impl Filter {
         stage: Option<String>,
         distinct: bool,
         extend: bool,
+        with: Vec<String>,
     ) -> Filter {
         Filter {
             name: name
@@ -43,6 +97,7 @@ impl Filter {
             stage,
             distinct,
             extend,
+            with,
         }
     }
 
@@ -75,18 +130,20 @@ impl Filter {
     }
 }
 
-/// One capture's matching words: (draw, pass, stage, slot, buffer, register, name, value text, hex).
-type Found = (
-    i64,
-    Option<i64>,
-    String,
-    u32,
-    String,
-    String,
-    String,
-    String,
-    String,
-);
+/// One matching word of a capture.
+struct Found {
+    draw: i64,
+    pass: Option<i64>,
+    stage: String,
+    slot: u32,
+    buffer: String,
+    register: String,
+    name: String,
+    value: String,
+    hex: String,
+    /// The `--with` columns.
+    with: Vec<String>,
+}
 
 fn found(c: &Capture, f: &Filter) -> Result<(Vec<Found>, usize), String> {
     let (first, last) = f.draws.unwrap_or((i64::MIN, i64::MAX));
@@ -100,6 +157,7 @@ fn found(c: &Capture, f: &Filter) -> Result<(Vec<Found>, usize), String> {
     let mut out = Vec::new();
     let mut uncaptured = 0;
     for (n, pass) in draws {
+        let mut with: Option<Vec<String>> = None;
         for b in rows(c, n).iter().filter(|b| b.kind == "cb") {
             if f.stage.as_ref().is_some_and(|s| *s != b.stage) {
                 continue;
@@ -124,17 +182,21 @@ fn found(c: &Capture, f: &Filter) -> Result<(Vec<Found>, usize), String> {
                 let Some(name) = w.name.filter(|name| f.matches(name)) else {
                     continue;
                 };
-                out.push((
-                    n,
+                let with = with
+                    .get_or_insert_with(|| draw_columns(c, n, &f.with, &mut reflection))
+                    .clone();
+                out.push(Found {
+                    draw: n,
                     pass,
-                    b.stage.clone(),
-                    b.slot,
-                    buffer.clone(),
-                    w.register,
+                    stage: b.stage.clone(),
+                    slot: b.slot,
+                    buffer: buffer.clone(),
+                    register: w.register,
                     name,
-                    w.text.trim().to_string(),
-                    w.hex,
-                ));
+                    value: w.text.trim().to_string(),
+                    hex: w.hex,
+                    with,
+                });
             }
         }
     }
@@ -159,10 +221,11 @@ pub fn constants(
         }
     };
     let head = if several { "capture\t" } else { "" };
+    let extra: String = f.with.iter().map(|w| format!("\t{w}")).collect();
     if f.distinct {
-        out!("{head}name\tvalue\thex\tdraws\tfirst\tlast");
+        out!("{head}name\tvalue\thex{extra}\tdraws\tfirst\tlast");
     } else {
-        out!("{head}draw\tpass\tstage\tslot\tbuffer\tregister\tname\tvalue\thex");
+        out!("{head}draw\tpass\tstage\tslot\tbuffer\tregister\tname\tvalue\thex{extra}");
     }
     let mut any = false;
     for capture in captures {
@@ -176,21 +239,23 @@ pub fn constants(
         }
         any |= !words.is_empty();
         if f.distinct {
-            // name -> (value, hex) -> draws reading it
-            let mut by: BTreeMap<String, BTreeMap<(String, String), Vec<i64>>> = BTreeMap::new();
-            for (draw, _, _, _, _, _, name, value, hex) in words {
-                by.entry(name)
+            // name -> (value, hex, with) -> draws reading it
+            type Values = BTreeMap<(String, String, Vec<String>), Vec<i64>>;
+            let mut by: BTreeMap<String, Values> = BTreeMap::new();
+            for w in words {
+                by.entry(w.name)
                     .or_default()
-                    .entry((value, hex))
+                    .entry((w.value, w.hex, w.with))
                     .or_default()
-                    .push(draw);
+                    .push(w.draw);
             }
             for (name, values) in by {
-                for ((value, hex), mut draws) in values {
+                for ((value, hex, with), mut draws) in values {
                     draws.sort_unstable();
                     draws.dedup();
+                    let with: String = with.iter().map(|w| format!("\t{w}")).collect();
                     out!(
-                        "{}{name}\t{value}\t{hex}\t{}\t{}\t{}",
+                        "{}{name}\t{value}\t{hex}{with}\t{}\t{}\t{}",
                         lead(capture),
                         draws.len(),
                         draws[0],
@@ -199,11 +264,20 @@ pub fn constants(
                 }
             }
         } else {
-            for (draw, pass, stage, slot, buffer, register, name, value, hex) in words {
+            for w in words {
+                let with: String = w.with.iter().map(|v| format!("\t{v}")).collect();
                 out!(
-                    "{}{draw}\t{}\t{stage}\t{slot}\t{buffer}\t{register}\t{name}\t{value}\t{hex}",
+                    "{}{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}{with}",
                     lead(capture),
-                    pass.map_or("-".into(), |p| p.to_string())
+                    w.draw,
+                    w.pass.map_or("-".into(), |p| p.to_string()),
+                    w.stage,
+                    w.slot,
+                    w.buffer,
+                    w.register,
+                    w.name,
+                    w.value,
+                    w.hex
                 );
             }
         }

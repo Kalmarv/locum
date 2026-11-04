@@ -187,6 +187,10 @@ enum Command {
         /// (as `cb --extend`).
         #[arg(long)]
         extend: bool,
+        /// Columns of each draw to add (and with --distinct to group by), comma-separated: vs, hs, ds, gs, ps, cs
+        /// (the program's name, or hash), stencil (the reference), topology, file (the mesh's, by --index).
+        #[arg(long, value_delimiter = ',', value_parser = constants::WITH)]
+        with: Vec<String>,
     },
     /// One draw: its shaders, state, everything bound, its constants by name, and the targets read after it.
     Draw {
@@ -769,10 +773,11 @@ fn run(cli: Cli) -> Result<(), String> {
             stage,
             distinct,
             extend,
+            with,
         } => constants::constants(
             &captures,
             open,
-            &constants::Filter::new(&name, draws, stage, distinct, extend),
+            &constants::Filter::new(&name, draws, stage, distinct, extend, with),
         ),
         Command::Draw {
             capture,

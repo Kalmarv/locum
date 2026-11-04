@@ -239,6 +239,8 @@ locum-cli bindings last --name g_SSS       # every register the draws had bound,
 locum-cli cb last 120 ps 3                 # a constant buffer, every register, named from the shader's reflection
 locum-cli constants m15 m16 --name SC_CameraPos --distinct  # named constants across draws and captures: a row
                                            # per draw (or each value and how many draws read it); parts with `|`
+                                           # --with ps,stencil,file adds the draw's program, stencil reference
+                                           # and mesh file as columns (and --distinct groups by them)
 locum-cli find last 0.35                   # which constant holds 0.35, its name, and the draws that saw it
                                            # (--stage ps, --name Scroll narrow it)
 locum-cli passes last
