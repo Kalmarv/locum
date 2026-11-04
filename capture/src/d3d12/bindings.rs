@@ -21,9 +21,20 @@ pub(super) fn project(
     let Some(root) = objects.get(&root) else {
         return;
     };
+    // A root parameter visible to every stage binds only the stages the pipeline has a shader for.
+    let present: Option<Vec<&str>> = objects
+        .get(&p.pso)
+        .and_then(|pso| pso["shaders"].as_array())
+        .map(|shaders| shaders.iter().filter_map(|s| s["stage"].as_str()).collect());
+    let visible = |visibility: &Value| -> Vec<&'static str> {
+        stages(visibility.as_u64().unwrap_or(0), compute)
+            .into_iter()
+            .filter(|s| present.as_ref().is_none_or(|p| p.contains(s)))
+            .collect()
+    };
     for sampler in root["decoded"]["samplers"].as_array().into_iter().flatten() {
         let state = super::graphics::state(c, "sampler", sampler);
-        for stage in stages(sampler["ShaderVisibility"].as_u64().unwrap_or(0), compute) {
+        for stage in visible(&sampler["ShaderVisibility"]) {
             c.bindings.push(db::Binding {
                 draw,
                 stage,
@@ -42,7 +53,7 @@ pub(super) fn project(
         let Some(parameter) = parameters.get(index as usize) else {
             continue;
         };
-        let stages = stages(parameter["visibility"].as_u64().unwrap_or(0), compute);
+        let stages = visible(&parameter["visibility"]);
         let d = &parameter["value"];
         if parameter["type"] == 0 {
             let table = &arg["value"];

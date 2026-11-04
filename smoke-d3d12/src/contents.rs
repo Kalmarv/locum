@@ -594,7 +594,7 @@ pub(super) unsafe fn capture(
             "D: promoted to COPY_DEST by its fill"
         );
         assert!(
-            contents("kind='buffer' AND width=320 AND content_note NOT LIKE 'upload%'")
+            contents("kind='buffer' AND width=320 AND content_source='first-use'")
                 .iter()
                 .all(|&v| v == 0x5E)
         );

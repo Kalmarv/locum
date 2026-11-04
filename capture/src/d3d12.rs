@@ -298,12 +298,9 @@ impl Prepared {
             } else if let Some(first) = self.first_use.get(&resource.id) {
                 match &first.content {
                     Ok((key, subs)) => {
+                        // Exact: d12_first_use says which submission it was copied before.
                         resource.content = Some(key.clone());
                         resource.content_source = Some("first-use");
-                        resource.content_note = Some(format!(
-                            "copied on the GPU just before submission {}, the first to use it",
-                            first.submission
-                        ));
                         hashes.clone_from(subs);
                     }
                     Err(why) => {
@@ -347,9 +344,17 @@ impl Prepared {
                 None => *uncopied.entry("copy not read back".into()).or_default() += 1,
             }
         }
+        let mut skipped = 0;
         for (why, count) in self.projection.uncopied.iter().chain(&uncopied) {
             capture.gap("d3d12-targets", why, *count);
+            skipped += count;
         }
+        let target_bytes: u64 = capture
+            .targets
+            .iter()
+            .filter_map(|t| crate::layout::texture(t.format, t.width, t.height, 1, 1, 1))
+            .map(|l| crate::layout::total(&l))
+            .sum();
         for gap in gaps {
             capture.gap("d3d12-upload-content", gap, 1);
         }
@@ -364,7 +369,8 @@ impl Prepared {
             "contents":capture.resources.iter().filter(|r|r.content.is_some()).count(),
             "content_bytes":capture.resources.iter().filter(|r|r.content.is_some()).map(|r|r.bytes).sum::<u64>(),
             "submissions":self.frame.submissions.len(),
-            "executions":self.projection.executions.len()
+            "executions":self.projection.executions.len(),
+            "targets":capture.targets.len(), "target_bytes":target_bytes, "targets_skipped":skipped
         }));
     }
     pub fn write(&self, tx: &Transaction<'_>) -> rusqlite::Result<()> {

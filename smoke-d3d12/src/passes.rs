@@ -478,6 +478,14 @@ pub(super) unsafe fn capture(
         for (sql, n) in [
             ("SELECT count(*) FROM gaps WHERE what='d3d12-targets'", 0),
             ("SELECT count(*) FROM draws", 6),
+            (
+                "SELECT json_extract(value, '$.targets') FROM meta WHERE key='counts'",
+                8,
+            ),
+            (
+                "SELECT json_extract(value, '$.target_bytes') FROM meta WHERE key='counts'",
+                6 * 512 + 16 + 256,
+            ),
         ] {
             assert_eq!(db.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap(), n, "{sql}");
         }
