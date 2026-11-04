@@ -21,6 +21,8 @@ pub struct Filter {
     pub call: Option<String>,
     /// A part of a program's debug name, matched in any case.
     pub name: Option<String>,
+    /// A resource or constant buffer name a program declares, matched whole in any case.
+    pub binds: Option<String>,
 }
 
 const SHADER_COLUMNS: [&str; 6] = ["vs", "hs", "ds", "gs", "ps", "cs"];
@@ -112,6 +114,11 @@ pub fn draws(c: &Capture, f: &Filter) -> Result<(), String> {
                 .collect();
             if let Some(w) = &wanted
                 && !names.iter().any(|(_, n)| n.to_lowercase().contains(w))
+            {
+                return None;
+            }
+            if let Some(b) = &f.binds
+                && !row.6.iter().flatten().any(|h| reflection.declares(c, h, b))
             {
                 return None;
             }

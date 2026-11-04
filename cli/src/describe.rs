@@ -179,6 +179,22 @@ pub enum Slot {
 }
 
 impl Reflection {
+    /// Whether shader `shader` declares a resource or constant buffer called `name` (any case).
+    pub fn declares(&mut self, c: &Capture, shader: &str, name: &str) -> bool {
+        let bindings = self.bindings.entry(shader.to_string()).or_insert_with(|| {
+            let key: String = c.row(
+                "SELECT blob FROM shaders WHERE hash = ?1 AND blob IS NOT NULL",
+                [shader],
+                |r| r.get(0),
+            )?;
+            rdef::bindings(&c.blob(&key).ok()?)
+        });
+        bindings
+            .iter()
+            .flatten()
+            .any(|b| b.name.eq_ignore_ascii_case(name))
+    }
+
     /// Shader `shader`'s debug name (`rdef::debug_name`), when its bytecode names one.
     pub fn name(&mut self, c: &Capture, shader: &str) -> Option<&str> {
         self.names

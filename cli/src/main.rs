@@ -75,6 +75,9 @@ enum Command {
         /// Draws whose program at any stage has this debug name, or a part of it (any case): `--name SsaoBlur`.
         #[arg(long)]
         name: Option<String>,
+        /// Draws whose programs declare a resource or constant buffer by this name (any case): `--binds g_LightBuffer`.
+        #[arg(long)]
+        binds: Option<String>,
     },
     /// One draw: its shaders, state, everything bound, its constants by name, and the targets read after it.
     Draw {
@@ -428,6 +431,7 @@ fn run(cli: Cli) -> Result<(), String> {
             content,
             call,
             name,
+            binds,
         } => draws::draws(
             &open(&capture)?,
             &draws::Filter {
@@ -441,6 +445,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 content,
                 call,
                 name,
+                binds,
             },
         ),
         Command::Draw {

@@ -116,7 +116,18 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, range: Range
                 (0, bytes.len())
             };
             write(out_path, &bytes[from..from + len])?;
-            out!("{}: {len} bytes of #{id} ({key})", out_path.display());
+            if s.kind == "buffer" {
+                out!("{}: {len} bytes of #{id} ({key})", out_path.display());
+            } else {
+                // What the bytes are: subresources in order, each mip's rows tightly packed.
+                let texel = format::texel(s.format)
+                    .map(|t| format!("; {t}"))
+                    .unwrap_or_default();
+                out!(
+                    "{}: {len} bytes ({key}) of {s}, rows tightly packed{texel}",
+                    out_path.display()
+                );
+            }
         }
         Kind::Dds => {
             let whole = which.sub.is_none() && which.mip == 0 && which.slice == 0;

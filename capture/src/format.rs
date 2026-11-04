@@ -79,6 +79,26 @@ pub fn is_depth_stencil(format: u32) -> bool {
     matches!(format, 19 | 20 | 44 | 45)
 }
 
+/// How a canonical texel of a depth format's family lays out its bytes (see `layout::join_depth_stencil`), or None
+/// for other formats, whose names say it.
+pub fn texel(format: u32) -> Option<&'static str> {
+    match format {
+        // R32G8X24_TYPELESS, D32_FLOAT_S8X24_UINT, R32_FLOAT_X8X24_TYPELESS, X32_TYPELESS_G8X24_UINT.
+        19..=22 => {
+            Some("8 bytes a texel: the 32-bit float depth, then the stencil byte and three zero bytes")
+        }
+        // R32_TYPELESS, D32_FLOAT, R32_FLOAT.
+        39..=41 => Some("4 bytes a texel: the 32-bit float depth"),
+        // R24G8_TYPELESS, D24_UNORM_S8_UINT, R24_UNORM_X8_TYPELESS, X24_TYPELESS_G8_UINT.
+        44..=47 => {
+            Some("4 bytes a texel: the 24-bit unorm depth in the low bits, the stencil in the top byte")
+        }
+        // R16_TYPELESS, D16_UNORM, R16_UNORM.
+        53 | 55 | 56 => Some("2 bytes a texel: the 16-bit unorm depth"),
+        _ => None,
+    }
+}
+
 /// The format to read a texture of `format` back as: typeless formats as their plain typed format, depth formats as
 /// the colour format of the same bits. Copies between the two are bit-exact.
 pub fn readable(format: u32) -> u32 {
