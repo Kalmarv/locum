@@ -387,6 +387,22 @@ pub(super) unsafe fn capture(
                 D3D12_BARRIER_LAYOUT_RENDER_TARGET,
             ],
         );
+        // Draw 7: t1 white, bound while it is a shader resource and only then moved into RENDER_TARGET (as Elden
+        // Ring's passes do): the barrier does not end a pass not yet drawn to. Close ends it.
+        transition(
+            &list2,
+            &t1,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        );
+        list2.OMSetRenderTargets(1, Some(&rtv(0)), true, None);
+        transition(
+            &list2,
+            &t1,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+        );
+        draw(&list2, (16, 8), white, 0.);
         list2.Close().unwrap();
         queue.ExecuteCommandLists(&[Some(list.cast().unwrap()), Some(list2.cast().unwrap())]);
         finish(queue, fence, 17);
@@ -447,6 +463,7 @@ pub(super) unsafe fn capture(
                 (4, "rt0", 2, 2, 3),
                 (5, "rt0", 16, 8, 0),
                 (6, "rt0", 8, 8, 0),
+                (7, "rt0", 16, 8, 0),
             ],
             "{rows:?}"
         );
@@ -475,16 +492,17 @@ pub(super) unsafe fn capture(
         colour(5, [255, 255, 0, 255]);
         colour(6, [255, 0, 255, 255]);
         colour(7, [0, 255, 255, 255]);
+        colour(8, [255, 255, 255, 255]);
         for (sql, n) in [
             ("SELECT count(*) FROM gaps WHERE what='d3d12-targets'", 0),
-            ("SELECT count(*) FROM draws", 6),
+            ("SELECT count(*) FROM draws", 7),
             (
                 "SELECT json_extract(value, '$.targets') FROM meta WHERE key='counts'",
-                8,
+                9,
             ),
             (
                 "SELECT json_extract(value, '$.target_bytes') FROM meta WHERE key='counts'",
-                6 * 512 + 16 + 256,
+                7 * 512 + 16 + 256,
             ),
         ] {
             assert_eq!(db.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap(), n, "{sql}");
@@ -492,6 +510,6 @@ pub(super) unsafe fn capture(
         debug_errors(device);
     }
     println!(
-        "D3D12 pass-end targets verified: barrier, rebind, clear, Close, render pass and enhanced-barrier ends; depth and stencil, array mip, layout target"
+        "D3D12 pass-end targets verified: barrier, rebind, clear, Close, render pass and enhanced-barrier ends; a target moved into RENDER_TARGET after binding; depth and stencil, array mip, layout target"
     );
 }

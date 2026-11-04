@@ -2,8 +2,9 @@
 //! right after the pass's last draw on the GPU, before anything later in the list can overwrite the targets.
 //!
 //! Lists reset or created while a capture is armed are instrumented. A pass ends when its targets are rebound or
-//! cleared from the state, a barrier moves a bound target out of its state, the list closes, or a native render pass
-//! ends. Its targets are copied just before the command that ends it (after EndRenderPass itself, its ending
+//! cleared from the state, a barrier moves a bound target that was drawn to out of its state, the list closes, or a
+//! native render pass ends. A barrier leaves the target bound: games bind a target and only then move it into
+//! RENDER_TARGET or DEPTH_WRITE (Elden Ring's shadow and G-buffer passes), and draw to it again after moving it back. Its targets are copied just before the command that ends it (after EndRenderPass itself, its ending
 //! access done): a transition from the state the target is in to COPY_SOURCE, a copy of the view's subresource into
 //! readback memory, the transition back. The application's own barrier names that state; otherwise a bound target
 //! is in RENDER_TARGET or DEPTH_WRITE (the layouts of those names for resources made in a layout), or what this
@@ -544,7 +545,8 @@ impl Pass {
     }
 
     /// A barrier moves subresources `range` of `resource` out of `state`: the pass ends for the bound targets it
-    /// touches, which are no longer bound for drawing.
+    /// touches that were drawn to, copied from that state. They stay bound: the draws after a barrier that moves
+    /// a target back into a writable state write it again.
     unsafe fn leaving(
         &mut self,
         list: &ID3D12GraphicsCommandList,
@@ -554,15 +556,16 @@ impl Pass {
         state: Access,
         out: &mut Vec<model::Checkpoint>,
     ) {
-        let touches =
-            |t: &Bound| t.resource == resource && t.subs.iter().any(|&s| range.holds(s, shape(&t.real)));
-        let (leaving, staying): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.targets).into_iter().partition(touches);
-        self.targets = staying;
-        for t in leaving.into_iter().filter(|t| t.drawn) {
+        for i in 0..self.targets.len() {
+            let t = &self.targets[i];
+            let shape = shape(&t.real);
+            if !t.drawn || t.resource != resource || !t.subs.iter().any(|&s| range.holds(s, shape)) {
+                continue;
+            }
+            let t = t.clone();
             let states: Vec<Access> = (0..t.subs.len())
                 .map(|p| {
-                    if range.holds(t.subs[p], shape(&t.real)) {
+                    if range.holds(t.subs[p], shape) {
                         state
                     } else {
                         self.state(&t, p)
@@ -570,6 +573,7 @@ impl Pass {
                 })
                 .collect();
             unsafe { self.copy(list, at, &t, &states, out) };
+            self.targets[i].drawn = false;
         }
     }
 
