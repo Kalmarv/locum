@@ -130,7 +130,7 @@ export class Capture {
   private reflection = new Map<string, ConstantBuffer[] | null>();
   private timelineCache: { rows: TimelineRow[]; groups: Group[] } | null = null;
   private modulesCache: { path: string; base: bigint; size: bigint }[] | null = null;
-  private features: { targetEvent: boolean; results: boolean } | null = null;
+  private features: { targetEvent: boolean; results: boolean; resultColumns: Set<string> } | null = null;
   private blobIndex: Database | null = null;
 
   constructor(readonly id: string, readonly path: string, readonly blobs: string, readonly label: string) {}
@@ -166,6 +166,7 @@ export class Capture {
     this.features ??= {
       targetEvent: db.query("PRAGMA table_info(targets)").all().some((r: any) => r.name === "event"),
       results: !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'results'").get(),
+      resultColumns: new Set(db.query("PRAGMA table_info(results)").all().map((r: any) => r.name as string)),
     };
     return this.features;
   }
@@ -456,18 +457,26 @@ export class Capture {
   }
 
   /**
-   * What an event whose shader's writes depend on the GPU's thread order wrote through its UAVs, as the game's GPU
-   * wrote it: each resource's whole contents right after the event (canonical layout).
+   * What an event wrote through its UAVs (or a clear through its view), as the game's GPU wrote it: each resource's
+   * contents right after the event (canonical layout), whole or one subresource. Captures from before every output
+   * was recorded hold only order-dependent ones, without the column saying so.
    */
   results(seq: number) {
     if (!this.hasResults) return [];
-    const rows = this.all("SELECT resource, content FROM results WHERE event = ? ORDER BY resource", seq);
+    const columns = this.schema().resultColumns;
+    const ordered = columns.has("order_dependent") ? "order_dependent" : "1";
+    const sub = columns.has("sub") ? "sub" : "NULL";
+    const rows = this.all(
+      `SELECT resource, content, ${ordered} AS ordered, ${sub} AS sub FROM results WHERE event = ? ORDER BY resource, sub`,
+      seq,
+    );
     const shapes = this.shapes(rows.map(r => r.resource));
     return rows.map(r => {
       const s = shapes.get(r.resource);
       return {
         resource: this.resourceRef(s, r.resource), content: r.content as string,
         size: this.blobSize(r.content), stride: s?.stride ?? 0,
+        ordered: !!r.ordered, sub: r.sub as number | null,
       };
     });
   }

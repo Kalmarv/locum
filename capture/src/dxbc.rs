@@ -1,8 +1,10 @@
-//! Instruction-level detection of potentially order-dependent SM4/5 atomics, over dx's `dxbc-reader` decoding.
+//! Instruction-level detection of potentially order-dependent atomics: SM4/5 programs over dx's `dxbc-reader`
+//! decoding, DXIL programs over its `dxil-reader`.
 
 /// One kind of atomic instruction, counted statically (not by executions).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AtomicOp {
+    /// The SM4/5 opcode; in DXIL, the `dx.op` code (0 for LLVM's own `atomicrmw` and `cmpxchg`).
     pub opcode: u16,
     pub name: &'static str,
     pub count: usize,
@@ -29,6 +31,9 @@ const ATOMICS: [u16; 13] = [172, 178, 179, 180, 181, 182, 183, 184, 185, 186, 18
 /// The program is decoded in full (`dxbc_reader::decode`): a container or token stream it cannot read is an error
 /// naming the word where reading stopped. This is not a replacement for the D3D bytecode validator.
 pub fn order_dependent(bytecode: &[u8]) -> Result<Option<OrderDependence>, String> {
+    if dxil_reader::parts(bytecode).is_ok_and(|parts| parts.iter().any(|p| &p.kind == b"DXIL")) {
+        return dxil(bytecode);
+    }
     let words = dxbc_reader::code(bytecode).map_err(|e| e.to_string())?;
     let program = dxbc_reader::decode(&words).map_err(|e| e.to_string())?;
     let ops: Vec<_> = ATOMICS
@@ -41,6 +46,56 @@ pub fn order_dependent(bytecode: &[u8]) -> Result<Option<OrderDependence>, Strin
                 count,
             })
         })
+        .collect();
+    Ok((!ops.is_empty()).then_some(OrderDependence { ops }))
+}
+
+/// The DXIL counterpart: the `dx.op` atomics that return the value they replaced (`atomicBinOp` 78,
+/// `atomicCompareExchange` 79) and the counter's `bufferUpdateCounter` 70 (append and consume), and LLVM's
+/// `atomicrmw` and `cmpxchg` on groupshared memory, each where its result is used. DXIL's atomics always return a
+/// value; an unused one is SM5's non-returning form. Conservative as the SM4/5 scan is.
+fn dxil(bytecode: &[u8]) -> Result<Option<OrderDependence>, String> {
+    use dxil_reader::module::Op;
+    let parts = dxil_reader::parts(bytecode).map_err(|e| e.to_string())?;
+    let module = dxil_reader::module(&parts, b"DXIL")
+        .map_err(|e| e.to_string())?
+        .ok_or("no DXIL part")?;
+    let mut counts: std::collections::BTreeMap<(u16, &'static str), usize> = Default::default();
+    for f in &module.functions {
+        let used: std::collections::HashSet<_> = f.instructions.iter().flat_map(|i| i.op.operands()).collect();
+        let constant = |id: dxil_reader::module::ValueId| {
+            let value = match id.checked_sub(f.first) {
+                None => module.values.get(id),
+                Some(local) => f.locals.get(local),
+            };
+            match value {
+                Some(dxil_reader::module::Value::Constant(dxil_reader::module::Constant::Integer(i))) => Some(i),
+                _ => None,
+            }
+        };
+        for inst in &f.instructions {
+            if !inst.result.is_some_and(|(r, _)| used.contains(&r)) {
+                continue;
+            }
+            let op = match &inst.op {
+                Op::Call { function, args } if module.name(*function).is_some_and(|n| n.starts_with("dx.op.")) => {
+                    match args.first().and_then(|&a| constant(a)) {
+                        Some(70) => (70, "bufferUpdateCounter"),
+                        Some(78) => (78, "atomicBinOp"),
+                        Some(79) => (79, "atomicCompareExchange"),
+                        _ => continue,
+                    }
+                }
+                Op::AtomicRmw { .. } => (0, "atomicrmw"),
+                Op::CmpXchg { .. } => (0, "cmpxchg"),
+                _ => continue,
+            };
+            *counts.entry(op).or_default() += 1;
+        }
+    }
+    let ops: Vec<_> = counts
+        .into_iter()
+        .map(|((opcode, name), count)| AtomicOp { opcode, name, count })
         .collect();
     Ok((!ops.is_empty()).then_some(OrderDependence { ops }))
 }
@@ -97,6 +152,28 @@ mod tests {
         words.extend(tail);
         words.push(RET);
         words
+    }
+
+    /// dxc 10.0.26100 `cs_6_0` of `RWByteAddressBuffer b : register(u0); groupshared uint g;
+    /// [numthreads(1, 1, 1)] void main() { uint o; b.InterlockedAdd(0, 1, o); b.InterlockedOr(4, 1); uint s;
+    /// InterlockedAdd(g, 1, s); b.Store(12, o + s); }`, and of one with only the `InterlockedOr` and a store of 7.
+    #[test]
+    fn dxil_atomics_count_where_their_results_are_used() {
+        let found = order_dependent(include_bytes!("testdata/dxil-atomics.cso")).unwrap().unwrap();
+        // InterlockedOr's atomicBinOp returns a value nothing reads.
+        assert_eq!(
+            found.ops,
+            [
+                AtomicOp { opcode: 0, name: "atomicrmw", count: 1 },
+                AtomicOp { opcode: 78, name: "atomicBinOp", count: 1 }
+            ]
+        );
+        assert_eq!(order_dependent(include_bytes!("testdata/dxil-plain.cso")), Ok(None));
+        // Its one UAV, u0 in space 0, as its PSV0 part declares it.
+        assert_eq!(
+            crate::rdef::uav_registers(include_bytes!("testdata/dxil-atomics.cso")),
+            Some(vec![(0, 0, 0)])
+        );
     }
 
     #[test]

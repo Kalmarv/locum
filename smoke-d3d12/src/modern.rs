@@ -36,7 +36,7 @@ unsafe fn sized(
     r.unwrap()
 }
 
-unsafe fn buffer_barrier(
+pub(super) unsafe fn buffer_barrier(
     list: &ID3D12GraphicsCommandList7,
     resource: &ID3D12Resource,
     sync: [D3D12_BARRIER_SYNC; 2],

@@ -43,6 +43,9 @@ pub struct List {
     /// waiting, copied after it where it is submitted unless a later list continues the pass.
     #[serde(skip)]
     pub checkpoints: Vec<Checkpoint>,
+    /// What its draws, dispatches and UAV clears wrote through UAVs, copied inside it right after each.
+    #[serde(skip)]
+    pub outputs: Vec<Output>,
     /// The targets (resource, subresource) this generation draws to before writing them any other way, with the
     /// views bound at the first such draw: where an earlier list left the copy of a pass with the same views
     /// waiting, this one continues the pass.
@@ -72,6 +75,20 @@ pub struct Checkpoint {
     pub sub: u32,
     /// Depth slice of a volume target.
     pub z: u32,
+    /// Why no copy was made.
+    pub gap: Option<String>,
+}
+
+/// A resource a draw, dispatch or UAV clear (the command at `command`) wrote through a UAV, copied inside its list
+/// right after it, before the command at `at`. Its bytes are read once the GPU has run the list.
+#[derive(Clone, Debug, Default)]
+pub struct Output {
+    pub id: u64,
+    pub at: usize,
+    pub command: usize,
+    pub resource: u64,
+    /// The subresource copied (a texture's, one a view covers); None, the whole resource (a buffer).
+    pub sub: Option<u32>,
     /// Why no copy was made.
     pub gap: Option<String>,
 }
@@ -117,6 +134,10 @@ impl Recording {
 
     pub fn checkpoint(&mut self, checkpoint: Checkpoint) {
         Arc::make_mut(&mut self.current).checkpoints.push(checkpoint);
+    }
+
+    pub fn output(&mut self, output: Output) {
+        Arc::make_mut(&mut self.current).outputs.push(output);
     }
 
     /// What the generation's pass tracking learned of the targets it continues and the resources it names.
@@ -418,6 +439,43 @@ impl Prepared {
             capture.gap("d3d12-targets", why, *count);
             skipped += count;
         }
+        // What draws, dispatches and clears wrote, each flagged where one of its programs is order-dependent.
+        let programs: BTreeMap<u64, Vec<String>> = capture
+            .draws
+            .iter()
+            .map(|d| (d.event, d.shaders.iter().flatten().cloned().collect()))
+            .collect();
+        let mut order_dependent = BTreeMap::<String, bool>::new();
+        let mut unrecorded = BTreeMap::<String, u64>::new();
+        for &(id, event, resource, sub) in &self.projection.outputs {
+            match self.checkpoints.get(&id) {
+                Some(Ok(key)) => {
+                    let ordered = programs.get(&event).is_some_and(|keys| {
+                        keys.iter().any(|k| {
+                            *order_dependent.entry(k.clone()).or_insert_with(|| {
+                                blobs
+                                    .get(k)
+                                    .ok()
+                                    .and_then(|code| crate::dxbc::order_dependent(&code).ok().flatten())
+                                    .is_some()
+                            })
+                        })
+                    });
+                    capture.results.push(db::Output {
+                        event,
+                        resource,
+                        sub,
+                        content: key.clone(),
+                        ordered,
+                    });
+                }
+                Some(Err(why)) => *unrecorded.entry(why.clone()).or_default() += 1,
+                None => *unrecorded.entry("copy not read back".into()).or_default() += 1,
+            }
+        }
+        for (why, count) in self.projection.unrecorded.iter().chain(&unrecorded) {
+            capture.gap("d3d12-results", why, *count);
+        }
         let target_bytes: u64 = capture
             .targets
             .iter()
@@ -605,6 +663,10 @@ pub struct Projection {
     drawn: BTreeMap<(String, u64), u64>,
     /// How the frame's pass ends went, for the capture's meta: where a frame's targets go missing.
     pass_ends: PassEnds,
+    /// What the frame's outputs copied, by copy: (event, resource, subresource).
+    outputs: Vec<(u64, u64, u64, Option<u32>)>,
+    /// Outputs no copy was made for, by reason; draws and dispatches in lists that copied none (not instrumented).
+    unrecorded: BTreeMap<String, u64>,
 }
 
 /// Counts of the frame's direct-list executions and their checkpoints.
@@ -970,7 +1032,27 @@ impl Projection {
             uncopied: BTreeMap::new(),
             missing: Vec::new(),
             drawn: BTreeMap::new(),
+            outputs: Vec::new(),
+            unrecorded: BTreeMap::new(),
             pass_ends: PassEnds::default(),
+        }
+    }
+
+    /// The outputs a list copied before its command `at`, each on the event of the command that wrote it (`seqs`, the
+    /// events of the list's commands so far). A generation executed again has the same copies, which hold its first
+    /// execution's outputs.
+    fn outputs(&mut self, list: &List, at: usize, seqs: &[u64], first: bool) {
+        for o in list.outputs.iter().filter(|o| o.at == at) {
+            let why = if first {
+                o.gap.clone()
+            } else {
+                Some("the list was executed again in the frame: its copies hold the first execution's outputs".into())
+            };
+            match (why, seqs.get(o.command)) {
+                (None, Some(&event)) => self.outputs.push((o.id, event, o.resource, o.sub)),
+                (Some(why), _) => *self.unrecorded.entry(why).or_default() += 1,
+                (None, None) => *self.unrecorded.entry("its command was not projected".into()).or_default() += 1,
+            }
         }
     }
 
@@ -1112,10 +1194,13 @@ impl Projection {
         if parent.is_some() {
             pipeline.graphics.begin_bundle();
         }
+        let mut seqs = Vec::with_capacity(list.commands.len());
         for (index, command) in list.commands.iter().enumerate() {
             self.checkpoints(capture, list, index, first);
+            self.outputs(list, index, &seqs, first);
             pipeline.apply(command);
             let seq = capture.events.len() as u64 + 1;
+            seqs.push(seq);
             // The event kinds D3D11 captures use, so both APIs browse alike.
             let kind = match command.call {
                 "DrawInstanced" | "DrawIndexedInstanced" | "DispatchMesh" => "draw",
@@ -1143,6 +1228,16 @@ impl Projection {
                 "ExecuteBundle" => "bundle",
                 _ => "state",
             };
+            if kind == "dispatch" && !list.instrumented {
+                *self
+                    .unrecorded
+                    .entry(
+                        "a dispatch of a list recorded before the capture was armed, or not for a direct queue, is \
+                         not followed by copies"
+                            .into(),
+                    )
+                    .or_default() += 1;
+            }
             // The bindings this event's draw adds, which say what it reads and writes.
             let bound = capture.bindings.len();
             let draw = if matches!(kind, "draw" | "dispatch" | "indirect") {
@@ -1244,6 +1339,7 @@ impl Projection {
             }
         }
         self.checkpoints(capture, list, list.commands.len(), first);
+        self.outputs(list, list.commands.len(), &seqs, first);
         if depth == 0 && list.kind == 0 && last_draw.is_some() {
             if list.instrumented {
                 self.pass_ends.lists_instrumented += 1;

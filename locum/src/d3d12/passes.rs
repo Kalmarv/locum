@@ -25,6 +25,11 @@
 //! views bound it is another pass by the capture's own reckoning (runs of draws with the same targets).
 //! Otherwise locum records a list of its own that copies the target, and submits it right after the closed list in
 //! the same ExecuteCommandLists call. Its memory is freed once the copy is read, not held for the list's life.
+//!
+//! What a draw, dispatch or UAV clear writes through UAVs (see [`super::outputs`]) is copied the same way right after
+//! it, before the list's next command: each resource from the state or layout it was written in (UNORDERED_ACCESS,
+//! or what this list's own barriers left it in) to COPY_SOURCE and back. A buffer is copied whole, a texture the
+//! subresources its view covers.
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
 use std::collections::{HashMap, HashSet};
@@ -51,6 +56,10 @@ pub fn recorded() -> u64 {
 /// Readback memory the live copies hold, and the most they may.
 static BYTES: AtomicU64 = AtomicU64::new(0);
 const BUDGET: u64 = 3 << 30;
+/// What outputs may hold of it: the rest is kept for pass-end targets.
+const OUTPUT_BUDGET: u64 = 2 << 30;
+/// The most one output's copy may be.
+const OUTPUT_BYTES: u64 = 64 << 20;
 const RENDER_TARGET: i32 = 0x4;
 const DEPTH_WRITE: i32 = 0x10;
 const ALL_SUBRESOURCES: u64 = 0xFFFF_FFFF;
@@ -561,14 +570,25 @@ pub struct Pass {
     continues: HashMap<(u64, u32), Vec<u64>>,
     /// The resources the list writes other than by drawing to them (see [`writes`]).
     written: HashSet<u64>,
+    /// What the list has bound, which names what its draws and dispatches write through UAVs.
+    bound: super::outputs::Bound,
+    /// What the command just recorded wrote through UAVs, or why some cannot be named, copied before the next: by
+    /// the index of the command.
+    due: Vec<(usize, Result<super::outputs::Written, String>)>,
+    /// The list has recorded enhanced barriers: its buffers are moved by them too.
+    enhanced: bool,
+    /// The outputs copied, taken at each command (see [`Pass::outputs`]).
+    outputs: Vec<model::Output>,
 }
 // Free-threaded D3D12 objects; a list's pass is used by whoever records the list, one at a time.
 unsafe impl Send for Pass {}
 
 const DEPTH_READ: i32 = 0x20;
 const UNORDERED_ACCESS: i32 = 0x8;
+const LAYOUT_COMMON: i32 = 0;
 const LAYOUT_GENERIC_READ: i32 = 1;
 const LAYOUT_RENDER_TARGET: i32 = 2;
+const LAYOUT_UNORDERED_ACCESS: i32 = 3;
 const LAYOUT_DEPTH_WRITE: i32 = 4;
 const LAYOUT_DEPTH_READ: i32 = 5;
 const LAYOUT_SHADER_RESOURCE: i32 = 6;
@@ -593,11 +613,12 @@ fn waits_in(access: Access) -> bool {
 }
 
 impl Pass {
-    /// A pass state for the real graphics list `real` of the direct type, or None for other lists.
+    /// A pass state for the real graphics list `real` of the direct type, opened with pipeline `pso`, or None for
+    /// other lists.
     ///
     /// # Safety
     /// `real` is the application's real command list.
-    pub unsafe fn new(real: *mut c_void) -> Option<Pass> {
+    pub unsafe fn new(real: *mut c_void, pso: u64) -> Option<Pass> {
         let list = unsafe { ID3D12GraphicsCommandList::from_raw_borrowed(&real) }?;
         if unsafe { list.GetType() } != D3D12_COMMAND_LIST_TYPE_DIRECT {
             return None;
@@ -614,7 +635,16 @@ impl Pass {
             waiting: Vec::new(),
             continues: HashMap::new(),
             written: HashSet::new(),
+            bound: super::outputs::Bound::reset(pso),
+            due: Vec::new(),
+            enhanced: false,
+            outputs: Vec::new(),
         })
+    }
+
+    /// The outputs copied since last asked.
+    pub fn outputs(&mut self) -> Vec<model::Output> {
+        std::mem::take(&mut self.outputs)
     }
 
     /// What the list's continuing draws and other writes were, for the submissions that decide pending ends.
@@ -641,6 +671,12 @@ impl Pass {
         let Some(list) = (unsafe { ID3D12GraphicsCommandList::from_raw_borrowed(&real) }) else {
             return out;
         };
+        unsafe { self.copy_outputs(list, at) };
+        self.bound.apply(call, a);
+        let (written, gaps) = self.bound.written(call, a);
+        self.due.extend(written.into_iter().map(|w| (at, Ok(w))));
+        self.due.extend(gaps.into_iter().map(|why| (at, Err(why))));
+        self.enhanced |= call == "Barrier";
         if let Some(suspended) = self.ended.take() {
             unsafe { self.end_pass(list, at, suspended, &mut out) };
         }
@@ -781,9 +817,15 @@ impl Pass {
         out
     }
 
-    /// Before Close, `at` commands into the list: passes still open, and those whose copies still wait, are pending,
-    /// decided where the list is submitted.
-    pub fn closing(&mut self, at: usize) -> Vec<model::Checkpoint> {
+    /// Before Close of the real list `real`, `at` commands into it: what its last command wrote is copied; passes
+    /// still open, and those whose copies still wait, are pending, decided where the list is submitted.
+    ///
+    /// # Safety
+    /// `real` is the application's real list this pass instruments.
+    pub unsafe fn closing(&mut self, real: *mut c_void, at: usize) -> Vec<model::Checkpoint> {
+        if let Some(list) = unsafe { ID3D12GraphicsCommandList::from_raw_borrowed(&real) } {
+            unsafe { self.copy_outputs(list, at) };
+        }
         let suspended = self.ended.take().unwrap_or(self.suspending);
         let mut out = Vec::new();
         let mut ends: Vec<(Bound, usize, Vec<u64>)> = std::mem::take(&mut self.waiting)
@@ -994,27 +1036,83 @@ impl Pass {
             return;
         }
         let mut c = checkpoint(t, at, None);
-        let predicate = self.predicate.and_then(|(r, offset, op)| {
-            super::real(r)
-                .and_then(|r| r.cast::<ID3D12Resource>().ok())
-                .map(|r| (r, offset, op))
-        });
-        match unsafe { copy_into(&self.device, list, t, states, predicate) } {
-            Ok(readback) => {
-                copies().insert(
-                    c.id,
-                    Copy {
-                        data: Arc::new(readback),
-                        list: 0,
-                        last: None,
-                        retired: false,
-                    },
-                );
-            }
+        match unsafe { copy_into(&self.device, list, t, states, self.predication()) } {
+            Ok(readback) => keep(c.id, readback),
             Err(why) => c.gap = Some(why),
         }
         out.push(c);
     }
+
+    /// The list's predication, with its buffer.
+    fn predication(&self) -> Option<(ID3D12Resource, u64, i32)> {
+        self.predicate.and_then(|(r, offset, op)| {
+            super::real(r)
+                .and_then(|r| r.cast::<ID3D12Resource>().ok())
+                .map(|r| (r, offset, op))
+        })
+    }
+
+    /// Copies what the command before `at` wrote through UAVs, recording each output, or why it was not copied.
+    unsafe fn copy_outputs(&mut self, list: &ID3D12GraphicsCommandList, at: usize) {
+        for (command, written) in std::mem::take(&mut self.due) {
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let (resource, sub, gap) = match written {
+                Ok(w) => {
+                    let copied = unsafe { self.copy_output(list, &w) }.map(|readback| keep(id, readback));
+                    (w.resource, w.sub, copied.err())
+                }
+                Err(why) => (0, None, Some(why)),
+            };
+            self.outputs.push(model::Output {
+                id,
+                at,
+                command,
+                resource,
+                sub,
+                gap,
+            });
+        }
+    }
+
+    /// Copies one output from the state or layout it was written in.
+    unsafe fn copy_output(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        w: &super::outputs::Written,
+    ) -> Result<Readback, String> {
+        let real = super::real(w.resource)
+            .and_then(|r| r.cast::<ID3D12Resource>().ok())
+            .ok_or("destroyed before it was copied")?;
+        let desc = unsafe { real.GetDesc() };
+        let buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        let sub = w.sub.unwrap_or(0);
+        let known = self
+            .known
+            .get(&w.resource)
+            .and_then(|k| k.iter().rev().find(|(r, _)| r.holds(sub, shape(&real))))
+            .map(|(_, access)| *access);
+        let simultaneous = desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
+        // A buffer has no layout: one an enhanced barrier moves is written with no state to leave.
+        let access = known.unwrap_or(if (buffer && self.enhanced) || (!buffer && layouts().contains(&w.resource)) {
+            Access::Layout(if simultaneous && !buffer { LAYOUT_COMMON } else { LAYOUT_UNORDERED_ACCESS })
+        } else {
+            Access::State(UNORDERED_ACCESS)
+        });
+        unsafe { output_into(&self.device, list, &real, &desc, w.sub, access, self.predication()) }
+    }
+}
+
+/// Keeps a copy's readback memory until its list is retired and the GPU is done with it.
+fn keep(id: u64, readback: Readback) {
+    copies().insert(
+        id,
+        Copy {
+            data: Arc::new(readback),
+            list: 0,
+            last: None,
+            retired: false,
+        },
+    );
 }
 
 /// The views of bound targets, in slot order with the depth last.
@@ -1184,10 +1282,14 @@ unsafe fn copy_into(
         .ok_or_else(|| format!("format {format} has no canonical layout"))?;
     let volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     let subs: Vec<(u32, Access)> = t.subs.iter().copied().zip(states.iter().copied()).collect();
-    let (to_copy, back) = (barriers(&t.real, &subs, true)?, barriers(&t.real, &subs, false)?);
-    if !to_copy.enhanced.is_empty() && list.cast::<ID3D12GraphicsCommandList7>().is_err() {
-        return Err("layout barriers need ID3D12GraphicsCommandList7".into());
-    }
+    // A target made for simultaneous access is drawn to in COMMON.
+    let common = if t.depth {
+        D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE
+    } else {
+        D3D12_BARRIER_ACCESS_RENDER_TARGET
+    };
+    let (to_copy, back) = (barriers(&t.real, &subs, true, common)?, barriers(&t.real, &subs, false, common)?);
+    to_copy.possible(list)?;
     let mut footprints = Vec::new();
     let mut bytes = 0u64;
     for &sub in &t.subs {
@@ -1213,40 +1315,7 @@ unsafe fn copy_into(
             .next_multiple_of(u64::from(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT));
         footprints.push((f, rows, row_bytes));
     }
-    if BYTES.fetch_add(bytes, Ordering::AcqRel) + bytes > BUDGET {
-        BYTES.fetch_sub(bytes, Ordering::AcqRel);
-        return Err(format!("checkpoint budget of {} GiB spent", BUDGET >> 30));
-    }
-    let mut readback: Option<ID3D12Resource> = None;
-    let created = unsafe {
-        device.CreateCommittedResource(
-            &D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_READBACK,
-                ..Default::default()
-            },
-            D3D12_HEAP_FLAG_NONE,
-            &D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: bytes,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            },
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            None,
-            &mut readback,
-        )
-    };
-    let readback = match (created, readback) {
-        (Ok(()), Some(r)) => r,
-        (e, _) => {
-            BYTES.fetch_sub(bytes, Ordering::AcqRel);
-            return Err(format!("readback buffer of {bytes} bytes: {e:?}"));
-        }
-    };
+    let readback = unsafe { readback_buffer(device, bytes, BUDGET) }?;
     unsafe {
         if predicate.is_some() {
             list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
@@ -1289,6 +1358,152 @@ unsafe fn copy_into(
     })
 }
 
+/// New readback memory of `bytes` bytes, while the live copies hold no more than `limit` with it; a [`Readback`]
+/// made of it gives the bytes back.
+unsafe fn readback_buffer(device: &ID3D12Device, bytes: u64, limit: u64) -> Result<ID3D12Resource, String> {
+    if BYTES.fetch_add(bytes, Ordering::AcqRel) + bytes > limit {
+        BYTES.fetch_sub(bytes, Ordering::AcqRel);
+        return Err(format!("readback budget of {} GiB spent", limit >> 30));
+    }
+    let mut readback: Option<ID3D12Resource> = None;
+    let created = unsafe {
+        device.CreateCommittedResource(
+            &D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            },
+            D3D12_HEAP_FLAG_NONE,
+            &D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: bytes.max(1),
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            },
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            None,
+            &mut readback,
+        )
+    };
+    match (created, readback) {
+        (Ok(()), Some(r)) => Ok(r),
+        (e, _) => {
+            BYTES.fetch_sub(bytes, Ordering::AcqRel);
+            Err(format!("readback buffer of {bytes} bytes: {e:?}"))
+        }
+    }
+}
+
+/// Records into `list` the copy of what a command wrote through a UAV into `real`: subresource `sub` of a texture,
+/// or the whole of a buffer (`sub` None), from `access`, suspending the list's predication `predicate` around it.
+unsafe fn output_into(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    real: &ID3D12Resource,
+    desc: &D3D12_RESOURCE_DESC,
+    sub: Option<u32>,
+    access: Access,
+    predicate: Option<(ID3D12Resource, u64, i32)>,
+) -> Result<Readback, String> {
+    let buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    let (layout, footprints, bytes) = if buffer {
+        let bytes = desc.Width;
+        if bytes > OUTPUT_BYTES {
+            return Err(format!("a buffer of {} MiB, more than one output's {} MiB", bytes >> 20, OUTPUT_BYTES >> 20));
+        }
+        (locum_capture::layout::buffer(bytes as u32), Vec::new(), bytes)
+    } else {
+        let sub = sub.unwrap_or(0);
+        let (mips, _) = shape(real);
+        let mip = sub % mips;
+        let depth = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+            (u32::from(desc.DepthOrArraySize) >> mip).max(1)
+        } else {
+            1
+        };
+        let format = desc.Format.0 as u32;
+        let layout = locum_capture::layout::texture(
+            format,
+            ((desc.Width >> mip) as u32).max(1),
+            (desc.Height >> mip).max(1),
+            depth,
+            1,
+            1,
+        )
+        .ok_or_else(|| format!("format {format} has no canonical layout"))?;
+        let size = locum_capture::layout::total(&layout);
+        if size > OUTPUT_BYTES {
+            return Err(format!(
+                "a subresource of {} MiB, more than one output's {} MiB",
+                size >> 20,
+                OUTPUT_BYTES >> 20
+            ));
+        }
+        let (mut f, mut rows, mut row_bytes) = (D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), 0u32, 0u64);
+        let mut total = 0u64;
+        unsafe {
+            device.GetCopyableFootprints(
+                desc,
+                sub,
+                1,
+                0,
+                Some(&mut f),
+                Some(&mut rows),
+                Some(&mut row_bytes),
+                Some(&mut total),
+            )
+        };
+        if row_bytes == u64::MAX || total == u64::MAX {
+            return Err(format!("GetCopyableFootprints refused subresource {sub}"));
+        }
+        (layout, vec![(f, rows, row_bytes)], total)
+    };
+    // Buffers move as a whole.
+    let index = if buffer { ALL_SUBRESOURCES as u32 } else { sub.unwrap_or(0) };
+    let subs = [(index, access)];
+    let written = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
+    let (to_copy, back) = (barriers(real, &subs, true, written)?, barriers(real, &subs, false, written)?);
+    to_copy.possible(list)?;
+    let readback = unsafe { readback_buffer(device, bytes, OUTPUT_BUDGET) }?;
+    unsafe {
+        if predicate.is_some() {
+            list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        }
+        to_copy.issue(list);
+        if buffer {
+            list.CopyBufferRegion(&readback, 0, real, 0, bytes);
+        } else {
+            let dst = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: borrowed(&readback),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: footprints[0].0,
+                },
+            };
+            let src = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: borrowed(real),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: index },
+            };
+            list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        }
+        back.issue(list);
+        if let Some((r, offset, op)) = &predicate {
+            list.SetPredication(r, *offset, D3D12_PREDICATION_OP(*op));
+        }
+    }
+    Ok(Readback {
+        readback,
+        footprints,
+        layout,
+        joined: None,
+        bytes,
+    })
+}
+
 /// A checkpoint of a bound target before command `at`, with a new id.
 fn checkpoint(t: &Bound, at: usize, gap: Option<&str>) -> model::Checkpoint {
     model::Checkpoint {
@@ -1306,14 +1521,15 @@ fn checkpoint(t: &Bound, at: usize, gap: Option<&str>) -> model::Checkpoint {
     }
 }
 
-/// Assigns the copies made in a list generation to that list, which retires them when it is reset or destroyed.
-pub fn belong(list: u64, checkpoints: &[model::Checkpoint]) {
+/// Assigns the copies made in a list generation (checkpoints' and outputs' ids) to that list, which retires them
+/// when it is reset or destroyed.
+pub fn belong(list: u64, ids: impl IntoIterator<Item = u64>) {
     let (mut c, mut p) = (copies(), pending());
-    for k in checkpoints {
-        if let Some(copy) = c.get_mut(&k.id) {
+    for id in ids {
+        if let Some(copy) = c.get_mut(&id) {
             copy.list = list;
         }
-        if let Some(end) = p.get_mut(&k.id) {
+        if let Some(end) = p.get_mut(&id) {
             end.list = list;
         }
     }
@@ -1403,34 +1619,71 @@ fn borrowed(r: &ID3D12Resource) -> ManuallyDrop<Option<ID3D12Resource>> {
 struct Barriers {
     legacy: Vec<D3D12_RESOURCE_BARRIER>,
     enhanced: Vec<D3D12_TEXTURE_BARRIER>,
+    buffers: Vec<D3D12_BUFFER_BARRIER>,
 }
 
 impl Barriers {
+    /// Whether `list` can record them: enhanced barriers need ID3D12GraphicsCommandList7.
+    fn possible(&self, list: &ID3D12GraphicsCommandList) -> Result<(), String> {
+        if (!self.enhanced.is_empty() || !self.buffers.is_empty())
+            && list.cast::<ID3D12GraphicsCommandList7>().is_err()
+        {
+            return Err("layout barriers need ID3D12GraphicsCommandList7".into());
+        }
+        Ok(())
+    }
+
     unsafe fn issue(&self, list: &ID3D12GraphicsCommandList) {
         if !self.legacy.is_empty() {
             unsafe { list.ResourceBarrier(&self.legacy) };
         }
+        let mut groups = Vec::new();
         if !self.enhanced.is_empty() {
-            let group = D3D12_BARRIER_GROUP {
+            groups.push(D3D12_BARRIER_GROUP {
                 Type: D3D12_BARRIER_TYPE_TEXTURE,
                 NumBarriers: self.enhanced.len() as u32,
                 Anonymous: D3D12_BARRIER_GROUP_0 {
                     pTextureBarriers: self.enhanced.as_ptr(),
                 },
-            };
-            // Checked when the barriers were made.
+            });
+        }
+        if !self.buffers.is_empty() {
+            groups.push(D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_BUFFER,
+                NumBarriers: self.buffers.len() as u32,
+                Anonymous: D3D12_BARRIER_GROUP_0 {
+                    pBufferBarriers: self.buffers.as_ptr(),
+                },
+            });
+        }
+        if !groups.is_empty() {
+            // Checked by `possible` before anything was recorded.
             let list7: ID3D12GraphicsCommandList7 = list.cast().expect("ID3D12GraphicsCommandList7");
-            unsafe { list7.Barrier(&[group]) };
+            unsafe { list7.Barrier(&groups) };
         }
     }
 }
 
-/// The transitions of a target's subresources, each from its state or layout, to COPY_SOURCE (`to_copy`) or back.
-fn barriers(r: &ID3D12Resource, subs: &[(u32, Access)], to_copy: bool) -> Result<Barriers, String> {
+/// The transitions of a resource's subresources, each from its state or layout, to COPY_SOURCE (`to_copy`) or back.
+/// A buffer has one, `ALL_SUBRESOURCES`; where it is moved by enhanced barriers (a layout given), it has no layout
+/// and only its access changes. `common` is how a subresource in the COMMON layout was used.
+fn barriers(
+    r: &ID3D12Resource,
+    subs: &[(u32, Access)],
+    to_copy: bool,
+    common: D3D12_BARRIER_ACCESS,
+) -> Result<Barriers, String> {
     let mut out = Barriers {
         legacy: Vec::new(),
         enhanced: Vec::new(),
+        buffers: Vec::new(),
     };
+    let buffer = unsafe { r.GetDesc() }.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    let copy = (
+        D3D12_BARRIER_SYNC_COPY,
+        D3D12_BARRIER_ACCESS_COPY_SOURCE,
+        D3D12_BARRIER_LAYOUT_COPY_SOURCE,
+    );
     for &(sub, access) in subs {
         match access {
             Access::State(s) if s & COPY_SOURCE != 0 => {}
@@ -1453,6 +1706,19 @@ fn barriers(r: &ID3D12Resource, subs: &[(u32, Access)], to_copy: bool) -> Result
                     },
                 });
             }
+            Access::Layout(_) if buffer => {
+                let written = (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+                let (before, after) = if to_copy { (written, (copy.0, copy.1)) } else { ((copy.0, copy.1), written) };
+                out.buffers.push(D3D12_BUFFER_BARRIER {
+                    SyncBefore: before.0,
+                    SyncAfter: after.0,
+                    AccessBefore: before.1,
+                    AccessAfter: after.1,
+                    pResource: borrowed(r),
+                    Offset: 0,
+                    Size: u64::MAX,
+                });
+            }
             Access::Layout(l) => {
                 let access = match l {
                     LAYOUT_COPY_SOURCE => continue,
@@ -1460,13 +1726,13 @@ fn barriers(r: &ID3D12Resource, subs: &[(u32, Access)], to_copy: bool) -> Result
                     LAYOUT_DEPTH_WRITE => D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE,
                     LAYOUT_DEPTH_READ => D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ,
                     LAYOUT_SHADER_RESOURCE | LAYOUT_GENERIC_READ => D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
-                    _ => return Err(format!("layout {l} where the pass ended")),
+                    LAYOUT_UNORDERED_ACCESS => D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    LAYOUT_COMMON => common,
+                    _ => return Err(format!("layout {l} where the copy is made")),
                 };
-                let copy = (
-                    D3D12_BARRIER_SYNC_COPY,
-                    D3D12_BARRIER_ACCESS_COPY_SOURCE,
-                    D3D12_BARRIER_LAYOUT_COPY_SOURCE,
-                );
+                // COMMON allows copying from it, and a texture made for simultaneous access has no other layout.
+                let copy_layout = if l == LAYOUT_COMMON { D3D12_BARRIER_LAYOUT(l) } else { copy.2 };
+                let copy = (copy.0, copy.1, copy_layout);
                 let target = (D3D12_BARRIER_SYNC_ALL, access, D3D12_BARRIER_LAYOUT(l));
                 let (before, after) = if to_copy { (target, copy) } else { (copy, target) };
                 out.enhanced.push(D3D12_TEXTURE_BARRIER {

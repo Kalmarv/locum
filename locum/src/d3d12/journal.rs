@@ -94,7 +94,7 @@ impl Data {
             .as_ref()
             .map(|r| r.snapshot())
     }
-    /// The checkpoints `make` records into an instrumented list, at its next command.
+    /// The checkpoints `make` records into an instrumented list, at its next command, and the outputs it copies.
     fn checkpoints(
         &self,
         recording: &mut model::Recording,
@@ -105,25 +105,30 @@ impl Data {
             return;
         };
         let checkpoints = make(pass, recording.len());
-        super::passes::belong(self.id, &checkpoints);
+        self.keep(recording, checkpoints, pass.outputs());
+    }
+    /// Assigns copies made in the list to its generation.
+    fn keep(&self, recording: &mut model::Recording, checkpoints: Vec<model::Checkpoint>, outputs: Vec<model::Output>) {
+        super::passes::belong(self.id, checkpoints.iter().map(|c| c.id).chain(outputs.iter().map(|o| o.id)));
         for c in checkpoints {
             recording.checkpoint(c);
         }
+        for o in outputs {
+            recording.output(o);
+        }
     }
-    /// Before Close is forwarded to the real list: a pass still open is pending, and the generation keeps what its
-    /// pass tracking learned of the targets it continues and the resources it names.
-    pub fn closing(&self) {
+    /// Before Close is forwarded to the real list `real`: what its last command wrote is copied, a pass still open
+    /// is pending, and the generation keeps what its pass tracking learned of the targets it continues and the
+    /// resources it names.
+    pub fn closing(&self, real: *mut c_void) {
         if !enabled() {
             return;
         }
         let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
         let pass = self.pass.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let (Some(recording), Some(mut pass)) = (recording.as_mut(), pass) {
-            let checkpoints = pass.closing(recording.len());
-            super::passes::belong(self.id, &checkpoints);
-            for c in checkpoints {
-                recording.checkpoint(c);
-            }
+            let checkpoints = unsafe { pass.closing(real, recording.len()) };
+            self.keep(recording, checkpoints, pass.outputs());
             let (continues, written) = pass.touches();
             recording.touches(continues, written);
         }
@@ -145,14 +150,14 @@ impl Data {
             && let Some(r) = self.recording.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
         {
             r.reset(allocator, pso);
-            self.instrument(r, real);
+            self.instrument(r, real, pso);
         }
         RESET_COST.add(start, 0);
     }
-    /// Instruments a generation opened with a capture armed, if the list is a direct one.
-    fn instrument(&self, recording: &mut model::Recording, real: *mut c_void) {
+    /// Instruments a generation opened with pipeline `pso` while a capture is armed, if the list is a direct one.
+    fn instrument(&self, recording: &mut model::Recording, real: *mut c_void, pso: u64) {
         let pass = if super::passes::ARMED.load(std::sync::atomic::Ordering::Acquire) {
-            unsafe { super::passes::Pass::new(real) }
+            unsafe { super::passes::Pass::new(real, pso) }
         } else {
             None
         };
@@ -252,6 +257,7 @@ pub fn owner_device(id: u64) -> u64 {
 pub fn destroy(id: u64) {
     let start = Instant::now();
     super::passes::destroyed(id);
+    super::outputs::destroyed(id);
     {
         let mut s = state();
         s.objects.remove(&id);
@@ -416,7 +422,7 @@ pub unsafe fn created_list(
         let (allocator, pso) = (super::id(allocator), super::id(pso));
         let mut recording = model::Recording::new(data.id, kind, allocator, pso, closed);
         if !closed && let Some(real) = super::real(data.id) {
-            data.instrument(&mut recording, windows::core::Interface::as_raw(&real));
+            data.instrument(&mut recording, windows::core::Interface::as_raw(&real), pso);
         }
         *data.recording.lock().unwrap_or_else(|e| e.into_inner()) = Some(recording);
         describe(
@@ -530,6 +536,7 @@ pub unsafe fn submit(
     let mut executed = Vec::new();
     for (at, list) in ordinals.into_iter().zip(&lists).filter(|(_, l)| l.instrumented) {
         let copied = list.checkpoints.iter().filter(|c| c.gap.is_none()).map(|c| c.id);
+        let copied = copied.chain(list.outputs.iter().filter(|o| o.gap.is_none()).map(|o| o.id));
         submitted.all.extend(copied.clone());
         let first = capture
             .as_mut()
@@ -897,7 +904,7 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
     if finished.is_some() {
         super::passes::ARMED.store(false, std::sync::atomic::Ordering::Release);
         log!(
-            "D3D12 capture closing: {} pass-end copies recorded so far",
+            "D3D12 capture closing: {} copies recorded so far",
             super::passes::recorded()
         );
     }
@@ -929,14 +936,9 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         capture.meta("capture_status", "incomplete");
         capture.meta(
             "verification_scope",
-            "command history, first-use contents and pass-end targets",
+            "command history, first-use contents, pass-end targets and what draws, dispatches and clears wrote through UAVs",
         );
         let mut prepared = frame.finish(&mut capture, projection);
-        capture.gap(
-            "d3d12-results",
-            "what each dispatch and draw wrote through UAVs is not recorded: verify compares only pass-end targets",
-            1,
-        );
         let t = std::time::Instant::now();
         // The copies finish on the GPU soon after the frame and the collector reads them in order: the capture is
         // written after the last, off the game's threads. The same "capture written" / "capture NOT written" lines as
@@ -1014,7 +1016,7 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         });
         super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
         log!(
-            "D3D12 capture armed at Present {frame_number}; cached list history retained; {} pass-end copies recorded so far",
+            "D3D12 capture armed at Present {frame_number}; cached list history retained; {} copies recorded so far",
             super::passes::recorded()
         );
     }

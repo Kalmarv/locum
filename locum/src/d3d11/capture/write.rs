@@ -238,7 +238,13 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                 Err(e) => Err(e),
             };
             match read {
-                Ok((key, _)) => capture.results.push((seq, resource, key, ordered)),
+                Ok((key, _)) => capture.results.push(db::Output {
+                    event: seq,
+                    resource,
+                    sub: None,
+                    content: key,
+                    ordered,
+                }),
                 Err(e) => {
                     let gap = if ordered {
                         (

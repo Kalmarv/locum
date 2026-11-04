@@ -12,10 +12,12 @@ use rusqlite::{Connection, params};
 
 /// Bumped when a table changes meaning.
 pub const SCHEMA_VERSION: u32 = 1;
-/// A D3D12 capture's: the same tables, plus the authoritative `d12_*` records.
-pub const D3D12_SCHEMA_VERSION: u32 = 5;
+/// A D3D12 capture's: the same tables, plus the authoritative `d12_*` records. 6 records `results`, a texture's by
+/// subresource (`sub`).
+pub const D3D12_SCHEMA_VERSION: u32 = 6;
 /// The oldest D3D12 schema readers accept: 2 to 4 differ from 5 only in `d12_upload_versions`,
-/// `d12_submission_descriptors` and the absence of `d12_first_use`, which the CLI and the viewer do not read.
+/// `d12_submission_descriptors` and the absence of `d12_first_use`, which the CLI and the viewer do not read; 5
+/// differs from 6 only in having no `results` rows.
 pub const D3D12_SCHEMA_OLDEST: u32 = 2;
 
 pub const SCHEMA: &str = r#"
@@ -90,12 +92,14 @@ CREATE TABLE targets(draw INTEGER NOT NULL, target TEXT NOT NULL, view INTEGER, 
 CREATE TABLE missing_targets(draw INTEGER NOT NULL, target TEXT NOT NULL, resource INTEGER, why TEXT NOT NULL);
 -- What the capture could not record, for `locum-cli info`.
 CREATE TABLE gaps(what TEXT NOT NULL, detail TEXT, count INTEGER NOT NULL);
--- What a draw or dispatch wrote through UAVs, as the game's GPU wrote it (key of the resource's whole contents right
--- after the event): replay checks its own output against it and goes on from it. order_dependent: one of its shaders
+-- What a draw or dispatch wrote through UAVs, as the game's GPU wrote it (key of the resource's contents right after
+-- the event): replay checks its own output against it and goes on from it. order_dependent: one of its shaders
 -- writes what depends on the order the GPU runs its threads, so the same records in another order are not a
 -- difference. Captures from before every output was recorded have only order-dependent rows, and no such column.
+-- sub: the contents are that subresource's only (a D3D12 texture's, the subresources its view covers, a row each);
+-- NULL, the whole resource. Captures from before it have no such column.
 CREATE TABLE results(event INTEGER NOT NULL, resource INTEGER NOT NULL, content TEXT NOT NULL,
-  order_dependent INTEGER NOT NULL, PRIMARY KEY(event, resource));
+  order_dependent INTEGER NOT NULL, sub INTEGER, PRIMARY KEY(event, resource, sub));
 CREATE INDEX bindings_draw ON bindings(draw);
 CREATE INDEX bindings_resource ON bindings(resource);
 CREATE INDEX bindings_content ON bindings(content);
@@ -294,6 +298,17 @@ pub struct MissingTarget {
     pub why: String,
 }
 
+/// What an event wrote, as the game's GPU wrote it: see the `results` table.
+#[derive(Clone, Debug, Default)]
+pub struct Output {
+    pub event: u64,
+    pub resource: u64,
+    /// The subresource the contents are of; None, the whole resource.
+    pub sub: Option<u32>,
+    pub content: String,
+    pub ordered: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Gap {
     pub what: String,
@@ -324,8 +339,7 @@ pub struct Capture {
     pub passes: Vec<Pass>,
     pub targets: Vec<Target>,
     pub missing_targets: Vec<MissingTarget>,
-    /// (event, resource, content key, order-dependent): see the `results` table.
-    pub results: Vec<(u64, u64, String, bool)>,
+    pub results: Vec<Output>,
     pub gaps: Vec<Gap>,
 }
 
@@ -574,9 +588,9 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
         for t in &capture.missing_targets {
             s.execute(params![t.draw as i64, t.target, t.resource as i64, t.why])?;
         }
-        let mut s = tx.prepare("INSERT INTO results VALUES(?1,?2,?3,?4)")?;
-        for (event, resource, content, ordered) in &capture.results {
-            s.execute(params![*event as i64, *resource as i64, content, ordered])?;
+        let mut s = tx.prepare("INSERT INTO results VALUES(?1,?2,?3,?4,?5)")?;
+        for o in &capture.results {
+            s.execute(params![o.event as i64, o.resource as i64, o.content, o.ordered, o.sub])?;
         }
         let mut s = tx.prepare("INSERT INTO gaps VALUES(?1,?2,?3)")?;
         for g in &capture.gaps {

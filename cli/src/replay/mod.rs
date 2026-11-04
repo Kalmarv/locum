@@ -472,6 +472,8 @@ fn execute(
 /// A resource checkpoint after a draw/dispatch UAV write or a clear.
 struct Written {
     resource: i64,
+    /// The subresource the game's bytes are of; None, the whole resource.
+    sub: Option<u32>,
     key: String,
     /// One of its shaders writes what depends on the order the GPU runs its threads.
     ordered: bool,
@@ -490,8 +492,9 @@ fn recorded(c: &Capture) -> HashMap<i64, Vec<Written>> {
     } else {
         "1"
     };
+    let sub = if columns.iter().any(|n| n == "sub") { "sub" } else { "NULL" };
     for (event, w) in c.rows(
-        &format!("SELECT event, resource, content, {ordered} FROM results"),
+        &format!("SELECT event, resource, content, {ordered}, {sub} FROM results"),
         [],
         |r| {
             Ok((
@@ -500,6 +503,7 @@ fn recorded(c: &Capture) -> HashMap<i64, Vec<Written>> {
                     resource: r.get(1)?,
                     key: r.get(2)?,
                     ordered: r.get(3)?,
+                    sub: r.get(4)?,
                 },
             ))
         },
@@ -553,7 +557,15 @@ fn settle(
     for w in written {
         let s = shape(c, w.resource).ok_or("resource vanished")?;
         let game = c.blob(&w.key)?;
-        let mine = b.read(w.resource)?;
+        let whole = b.read(w.resource)?;
+        // A subresource's row holds its bytes only.
+        let mine = match w.sub {
+            None => whole.clone(),
+            Some(sub) => sub_of(&s, &whole, Some(sub))
+                .ok_or_else(|| format!("#{} has no subresource {sub}", w.resource))?
+                .0
+                .to_vec(),
+        };
         // A structured buffer's records are its structures; anything else is taken in 4-byte words, the unit UAV
         // atomics work in.
         let stride = if s.kind == "buffer" && s.stride > 0 {
@@ -584,12 +596,30 @@ fn settle(
         };
         if !matches!(settled, Settled::Identical) {
             if let Some(dir) = keep {
-                let file = |side: &str| dir.join(format!("event-{seq}-{}.{side}.bin", w.resource));
+                let part = w.sub.map_or(String::new(), |sub| format!("-sub{sub}"));
+                let file = |side: &str| dir.join(format!("event-{seq}-{}{part}.{side}.bin", w.resource));
                 kept(&file("replay"), &mine)?;
                 kept(&file("game"), &game)?;
             }
             if w.ordered || all {
-                b.write(c, w.resource, &game)?;
+                let contents = match w.sub {
+                    None => game.clone(),
+                    Some(sub) => {
+                        let (_, x) = sub_of(&s, &whole, Some(sub)).expect("read above");
+                        if game.len() as u64 != x.size {
+                            return Err(format!(
+                                "#{} subresource {sub}: the game's {} bytes, {} expected",
+                                w.resource,
+                                game.len(),
+                                x.size
+                            ));
+                        }
+                        let mut contents = whole.clone();
+                        contents[x.offset as usize..(x.offset + x.size) as usize].copy_from_slice(&game);
+                        contents
+                    }
+                };
+                b.write(c, w.resource, &contents)?;
             }
         }
         out.push(Compared {
@@ -789,9 +819,9 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     Ok(())
 }
 
-/// Gaps that are checks the capture could not make or keep (targets not read back, a command list's earlier
+/// Gaps that are checks the capture could not make or keep (targets or outputs not read back, a command list's earlier
 /// executions, the CPU's memory), not inputs the replay lacks: shown, but they leave the proof complete.
-const CHECKS: &str = "'evidence', 'targets', 'outputs', 'memory'";
+const CHECKS: &str = "'evidence', 'targets', 'outputs', 'memory', 'd3d12-targets', 'd3d12-results'";
 
 /// Replays the whole frame and compares every target the capture read back with the replay's at the same point. Fails
 /// unless every target compared is identical and nothing kept the capture or the replay from being complete.

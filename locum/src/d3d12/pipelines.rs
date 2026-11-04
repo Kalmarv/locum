@@ -24,6 +24,10 @@ pub unsafe fn bytes(pointer: *const c_void, len: usize) -> Value {
 }
 unsafe fn shader(stage: &str, code: &D3D12_SHADER_BYTECODE) -> Value {
     let mut value = unsafe { bytes(code.pShaderBytecode, code.BytecodeLength) };
+    if let Some(key) = value["blob"].as_str() {
+        let data = unsafe { slice(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) };
+        super::outputs::program(key, data);
+    }
     if let Some(o) = value.as_object_mut() {
         o.insert("stage".into(), json!(stage));
     }
@@ -197,7 +201,11 @@ pub unsafe fn created(device: u64, out: *mut *mut c_void, description: impl FnOn
     if !journal::enabled() || out.is_null() || unsafe { (*out).is_null() } {
         return;
     }
-    journal::describe(id(unsafe { *out }), device, description());
+    let (id, description) = (id(unsafe { *out }), description());
+    if description.get("shaders").is_some() {
+        super::outputs::pipeline(id, &description);
+    }
+    journal::describe(id, device, description);
 }
 
 pub unsafe fn root_signature(
@@ -212,6 +220,7 @@ pub unsafe fn root_signature(
     }
     let blob = unsafe { bytes(pointer, len) };
     let decoded = unsafe { decode_root(pointer, len) }.unwrap_or_else(|e| json!({"diagnostic":e}));
+    super::outputs::root(id(unsafe { *out }), &decoded);
     journal::describe(
         id(unsafe { *out }),
         device,

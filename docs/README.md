@@ -421,7 +421,7 @@ and method, with periodic counts and journal timings. Object identities remain i
 
 The inspection foundation records command lists continuously, so lists and bundles recorded before a capture request
 retain their original generations. A request arms at the next non-test Present and closes at the following Present.
-Captures use schema 5 with `api=d3d12`: queue submissions, list executions, fence values, descriptor versions, root
+Captures use schema 6 with `api=d3d12`: queue submissions, list executions, fence values, descriptor versions, root
 signatures, root arguments and PSO inputs are authoritative records. Upload buffers are copied whole once, at the
 frame's first submission; each later submission keeps only the constant-buffer ranges its root and descriptor CBVs
 name, copying ranges less than 64 KiB apart as one. Every other resource a submission is the first of the frame to
@@ -446,7 +446,7 @@ requires (RENDER_TARGET, DEPTH_WRITE or DEPTH_READ per plane, or the layouts of 
 layout), or what the list's own barriers left it in, to COPY_SOURCE and back, with predication suspended. Its bytes
 are read after the list's first execution in the frame completes, into `targets` rows on the last draw that had the
 target bound. Lists recorded before the request, a list executed again in the frame, multisampled targets,
-attachments a render pass discards or suspends into another list, and copies past the 3 GiB checkpoint budget are
+attachments a render pass discards or suspends into another list, and copies past the 3 GiB readback budget are
 `d3d12-targets` gaps. The budget is spent as the copies are recorded, in the order the game records its lists, not
 in pass order, so the passes past it are not only the frame's last; `passes` marks each pass whose targets were not
 read back after its draws, and says where they were (with the later pass a continued pass ends in) or why not.
@@ -458,8 +458,22 @@ draw, resource, binding and pipeline views. Display order across queues is not a
 and fence operations are retained separately. CPU-consumed descriptor definitions are frozen when recorded, while
 GPU descriptor tables use the versions present at submission.
 
-Captures do not yet record what each dispatch wrote through UAVs (`results`, as on Direct3D 11), nor the contents
-and tile mappings of reserved resources, so verify compares pass-end targets only, and a reserved resource starts
+What each draw, dispatch and UAV clear of an instrumented list writes through UAVs is copied the same way, right
+after it, before the list's next command, into `results` rows as on Direct3D 11. The resources are found as the list
+is recorded: each program's UAV registers (from its `PSV0` part, or a DXBC program's reflection), where the root
+signature puts them (a root UAV or a table's range), and what the root argument or the table's descriptor names at
+that moment; an append or consume buffer's counter is written too. A buffer is copied whole (`sub` empty); a texture
+the subresources its view covers, one row each (`sub` the subresource index). Each copy moves the resource from
+UNORDERED_ACCESS (or what the list's own barriers left it in; in a list that records enhanced barriers, buffers by
+access only; a texture made in a layout from UNORDERED_ACCESS, or COMMON if made for simultaneous access) to
+COPY_SOURCE and back. `order_dependent` marks the rows of a command one of whose programs uses an atomic's result
+(DXBC `imm_atomic_*`, DXIL `atomicBinOp`, `atomicCompareExchange`, `bufferUpdateCounter` or an LLVM atomic whose
+value is used). What could not be copied is a `d3d12-results` gap with its reason: lists recorded before the
+request, compute and copy queues, bundles, a list executed again, arrays of more than 64 registers or unbounded
+ones, multisampled UAVs, an output over 64 MiB, and copies past the 2 GiB of the readback budget outputs may hold
+(the rest is kept for pass-end targets).
+
+Captures do not yet record the contents and tile mappings of reserved resources, so a reserved resource starts
 replay with undefined contents.
 Upload copies assume the application's host writes obey D3D12 synchronization. Captures retain the original
 shader bytes regardless of whether reflection succeeds. Resource reachability comes from API state and root

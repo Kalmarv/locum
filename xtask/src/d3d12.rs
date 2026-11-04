@@ -299,11 +299,29 @@ fn replay_checks(stage: &std::path::Path, pid: u32) {
         text.lines().nth(1).unwrap_or_default().trim().to_string()
     };
     // Every capture replays without an event, argument or descriptor kind it skips.
-    for name in ["journal", "graphics", "modern", "contents", "passes", "compute-first", "cb-copied"] {
+    for name in ["journal", "graphics", "modern", "contents", "passes", "compute-first", "cb-copied", "results"] {
         let (_, text) = run(&["verify", "--warp", &capture(name)]);
         assert!(!text.contains(" are not replayed"), "{name}: verify skipped something it should replay");
         assert!(!text.contains("locum-cli: event "), "{name}: replay failed");
     }
+    // What each dispatch and the clear wrote through UAVs, as replay makes it: the game's bytes, and the tickets the
+    // same records whatever order the GPU took them in.
+    let (_, text) = run(&["verify", "--warp", &capture("results")]);
+    assert!(
+        text.contains("what draws and dispatches wrote through UAVs: 9 identical to the game's, 0 different"),
+        "results: every dispatch's outputs identical on replay"
+    );
+    assert!(
+        text.contains("clear outputs: 1 identical to the game's, 0 different"),
+        "results: the clear's output identical on replay"
+    );
+    let ordered = text
+        .lines()
+        .find_map(|l| l.strip_prefix("order-dependent shaders' outputs: "))
+        .expect("results: the tickets' outputs compared");
+    let n: Vec<u32> = ordered.split(|c: char| !c.is_ascii_digit()).filter_map(|w| w.parse().ok()).collect();
+    assert!(n.len() == 3 && n[0] + n[1] == 2 && n[2] == 0, "results: the tickets' outputs: {ordered}");
+    println!("ok   D3D12 verify: what dispatches and a clear wrote through UAVs replays as the game's");
     // Passes' targets, drawn from root constants across lists, are the fixture's bit for bit.
     let (_, text) = run(&["verify", "--warp", &capture("passes")]);
     let identical = text.lines().find_map(|l| {

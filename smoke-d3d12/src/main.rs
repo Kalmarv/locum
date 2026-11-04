@@ -12,6 +12,7 @@ mod contents;
 mod graphics;
 mod modern;
 mod passes;
+mod results;
 
 fn identity<T: Interface, U: Interface>(a: &T, b: &U) {
     assert_eq!(
@@ -478,6 +479,8 @@ unsafe fn run() {
         finish(&queue, &fence, 21);
         cb_copied::capture(&device, &queue, &fence, &chain);
         finish(&queue, &fence, 24);
+        results::capture(&device, &queue, &fence, &chain);
+        finish(&queue, &fence, 27);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

@@ -253,6 +253,17 @@ pub fn address(value: u64) -> Value {
         json!({"candidates":candidates,"diagnostic":"GPU address is not uniquely associated with a live resource"})
     })
 }
+/// The UAV slot `slot` of heap `heap` holds now: its resource, its counter's (0 for none) and its view.
+pub fn uav(heap: u64, slot: usize) -> Option<(u64, u64, super::descriptors::Description)> {
+    read(|index| {
+        let heap = index.heaps.get(&heap)?;
+        if slot >= heap.slots.len() {
+            return None;
+        }
+        let payload = heap.get(slot).payload?;
+        (payload.kind == "uav").then_some((payload.resource, payload.counter, payload.description))
+    })
+}
 pub fn unique_address(value: u64) -> Option<(u64, u64)> {
     read(|index| {
         let mut matches = index.va.get(value);

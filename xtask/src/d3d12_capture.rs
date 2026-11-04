@@ -138,7 +138,7 @@ pub fn before(c: &Class, e: &Entry) -> String {
         return s;
     }
     if c.module == "d12_list" && n == "Close" {
-        return "self.data.closing();\n".into();
+        return "self.data.closing(self.real());\n".into();
     }
     if c.module != "d12_list"
         || matches!(

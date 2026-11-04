@@ -121,6 +121,10 @@ export interface ResultOut {
   /** Bytes in the blob store, or null when it is not there. */
   size: number | null;
   stride: number;
+  /** Its shader's writes depend on the order the GPU runs its threads. */
+  ordered: boolean;
+  /** The subresource the contents are of, or null for the whole resource. */
+  sub: number | null;
 }
 
 export interface Draw {
