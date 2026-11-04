@@ -933,8 +933,8 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         );
         let mut prepared = frame.finish(&mut capture, projection);
         capture.gap(
-            "d3d12-capture-development",
-            "replay and per-dispatch UAV results are in development",
+            "d3d12-results",
+            "what each dispatch and draw wrote through UAVs is not recorded: verify compares only pass-end targets",
             1,
         );
         let t = std::time::Instant::now();

@@ -71,8 +71,6 @@ pub struct Queued {
 pub struct Draw {
     pub draw: i64,
     pub event: i64,
-    /// Whether the capture's API can be replayed, so `export --at` can give what a draw saw.
-    pub replay: bool,
     pub call: String,
     /// The call's arguments as the API orders them.
     pub args: Value,
@@ -588,7 +586,6 @@ pub fn describe(c: &Capture, n: i64, all: bool, reflection: &mut Reflection) -> 
     Ok(Draw {
         draw: n,
         event,
-        replay: c.meta("api").as_deref() == Some("d3d11"),
         named_args: describe::call_args(&call, &args),
         args: serde_json::from_str(&args).unwrap_or(Value::String(args)),
         call,
@@ -975,17 +972,10 @@ fn print_bound(d: &Draw) {
                 (Some(key), Some(e)) => {
                     line += &format!(
                         "  contents {} as the frame began ({}), not as this draw saw them: written since, last at \
-                         event {e} ({})",
+                         event {e} (export --at {} gives what it saw)",
                         short(key),
                         b.contents_source.as_deref().unwrap_or_default(),
-                        if d.replay || b.shape.as_deref().is_some_and(|s| s.contains(" buffer ")) {
-                            format!("export --at {} gives what it saw", d.event)
-                        } else {
-                            format!(
-                                "no replay for this API yet; `events --resource {r}` lists what reads and writes it",
-                                r = b.resource.unwrap_or_default()
-                            )
-                        }
+                        d.event
                     )
                 }
                 (Some(key), None) => {

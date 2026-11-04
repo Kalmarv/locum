@@ -832,8 +832,10 @@ fn collect(pending: Pending) -> Batch {
 }
 
 /// Subresources' bytes in the canonical layout `layout`, from the footprints the GPU copied them into at `data`
-/// (every subresource of plane 0, then every one of plane 1 for a depth-stencil format `joined` into one texel of
-/// that many bytes); no footprints for a buffer.
+/// (see [`locum_capture::layout::from_footprints`]); no footprints for a buffer.
+///
+/// # Safety
+/// `data` must point to `bytes` readable bytes.
 pub(super) unsafe fn canonical(
     layout: &[Sub],
     joined: Option<u32>,
@@ -841,57 +843,18 @@ pub(super) unsafe fn canonical(
     data: *const u8,
     bytes: u64,
 ) -> Result<Vec<u8>, String> {
-    let total = locum_capture::layout::total(layout);
-    if footprints.is_empty() {
-        // A buffer: its bytes as they are.
-        return Ok(unsafe { core::slice::from_raw_parts(data, total.min(bytes) as usize) }.to_vec());
-    }
-    // One plane of one subresource, tightly packed.
-    let plane = |index: usize| -> Result<(Vec<u8>, u64), String> {
-        let (f, rows, row_bytes) = footprints
-            .get(index)
-            .ok_or(format!("no footprint for subresource {index}"))?;
-        let (pitch, depth) = (f.Footprint.RowPitch as usize, f.Footprint.Depth as usize);
-        let mut out = Vec::with_capacity(*row_bytes as usize * *rows as usize * depth);
-        for z in 0..depth {
-            for y in 0..*rows as usize {
-                let at = f.Offset as usize + (z * *rows as usize + y) * pitch;
-                out.extend_from_slice(unsafe {
-                    core::slice::from_raw_parts(data.add(at), *row_bytes as usize)
-                });
-            }
-        }
-        Ok((out, *row_bytes))
-    };
-    let mut out = Vec::with_capacity(total as usize);
-    let per_plane = layout.len();
-    for (i, sub) in layout.iter().enumerate() {
-        let (first, row_bytes) = plane(i)?;
-        match joined {
-            Some(texel) => {
-                let (stencil, _) = plane(i + per_plane)?;
-                locum_capture::layout::join_depth_stencil(texel, &first, &stencil, &mut out);
-            }
-            None => {
-                if row_bytes != u64::from(sub.row_bytes) || first.len() as u64 != sub.size {
-                    return Err(format!(
-                        "subresource {i}: the copy's {row_bytes}-byte rows ({} bytes) differ from the canonical layout's {} ({} bytes)",
-                        first.len(),
-                        sub.row_bytes,
-                        sub.size
-                    ));
-                }
-                out.extend_from_slice(&first);
-            }
-        }
-    }
-    if out.len() as u64 != total {
-        return Err(format!(
-            "{} bytes copied for a {total}-byte canonical layout",
-            out.len()
-        ));
-    }
-    Ok(out)
+    let footprints: Vec<locum_capture::layout::Footprint> = footprints
+        .iter()
+        .map(|(f, rows, row_bytes)| locum_capture::layout::Footprint {
+            offset: f.Offset,
+            row_pitch: f.Footprint.RowPitch,
+            depth: f.Footprint.Depth,
+            rows: *rows,
+            row_bytes: *row_bytes,
+        })
+        .collect();
+    let data = unsafe { core::slice::from_raw_parts(data, bytes as usize) };
+    locum_capture::layout::from_footprints(layout, joined, &footprints, data)
 }
 
 fn first_use(
@@ -954,57 +917,5 @@ mod tests {
         assert!(unreadable(Access::State(0x80), D3D12_COMMAND_LIST_TYPE_DIRECT).is_none());
         assert!(unreadable(Access::Layout(UNDEFINED), D3D12_COMMAND_LIST_TYPE_DIRECT).is_some());
         assert!(unreadable(Access::Layout(24), D3D12_COMMAND_LIST_TYPE_DIRECT).is_some());
-    }
-
-    #[test]
-    fn footprints_lose_their_row_padding_and_depth_stencil_planes_join() {
-        let footprint =
-            |offset: u64, width: u32, height: u32, pitch: u32| D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                Offset: offset,
-                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                    Width: width,
-                    Height: height,
-                    Depth: 1,
-                    RowPitch: pitch,
-                    ..Default::default()
-                },
-            };
-        // A 2x2 RGBA8 texture copied with 256-byte rows.
-        let mut data = vec![0u8; 512];
-        data[..8].copy_from_slice(&[1; 8]);
-        data[256..264].copy_from_slice(&[2; 8]);
-        let snapshot = Snapshot {
-            resource: 1,
-            states: Vec::new(),
-            subresources: 1,
-            layout: locum_capture::layout::texture(28, 2, 2, 1, 1, 1).unwrap(),
-            joined: None,
-        };
-        let out = unsafe {
-            canonical(
-                &snapshot.layout,
-                snapshot.joined,
-                &[(footprint(0, 2, 2, 256), 2, 8)],
-                data.as_ptr(),
-                512,
-            )
-        }
-        .unwrap();
-        assert_eq!(out, [[1u8; 8], [2u8; 8]].concat());
-        // A 1x1 D24S8 texture: depth plane then stencil plane.
-        let mut data = vec![0u8; 1024];
-        data[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0]);
-        data[512] = 0x7F;
-        let snapshot = Snapshot {
-            resource: 2,
-            states: Vec::new(),
-            subresources: 2,
-            layout: locum_capture::layout::texture(45, 1, 1, 1, 1, 1).unwrap(),
-            joined: Some(4),
-        };
-        let planes = [(footprint(0, 1, 1, 256), 1, 4), (footprint(512, 1, 1, 256), 1, 1)];
-        let out =
-            unsafe { canonical(&snapshot.layout, snapshot.joined, &planes, data.as_ptr(), 1024) }.unwrap();
-        assert_eq!(out, [0x11, 0x22, 0x33, 0x7F]);
     }
 }

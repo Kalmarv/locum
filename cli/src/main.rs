@@ -440,7 +440,7 @@ enum Command {
         /// Run on WARP, the software rasterizer, instead of the GPU.
         #[arg(long)]
         warp: bool,
-        /// Enable D3D11 validation; errors make verification fail.
+        /// Enable the D3D11 or D3D12 debug layer (D3D12: with GPU-based validation); errors make verification fail.
         #[arg(long)]
         debug: bool,
         #[arg(short, long, default_value = "replay")]
@@ -453,7 +453,7 @@ enum Command {
         capture: String,
         #[arg(long)]
         warp: bool,
-        /// Enable D3D11 validation; errors make verification fail.
+        /// Enable the D3D11 or D3D12 debug layer (D3D12: with GPU-based validation); errors make verification fail.
         #[arg(long)]
         debug: bool,
         /// Compare at most this many targets.

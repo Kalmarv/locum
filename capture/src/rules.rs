@@ -42,7 +42,7 @@ pub struct Rule {
     /// The stage the rule changes (pixel for `solid`).
     pub stage: usize,
     /// Shaders that must be bound, by stage.
-    pub when: Vec<(usize, u64)>,
+    pub when: Vec<(usize, u128)>,
     pub action: Action,
 }
 
@@ -51,15 +51,15 @@ pub fn stage_named(name: &str) -> Option<usize> {
 }
 
 /// How the hash in `stage=hash` names a shader, given the stage's number and the text after `=`.
-pub type Resolve<'a> = &'a dyn Fn(usize, &str) -> Result<u64, String>;
+pub type Resolve<'a> = &'a dyn Fn(usize, &str) -> Result<u128, String>;
 
 /// The text read as the hash, in hex: for the game, where a rule can name a shader made after it is read.
-pub fn hex(_stage: usize, hash: &str) -> Result<u64, String> {
-    u64::from_str_radix(hash, 16).map_err(|_| format!("{hash:?} is not a hex hash"))
+pub fn hex(_stage: usize, hash: &str) -> Result<u128, String> {
+    u128::from_str_radix(hash, 16).map_err(|_| format!("{hash:?} is not a hex hash"))
 }
 
 /// `vs=0123456789abcdef`.
-fn condition(word: &str, resolve: Resolve) -> Result<(usize, u64), String> {
+fn condition(word: &str, resolve: Resolve) -> Result<(usize, u128), String> {
     let (stage, hash) = word
         .split_once('=')
         .ok_or_else(|| format!("{word:?} is not stage=hash"))?;
@@ -169,7 +169,7 @@ impl Rule {
     }
 
     /// Whether its conditions hold, given the hash of the shader bound at each stage.
-    pub fn holds(&self, mut hash: impl FnMut(usize) -> Option<u64>) -> bool {
+    pub fn holds(&self, mut hash: impl FnMut(usize) -> Option<u128>) -> bool {
         self.when.iter().all(|&(stage, h)| hash(stage) == Some(h))
     }
 }

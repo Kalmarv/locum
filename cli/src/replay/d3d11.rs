@@ -533,10 +533,10 @@ impl D3d11 {
             .ok_or("no draw row")?;
         let (hashes, topology, layout_id, raster, blend, depth, factor, mask, stencil_ref) = row;
         let compute = call.starts_with("Dispatch");
-        let bound = |stage: usize| -> Option<u64> {
+        let bound = |stage: usize| -> Option<u128> {
             hashes[stage]
                 .as_deref()
-                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .and_then(|h| u128::from_str_radix(h, 16).ok())
         };
         let applying: Vec<&Rule> = rules
             .iter()

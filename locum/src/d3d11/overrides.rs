@@ -132,7 +132,7 @@ impl Bound<'_> {
     }
 
     fn holds(&mut self, rule: &Rule) -> bool {
-        rule.rule.holds(|stage| self.hash(STAGES[stage]))
+        rule.rule.holds(|stage| self.hash(STAGES[stage]).map(u128::from))
     }
 }
 

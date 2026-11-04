@@ -7,7 +7,7 @@
 //! Resources start with their contents as the frame began.
 
 mod d3d11;
-pub mod d3d12_buffers;
+mod d3d12;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
@@ -56,8 +56,15 @@ impl Mode {
     }
 }
 
-/// The resources an event reads and writes. A draw's constant buffers are not among its reads: replay binds the
-/// bytes the GPU read, captured at the draw.
+/// Whether replay binds a draw's constant buffers from the bytes the capture took at the draw (Direct3D 11), rather
+/// than through its own copies of the buffers (Direct3D 12, whose views name buffers by address). Then a buffer a
+/// draw reads only as constants is not among what it needs.
+fn captured_constants(c: &Capture) -> bool {
+    c.meta("api").as_deref() == Some("d3d11")
+}
+
+/// The resources an event reads and writes. Where replay binds captured constants, a draw's constant buffers are not
+/// among its reads.
 fn touches(c: &Capture) -> BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)> {
     let mut out: BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)> = BTreeMap::new();
     for seq in c.rows("SELECT seq FROM events", [], |r| r.get::<_, i64>(0)) {
@@ -72,6 +79,9 @@ fn touches(c: &Capture) -> BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)> {
         } else {
             e.0.insert(resource);
         }
+    }
+    if !captured_constants(c) {
+        return out;
     }
     // Drop reads that are only constant buffers of the draw.
     let cb_only: Vec<(i64, i64)> = c.rows(
@@ -149,9 +159,12 @@ fn with_bound(c: &Capture, events: Vec<i64>, mut resources: BTreeSet<i64>) -> Pl
     // Everything a draw has bound, and the resource of every view an event names, in one query (one per event
     // scans the bindings once per event: minutes on a game's frame).
     let mut bound: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+    let constants = if captured_constants(c) { "AND b.kind <> 'cb'" } else { "" };
     for (event, resource) in c.rows(
-        "SELECT DISTINCT d.event, b.resource FROM bindings b JOIN draws d ON d.n = b.draw \
-         WHERE b.resource IS NOT NULL AND b.kind <> 'cb'",
+        &format!(
+            "SELECT DISTINCT d.event, b.resource FROM bindings b JOIN draws d ON d.n = b.draw \
+             WHERE b.resource IS NOT NULL {constants}"
+        ),
         [],
         |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
     ) {
@@ -600,6 +613,7 @@ fn same_records(a: &[u8], b: &[u8], stride: usize) -> bool {
 fn backend(c: &Capture, warp: bool, debug: bool) -> Result<Box<dyn Backend>, String> {
     match c.meta("api").as_deref() {
         Some("d3d11") => Ok(Box::new(d3d11::D3d11::new(warp, debug)?)),
+        Some("d3d12") => Ok(Box::new(d3d12::D3d12::new(warp, debug)?)),
         Some(api) => Err(format!("no replay for {api} captures yet")),
         None => Err("the capture names no API to replay".into()),
     }
@@ -629,7 +643,7 @@ pub struct Options {
 
 /// The shader a rule names, by its hash or the start of it, among the capture's shaders of that stage: a hash that
 /// names none of them, or more than one, is an error rather than a rule that never applies.
-fn shader_named(c: &Capture, stage: usize, hash: &str) -> Result<u64, String> {
+fn shader_named(c: &Capture, stage: usize, hash: &str) -> Result<u128, String> {
     let name = rules::STAGES[stage];
     if hash.is_empty() || !hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return Err(format!("{hash:?} is not a hex hash"));
@@ -640,7 +654,7 @@ fn shader_named(c: &Capture, stage: usize, hash: &str) -> Result<u64, String> {
         |r| r.get(0),
     );
     match found.as_slice() {
-        [one] => u64::from_str_radix(one, 16).map_err(|_| format!("{one:?} is not a hex hash")),
+        [one] => u128::from_str_radix(one, 16).map_err(|_| format!("{one:?} is not a hex hash")),
         [] => Err(format!("the capture has no {name} shader {hash}")),
         [a, b, ..] => Err(format!(
             "{name}={hash} names more than one shader ({a}, {b}): give more of the hash"
@@ -1048,15 +1062,20 @@ pub fn verify(
             ))
         },
     );
-    let missing: i64 = c
-        .row(
-            "SELECT count(*) FROM resources WHERE used = 1 AND content IS NULL AND coalesce(content_source, '') != 'tile-events'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    if missing > 0 {
-        incomplete.push(format!("{missing} resources the frame used have no contents"));
+    let missing: Vec<i64> = c.rows(
+        "SELECT id FROM resources WHERE used = 1 AND content IS NULL AND coalesce(content_source, '') != 'tile-events' \
+         ORDER BY id",
+        [],
+        |r| r.get(0),
+    );
+    if !missing.is_empty() {
+        let named: Vec<String> = missing.iter().take(12).map(|id| format!("#{id}")).collect();
+        incomplete.push(format!(
+            "{} resources the frame used have no contents (`resource` says why): {}{}",
+            missing.len(),
+            named.join(" "),
+            if missing.len() > named.len() { " .." } else { "" }
+        ));
     }
     incomplete.extend(b.warnings().into_iter().map(|w| format!("replay: {w}")));
     for i in &incomplete {

@@ -57,7 +57,7 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
   - any rule can end with `if vs=<hash> ps=<hash> ...`; every stage can be named (vs hs ds gs ps cs).
 
   Hashes are the whole 16 hex digits here. Rules given to `locum-cli replay` can use the start of a hash instead,
-  as long as it names exactly one shader of that stage in the capture.
+  as long as it names exactly one shader of that stage in the capture (a Direct3D 12 capture's hashes have 32).
 
   Rules apply at the draw, on its own context, and are undone after it. A changed constant is written into a GPU copy
   of the bound buffer, so draws on deferred contexts get theirs when their command list runs. `locum.log` reports how
@@ -281,11 +281,6 @@ A match of only index bytes is corroborated by the vertex buffers the draw reads
 `bindings` table keeps every row (a D3D12 root table binds every descriptor of its ranges); `locum-cli bindings`
 says which ones the program reads (`read`), so SQL is not needed for that.
 
-On Direct3D 12, `export --at` rebuilds a buffer as an event saw it without a replay: its contents as the frame began,
-with each copy into it applied in order (a copy from an upload buffer reads the bytes that buffer held when the copy's
-submission ran, which the capture keeps per submission; a copy from another buffer reads that one at the copy) and
-each `WriteBufferImmediate`. A buffer a dispatch or a query resolve wrote before the event is refused: the capture
-holds no bytes of those writes.
 
 `upgrade` rewrites what a capture derived, not what it recorded, from the capture's own authoritative records, in one
 transaction (`--check` says what it would change and writes nothing). D3D12 bindings are projected again from each
@@ -340,6 +335,18 @@ event already taken) reads or writes is taken too, and every resource starts wit
 Each draw runs from the full state captured at it, with its constant buffers made from the bytes the GPU read. With
 rules, the draw is replayed twice, and its targets are written as recorded (`rt0.recorded.png`) and with the rules
 (`rt0.rules.png`), and `rt0.diff.png` shows the texels that changed in magenta over the unchanged ones in grey.
+
+A Direct3D 12 capture replays the same way, on a device of its own. Each resource is made committed on the heap type
+it was recorded on (a placed one too, so memory the game aliased between resources is not shared, and a reserved one
+with every tile mapped; verify says so). Upload buffers hold, at each submission, the bytes that submission saw. The
+game's shader-visible descriptor heaps are mirrored and their slots rewritten with each submission's changes, so a
+root table points where it pointed in the game. Each event runs in a command list of its own: buffers and most
+textures go back to the common state between them, and depth and multisampled textures get the transitions each
+draw needs, so the game's own barriers are not replayed. Pipelines are rebuilt from their recorded subobjects and
+root signatures from their bytes; root constants, root views and tables are set as each draw had them. Rules work
+as on Direct3D 11: a shader or solid rule compiles to DXIL (`ps_6_0`, with the SDK's dxcompiler) for a DXIL
+pipeline, and a constant rule rewrites a root constant, or a copy of the constant buffer a root view or table points
+at. Query resolves are not replayed. `--debug` adds GPU-based validation to the debug layer.
 
 The memory dump ties what the GPU saw back to the game's memory:
 
@@ -450,7 +457,9 @@ draw, resource, binding and pipeline views. Display order across queues is not a
 and fence operations are retained separately. CPU-consumed descriptor definitions are frozen when recorded, while
 GPU descriptor tables use the versions present at submission.
 
-This milestone remains explicitly incomplete: per-dispatch UAV results and D3D12 replay are subsequent work.
+Captures do not yet record what each dispatch wrote through UAVs (`results`, as on Direct3D 11), nor the contents
+and tile mappings of reserved resources, so verify compares pass-end targets only, and a reserved resource starts
+replay with undefined contents.
 Upload copies assume the application's host writes obey D3D12 synchronization. Captures retain the original
 shader bytes regardless of whether reflection succeeds. Resource reachability comes from API state and root
 signatures, not a single shader parser's conclusions.

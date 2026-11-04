@@ -201,6 +201,8 @@ pub fn smoke(root: &std::path::Path) {
             "locum-shim-nvapi64",
             "-p",
             "locum-smoke-d3d12",
+            "-p",
+            "locum-cli",
         ])
         .status()
         .expect("build D3D12 smoke");
@@ -213,6 +215,7 @@ pub fn smoke(root: &std::path::Path) {
         "d3d12.dll",
         "nvapi64.dll",
         "locum-smoke-d3d12.exe",
+        "locum-cli.exe",
     ] {
         std::fs::copy(root.join("target/release").join(file), stage.join(file)).unwrap();
     }
@@ -222,11 +225,16 @@ pub fn smoke(root: &std::path::Path) {
     if old_log.is_file() {
         std::fs::remove_file(&old_log).unwrap();
     }
-    let result = Command::new(stage.join("locum-smoke-d3d12.exe"))
+    // The fixture labels its captures with its process ID.
+    let child = Command::new(stage.join("locum-smoke-d3d12.exe"))
         .current_dir(&stage)
         .env("LOCUM_DIR", &log)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("run D3D12 WARP smoke");
+    let pid = child.id();
+    let result = child.wait_with_output().expect("run D3D12 WARP smoke");
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
     print!("{stdout}");
@@ -267,4 +275,83 @@ pub fn smoke(root: &std::path::Path) {
         assert!(log.contains(proof), "missing wrapper proof: {proof}");
     }
     println!("D3D12 log proves proxied device, queue, resources, list execution and swapchain");
+    replay_checks(&stage, pid);
+}
+
+/// Replays the fixture's captures with locum-cli on WARP: verify, a rule, and contents at an event.
+fn replay_checks(stage: &std::path::Path, pid: u32) {
+    use std::process::Command;
+    let log = stage.join("log");
+    let capture = |name: &str| log.join("captures").join(format!("{name}-{pid}")).display().to_string();
+    let run = |args: &[&str]| {
+        let output = Command::new(stage.join("locum-cli.exe"))
+            .args(args)
+            .env("LOCUM_DIR", &log)
+            .output()
+            .unwrap_or_else(|e| panic!("locum-cli {args:?}: {e}"));
+        let text = String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        println!("--- locum-cli {}\n{text}", args.join(" "));
+        (output.status.success(), text)
+    };
+    let sql = |name: &str, query: &str| -> String {
+        let (ok, text) = run(&["sql", &capture(name), query]);
+        assert!(ok, "locum-cli sql {query}");
+        text.lines().nth(1).unwrap_or_default().trim().to_string()
+    };
+    // Every capture replays without an event, argument or descriptor kind it skips.
+    for name in ["journal", "graphics", "modern", "contents", "passes", "compute-first", "cb-copied"] {
+        let (_, text) = run(&["verify", "--warp", &capture(name)]);
+        assert!(!text.contains(" are not replayed"), "{name}: verify skipped something it should replay");
+        assert!(!text.contains("locum-cli: event "), "{name}: replay failed");
+    }
+    // Passes' targets, drawn from root constants across lists, are the fixture's bit for bit.
+    let (_, text) = run(&["verify", "--warp", &capture("passes")]);
+    let identical = text.lines().find_map(|l| {
+        let w: Vec<&str> = l.split_whitespace().collect();
+        (w.len() > 4 && w[1] == "of" && w[3] == "targets" && w[4] == "identical;" && w[0] == w[2] && w[0] != "0")
+            .then(|| w[0].to_string())
+    });
+    let targets = identical.expect("passes: every target identical on replay");
+    println!("ok   D3D12 verify: passes' {targets} targets replay bit for bit");
+
+    // A constant rule on a root constants register: the fixture's colour as recorded, the rule's after.
+    let out = log.join("replay-rule");
+    let (_, text) = run(&[
+        "replay",
+        "--warp",
+        &capture("passes"),
+        "6",
+        "--rule",
+        "constant ps b0 c0 0 1 0 1",
+        "-o",
+        &out.display().to_string(),
+    ]);
+    assert!(
+        text.contains("against the game's: identical") && text.contains("64 of 64 texels differ"),
+        "replay with a root-constant rule"
+    );
+    println!("ok   D3D12 replay: a rule on root constants changes every texel; without it, the game's");
+
+    // What draw 6 left in its target, from the replay of the frame up to the event after it.
+    let event: i64 = sql("passes", "SELECT event FROM draws WHERE n = 6").parse().expect("draw 6's event");
+    let target = sql("passes", "SELECT resource FROM bindings WHERE draw = 6 AND kind = 'rtv'");
+    let raw = log.join("at.raw");
+    let (ok, _) = run(&[
+        "export",
+        &capture("passes"),
+        &target,
+        "--at",
+        &(event + 1).to_string(),
+        "--warp",
+        "-o",
+        &raw.display().to_string(),
+    ]);
+    assert!(ok, "export --at");
+    // passes.rs draws its sixth triangle, over the whole 8x8 target, in cyan.
+    let bytes = std::fs::read(&raw).unwrap();
+    assert!(
+        bytes.len() == 8 * 8 * 4 && bytes.chunks(4).all(|t| t == [0, 255, 255, 255]),
+        "export --at: draw 6's cyan in every texel"
+    );
+    println!("ok   D3D12 export --at: a target as the event after a draw saw it");
 }

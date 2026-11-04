@@ -131,9 +131,185 @@ pub fn join_depth_stencil(texel_bytes: u32, depth: &[u8], stencil: &[u8], out: &
     }
 }
 
+/// Splits canonical texels of the D24S8 family (4 bytes) or the D32S8X24 family (8 bytes) into the depth plane (4
+/// bytes a texel) and stencil plane (1 byte) Direct3D 12 copies them as: the inverse of [`join_depth_stencil`]. The
+/// D24S8 depth plane's top byte is zero.
+pub fn split_depth_stencil(texel_bytes: u32, texels: &[u8], depth: &mut Vec<u8>, stencil: &mut Vec<u8>) {
+    for t in texels.chunks_exact(texel_bytes as usize) {
+        if texel_bytes == 8 {
+            depth.extend_from_slice(&t[..4]);
+            stencil.push(t[4]);
+        } else {
+            depth.extend_from_slice(&[t[0], t[1], t[2], 0]);
+            stencil.push(t[3]);
+        }
+    }
+}
+
+/// Where a copy between a texture and a buffer puts one plane of one subresource in the buffer: Direct3D 12's placed
+/// footprint, with the rows and bytes a row `GetCopyableFootprints` gives for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Footprint {
+    pub offset: u64,
+    pub row_pitch: u32,
+    pub depth: u32,
+    pub rows: u32,
+    pub row_bytes: u64,
+}
+
+impl Footprint {
+    fn at(&self, z: usize, y: usize) -> usize {
+        self.offset as usize + (z * self.rows as usize + y) * self.row_pitch as usize
+    }
+}
+
+/// Subresources' bytes in the canonical layout `layout`, from a buffer `data` they were copied into at
+/// `footprints`: every subresource of plane 0, then, for a depth-stencil format whose canonical texel is `joined`
+/// bytes, every one of plane 1. No footprints means a buffer, whose bytes are its contents.
+pub fn from_footprints(
+    layout: &[Sub],
+    joined: Option<u32>,
+    footprints: &[Footprint],
+    data: &[u8],
+) -> Result<Vec<u8>, String> {
+    let total = total(layout);
+    if footprints.is_empty() {
+        return Ok(data[..(total as usize).min(data.len())].to_vec());
+    }
+    // One plane of one subresource, tightly packed.
+    let plane = |index: usize| -> Result<(Vec<u8>, u64), String> {
+        let f = footprints
+            .get(index)
+            .ok_or(format!("no footprint for subresource {index}"))?;
+        let mut out = Vec::with_capacity(f.row_bytes as usize * f.rows as usize * f.depth as usize);
+        for z in 0..f.depth as usize {
+            for y in 0..f.rows as usize {
+                let at = f.at(z, y);
+                out.extend_from_slice(
+                    data.get(at..at + f.row_bytes as usize)
+                        .ok_or(format!("subresource {index} lies past the copy's {} bytes", data.len()))?,
+                );
+            }
+        }
+        Ok((out, f.row_bytes))
+    };
+    let mut out = Vec::with_capacity(total as usize);
+    for (i, sub) in layout.iter().enumerate() {
+        let (first, row_bytes) = plane(i)?;
+        match joined {
+            Some(texel) => {
+                let (stencil, _) = plane(i + layout.len())?;
+                join_depth_stencil(texel, &first, &stencil, &mut out);
+            }
+            None => {
+                if row_bytes != u64::from(sub.row_bytes) || first.len() as u64 != sub.size {
+                    return Err(format!(
+                        "subresource {i}: the copy's {row_bytes}-byte rows ({} bytes) differ from the canonical layout's {} ({} bytes)",
+                        first.len(),
+                        sub.row_bytes,
+                        sub.size
+                    ));
+                }
+                out.extend_from_slice(&first);
+            }
+        }
+    }
+    if out.len() as u64 != total {
+        return Err(format!(
+            "{} bytes copied for a {total}-byte canonical layout",
+            out.len()
+        ));
+    }
+    Ok(out)
+}
+
+/// Writes canonical `contents` into a buffer `out` at `footprints`, ready to be copied into the texture: the inverse
+/// of [`from_footprints`].
+pub fn into_footprints(
+    layout: &[Sub],
+    joined: Option<u32>,
+    footprints: &[Footprint],
+    contents: &[u8],
+    out: &mut [u8],
+) -> Result<(), String> {
+    if contents.len() as u64 != total(layout) {
+        return Err(format!(
+            "{} bytes of contents for a {}-byte canonical layout",
+            contents.len(),
+            total(layout)
+        ));
+    }
+    let size = out.len();
+    let mut put = |index: usize, plane: &[u8]| -> Result<(), String> {
+        let f = footprints
+            .get(index)
+            .ok_or(format!("no footprint for subresource {index}"))?;
+        let row = f.row_bytes as usize;
+        if plane.len() != row * f.rows as usize * f.depth as usize {
+            return Err(format!(
+                "subresource {index}: {} bytes for {} rows of {row} bytes",
+                plane.len(),
+                f.rows as usize * f.depth as usize
+            ));
+        }
+        for (k, line) in plane.chunks_exact(row.max(1)).enumerate() {
+            let at = f.at(k / f.rows as usize, k % f.rows as usize);
+            out.get_mut(at..at + row)
+                .ok_or(format!("subresource {index} lies past the {size}-byte buffer"))?
+                .copy_from_slice(line);
+        }
+        Ok(())
+    };
+    for (i, sub) in layout.iter().enumerate() {
+        let bytes = &contents[sub.offset as usize..(sub.offset + sub.size) as usize];
+        match joined {
+            Some(texel) => {
+                let (mut depth, mut stencil) = (Vec::new(), Vec::new());
+                split_depth_stencil(texel, bytes, &mut depth, &mut stencil);
+                put(i, &depth)?;
+                put(i + layout.len(), &stencil)?;
+            }
+            None => put(i, bytes)?,
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn footprints_lose_their_row_padding_and_depth_stencil_planes_join() {
+        let footprint = |offset: u64, rows: u32, row_bytes: u64| Footprint {
+            offset,
+            row_pitch: 256,
+            depth: 1,
+            rows,
+            row_bytes,
+        };
+        // A 2x2 RGBA8 texture copied with 256-byte rows.
+        let mut data = vec![0u8; 512];
+        data[..8].copy_from_slice(&[1; 8]);
+        data[256..264].copy_from_slice(&[2; 8]);
+        let layout = texture(28, 2, 2, 1, 1, 1).unwrap();
+        let out = from_footprints(&layout, None, &[footprint(0, 2, 8)], &data).unwrap();
+        assert_eq!(out, [[1u8; 8], [2u8; 8]].concat());
+        let mut back = vec![0u8; 512];
+        into_footprints(&layout, None, &[footprint(0, 2, 8)], &out, &mut back).unwrap();
+        assert_eq!(back, data);
+        // A 1x1 D24S8 texture: depth plane then stencil plane.
+        let mut data = vec![0u8; 1024];
+        data[..4].copy_from_slice(&[0x11, 0x22, 0x33, 0]);
+        data[512] = 0x7F;
+        let layout = texture(45, 1, 1, 1, 1, 1).unwrap();
+        let planes = [footprint(0, 1, 4), footprint(512, 1, 1)];
+        let out = from_footprints(&layout, Some(4), &planes, &data).unwrap();
+        assert_eq!(out, [0x11, 0x22, 0x33, 0x7F]);
+        let mut back = vec![0u8; 1024];
+        into_footprints(&layout, Some(4), &planes, &out, &mut back).unwrap();
+        assert_eq!(back, data);
+    }
 
     #[test]
     fn mip_chain() {
@@ -166,6 +342,9 @@ mod tests {
         out.clear();
         join_depth_stencil(8, &depth[..4], &[0xA1], &mut out);
         assert_eq!(out, [0x11, 0x22, 0x33, 0xEE, 0xA1, 0, 0, 0]);
+        let (mut d, mut s) = (Vec::new(), Vec::new());
+        split_depth_stencil(8, &out, &mut d, &mut s);
+        assert_eq!((d.as_slice(), s.as_slice()), (&depth[..4], &[0xA1][..]));
     }
 
     #[test]

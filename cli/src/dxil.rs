@@ -102,6 +102,28 @@ pub fn disassemble(code: &[u8]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(bytes).trim_end_matches('\0').into())
 }
 
+/// Compiles HLSL `source`'s `main` for `profile` (`ps_6_0`) to DXIL, signed when the compiler finds `dxil.dll`.
+pub fn compile(source: &str, profile: &str) -> Result<Vec<u8>, String> {
+    let compiler: IDxcCompiler3 = create(&CLSID_DxcCompiler)?;
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let words = [wide("-E"), wide("main"), wide("-T"), wide(profile)];
+    let args: Vec<PCWSTR> = words.iter().map(|w| PCWSTR(w.as_ptr())).collect();
+    let result: IDxcResult = unsafe { compiler.Compile(&buffer(source.as_bytes()), Some(&args), None) }
+        .map_err(|e| e.to_string())?;
+    let blob_bytes = |b: &IDxcBlob| unsafe {
+        std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize()).to_vec()
+    };
+    let status = unsafe { result.GetStatus() }.map_err(|e| e.to_string())?;
+    if status.is_err() {
+        let errors = unsafe { result.GetErrorBuffer() }
+            .map(|b| String::from_utf8_lossy(&blob_bytes(&b.cast().expect("an error buffer is a blob"))).into_owned())
+            .unwrap_or_default();
+        return Err(format!("{}: {}", status.message(), errors.trim_end_matches('\0')));
+    }
+    let code = unsafe { result.GetResult() }.map_err(|e| e.to_string())?;
+    Ok(blob_bytes(&code))
+}
+
 fn native_ranges(code: &[u8]) -> Result<Vec<Value>, String> {
     let utils: IDxcUtils = create(&CLSID_DxcUtils)?;
     let mut pointer = std::ptr::null_mut();

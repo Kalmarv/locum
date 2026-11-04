@@ -165,20 +165,11 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
     let s = shape(c, id).ok_or_else(|| format!("no resource #{id}"))?;
     let (bytes, key) = match which.at {
         Some(event) => {
-            let d3d12 = c.meta("api").as_deref() == Some("d3d12");
-            let (bytes, events, warnings) = if d3d12 {
-                crate::replay::d3d12_buffers::buffer_at(c, id, event)?
-            } else {
-                crate::replay::contents_at(c, id, event, which.warp)?
-            };
+            let (bytes, events, warnings) = crate::replay::contents_at(c, id, event, which.warp)?;
             for w in &warnings {
                 told!(out_path, "warning: {w}");
             }
-            let source = if d3d12 {
-                format!("as event {event} saw it: its contents as the frame began with the {events} writes before it")
-            } else {
-                format!("as event {event} saw it: replayed from the frame's start with {events} events")
-            };
+            let source = format!("as event {event} saw it: replayed from the frame's start with {events} events");
             told!(out_path, "#{id} {source}");
             (bytes, source)
         }
