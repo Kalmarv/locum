@@ -475,6 +475,23 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         }
         capture.resources.push(row);
     }
+    // A structured buffer (D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) is only ever viewed structured: its views read
+    // elements of its stride.
+    let structured: HashMap<u64, u32> = capture
+        .resources
+        .iter()
+        .filter(|r| r.misc & 0x40 != 0 && r.stride != 0)
+        .map(|r| (r.id, r.stride))
+        .collect();
+    for b in capture
+        .bindings
+        .iter_mut()
+        .filter(|b| matches!(b.kind, "srv" | "uav"))
+    {
+        if let Some(stride) = b.resource.and_then(|r| structured.get(&r)) {
+            b.stride = Some(*stride);
+        }
+    }
     drop(tracked);
     capture.views = views;
     capture.states = states;

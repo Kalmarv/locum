@@ -14,6 +14,9 @@ use rusqlite::{Connection, params};
 pub const SCHEMA_VERSION: u32 = 1;
 /// A D3D12 capture's: the same tables, plus the authoritative `d12_*` records.
 pub const D3D12_SCHEMA_VERSION: u32 = 5;
+/// The oldest D3D12 schema readers accept: 2 to 4 differ from 5 only in `d12_upload_versions`,
+/// `d12_submission_descriptors` and the absence of `d12_first_use`, which the CLI and the viewer do not read.
+pub const D3D12_SCHEMA_OLDEST: u32 = 2;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);

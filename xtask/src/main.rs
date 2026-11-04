@@ -1018,10 +1018,12 @@ fn cli_checks(cli: &Path, log_dir: &Path) -> bool {
                     && t.contains("(upload)")
                     && t.contains("(first-use)")
                     && t.contains("topology: triangle list (4)")
-                    && t.contains("ps srv0 (the shader does not use it)")
+                    && t.contains("(1 bound register the shaders do not use; --all shows it)")
+                    && !t.contains("ps srv0")
+                    && run(&["draw", "0", "--all"]).contains("ps srv0 (the shader does not use it)")
             },
             "locum-cli draw 0: ps b3 named Frame.value holding 1032; upload and first-use contents; topology named; \
-             the texture bound at t0 that the shader does not read says so",
+             the texture bound at t0 that the shader does not read is left out and counted, and --all names it",
         ),
         (
             {

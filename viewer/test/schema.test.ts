@@ -10,6 +10,7 @@ const version = (name: string) => Number(db.match(new RegExp(`pub const ${name}:
 
 test("the viewer reads the schema each API's captures are written in", () => {
   expect(SCHEMAS.d3d11![1]).toBe(version("SCHEMA_VERSION"));
+  expect(SCHEMAS.d3d12![0]).toBe(version("D3D12_SCHEMA_OLDEST"));
   expect(SCHEMAS.d3d12![1]).toBe(version("D3D12_SCHEMA_VERSION"));
 });
 

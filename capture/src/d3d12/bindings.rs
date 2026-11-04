@@ -203,6 +203,11 @@ pub(super) fn descriptor_binding(
         b.state = super::graphics::state(c, "sampler", &d.description);
     } else {
         b.view = Some(d.id);
+        // A structured buffer view's element size.
+        b.stride = d.description["payload"]["StructureByteStride"]
+            .as_u64()
+            .filter(|s| *s != 0)
+            .map(|s| s as u32);
         if !c.views.iter().any(|v| v.id == d.id) {
             let resource = c.resources.iter().find(|r| r.id == d.resource);
             let format = d.description["format"]

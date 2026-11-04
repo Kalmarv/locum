@@ -31,12 +31,47 @@ function loadFilter(): Filter {
   }
 }
 
+/** Where a D3D12 copy's arguments name its source and destination, as `accesses` in capture/src/d3d12.rs reads them. */
+const D3D12_COPIES: Record<string, [number, number]> = {
+  CopyBufferRegion: [2, 0],
+  CopyResource: [1, 0],
+  CopyTextureRegion: [4, 0],
+  ResolveSubresource: [2, 0],
+  ResolveSubresourceRegion: [4, 0],
+};
+
+/** A resource a D3D12 argument names: an id, a copy location or address (`resource`), or a view's definition. */
+const named = (v: any) => v?.resource ?? v?.definition?.resource ?? v;
+
+/** A D3D12 event's summary from its positional arguments (D3D11 events name theirs). */
+function d3d12Summary(r: Row, a: any[]): string | null {
+  const copy = D3D12_COPIES[r.call];
+  if (copy) {
+    const bytes = r.call === "CopyBufferRegion" ? ` ${a[4]} bytes, offset ${a[3]} → ${a[1]}` : "";
+    return `#${named(a[copy[0]])} → #${named(a[copy[1]])}${bytes}`;
+  }
+  switch (r.call) {
+    case "ClearRenderTargetView":
+      return `view #${a[0]?.definition?.id} of #${named(a[0])} ${compact(a[1])}`;
+    case "ClearDepthStencilView":
+      return `view #${a[0]?.definition?.id} of #${named(a[0])} depth ${a[2]} stencil ${a[3]}`;
+    case "ClearUnorderedAccessViewUint":
+    case "ClearUnorderedAccessViewFloat":
+      return `#${named(a[2])} ${compact(a[3])}`;
+  }
+  return null;
+}
+
 /** A one-line summary of what an event did. */
-function summary(r: Row): string {
+export function summary(r: Row): string {
   let a: any = r.args;
   try {
     a = JSON.parse(r.args);
   } catch {}
+  if (Array.isArray(a) && r.kind !== "draw" && r.kind !== "dispatch") {
+    const d3d12 = d3d12Summary(r, a);
+    if (d3d12 != null) return d3d12;
+  }
   switch (r.kind) {
     case "draw":
       return `#${r.draw} ${Array.isArray(a) ? `[${a.join(",")}]` : r.args}  vs ${short(r.vs, 8)} ps ${short(r.ps, 8)}`;

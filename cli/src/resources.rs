@@ -271,7 +271,9 @@ pub fn resource(c: &Capture, id: i64) -> Result<(), String> {
         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
     );
     if !bound.is_empty() {
-        out!("bound to {} draws:", bound.len());
+        let mut draws: Vec<i64> = bound.iter().map(|b| b.0).collect();
+        draws.dedup();
+        out!("{} bindings in {} draws:", bound.len(), draws.len());
         for (d, stage, kind, slot) in bound.iter().take(24) {
             out!("  draw {d}: {stage} {kind}{slot}");
         }
@@ -383,8 +385,9 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
             }
             _ => String::new(),
         };
+        let kept = upload_source(c, seq, &call, args.as_deref()).unwrap_or_default();
         out!(
-            "{seq:>6} {kind:<9} {call:<28} {place:<8} {}{}{touches}{}{}",
+            "{seq:>6} {kind:<9} {call:<28} {place:<8} {}{}{touches}{kept}{}{}",
             draw.map(|d| format!("draw {d} ")).unwrap_or_default(),
             args.unwrap_or_default(),
             writes
@@ -394,6 +397,46 @@ pub fn events(c: &Capture, f: &EventFilter) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// For a D3D12 buffer copy from an upload buffer, whether the capture kept the bytes it read: the upload ranges its
+/// submission copied (`d12_upload_versions`), or only the buffer as the frame began, which later CPU writes may have
+/// changed.
+fn upload_source(c: &Capture, event: i64, call: &str, args: Option<&str>) -> Option<String> {
+    if c.meta("api").as_deref() != Some("d3d12") {
+        return None;
+    }
+    let a: serde_json::Value = serde_json::from_str(args?).ok()?;
+    let id = |v: &serde_json::Value| v["resource"].as_i64().or_else(|| v.as_i64());
+    let (source, offset, bytes) = match call {
+        "CopyBufferRegion" => (id(&a[2])?, a[3].as_i64()?, a[4].as_i64()?),
+        "CopyResource" => (id(&a[1])?, 0, -1),
+        _ => return None,
+    };
+    let upload = c
+        .row(
+            "SELECT json_extract(description, '$.heap_properties.type') FROM d12_objects WHERE id = ?1",
+            [source],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .flatten()
+        == Some(2);
+    if !upload {
+        return None;
+    }
+    let kept: i64 = c.count(
+        "SELECT count(*) FROM d12_upload_versions u JOIN d12_executions x ON x.submission = u.submission \
+         JOIN d12_event_locations l ON l.execution = x.id \
+         WHERE l.event = ?1 AND u.resource = ?2 AND u.offset <= ?3 \
+         AND (?4 < 0 OR u.offset + json_extract(u.content_json, '$.size') >= ?3 + ?4) \
+         AND (?4 >= 0 OR u.whole = 1)",
+        rusqlite::params![event, source, offset, bytes],
+    );
+    Some(if kept > 0 {
+        "  (the upload bytes it read are kept)".into()
+    } else {
+        "  (the upload bytes it read are not kept: only as the frame began)".into()
+    })
 }
 
 pub fn stack(c: &Capture, id: i64) -> Result<(), String> {

@@ -810,8 +810,10 @@ fn print(d: &Draw) {
     }
     if d.unused > 0 {
         out!(
-            "  ({} bound registers the shaders do not use; --all shows them)",
-            d.unused
+            "  ({} bound register{} the shaders do not use; --all shows {})",
+            d.unused,
+            if d.unused == 1 { "" } else { "s" },
+            if d.unused == 1 { "it" } else { "them" }
         );
     }
     for k in &d.constants {

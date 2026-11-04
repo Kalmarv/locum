@@ -85,12 +85,13 @@ pub fn open(arg: &str, blobs: Option<&Path>) -> Result<Capture, String> {
             r.get(0)
         })
         .map_err(|e| format!("capture schema: {e}"))?;
+    use locum_capture::db::{D3D12_SCHEMA_OLDEST, D3D12_SCHEMA_VERSION, SCHEMA_VERSION};
     let readable = match api.as_str() {
-        "d3d11" => locum_capture::db::SCHEMA_VERSION,
-        "d3d12" => locum_capture::db::D3D12_SCHEMA_VERSION,
-        _ => 0,
+        "d3d11" => Some(SCHEMA_VERSION..=SCHEMA_VERSION),
+        "d3d12" => Some(D3D12_SCHEMA_OLDEST..=D3D12_SCHEMA_VERSION),
+        _ => None,
     };
-    if version != readable.to_string() {
+    if !readable.is_some_and(|r| version.parse().is_ok_and(|v| r.contains(&v))) {
         return Err(format!(
             "capture API {api:?}, schema {version:?} is not readable by this locum-cli"
         ));

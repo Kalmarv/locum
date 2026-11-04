@@ -254,31 +254,51 @@ pub fn find(c: &Capture, target: f64, tolerance: f64, int: bool) -> Result<(), S
 }
 
 pub fn passes(c: &Capture) -> Result<(), String> {
-    let rows: Vec<(i64, i64, i64)> = c.rows(
-        "SELECT n, first_draw, last_draw FROM passes ORDER BY n",
+    let rows: Vec<(i64, i64, i64, bool, Option<i64>)> = c.rows(
+        "SELECT p.n, p.first_draw, p.last_draw, e.deferred, e.list FROM passes p JOIN draws d ON d.n = p.first_draw \
+         JOIN events e ON e.seq = d.event ORDER BY p.n",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     );
-    out!("{:>4} {:>11} {:>5}  targets", "pass", "draws", "count");
-    for (n, first, last) in rows {
-        let targets: Vec<String> = c.rows(
-            "SELECT kind, slot, resource FROM bindings WHERE draw = ?1 AND kind IN ('rtv', 'dsv') ORDER BY kind DESC, slot",
-            [first],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?)),
-        )
-        .into_iter()
-        .map(|(kind, slot, res)| {
-            let name = if kind == "dsv" { "depth".to_string() } else { format!("rt{slot}") };
-            let s = res.and_then(|r| shape(c, r)).map_or("?".into(), |s| s.to_string());
-            format!("{name} {s}")
-        })
-        .collect();
+    out!(
+        "{:>4} {:>11} {:>5} {:<9} targets",
+        "pass",
+        "draws",
+        "count",
+        "list"
+    );
+    let mut previous: Option<Vec<String>> = None;
+    for (n, first, last, deferred, list) in rows {
+        let targets: Vec<String> = c
+            .rows(
+                "SELECT kind, slot, resource FROM bindings WHERE draw = ?1 AND kind IN ('rtv', 'dsv') ORDER BY kind DESC, slot",
+                [first],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?)),
+            )
+            .into_iter()
+            .map(|(kind, slot, res)| {
+                let name = if kind == "dsv" { "depth".to_string() } else { format!("rt{slot}") };
+                let s = res.and_then(|r| shape(c, r)).map_or("?".into(), |s| s.to_string());
+                format!("{name} {s}")
+            })
+            .collect();
         let count = c.count("SELECT count(*) FROM draws WHERE pass = ?1", [n]);
-        out!(
-            "{n:>4} {:>11} {count:>5}  {}",
-            format!("{first}-{last}"),
+        // Games that record one pass on several lists (Elden Ring's G-buffer) split it where each list ends.
+        let shown = if previous.as_ref() == Some(&targets) && !targets.is_empty() {
+            "the same targets as the pass before".to_string()
+        } else {
             targets.join(", ")
+        };
+        let place = match (deferred, list) {
+            (true, Some(l)) => format!("list {l}"),
+            (true, None) => "list".into(),
+            _ => "imm".into(),
+        };
+        out!(
+            "{n:>4} {:>11} {count:>5} {place:<9} {shown}",
+            format!("{first}-{last}")
         );
+        previous = Some(targets);
     }
     Ok(())
 }
