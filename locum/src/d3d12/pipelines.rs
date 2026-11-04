@@ -6,19 +6,21 @@ use serde_json::{Value, json};
 use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
 use windows::core::{GUID, HRESULT, Interface, PCSTR};
 
+/// Bytes into the blob store by content hash. A full writer queue is waited for, never dropped: the capture's
+/// shader and upload records point at these blobs.
 pub unsafe fn bytes(pointer: *const c_void, len: usize) -> Value {
     if len == 0 {
         return Value::Null;
     }
     let data = unsafe { slice(pointer.cast::<u8>(), len) };
     let hash = locum_capture::hash::key(data);
-    let queued = locum_capture::writer::blob(
+    locum_capture::writer::blob(
         &crate::settings::settings().blobs,
         hash.clone(),
         data.to_vec(),
-        false,
+        true,
     );
-    json!({"blob":hash,"size":len,"queued":queued})
+    json!({"blob":hash,"size":len})
 }
 unsafe fn shader(stage: &str, code: &D3D12_SHADER_BYTECODE) -> Value {
     let mut value = unsafe { bytes(code.pShaderBytecode, code.BytecodeLength) };

@@ -683,6 +683,20 @@ unsafe fn journal_capture(
         let db = rusqlite::Connection::open(&path).unwrap();
         for (query, expected) in [
             ("SELECT count(*) FROM d12_submissions", 3),
+            // Each submission records the descriptor definitions that changed since the previous one: all three
+            // at the first, the copied CBV at the second, nothing at the third.
+            (
+                "SELECT count(*) FROM d12_submission_descriptors WHERE submission=(SELECT min(id) FROM d12_submissions)",
+                3,
+            ),
+            (
+                "SELECT count(*) FROM d12_submission_descriptors WHERE submission=(SELECT min(id) FROM d12_submissions)+1",
+                1,
+            ),
+            (
+                "SELECT count(*) FROM d12_submission_descriptors WHERE submission=(SELECT max(id) FROM d12_submissions)",
+                0,
+            ),
             ("SELECT count(*) FROM d12_executions", 3),
             ("SELECT count(*) FROM d12_lists", 2),
             ("SELECT count(*) FROM draws WHERE call='Dispatch'", 3),

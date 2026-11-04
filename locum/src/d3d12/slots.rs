@@ -89,6 +89,34 @@ impl Heap {
             description: p.description.json(),
         })
     }
+    /// The slot's current definition, read under its lock: kind `empty` once it has been emptied.
+    fn current(&self, slot: usize) -> model::Descriptor {
+        let s = self.slots[slot]
+            .value
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match s.payload {
+            Some(p) => model::Descriptor {
+                id: s.version,
+                heap: self.id,
+                slot: slot as u32,
+                kind: p.kind,
+                resource: p.resource,
+                counter: p.counter,
+                description: p.description.json(),
+            },
+            None => model::Descriptor {
+                id: s.version,
+                heap: self.id,
+                slot: slot as u32,
+                kind: "empty",
+                resource: 0,
+                counter: 0,
+                description: Value::Null,
+            },
+        }
+    }
 }
 fn next_version() -> u64 {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -318,13 +346,30 @@ pub fn copy_simple(count: u32, destination: u64, source: u64) {
 pub fn stride(handle: u64) -> Option<u32> {
     read(|index| index.unique(handle, false).map(|(heap, _)| heap.stride))
 }
-pub fn snapshot() -> Vec<model::Descriptor> {
+/// The version stamp each descriptor slot had when last reported, per heap id.
+pub type Known = HashMap<u64, Vec<u64>>;
+/// The definitions descriptor slots took since `known` was last brought up to date (every defined slot the first
+/// time), bringing it up to date; a slot emptied since it was reported comes back as kind `empty`. Only slots whose
+/// version stamp moved are read, so an unchanged heap costs one atomic load per slot.
+pub fn changes(known: &mut Known) -> Vec<model::Descriptor> {
     read(|index| {
-        index
-            .heaps
-            .values()
-            .flat_map(|heap| (0..heap.slots.len()).filter_map(|slot| heap.definition(slot)))
-            .collect()
+        known.retain(|heap, _| index.heaps.contains_key(heap));
+        let mut out = Vec::new();
+        for heap in index.heaps.values() {
+            let versions = known.entry(heap.id).or_insert_with(|| vec![0; heap.slots.len()]);
+            for (slot, entry) in heap.slots.iter().enumerate() {
+                if entry.version.load(Ordering::Acquire) == versions[slot] {
+                    continue;
+                }
+                let d = heap.current(slot);
+                let reported = versions[slot] != 0;
+                versions[slot] = d.id;
+                if d.kind != "empty" || reported {
+                    out.push(d);
+                }
+            }
+        }
+        out
     })
 }
 pub fn counts() -> (usize, usize, usize) {
@@ -417,5 +462,45 @@ mod tests {
         assert_eq!(address(BASE + 64)["resource"], 1_000_003);
         assert_eq!(address(BASE + 64)["offset"], 32);
         destroy(1_000_003);
+    }
+    #[test]
+    fn changes_report_each_definition_once_and_emptied_slots_as_empty() {
+        const BASE: u64 = 0xB000000000;
+        const HEAP: u64 = 2_000_000;
+        register_heap(HEAP, BASE, 0, 4, 32);
+        let cb = |offset| Description::Cb {
+            resource: 42,
+            offset,
+            bytes: 256,
+        };
+        let mut known = Known::new();
+        let ours = |known: &mut Known| -> Vec<(u32, &'static str)> {
+            changes(known)
+                .into_iter()
+                .filter(|d| d.heap == HEAP)
+                .map(|d| (d.slot, d.kind))
+                .collect()
+        };
+        assert!(ours(&mut known).is_empty(), "empty slots are not reported");
+        set(BASE, "cb", 42, 0, cb(0));
+        set(BASE + 32, "cb", 42, 0, cb(256));
+        assert_eq!(ours(&mut known), vec![(0, "cb"), (1, "cb")]);
+        assert!(
+            ours(&mut known).is_empty(),
+            "unchanged slots are not reported again"
+        );
+        set(BASE + 32, "cb", 42, 0, cb(512));
+        assert_eq!(ours(&mut known), vec![(1, "cb")]);
+        // Copying a never-defined slot over a defined one empties it.
+        copy_simple(1, BASE, BASE + 96);
+        copy_simple(1, BASE + 64, BASE + 96);
+        assert_eq!(
+            ours(&mut known),
+            vec![(0, "empty")],
+            "an emptied slot is reported once, a never-defined one not"
+        );
+        destroy(HEAP);
+        changes(&mut known);
+        assert!(!known.contains_key(&HEAP), "a destroyed heap is forgotten");
     }
 }

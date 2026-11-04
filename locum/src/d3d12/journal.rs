@@ -124,6 +124,10 @@ struct State {
     cpu_seq: u64,
     next_submission: u64,
     capture: Option<(PathBuf, model::Frame)>,
+    /// The descriptor versions the armed frame's submissions have reported.
+    descriptors: super::slots::Known,
+    /// The armed frame's constant-buffer views as of its latest submission: (heap, slot) to (resource, begin, end).
+    constant_buffers: BTreeMap<(u64, u32), (u64, u64, u64)>,
 }
 #[derive(Default)]
 struct Upload {
@@ -350,7 +354,22 @@ pub unsafe fn submit(queue: &Data, sequence: u64, count: u32, pointers: *const *
     let (cpu_seq, id) = (s.cpu_seq, s.next_submission);
     let armed = s.capture.is_some();
     let descriptors = if armed {
-        super::slots::snapshot()
+        let changes = super::slots::changes(&mut s.descriptors);
+        for d in &changes {
+            let range = (
+                d.kind,
+                d.description["buffer"]["offset"].as_u64(),
+                d.description["bytes"].as_u64(),
+            );
+            match range {
+                ("cb", Some(offset), Some(bytes)) => s.constant_buffers.insert(
+                    (d.heap, d.slot),
+                    (d.resource, offset, offset.saturating_add(bytes)),
+                ),
+                _ => s.constant_buffers.remove(&(d.heap, d.slot)),
+            };
+        }
+        changes
     } else {
         Vec::new()
     };
@@ -375,7 +394,12 @@ pub unsafe fn submit(queue: &Data, sequence: u64, count: u32, pointers: *const *
     }
     let uploads = match s.capture.as_ref() {
         Some((_, frame)) => unsafe {
-            upload_contents(&s.uploads, frame.submissions.is_empty(), &lists, &descriptors)
+            upload_contents(
+                &s.uploads,
+                frame.submissions.is_empty(),
+                &lists,
+                s.constant_buffers.values(),
+            )
         },
         None => Vec::new(),
     };
@@ -401,15 +425,17 @@ const CONSTANT_BUFFER_BYTES: u64 = 65536;
 /// (marked `whole`, the contents its resources began the frame with), then at each submission only the
 /// constant-buffer ranges its lists' root CBVs and the descriptor heaps' CBVs name, merged into runs per buffer.
 /// Copying every upload buffer whole at every submission cost seconds per submission on Elden Ring's persistent
-/// 323 MB ring, so the armed frame never reached its closing Present.
+/// 323 MB ring, so the armed frame never reached its closing Present. Copying each range on its own cost as much:
+/// Elden Ring's 128k CBVs left 23.7k separate runs of ~540 bytes per submission, 36 s of per-copy overhead in one
+/// frame; runs closer than [`CONSTANT_BUFFER_BYTES`] are copied as one (81 copies for that frame, 629 MiB).
 ///
 /// # Safety
 /// Mapped pointers in `uploads` are the application's live persistent maps.
-unsafe fn upload_contents(
+unsafe fn upload_contents<'a>(
     uploads: &BTreeMap<u64, Upload>,
     first: bool,
     lists: &[Arc<model::List>],
-    descriptors: &[model::Descriptor],
+    constant_buffers: impl Iterator<Item = &'a (u64, u64, u64)>,
 ) -> Vec<(u64, Value)> {
     let mut out = Vec::new();
     if first {
@@ -425,18 +451,8 @@ unsafe fn upload_contents(
     for list in lists {
         constant_ranges(list, uploads, &mut ranges);
     }
-    for d in descriptors {
-        if d.kind == "cb"
-            && uploads.contains_key(&d.resource)
-            && let (Some(offset), Some(bytes)) = (
-                d.description["buffer"]["offset"].as_u64(),
-                d.description["bytes"].as_u64(),
-            )
-        {
-            ranges.push((d.resource, offset, offset.saturating_add(bytes)));
-        }
-    }
-    for (resource, begin, end) in runs(ranges) {
+    ranges.extend(constant_buffers.filter(|(resource, _, _)| uploads.contains_key(resource)));
+    for (resource, begin, end) in runs(ranges, CONSTANT_BUFFER_BYTES) {
         let u = &uploads[&resource];
         let end = end.min(u.bytes as u64);
         if begin < end {
@@ -469,13 +485,16 @@ fn constant_ranges(list: &model::List, uploads: &BTreeMap<u64, Upload>, ranges: 
     }
 }
 
-/// Overlapping or touching ranges of the same resource, merged.
-fn runs(mut ranges: Vec<(u64, u64, u64)>) -> Vec<(u64, u64, u64)> {
+/// Ranges of the same resource, merged where they overlap or are fewer than `gap` bytes apart: one copy of the bytes
+/// between costs less than another copy's overhead.
+fn runs(mut ranges: Vec<(u64, u64, u64)>, gap: u64) -> Vec<(u64, u64, u64)> {
     ranges.sort_unstable();
     let mut merged: Vec<(u64, u64, u64)> = Vec::new();
     for (resource, begin, end) in ranges {
         match merged.last_mut() {
-            Some(last) if last.0 == resource && begin <= last.2 => last.2 = last.2.max(end),
+            Some(last) if last.0 == resource && begin <= last.2.saturating_add(gap) => {
+                last.2 = last.2.max(end)
+            }
             _ => merged.push((resource, begin, end)),
         }
     }
@@ -668,6 +687,8 @@ pub fn present(frame_number: u64) {
             return;
         }
         let mut s = state();
+        s.descriptors.clear();
+        s.constant_buffers.clear();
         s.capture = Some((
             path,
             model::Frame {
@@ -676,5 +697,29 @@ pub fn present(frame_number: u64) {
             },
         ));
         log!("D3D12 capture armed at Present {frame_number}; cached list history retained");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::runs;
+    #[test]
+    fn ranges_merge_across_gaps_smaller_than_the_threshold_and_never_across_resources() {
+        let ranges = vec![
+            (7, 1000, 1256),
+            (7, 0, 256),
+            (7, 100, 300),
+            (7, 5000, 5100),
+            (8, 300, 400),
+        ];
+        assert_eq!(
+            runs(ranges.clone(), 0),
+            vec![(7, 0, 300), (7, 1000, 1256), (7, 5000, 5100), (8, 300, 400)]
+        );
+        assert_eq!(
+            runs(ranges.clone(), 700),
+            vec![(7, 0, 1256), (7, 5000, 5100), (8, 300, 400)]
+        );
+        assert_eq!(runs(ranges, 1 << 20), vec![(7, 0, 5100), (8, 300, 400)]);
     }
 }

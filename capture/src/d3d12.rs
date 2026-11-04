@@ -92,6 +92,8 @@ pub struct Submission {
     pub queue_seq: u64,
     pub cpu_seq: u64,
     pub lists: Vec<Arc<List>>,
+    /// The definitions descriptor slots took since the capture's previous submission (every defined slot at its
+    /// first); kind `empty` marks a slot emptied.
     pub descriptors: Vec<Descriptor>,
     pub uploads: Vec<(u64, Value)>,
 }
@@ -252,6 +254,8 @@ struct Projection {
     locations: Vec<(u64, u64, usize, u64)>,
     objects: BTreeMap<u64, Value>,
     draw_states: Vec<(u64, u64, Pipeline)>,
+    /// Each descriptor slot's definition as of the submission being projected, by (heap, slot).
+    descriptors: BTreeMap<(u64, u32), Descriptor>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -418,8 +422,16 @@ impl Frame {
                 .map(|o| (o.id, o.description.clone()))
                 .collect(),
             draw_states: Vec::new(),
+            descriptors: BTreeMap::new(),
         };
         for submission in &self.submissions {
+            for d in &submission.descriptors {
+                if d.kind == "empty" {
+                    p.descriptors.remove(&(d.heap, d.slot));
+                } else {
+                    p.descriptors.insert((d.heap, d.slot), d.clone());
+                }
+            }
             capture.events.push(db::Event {
                 seq: capture.events.len() as u64 + 1,
                 kind: "submit",
@@ -701,7 +713,7 @@ impl Projection {
                     kind == "dispatch",
                     pipeline,
                     &self.objects,
-                    submission,
+                    &self.descriptors,
                 );
                 self.draw_states.push((n, submission.id, pipeline.clone()));
                 Some(n)

@@ -1,6 +1,6 @@
 //! Browsing projection of authoritative root arguments and descriptor versions.
 //! Reachability comes from the root signature and API state, never shader reflection.
-use super::{Descriptor, Pipeline, Submission};
+use super::{Descriptor, Pipeline};
 use crate::{db, hash};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -11,7 +11,7 @@ pub(super) fn project(
     compute: bool,
     p: &Pipeline,
     objects: &BTreeMap<u64, Value>,
-    submission: &Submission,
+    descriptors: &BTreeMap<(u64, u32), Descriptor>,
 ) {
     let (root, args) = if compute {
         (p.compute_root, &p.compute_args)
@@ -59,10 +59,10 @@ pub(super) fn project(
                 let count = range["NumDescriptors"].as_u64().unwrap_or(0);
                 let start = base.saturating_add(offset);
                 let end = start.saturating_add(count);
-                for descriptor in submission
-                    .descriptors
-                    .iter()
-                    .filter(|v| v.heap == heap && u64::from(v.slot) >= start && u64::from(v.slot) < end)
+                let slot = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
+                for descriptor in descriptors
+                    .range((heap, slot(start))..(heap, slot(end)))
+                    .map(|(_, d)| d)
                 {
                     let register = range["BaseShaderRegister"].as_u64().unwrap_or(0)
                         + (u64::from(descriptor.slot) - start);

@@ -13,7 +13,7 @@ use rusqlite::{Connection, params};
 /// Bumped when a table changes meaning.
 pub const SCHEMA_VERSION: u32 = 1;
 /// A D3D12 capture's: the same tables, plus the authoritative `d12_*` records.
-pub const D3D12_SCHEMA_VERSION: u32 = 3;
+pub const D3D12_SCHEMA_VERSION: u32 = 4;
 
 pub const SCHEMA: &str = r#"
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
