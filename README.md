@@ -1,86 +1,102 @@
 # locum
 
-See everything a Direct3D 11 game draws in a frame: every draw and dispatch, its shaders, constants, textures,
-buffers and state, and the render targets after each pass, in one SQLite file you can browse, query and replay.
-Like RenderDoc, without injecting anything: three DLLs go in the game's folder.
+A frame capture and replay tool for Direct3D 11 and Direct3D 12 games on Windows. It runs as stand-in system DLLs in
+the game's folder and writes each captured frame to a SQLite database, which a command-line tool and a local web
+viewer read.
 
-- **Capture** a frame with everything the GPU did and read.
-- **Browse** it in a local web viewer or with `locum-cli`, or query it with SQL.
-- **Trace** textures and buffers to the files they came from, and constants to the game's memory.
-- **Change** a draw (skip it, swap a shader, set a constant), live in the game or offline.
-- **Replay** the frame offline, checking every render target against the game's bit for bit.
+## Features
 
-## Quick start
+- Records every draw, dispatch, clear, copy, update and map of a frame in GPU order, with each draw's shaders, state and bindings
+- Records the constant-buffer bytes each draw read, with constants named from the shaders' DXBC or DXIL reflection
+- Stores each used resource's contents as the frame began and the render and depth targets at the end of each pass
+- Captures up to 64 consecutive frames from one request
+- Keeps resource contents in a blob store shared by all captures of a game, keyed by XXH3-128 and LZ4-compressed
+- Lists, filters, exports (DDS, PNG, raw) and queries captures with `locum-cli`, including plain SQL
+- Traces a target's output lane back to the texture channels, constants and vertex attributes it came from
+- Replays a draw or a whole frame offline on the GPU or on WARP and verifies every target against the game's
+- Changes draws with rules (skip, solid colour, replacement shader, constant), live in Direct3D 11 games or in replay
+- Names textures, buffers and shader programs after the game's own files through indexes of DDS files, shaders and key lists
+- Diffs two captures draw by draw
+- Writes a process memory dump at capture time and searches it for the values a draw saw (Direct3D 11)
+- Reads, sets and calls game values from a `table.txt` to set up a scene before a capture
+- Browses captures in a local web viewer with timeline, draw, resource, shader and SQL pages
+- Compares the output of shaders whose results depend on GPU thread order by records rather than bytes
 
-Requires Windows, a 64-bit Direct3D 11 game, Rust, and [Bun](https://bun.sh) for the viewer.
+## Getting Started
 
-```bash
+### Requirements
+
+- Windows, and a 64-bit game that uses Direct3D 11 or Direct3D 12
+- Rust 1.99.0 (pinned in `rust-toolchain.toml`) with the MSVC build tools; the DLL shims are linked with `lib.exe`
+- [Bun](https://bun.sh) for the viewer
+- `dxcompiler.dll` for DXIL tools and DXIL replay rules: found on the DLL search path, in the Windows SDK, or at `LOCUM_DXCOMPILER`
+
+Do not use locum on games with anti-cheat. Live override rules, memory dumps and the `skip`/`max_mb` capture options
+are implemented for Direct3D 11 only.
+
+### Installation
+
+None of the packages are published. Build the workspace from source:
+
+```powershell
 cargo build --release
 ```
 
-1. Copy `locum.dll`, `d3d11.dll` and `dxgi.dll` from `target/release/` next to the game's `.exe` (for Unreal games,
-   the one under `Binaries/Win64`). For a Direct3D 12 game, copy `locum.dll`, `d3d12.dll`, `dxgi.dll` and
-   `nvapi64.dll`.
-2. Run the game. To capture a frame, create an empty file named `capture` in `%LOCALAPPDATA%\locum`. A few seconds
-   later the frame is in `captures/frame-<n>/`.
-3. Open it:
-
-   ```bash
-   cd viewer && bun install && bun run viewer --db "%LOCALAPPDATA%\locum\captures\frame-<n>"
-   ```
-
-4. Delete the three DLLs from the game's folder when done.
-
-## Usage
-
-`locum-cli` reads captures; `last` names the newest.
-
-| Command | What it shows |
+| Package | What it is |
 |---|---|
-| `locum-cli draws last` | every draw and dispatch, in GPU order |
-| `locum-cli draw last 120` | one draw: state, everything bound, constants by name, targets after it |
-| `locum-cli shader last 9f2c -d` | a shader's constant buffers and disassembly |
-| `locum-cli trace last 120 rt1.z` | what a target lane is made of: textures by channel, constants by name and value, vertex attributes |
-| `locum-cli resource last 812` | a resource: where it was made, its contents, what the frame did with it |
-| `locum-cli export last 812 -o tex.dds` | a texture or buffer as the frame began |
-| `locum-cli pixel last 120:rt0 960 540` | one texel in every readback of a target: which passes changed it |
-| `locum-cli find last 0.35` | which constant holds a value, and the draws that saw it |
-| `locum-cli sql last "SELECT ..."` | anything else |
-| `locum-cli replay last 120 --rule "skip ps=9f2c"` | the draw replayed with a change, before and after |
-| `locum-cli verify last` | the whole frame replayed and compared with the game's |
+| `locum` | `locum.dll`: wraps the Direct3D and DXGI objects and records captures |
+| `locum-shim-d3d11`, `locum-shim-dxgi`, `locum-shim-d3d12` | `d3d11.dll`, `dxgi.dll`, `d3d12.dll`: forward every export to `locum.dll` |
+| `locum-shim-nvapi64` | `nvapi64.dll`: an empty NVAPI for Direct3D 12 games |
+| `locum-capture` | The capture format, blob store, formats, reflection and rule language |
+| `locum-d3d11` | Direct3D 11 readback shared by capture and replay |
+| `locum-cli` | Reads, replays and verifies captures |
+| `viewer` | Bun and Preact web viewer for captures |
+| `locum-smoke`, `locum-smoke-d3d12`, `xtask` | Test programs and the `cargo xtask` build tasks |
 
-`locum-cli --help` lists the rest (diff two captures, memory dumps, file indexes).
+Copy the DLLs from `target/release/` next to the game's executable (for Unreal games, the one under `Binaries/Win64`):
 
-## Configuration
+- Direct3D 11: `locum.dll`, `d3d11.dll`, `dxgi.dll`
+- Direct3D 12: `locum.dll`, `d3d12.dll`, `dxgi.dll`, `nvapi64.dll`
 
-| Variable | Default | Description |
-|---|---|---|
-| `LOCUM_DIR` | `%LOCALAPPDATA%\locum` | where locum writes its log, shaders and captures |
-| `LOCUM_BLOBS` | `blobs/` in that folder | the store of resource contents shared by captures |
-| `LOCUM_INDEX` | none | indexes of the game's files, for naming resources (`;`-separated) |
+Remove them again when you are done.
 
-`settings.txt` and `overrides.txt` in that folder set capture options and change draws live; see
-[docs/README.md](docs/README.md#files-and-settings).
+### Usage
 
-## Limits
+locum writes its log, shaders and captures to `%LOCALAPPDATA%\locum` (or `LOCUM_DIR`). With the game running, create
+an empty file named `capture` there. locum removes the file and writes the next frame to `captures\frame-<n>\`.
 
-- 64-bit only. Direct3D 12 captures record every command, state, shader and constant, the contents each resource
-  had when the frame first used it, the targets each pass ended with and what draws and dispatches wrote through
-  UAVs, the tile mappings of reserved resources, and replay, with placed and reserved resources in heaps as the
-  game shared them. Vulkan games run as normal, unseen.
-- Don't use it on games with anti-cheat.
+```powershell
+New-Item "$env:LOCALAPPDATA\locum\capture"
 
-## Development
-
-```bash
-cargo build --release
-cargo xtask smoke   # runs small Direct3D programs through locum and verifies their captures on the GPU and WARP
-cargo xtask gen     # regenerates the COM wrappers after a windows crate update
+locum-cli info last                          # what the capture holds and what it is missing
+locum-cli draws last --ps 9f2c               # draws that used a pixel shader
+locum-cli draw last 120                      # one draw: state, bindings, named constants, targets after it
+locum-cli target last 120 rt0 -o rt0.png     # a render target read back after its pass
+locum-cli verify last                        # replay the frame and compare every target with the game's
 ```
 
-[docs/README.md](docs/README.md) covers how locum works, every file it writes, the capture's tables, and
-replay. [viewer/README.md](viewer/README.md) covers the viewer.
+To open the capture in the viewer, which prints its address (`http://127.0.0.1:5170/...`):
 
-## License
+```powershell
+cd viewer
+bun install
+bun run viewer --db "$env:LOCALAPPDATA\locum\captures\frame-<n>"
+```
 
-[GPL-3.0-or-later](LICENSE)
+Other commands:
+
+- `locum-cli shader last 9f2c -d`: a shader's constant buffers, bindings and disassembly (`--wgsl` for WGSL)
+- `locum-cli trace last 120 rt1.z`: what one lane of a target is made of
+- `locum-cli export last 812 -o tex.dds`: a resource's contents as the frame began
+- `locum-cli replay last 120 --rule "skip ps=9f2c"`: a draw replayed with a rule, before and after
+- `locum-cli diff before after`: two captures compared draw by draw
+- `locum-cli --index files.db join last`: what each resource was made from
+- `locum-cli sql last "SELECT ..."`: any query on the capture
+
+`locum-cli --help` lists every command. `settings.txt`, `overrides.txt`, `table.txt` and the capture request options
+are described in [docs/README.md](docs/README.md).
+
+`cargo xtask smoke` runs the Direct3D 11 test programs through locum and verifies their captures on the GPU and WARP.
+`cargo xtask smoke --api d3d12` does the same for Direct3D 12, and `bun test` runs the viewer's tests.
+[docs/README.md](docs/README.md) is the full reference, and [viewer/README.md](viewer/README.md) covers the viewer.
+locum is licensed under [GPL-3.0-or-later](LICENSE).
