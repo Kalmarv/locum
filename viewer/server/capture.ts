@@ -6,6 +6,7 @@ import { existsSync, openSync, readSync, closeSync, statSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { constantBuffers, nameAt, type ConstantBuffer } from "./rdef";
 import { formatName, readable, readTexel, textureSubs, type Sub, layout } from "./format";
+import { lz4Block } from "./lz4";
 
 type Row = Record<string, any>;
 
@@ -132,6 +133,7 @@ export class Capture {
   private modulesCache: { path: string; base: bigint; size: bigint }[] | null = null;
   private features: { targetEvent: boolean; results: boolean; resultColumns: Set<string> } | null = null;
   private blobIndex: Database | null = null;
+  private blobTables = new Set<string>();
 
   constructor(readonly id: string, readonly path: string, readonly blobs: string, readonly label: string) {}
 
@@ -200,14 +202,35 @@ export class Capture {
     return out;
   }
 
-  /** Where a blob is: in a pack (the store's `index.db` says where), or a file of its own (stores from before packs). */
-  private locate(key: string): { path: string; at: number; size: number } | null {
+  /** Where a blob is: `stored` bytes in a pack, decoding by `codec` to `size` (the store's `index.db` says where:
+   * table `packed`, or `blobs` for the raw blobs of stores from before compression), or a file of its own (stores
+   * from before packs). */
+  private locate(key: string): { path: string; at: number; stored: number; size: number; codec: string } | null {
     const index = join(this.blobs, "index.db");
-    if (!this.blobIndex && existsSync(index)) this.blobIndex = new Database(index, { readonly: true });
-    const row = this.blobIndex?.query("SELECT pack, offset, size FROM blobs WHERE key = ?").get(key) as any;
-    if (row) return { path: join(this.blobs, "packs", row.pack), at: Number(row.offset), size: Number(row.size) };
+    if (!this.blobIndex && existsSync(index)) {
+      this.blobIndex = new Database(index, { readonly: true });
+      const tables = this.blobIndex.query("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Row[];
+      this.blobTables = new Set(tables.map((t) => t.name));
+    }
+    let row: Row | null = null;
+    if (this.blobTables.has("packed"))
+      row = this.blobIndex!.query("SELECT pack, offset, stored, size, codec FROM packed WHERE key = ?").get(key) as Row | null;
+    if (!row && this.blobTables.has("blobs"))
+      row = this.blobIndex!.query("SELECT pack, offset, size AS stored, size, 'raw' AS codec FROM blobs WHERE key = ?").get(
+        key,
+      ) as Row | null;
+    if (row)
+      return {
+        path: join(this.blobs, "packs", row.pack),
+        at: Number(row.offset),
+        stored: Number(row.stored),
+        size: Number(row.size),
+        codec: row.codec,
+      };
     const file = join(this.blobs, key.slice(0, 2), key);
-    return existsSync(file) ? { path: file, at: 0, size: statSync(file).size } : null;
+    if (!existsSync(file)) return null;
+    const size = statSync(file).size;
+    return { path: file, at: 0, stored: size, size, codec: "raw" };
   }
 
   hasBlob(key: string): boolean {
@@ -223,20 +246,12 @@ export class Capture {
     const where = this.locate(key);
     if (!where) throw new Error(`blob ${key} is not in ${this.blobs}`);
     const total = where.size;
-    const n = Math.max(0, Math.min(size ?? total - offset, total - offset));
-    const out = new Uint8Array(n);
-    const fd = openSync(where.path, "r");
-    try {
-      let done = 0;
-      while (done < n) {
-        const got = readSync(fd, out, done, n - done, where.at + offset + done);
-        if (got <= 0) break;
-        done += got;
-      }
-    } finally {
-      closeSync(fd);
-    }
-    return out;
+    const from = Math.min(Math.max(0, offset), total);
+    const n = Math.max(0, Math.min(size ?? total - from, total - from));
+    if (where.codec === "raw") return readAt(where.path, where.at + from, n);
+    if (where.codec !== "lz4") throw new Error(`blob ${key} is stored as ${where.codec}, which this viewer does not read`);
+    const whole = lz4Block(readAt(where.path, where.at, where.stored), total);
+    return from === 0 && n === total ? whole : whole.slice(from, from + n);
   }
 
   // ---- info -------------------------------------------------------------------------------------------------------
@@ -888,4 +903,21 @@ export function summarize(path: string) {
   } catch (e) {
     return { error: String(e) };
   }
+}
+
+/** `n` bytes of a file from `at`. */
+function readAt(path: string, at: number, n: number): Uint8Array<ArrayBuffer> {
+  const out = new Uint8Array(n);
+  const fd = openSync(path, "r");
+  try {
+    let done = 0;
+    while (done < n) {
+      const got = readSync(fd, out, done, n - done, at + done);
+      if (got <= 0) throw new Error(`${path}: ends before byte ${at + n}`);
+      done += got;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return out;
 }

@@ -2,9 +2,16 @@
 //! written once; captures of the same textures add nothing, so one store serves every run of a game.
 //!
 //! Blobs are appended to pack files, `<root>/packs/<process>-<time>.pack`, one per writing process, and
-//! `<root>/index.db` (SQLite, table `blobs(key, pack, offset, size)`) says where each one is. A capture's hundreds of
-//! thousands of blobs are then a few large sequential writes and one transaction, not a file each. Stores written
-//! before packs hold one file per blob at `<root>/<first two digits>/<key>`; those are still read.
+//! `<root>/index.db` (SQLite, table `packed(key, pack, offset, stored, size, codec)`) says where each one is: `stored`
+//! bytes at `offset` in the pack, which decode by `codec` to the blob's `size` bytes. A capture's hundreds of
+//! thousands of blobs are then a few large sequential writes and one transaction, not a file each. Blobs are LZ4
+//! blocks (codec `lz4`) unless that saves too little to be worth decoding (codec `raw`): a frame's targets and
+//! contents shrink about threefold, block-compressed textures hardly at all.
+//!
+//! Older stores are still read: their table `blobs(key, pack, offset, size)` holds raw blobs, and stores from before
+//! packs hold one file per blob at `<root>/<first two digits>/<key>`. A reader from before `packed` finds none of its
+//! blobs, rather than reading compressed bytes as the blob. [`Blobs::collect`] rewrites both older forms into
+//! compressed packs.
 //!
 //! The index also lists the captures that use the store (table `captures(path)`): a capture is listed before its
 //! `capture.db` is written. [`Blobs::collect`] keeps the blobs those captures name and drops the rest, so deleting a
@@ -18,6 +25,7 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use primase_foundations::compress::{Compressor, Decompressor, Lz4};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 /// A pack is closed and the next one begun past this size.
@@ -26,14 +34,67 @@ const PACK_LIMIT: u64 = 4 << 30;
 /// The file every process using a store holds locked, shared; [`Blobs::collect`] holds it alone.
 const LOCK: &str = "store.lock";
 
+/// Blobs smaller than this are stored raw: there is too little in them to find repeats in.
+const COMPRESS_FROM: usize = 256;
+
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS packed(key TEXT PRIMARY KEY, pack TEXT NOT NULL, offset INTEGER NOT \
+                      NULL, stored INTEGER NOT NULL, size INTEGER NOT NULL, codec TEXT NOT NULL) WITHOUT ROWID;
+                      CREATE TABLE IF NOT EXISTS captures(path TEXT PRIMARY KEY) WITHOUT ROWID;";
+
 #[derive(Clone, Debug)]
 pub struct Blobs {
     root: PathBuf,
 }
 
-/// Where a blob is: a pack and its bytes there, or a file of its own (older stores).
+/// How a blob's bytes in its pack decode to the blob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Codec {
+    Raw,
+    Lz4,
+}
+
+impl Codec {
+    fn name(self) -> &'static str {
+        match self {
+            Codec::Raw => "raw",
+            Codec::Lz4 => "lz4",
+        }
+    }
+
+    fn parse(name: &str) -> rusqlite::Result<Codec> {
+        match name {
+            "raw" => Ok(Codec::Raw),
+            "lz4" => Ok(Codec::Lz4),
+            other => Err(rusqlite::Error::InvalidColumnType(
+                0,
+                format!("codec {other:?}, which this locum does not read"),
+                rusqlite::types::Type::Text,
+            )),
+        }
+    }
+}
+
+/// A blob's bytes as stored: compressed when that saves at least a sixteenth, else as they are.
+fn encode(bytes: &[u8]) -> io::Result<(std::borrow::Cow<'_, [u8]>, Codec)> {
+    if bytes.len() >= COMPRESS_FROM {
+        let packed = Lz4.compress(bytes).map_err(io::Error::other)?;
+        if packed.len() <= bytes.len() - bytes.len() / 16 {
+            return Ok((packed.into(), Codec::Lz4));
+        }
+    }
+    Ok((bytes.into(), Codec::Raw))
+}
+
+/// Where a blob is: `stored` bytes in a pack decoding to `size`, or a file of its own (stores from before packs).
+#[derive(Clone, Debug)]
 enum Place {
-    Pack { pack: String, offset: u64, size: u64 },
+    Pack {
+        pack: String,
+        offset: u64,
+        stored: u64,
+        size: u64,
+        codec: Codec,
+    },
     File(PathBuf),
 }
 
@@ -55,19 +116,24 @@ pub struct Copied {
 /// What [`Blobs::collect`] kept and dropped (or would, when only counting).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Collected {
+    /// Blobs kept, and their bytes (decoded).
     pub kept: u64,
     pub kept_bytes: u64,
     pub dropped: u64,
     pub dropped_bytes: u64,
-    /// Packs holding dropped blobs, their kept blobs copied to new packs and the old ones deleted.
+    /// Packs rewritten (holding dropped or uncompressed blobs): their kept blobs copied to new packs, the old deleted.
     pub packs_rewritten: u64,
+    /// Blobs of an older store's forms (the table `blobs`, one file each) moved into compressed packs.
+    pub converted: u64,
     /// Pack files no index entry names (what a writer that stopped before indexing left), deleted, and their bytes.
     pub orphan_packs: u64,
     pub orphan_bytes: u64,
-    /// One-file blobs of an older store moved into packs.
-    pub files_packed: u64,
     /// Index entries whose pack is not there: left as they are.
     pub missing: u64,
+    /// The store's blob bytes on disk before and after (when only counting, after is before less what is dropped:
+    /// what converting saves is not known until it is done).
+    pub disk_before: u64,
+    pub disk_after: u64,
 }
 
 impl Blobs {
@@ -95,7 +161,7 @@ impl Blobs {
         self.store().find(key).is_some()
     }
 
-    /// The size of a blob in the store.
+    /// The size of a blob in the store (decoded).
     pub fn size(&self, key: &str) -> Option<u64> {
         match self.store().find(key)? {
             Place::Pack { size, .. } => Some(size),
@@ -122,7 +188,7 @@ impl Blobs {
         self.store().flush()
     }
 
-    /// Bytes appended since the last flush.
+    /// Bytes appended since the last flush (as given, before compression).
     pub fn unflushed(&self) -> u64 {
         self.store().unflushed
     }
@@ -144,48 +210,64 @@ impl Blobs {
             store.flush()?;
         }
         let missing = || io::Error::new(io::ErrorKind::NotFound, format!("blob {key} is not in the store"));
-        match store.find(key).ok_or_else(missing)? {
+        let place = store.find(key).ok_or_else(missing)?;
+        // The span asked for, within the blob's `total` bytes.
+        let span = |total: u64| {
+            let from = offset.min(total);
+            (from, size.unwrap_or(total - from).min(total - from) as usize)
+        };
+        match place {
             Place::Pack {
                 pack,
                 offset: at,
+                stored,
                 size: total,
+                codec,
             } => {
-                let n = size
-                    .unwrap_or(total.saturating_sub(offset))
-                    .min(total.saturating_sub(offset));
+                let (from, n) = span(total);
                 let file = store.reader(&pack)?;
-                file.seek(SeekFrom::Start(at + offset.min(total)))?;
-                let mut out = vec![0; n as usize];
-                file.read_exact(&mut out)?;
-                Ok(out)
+                match codec {
+                    Codec::Raw => read_at(file, at + from, n),
+                    Codec::Lz4 => {
+                        let packed = read_at(file, at, stored as usize)?;
+                        let mut whole = Lz4
+                            .decompress(&packed, total as usize)
+                            .map_err(|e| io::Error::other(format!("blob {key}: {e}")))?;
+                        whole.truncate(from as usize + n);
+                        whole.drain(..from as usize);
+                        Ok(whole)
+                    }
+                }
             }
             Place::File(path) => {
-                let mut file = File::open(path)?;
-                let total = file.metadata()?.len();
-                let n = size
-                    .unwrap_or(total.saturating_sub(offset))
-                    .min(total.saturating_sub(offset));
-                file.seek(SeekFrom::Start(offset.min(total)))?;
-                let mut out = vec![0; n as usize];
-                file.read_exact(&mut out)?;
-                Ok(out)
+                let file = File::open(path)?;
+                let (from, n) = span(file.metadata()?.len());
+                read_at(&file, from, n)
             }
         }
     }
 
-    /// Every blob in the store, indexed and one-file, sorted by key.
+    /// Every blob in the store, in each of its forms, sorted by key.
     pub fn entries(&self) -> io::Result<Vec<Entry>> {
         let mut store = self.store();
         store.flush()?;
         let mut out: BTreeMap<String, u64> = BTreeMap::new();
+        let tables = store.tables()?;
         if let Some(index) = store.index(false)? {
-            let mut s = index.prepare("SELECT key, size FROM blobs").map_err(sql)?;
-            let rows = s
-                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))
-                .map_err(sql)?;
-            for row in rows {
-                let (key, size) = row.map_err(sql)?;
-                out.insert(key, size);
+            for (table, present) in [("packed", tables.packed), ("blobs", tables.legacy)] {
+                if !present {
+                    continue;
+                }
+                let mut s = index
+                    .prepare(&format!("SELECT key, size FROM {table}"))
+                    .map_err(sql)?;
+                let rows = s
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))
+                    .map_err(sql)?;
+                for row in rows {
+                    let (key, size) = row.map_err(sql)?;
+                    out.entry(key).or_insert(size);
+                }
             }
         }
         for (key, path) in files(&self.root)? {
@@ -226,20 +308,12 @@ impl Blobs {
     /// The captures listed as using the store, as they were listed (absolute paths).
     pub fn captures(&self) -> io::Result<Vec<PathBuf>> {
         let mut store = self.store();
+        if !store.tables()?.captures {
+            return Ok(Vec::new());
+        }
         let Some(index) = store.index(false)? else {
             return Ok(Vec::new());
         };
-        let listed: bool = index
-            .query_row(
-                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'captures'",
-                [],
-                |r| r.get::<_, i64>(0),
-            )
-            .map_err(sql)?
-            > 0;
-        if !listed {
-            return Ok(Vec::new());
-        }
         let mut s = index
             .prepare("SELECT path FROM captures ORDER BY path")
             .map_err(sql)?;
@@ -286,9 +360,10 @@ impl Blobs {
         Ok(done)
     }
 
-    /// Keeps the blobs `keep` says yes to and drops the rest: packs holding dropped blobs have their kept blobs copied
-    /// to new packs and are deleted, one-file blobs are packed (or deleted), and packs no entry names are deleted.
-    /// With `count_only`, says what it would do and changes nothing. Refused while another process uses the store.
+    /// Keeps the blobs `keep` says yes to and drops the rest. Packs holding dropped blobs, or blobs stored raw by an
+    /// older locum, have their kept blobs copied to new packs (compressed where that pays) and are deleted; one-file
+    /// blobs are packed (or deleted); packs no entry names are deleted. With `count_only`, says what it would do and
+    /// changes nothing. Refused while another process uses the store.
     pub fn collect(&self, keep: &dyn Fn(&str) -> bool, count_only: bool) -> io::Result<Collected> {
         let mut store = self.store();
         store.close()?;
@@ -321,9 +396,16 @@ impl Blobs {
         let mut store = self.store();
         store.flush().unwrap();
         if let Some(index) = store.index(false).unwrap() {
-            index.execute("DELETE FROM blobs WHERE key = ?1", [key]).unwrap();
+            index.execute("DELETE FROM packed WHERE key = ?1", [key]).unwrap();
         }
     }
+}
+
+fn read_at(mut file: &File, at: u64, n: usize) -> io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(at))?;
+    let mut out = vec![0; n];
+    file.read_exact(&mut out)?;
+    Ok(out)
 }
 
 /// The one-file blobs of an older store: `<root>/<first two digits>/<key>`.
@@ -347,6 +429,28 @@ fn files(root: &Path) -> io::Result<Vec<(String, PathBuf)>> {
         }
     }
     Ok(out)
+}
+
+/// Which of the index's tables are there.
+#[derive(Clone, Copy, Default)]
+struct Tables {
+    packed: bool,
+    legacy: bool,
+    captures: bool,
+}
+
+fn tables(index: &Connection) -> rusqlite::Result<Tables> {
+    let mut t = Tables::default();
+    let mut s = index.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
+    for name in s.query_map([], |r| r.get::<_, String>(0))? {
+        match name?.as_str() {
+            "packed" => t.packed = true,
+            "blobs" => t.legacy = true,
+            "captures" => t.captures = true,
+            _ => {}
+        }
+    }
+    Ok(t)
 }
 
 /// A new pack of this process's under `<root>/packs`: its name and file.
@@ -411,6 +515,16 @@ impl Out {
     }
 }
 
+/// An index entry as [`collect`] reads it.
+struct Row {
+    key: String,
+    offset: u64,
+    stored: u64,
+    size: u64,
+    codec: Codec,
+    legacy: bool,
+}
+
 fn collect(root: &Path, keep: &dyn Fn(&str) -> bool, count_only: bool) -> io::Result<Collected> {
     let mut done = Collected::default();
     let index_path = root.join("index.db");
@@ -418,10 +532,12 @@ fn collect(root: &Path, keep: &dyn Fn(&str) -> bool, count_only: bool) -> io::Re
     if !index_path.is_file() && (loose.is_empty() || count_only) {
         for (key, path) in &loose {
             let size = std::fs::metadata(path)?.len();
+            done.disk_before += size;
             if keep(key) {
                 done.kept += 1;
                 done.kept_bytes += size;
-                done.files_packed += 1;
+                done.converted += 1;
+                done.disk_after += size;
             } else {
                 done.dropped += 1;
                 done.dropped_bytes += size;
@@ -434,30 +550,48 @@ fn collect(root: &Path, keep: &dyn Fn(&str) -> bool, count_only: bool) -> io::Re
         .busy_timeout(std::time::Duration::from_secs(30))
         .map_err(sql)?;
     index.pragma_update(None, "journal_mode", "WAL").map_err(sql)?;
-    index
-        .execute_batch(
-            "CREATE TABLE IF NOT EXISTS blobs(key TEXT PRIMARY KEY, pack TEXT NOT NULL, offset INTEGER NOT NULL, \
-             size INTEGER NOT NULL) WITHOUT ROWID",
-        )
-        .map_err(sql)?;
-    let mut packs: BTreeMap<String, Vec<(String, u64, u64)>> = BTreeMap::new();
-    {
+    index.execute_batch(SCHEMA).map_err(sql)?;
+    let present = tables(&index).map_err(sql)?;
+    let mut packs: BTreeMap<String, Vec<Row>> = BTreeMap::new();
+    let mut indexed = std::collections::HashSet::new();
+    for (table, legacy) in [("packed", false), ("blobs", true)] {
+        if legacy && !present.legacy {
+            continue;
+        }
+        let columns = if legacy {
+            "key, pack, offset, size, size, 'raw'"
+        } else {
+            "key, pack, offset, stored, size, codec"
+        };
         let mut s = index
-            .prepare("SELECT key, pack, offset, size FROM blobs")
+            .prepare(&format!("SELECT {columns} FROM {table}"))
             .map_err(sql)?;
         let rows = s
             .query_map([], |r| {
                 Ok((
-                    r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)? as u64,
-                    r.get::<_, i64>(3)? as u64,
+                    Row {
+                        key: r.get(0)?,
+                        offset: r.get::<_, i64>(2)? as u64,
+                        stored: r.get::<_, i64>(3)? as u64,
+                        size: r.get::<_, i64>(4)? as u64,
+                        codec: Codec::parse(&r.get::<_, String>(5)?)?,
+                        legacy,
+                    },
                 ))
             })
             .map_err(sql)?;
         for row in rows {
-            let (key, pack, offset, size) = row.map_err(sql)?;
-            packs.entry(pack).or_default().push((key, offset, size));
+            let (pack, row) = row.map_err(sql)?;
+            // A key in both tables (an older locum wrote it again): the current table's is the one read.
+            if indexed.insert(row.key.clone()) {
+                packs.entry(pack).or_default().push(row);
+            } else if legacy {
+                packs.entry(pack).or_default().push(Row {
+                    key: String::new(),
+                    ..row
+                });
+            }
         }
     }
     let dir = root.join("packs");
@@ -475,54 +609,95 @@ fn collect(root: &Path, keep: &dyn Fn(&str) -> bool, count_only: bool) -> io::Re
             }
         }
     }
+    done.disk_before += done.orphan_bytes;
     let mut out = Out {
         root: root.to_path_buf(),
         pack: None,
     };
-    for (pack, mut blobs) in packs {
+    for (pack, rows) in packs {
         let path = dir.join(&pack);
         if !path.is_file() {
-            done.missing += blobs.len() as u64;
+            done.missing += rows.len() as u64;
             continue;
         }
-        let (kept, dropped): (Vec<_>, Vec<_>) = blobs.drain(..).partition(|(key, _, _)| keep(key));
+        let on_disk = std::fs::metadata(&path)?.len();
+        done.disk_before += on_disk;
+        // A legacy row without a key is a second copy of a blob the current table has: dropped with its pack.
+        let (kept, dropped): (Vec<Row>, Vec<Row>) =
+            rows.into_iter().partition(|r| !r.key.is_empty() && keep(&r.key));
+        let dropped_named = dropped.iter().filter(|r| !r.key.is_empty());
         done.kept += kept.len() as u64;
-        done.kept_bytes += kept.iter().map(|b| b.2).sum::<u64>();
-        done.dropped += dropped.len() as u64;
-        done.dropped_bytes += dropped.iter().map(|b| b.2).sum::<u64>();
-        if dropped.is_empty() {
+        done.kept_bytes += kept.iter().map(|r| r.size).sum::<u64>();
+        done.dropped += dropped_named.clone().count() as u64;
+        done.dropped_bytes += dropped_named.map(|r| r.size).sum::<u64>();
+        let converting = kept.iter().filter(|r| r.legacy).count() as u64;
+        if dropped.is_empty() && converting == 0 {
+            done.disk_after += on_disk;
             continue;
         }
         done.packs_rewritten += 1;
+        done.converted += converting;
         if count_only {
+            done.disk_after += kept.iter().map(|r| r.stored).sum::<u64>();
             continue;
         }
         let mut moved = Vec::with_capacity(kept.len());
-        let mut file = File::open(&path)?;
+        let file = File::open(&path)?;
         let mut sorted = kept;
-        sorted.sort_by_key(|b| b.1);
-        for (key, offset, size) in sorted {
-            file.seek(SeekFrom::Start(offset))?;
-            let mut bytes = vec![0; size as usize];
-            file.read_exact(&mut bytes)?;
-            let (to, at) = out.write(&bytes)?;
-            moved.push((key, to, at));
+        sorted.sort_by_key(|r| r.offset);
+        for r in sorted {
+            let bytes = read_at(&file, r.offset, r.stored as usize)?;
+            let (stored, codec) = if r.legacy {
+                encode(&bytes)?
+            } else {
+                (bytes.as_slice().into(), r.codec)
+            };
+            let (to, at) = out.write(&stored)?;
+            done.disk_after += stored.len() as u64;
+            moved.push((r.key, to, at, stored.len() as u64, r.size, codec, r.legacy));
         }
         drop(file);
         out.sync()?;
         let tx = index.unchecked_transaction().map_err(sql)?;
         {
-            let mut update = tx
-                .prepare_cached("UPDATE blobs SET pack = ?2, offset = ?3 WHERE key = ?1")
+            let mut put = tx
+                .prepare_cached("INSERT OR REPLACE INTO packed VALUES(?1, ?2, ?3, ?4, ?5, ?6)")
                 .map_err(sql)?;
-            for (key, to, at) in &moved {
-                update.execute(params![key, to, *at as i64]).map_err(sql)?;
+            let mut unlist = tx
+                .prepare_cached(if present.legacy {
+                    "DELETE FROM blobs WHERE key = ?1"
+                } else {
+                    "SELECT ?1 WHERE 0"
+                })
+                .map_err(sql)?;
+            for (key, to, at, stored, size, codec, legacy) in &moved {
+                put.execute(params![
+                    key,
+                    to,
+                    *at as i64,
+                    *stored as i64,
+                    *size as i64,
+                    codec.name()
+                ])
+                .map_err(sql)?;
+                if *legacy {
+                    unlist.execute([key]).map_err(sql)?;
+                }
             }
-            let mut delete = tx
-                .prepare_cached("DELETE FROM blobs WHERE key = ?1")
+            let mut drop_current = tx
+                .prepare_cached("DELETE FROM packed WHERE key = ?1")
                 .map_err(sql)?;
-            for (key, _, _) in &dropped {
-                delete.execute([key]).map_err(sql)?;
+            for r in dropped.iter().filter(|r| !r.key.is_empty()) {
+                if r.legacy {
+                    unlist.execute([&r.key]).map_err(sql)?;
+                } else {
+                    drop_current.execute([&r.key]).map_err(sql)?;
+                }
+            }
+            if present.legacy {
+                // What else the old table says is in this pack (second copies) goes with it.
+                tx.execute("DELETE FROM blobs WHERE pack = ?1", [&pack])
+                    .map_err(sql)?;
             }
         }
         tx.commit().map_err(sql)?;
@@ -532,22 +707,23 @@ fn collect(root: &Path, keep: &dyn Fn(&str) -> bool, count_only: bool) -> io::Re
     let mut removed = Vec::new();
     for (key, path) in loose {
         let size = std::fs::metadata(&path)?.len();
-        let indexed = index
-            .query_row("SELECT 1 FROM blobs WHERE key = ?1", [&key], |_| Ok(()))
-            .optional()
-            .map_err(sql)?
-            .is_some();
-        if indexed {
+        done.disk_before += size;
+        if indexed.contains(&key) {
             // A pack has it already: the file is a second copy.
             done.orphan_bytes += size;
             removed.push(path);
         } else if keep(&key) {
             done.kept += 1;
             done.kept_bytes += size;
-            done.files_packed += 1;
-            if !count_only {
-                let (to, at) = out.write(&std::fs::read(&path)?)?;
-                packed.push((key, to, at, size, path));
+            done.converted += 1;
+            if count_only {
+                done.disk_after += size;
+            } else {
+                let bytes = std::fs::read(&path)?;
+                let (stored, codec) = encode(&bytes)?;
+                let (to, at) = out.write(&stored)?;
+                done.disk_after += stored.len() as u64;
+                packed.push((key, to, at, stored.len() as u64, size, codec, path));
             }
         } else {
             done.dropped += 1;
@@ -560,16 +736,23 @@ fn collect(root: &Path, keep: &dyn Fn(&str) -> bool, count_only: bool) -> io::Re
         let tx = index.unchecked_transaction().map_err(sql)?;
         {
             let mut insert = tx
-                .prepare_cached("INSERT INTO blobs VALUES(?1, ?2, ?3, ?4)")
+                .prepare_cached("INSERT INTO packed VALUES(?1, ?2, ?3, ?4, ?5, ?6)")
                 .map_err(sql)?;
-            for (key, to, at, size, _) in &packed {
+            for (key, to, at, stored, size, codec, _) in &packed {
                 insert
-                    .execute(params![key, to, *at as i64, *size as i64])
+                    .execute(params![
+                        key,
+                        to,
+                        *at as i64,
+                        *stored as i64,
+                        *size as i64,
+                        codec.name()
+                    ])
                     .map_err(sql)?;
             }
         }
         tx.commit().map_err(sql)?;
-        for path in packed.iter().map(|p| &p.4).chain(&removed) {
+        for path in packed.iter().map(|p| &p.6).chain(&removed) {
             std::fs::remove_file(path)?;
             if let Some(parent) = path.parent() {
                 // Gone once its last blob is.
@@ -589,10 +772,12 @@ struct Store {
     lock: Option<File>,
     /// The index: opened read-only until this process writes, then read-write (and created).
     index: Option<(Connection, bool)>,
+    /// Which tables the index has, read when it is opened.
+    tables: Tables,
     /// This process's pack being appended to: its name, the file, and its length.
     pack: Option<(String, BufWriter<File>, u64)>,
     /// Blobs appended but not yet in the index.
-    pending: HashMap<String, (String, u64, u64)>,
+    pending: HashMap<String, Place>,
     unflushed: u64,
     readers: HashMap<String, File>,
 }
@@ -603,6 +788,7 @@ impl Store {
             root,
             lock: None,
             index: None,
+            tables: Tables::default(),
             pack: None,
             pending: HashMap::new(),
             unflushed: 0,
@@ -662,41 +848,66 @@ impl Store {
             if write {
                 c.pragma_update(None, "journal_mode", "WAL").map_err(sql)?;
                 c.pragma_update(None, "synchronous", "NORMAL").map_err(sql)?;
-                c.execute_batch(
-                    "CREATE TABLE IF NOT EXISTS blobs(key TEXT PRIMARY KEY, pack TEXT NOT NULL, offset INTEGER NOT NULL, \
-                     size INTEGER NOT NULL) WITHOUT ROWID;
-                     CREATE TABLE IF NOT EXISTS captures(path TEXT PRIMARY KEY) WITHOUT ROWID;",
-                )
-                .map_err(sql)?;
+                c.execute_batch(SCHEMA).map_err(sql)?;
             }
+            self.tables = tables(&c).map_err(sql)?;
             self.index = Some((c, write));
         }
         Ok(self.index.as_ref().map(|(c, _)| c))
     }
 
+    /// The index's tables (none when there is no index).
+    fn tables(&mut self) -> io::Result<Tables> {
+        Ok(match self.index(false)? {
+            Some(_) => self.tables,
+            None => Tables::default(),
+        })
+    }
+
     fn find(&mut self, key: &str) -> Option<Place> {
-        if let Some((pack, offset, size)) = self.pending.get(key) {
-            return Some(Place::Pack {
-                pack: pack.clone(),
-                offset: *offset,
-                size: *size,
-            });
+        if let Some(place) = self.pending.get(key) {
+            return Some(place.clone());
         }
+        let tables = self.tables().ok()?;
         if let Ok(Some(index)) = self.index(false) {
-            let found = index
-                .prepare_cached("SELECT pack, offset, size FROM blobs WHERE key = ?1")
-                .and_then(|mut s| {
-                    s.query_row([key], |r| {
-                        Ok(Place::Pack {
-                            pack: r.get(0)?,
-                            offset: r.get::<_, i64>(1)? as u64,
-                            size: r.get::<_, i64>(2)? as u64,
+            let mut found = None;
+            if tables.packed {
+                found = index
+                    .prepare_cached("SELECT pack, offset, stored, size, codec FROM packed WHERE key = ?1")
+                    .and_then(|mut s| {
+                        s.query_row([key], |r| {
+                            Ok(Place::Pack {
+                                pack: r.get(0)?,
+                                offset: r.get::<_, i64>(1)? as u64,
+                                stored: r.get::<_, i64>(2)? as u64,
+                                size: r.get::<_, i64>(3)? as u64,
+                                codec: Codec::parse(&r.get::<_, String>(4)?)?,
+                            })
                         })
+                        .optional()
                     })
-                    .optional()
-                })
-                .ok()
-                .flatten();
+                    .ok()
+                    .flatten();
+            }
+            if found.is_none() && tables.legacy {
+                found = index
+                    .prepare_cached("SELECT pack, offset, size FROM blobs WHERE key = ?1")
+                    .and_then(|mut s| {
+                        s.query_row([key], |r| {
+                            let size = r.get::<_, i64>(2)? as u64;
+                            Ok(Place::Pack {
+                                pack: r.get(0)?,
+                                offset: r.get::<_, i64>(1)? as u64,
+                                stored: size,
+                                size,
+                                codec: Codec::Raw,
+                            })
+                        })
+                        .optional()
+                    })
+                    .ok()
+                    .flatten();
+            }
             if found.is_some() {
                 return found;
             }
@@ -710,10 +921,11 @@ impl Store {
         if self.find(key).is_some() {
             return Ok(false);
         }
+        let (stored, codec) = encode(bytes)?;
         if self
             .pack
             .as_ref()
-            .is_some_and(|(_, _, len)| *len + bytes.len() as u64 > PACK_LIMIT)
+            .is_some_and(|(_, _, len)| *len + stored.len() as u64 > PACK_LIMIT)
         {
             self.flush()?;
             self.pack = None;
@@ -725,10 +937,18 @@ impl Store {
             self.pack = Some((name, BufWriter::with_capacity(16 << 20, file), 0));
         }
         let (name, file, len) = self.pack.as_mut().expect("a pack");
-        file.write_all(bytes)?;
-        self.pending
-            .insert(key.to_owned(), (name.clone(), *len, bytes.len() as u64));
-        *len += bytes.len() as u64;
+        file.write_all(&stored)?;
+        self.pending.insert(
+            key.to_owned(),
+            Place::Pack {
+                pack: name.clone(),
+                offset: *len,
+                stored: stored.len() as u64,
+                size: bytes.len() as u64,
+                codec,
+            },
+        );
+        *len += stored.len() as u64;
         self.unflushed += bytes.len() as u64;
         Ok(true)
     }
@@ -746,11 +966,28 @@ impl Store {
             let tx = index.unchecked_transaction().map_err(sql)?;
             {
                 let mut s = tx
-                    .prepare_cached("INSERT OR IGNORE INTO blobs VALUES(?1, ?2, ?3, ?4)")
+                    .prepare_cached("INSERT OR IGNORE INTO packed VALUES(?1, ?2, ?3, ?4, ?5, ?6)")
                     .map_err(sql)?;
-                for (key, (pack, offset, size)) in &pending {
-                    s.execute(params![key, pack, *offset as i64, *size as i64])
+                for (key, place) in &pending {
+                    if let Place::Pack {
+                        pack,
+                        offset,
+                        stored,
+                        size,
+                        codec,
+                        ..
+                    } = place
+                    {
+                        s.execute(params![
+                            key,
+                            pack,
+                            *offset as i64,
+                            *stored as i64,
+                            *size as i64,
+                            codec.name()
+                        ])
                         .map_err(sql)?;
+                    }
                 }
             }
             tx.commit().map_err(sql)
@@ -799,6 +1036,23 @@ mod tests {
         dir
     }
 
+    /// Bytes that compress (a pattern) and bytes that do not (an xorshift stream), each `n` long.
+    fn compressible(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i / 64) as u8).collect()
+    }
+
+    fn noise(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
     #[test]
     fn put_get() {
         let dir = fresh("test");
@@ -809,6 +1063,39 @@ mod tests {
         assert_eq!(blobs.get(&key).unwrap(), b"abc");
         assert_eq!(blobs.read(&key, 1, Some(1)).unwrap(), b"b");
         assert_eq!(blobs.size(&key), Some(3));
+        blobs.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A blob that compresses is stored as an LZ4 block and one that does not as it is; both read back whole and in
+    /// part, here and from a fresh process's view of the store.
+    #[test]
+    fn compressed_and_raw() {
+        let dir = fresh("codec");
+        let blobs = Blobs::new(&dir);
+        let (a, b) = (compressible(100_000), noise(100_000, 7));
+        let (ka, kb) = (crate::hash::key(&a), crate::hash::key(&b));
+        blobs.put(&ka, &a).unwrap();
+        blobs.put(&kb, &b).unwrap();
+        let mut other = Store::new(dir.clone());
+        let Some(Place::Pack {
+            stored, size, codec, ..
+        }) = other.find(&ka)
+        else {
+            panic!("not indexed")
+        };
+        assert_eq!((codec, size), (Codec::Lz4, 100_000));
+        assert!(stored < 10_000, "{stored}");
+        let Some(Place::Pack { stored, codec, .. }) = other.find(&kb) else {
+            panic!("not indexed")
+        };
+        assert_eq!((codec, stored), (Codec::Raw, 100_000));
+        drop(other);
+        assert_eq!(blobs.get(&ka).unwrap(), a);
+        assert_eq!(blobs.get(&kb).unwrap(), b);
+        assert_eq!(blobs.read(&ka, 640, Some(70)).unwrap(), &a[640..710]);
+        assert_eq!(blobs.read(&kb, 99_990, None).unwrap(), &b[99_990..]);
+        assert_eq!(blobs.size(&ka), Some(100_000));
         blobs.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -841,6 +1128,63 @@ mod tests {
         assert_eq!(blobs.get(&old).unwrap(), b"old");
         assert!(!blobs.append(&old, b"old").unwrap());
         drop(other);
+        blobs.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store an older locum wrote (raw blobs in the table `blobs`) is read as it is, and collecting moves what it
+    /// keeps into compressed packs and the current table, reading back the same.
+    #[test]
+    fn older_table_read_and_converted() {
+        let dir = fresh("legacy");
+        std::fs::create_dir_all(dir.join("packs")).unwrap();
+        let data: Vec<Vec<u8>> = (0..4).map(|i| compressible(10_000 + i)).collect();
+        let keys: Vec<String> = data.iter().map(|d| crate::hash::key(d)).collect();
+        let mut pack = Vec::new();
+        let index = Connection::open(dir.join("index.db")).unwrap();
+        index
+            .execute_batch(
+                "CREATE TABLE blobs(key TEXT PRIMARY KEY, pack TEXT NOT NULL, offset INTEGER NOT NULL, size INTEGER \
+                 NOT NULL) WITHOUT ROWID",
+            )
+            .unwrap();
+        for (k, d) in keys.iter().zip(&data) {
+            index
+                .execute(
+                    "INSERT INTO blobs VALUES(?1, 'old.pack', ?2, ?3)",
+                    params![k, pack.len() as i64, d.len() as i64],
+                )
+                .unwrap();
+            pack.extend_from_slice(d);
+        }
+        drop(index);
+        std::fs::write(dir.join("packs").join("old.pack"), &pack).unwrap();
+        let blobs = Blobs::new(&dir);
+        assert_eq!(blobs.get(&keys[2]).unwrap(), data[2]);
+        assert_eq!(blobs.entries().unwrap().len(), 4);
+        let keep = |k: &str| k != keys[3];
+        let done = blobs.collect(&keep, false).unwrap();
+        assert_eq!(
+            (done.kept, done.dropped, done.converted, done.packs_rewritten),
+            (3, 1, 3, 1)
+        );
+        assert!(done.disk_after * 10 < done.disk_before, "{done:?}");
+        assert!(!dir.join("packs").join("old.pack").exists());
+        let index = Connection::open(dir.join("index.db")).unwrap();
+        let legacy: i64 = index
+            .query_row("SELECT count(*) FROM blobs", [], |r| r.get(0))
+            .unwrap();
+        let current: i64 = index
+            .query_row("SELECT count(*) FROM packed WHERE codec = 'lz4'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!((legacy, current), (0, 3));
+        drop(index);
+        for (k, d) in keys.iter().zip(&data).take(3) {
+            assert_eq!(&blobs.get(k).unwrap(), d);
+        }
+        assert!(!blobs.has(&keys[3]));
         blobs.close().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -886,7 +1230,13 @@ mod tests {
     fn collect_keeps_what_is_named() {
         let dir = fresh("collect");
         let blobs = Blobs::new(&dir);
-        let data: Vec<Vec<u8>> = (0..50u32).map(|i| format!("blob {i}").into_bytes()).collect();
+        let data: Vec<Vec<u8>> = (0..50u32)
+            .map(|i| match i % 3 {
+                0 => compressible(1000 + i as usize),
+                1 => noise(1000, i as u64),
+                _ => format!("blob {i}").into_bytes(),
+            })
+            .collect();
         let keys: Vec<String> = data.iter().map(|d| crate::hash::key(d)).collect();
         for (k, d) in keys.iter().zip(&data) {
             blobs.append(k, d).unwrap();
@@ -917,8 +1267,23 @@ mod tests {
         assert_eq!((counted.kept, counted.dropped, counted.orphan_packs), (26, 26, 1));
         assert!(blobs.has(&keys[1]), "counting changes nothing");
         let done = blobs.collect(&keep, false).unwrap();
-        assert_eq!(done, counted);
-        assert_eq!(done.files_packed, 1);
+        assert_eq!(
+            (
+                done.kept,
+                done.dropped,
+                done.orphan_packs,
+                done.converted,
+                done.disk_before
+            ),
+            (
+                counted.kept,
+                counted.dropped,
+                counted.orphan_packs,
+                counted.converted,
+                counted.disk_before
+            )
+        );
+        assert_eq!(done.converted, 1);
         let mut other = Store::new(dir.clone());
         for (i, k) in keys.iter().enumerate() {
             assert_eq!(other.find(k).is_some(), i % 2 == 0, "blob {i}");
@@ -932,7 +1297,7 @@ mod tests {
         assert!(!dir.join(&loose_kept[..2]).join(&loose_kept).exists());
         // One pack of what was kept; the old pack and the orphan are gone.
         assert_eq!(std::fs::read_dir(dir.join("packs")).unwrap().count(), 1);
-        // Nothing left to drop.
+        // Nothing left to drop or convert.
         let again = blobs.collect(&keep, false).unwrap();
         assert_eq!((again.dropped, again.packs_rewritten, again.kept), (0, 0, 26));
         blobs.close().unwrap();

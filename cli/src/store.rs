@@ -30,7 +30,7 @@ pub fn info(root: &Path) -> Result<(), String> {
         .filter_map(|f| f.metadata().ok().map(|m| m.len()))
         .collect();
     out!(
-        "{}: {} blobs, {}; {} packs, {}",
+        "{}: {} blobs, {} decoded; {} packs, {} on disk",
         root.display(),
         entries.len(),
         gib(entries.iter().map(|e| e.size).sum()),
@@ -176,8 +176,11 @@ pub fn collect(root: &Path, count_only: bool) -> Result<(), String> {
             gib(done.orphan_bytes)
         );
     }
-    if done.files_packed > 0 {
-        out!("{} one-file blobs {verb} moved into packs", done.files_packed);
+    if done.converted > 0 {
+        out!(
+            "{} blobs an older locum stored uncompressed {verb} compressed into new packs",
+            done.converted
+        );
     }
     if done.missing > 0 {
         out!(
@@ -185,5 +188,15 @@ pub fn collect(root: &Path, count_only: bool) -> Result<(), String> {
             done.missing
         );
     }
+    out!(
+        "on disk: {} before, {} after{}",
+        gib(done.disk_before),
+        gib(done.disk_after),
+        if count_only && done.converted > 0 {
+            " (before compressing the older blobs, which only doing it measures)"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
