@@ -264,6 +264,22 @@ pub fn uav(heap: u64, slot: usize) -> Option<(u64, u64, super::descriptors::Desc
         (payload.kind == "uav").then_some((payload.resource, payload.counter, payload.description))
     })
 }
+/// Every live buffer GPU address `value` is in, and its offset in each (several where placed buffers share memory).
+pub fn buffers_at(value: u64) -> Vec<(u64, u64)> {
+    read(|index| {
+        index
+            .va
+            .get(value)
+            .filter_map(|id| {
+                let &(base, size) = index.addresses.get(&id)?;
+                value
+                    .checked_sub(base)
+                    .filter(|&o| o < size)
+                    .map(|offset| (id, offset))
+            })
+            .collect()
+    })
+}
 pub fn unique_address(value: u64) -> Option<(u64, u64)> {
     read(|index| {
         let mut matches = index.va.get(value);

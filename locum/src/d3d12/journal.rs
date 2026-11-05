@@ -105,7 +105,7 @@ impl Data {
             return;
         };
         let checkpoints = make(pass, recording.len());
-        self.keep(recording, checkpoints, pass.outputs());
+        self.keep(recording, checkpoints, pass.outputs(), pass.arguments());
     }
     /// Assigns copies made in the list to its generation.
     fn keep(
@@ -113,19 +113,24 @@ impl Data {
         recording: &mut model::Recording,
         checkpoints: Vec<model::Checkpoint>,
         outputs: Vec<model::Output>,
+        arguments: Vec<model::Arguments>,
     ) {
         super::passes::belong(
             self.id,
             checkpoints
                 .iter()
                 .map(|c| c.id)
-                .chain(outputs.iter().map(|o| o.id)),
+                .chain(outputs.iter().map(|o| o.id))
+                .chain(arguments.iter().map(|a| a.id)),
         );
         for c in checkpoints {
             recording.checkpoint(c);
         }
         for o in outputs {
             recording.output(o);
+        }
+        for a in arguments {
+            recording.arguments(a);
         }
     }
     /// Before Close is forwarded to the real list `real`: what its last command wrote is copied, a pass still open
@@ -139,7 +144,7 @@ impl Data {
         let pass = self.pass.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let (Some(recording), Some(mut pass)) = (recording.as_mut(), pass) {
             let checkpoints = unsafe { pass.closing(real, recording.len()) };
-            self.keep(recording, checkpoints, pass.outputs());
+            self.keep(recording, checkpoints, pass.outputs(), pass.arguments());
             let (continues, written) = pass.touches();
             recording.touches(continues, written);
         }
@@ -280,6 +285,10 @@ pub fn track(id: u64, description: &Value, initial: super::states::Access) {
         1
     };
     state().states.create(id, description, initial, planes);
+}
+/// Object `id`'s description, as it was made.
+pub fn description(id: u64) -> Option<Value> {
+    state().objects.get(&id).map(|o| o.description.clone())
 }
 pub fn owner_device(id: u64) -> u64 {
     state().objects.get(&id).map_or(0, |o| o.device)
@@ -569,6 +578,11 @@ pub unsafe fn submit(
         let copied = list.checkpoints.iter().filter(|c| c.gap.is_none()).map(|c| c.id);
         let copied = copied.chain(list.outputs.iter().filter(|o| o.gap.is_none()).map(|o| o.id));
         submitted.all.extend(copied.clone());
+        if capture.is_some() {
+            let arguments = list.arguments.iter().filter(|a| a.gap.is_none()).map(|a| a.id);
+            submitted.all.extend(arguments.clone());
+            submitted.arguments.extend(arguments);
+        }
         let first = capture
             .as_mut()
             .is_some_and(|live| live.executed.insert((list.id, list.generation)));
@@ -1032,6 +1046,7 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         mut capture,
         results,
         series: of,
+        used,
         ..
     }) = finished
     {
@@ -1065,6 +1080,8 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
             "command history, first-use contents, pass-end targets and what draws, dispatches and clears wrote through UAVs",
         );
         let mut prepared = frame.finish(&mut capture, projection);
+        // Before the game's next submission on this thread: the buffers only argument records name are copied now.
+        unsafe { super::indirect::after_frame(&mut prepared, &mut capture, &used, &results) };
         let t = std::time::Instant::now();
         // The copies finish on the GPU soon after the frame and the collector reads them in order: the capture is
         // written after the last, off the game's threads. The same "capture written" / "capture NOT written" lines as

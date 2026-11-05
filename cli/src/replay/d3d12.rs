@@ -33,6 +33,7 @@ use crate::open::Capture;
 
 use super::Backend;
 
+mod indirect;
 mod memory;
 mod pipelines;
 mod queries;
@@ -243,6 +244,8 @@ pub struct D3d12 {
     roots: HashMap<i64, Option<Root>>,
     psos: HashMap<(i64, Vec<String>), Option<ID3D12PipelineState>>,
     signatures: HashMap<i64, Option<ID3D12CommandSignature>>,
+    /// The game's buffers by GPU address, for the addresses in ExecuteIndirect's argument records.
+    addresses: Option<indirect::Addresses>,
     /// By command list execution, its depth bounds and shading rate calls, which `d12_draw_state` does not hold.
     list_state: Option<HashMap<i64, Vec<ListCall>>>,
     replaced: HashMap<String, Option<Vec<u8>>>,
@@ -410,6 +413,7 @@ impl D3d12 {
                 roots: HashMap::new(),
                 psos: HashMap::new(),
                 signatures: HashMap::new(),
+                addresses: None,
                 list_state: None,
                 replaced: HashMap::new(),
                 memory: memory::Memory::default(),
@@ -1012,16 +1016,59 @@ impl D3d12 {
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .map(|a| D3D12_INDIRECT_ARGUMENT_DESC {
-                            Type: D3D12_INDIRECT_ARGUMENT_TYPE(a["type"].as_i64().unwrap_or(-1) as i32),
-                            ..Default::default()
+                        .map(|a| {
+                            let n = |k: &str| a[k].as_u64().unwrap_or(0) as u32;
+                            let root = n("root_parameter");
+                            let t = D3D12_INDIRECT_ARGUMENT_TYPE(a["type"].as_i64().unwrap_or(-1) as i32);
+                            D3D12_INDIRECT_ARGUMENT_DESC {
+                                Type: t,
+                                Anonymous: match t {
+                                    D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW => {
+                                        D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                                            VertexBuffer: D3D12_INDIRECT_ARGUMENT_DESC_0_0 {
+                                                Slot: n("slot"),
+                                            },
+                                        }
+                                    }
+                                    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT
+                                    | D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT => {
+                                        D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                                            Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                                                RootParameterIndex: root,
+                                                DestOffsetIn32BitValues: n("offset"),
+                                                Num32BitValuesToSet: n("count"),
+                                            },
+                                        }
+                                    }
+                                    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW
+                                    | D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW
+                                    | D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW => {
+                                        D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                                            ConstantBufferView: D3D12_INDIRECT_ARGUMENT_DESC_0_2 {
+                                                RootParameterIndex: root,
+                                            },
+                                        }
+                                    }
+                                    _ => Default::default(),
+                                },
+                            }
                         })
                         .collect();
-                    // Draws and dispatches only: an argument that changes a binding names a root parameter or slot
-                    // the capture does not keep.
-                    if args.is_empty() || args.iter().any(|a| !(0..=2).contains(&a.Type.0)) {
+                    // A signature that sets root arguments is made against the root signature it was made with.
+                    let sets_root = args.iter().any(|a| (5..=8).contains(&a.Type.0) || a.Type.0 == 11);
+                    let root_id = d["root_signature"].as_i64().unwrap_or(0);
+                    let root = if sets_root {
+                        self.root(c, root_id).map(|r| r.signature.clone())
+                    } else {
+                        None
+                    };
+                    if args.is_empty() {
+                        self.warn(format!("command signature #{id} has no arguments"));
+                        None
+                    } else if sets_root && root.is_none() {
                         self.warn(format!(
-                            "command signature #{id} has arguments other than one draw or dispatch, which are not replayed"
+                            "command signature #{id} sets root arguments of root signature #{root_id}, which replay \
+                             could not make"
                         ));
                         None
                     } else {
@@ -1032,7 +1079,7 @@ impl D3d12 {
                             NodeMask: 0,
                         };
                         let mut s: Option<ID3D12CommandSignature> = None;
-                        match unsafe { self.device.CreateCommandSignature(&desc, None, &mut s) } {
+                        match unsafe { self.device.CreateCommandSignature(&desc, root.as_ref(), &mut s) } {
                             Ok(()) => s,
                             Err(e) => {
                                 self.warn(format!("command signature #{id} could not be made: {e}"));
@@ -1110,6 +1157,7 @@ impl D3d12 {
     }
 
     /// Runs a draw, dispatch or indirect execution from the state the capture took at it.
+    #[allow(clippy::too_many_arguments)]
     fn draw(
         &mut self,
         c: &Capture,
@@ -1118,6 +1166,7 @@ impl D3d12 {
         call: &str,
         args: &Value,
         rules: &[Rule],
+        arguments: indirect::Arguments,
     ) -> Result<(), String> {
         type Head = (i64, [Option<String>; 6]);
         let (n, hashes): Head = c
@@ -1448,23 +1497,24 @@ impl D3d12 {
                 ),
                 "Dispatch" => self.list.Dispatch(a(0) as u32, a(1) as u32, a(2) as u32),
                 "ExecuteIndirect" => {
-                    let Some(signature) = self.signature(c, a(0) as i64) else {
+                    let signature = self.signature(c, a(0) as i64);
+                    let (Some(signature), false) =
+                        (signature, matches!(arguments, indirect::Arguments::Skip))
+                    else {
                         self.barriers(&needs, true);
                         return Ok(());
                     };
-                    let arguments = self.resource(a(2) as i64)?;
+                    // Patched records begin at the copy's start.
+                    let (buffer, offset) = match arguments {
+                        indirect::Arguments::Patched(copy) => (copy, 0),
+                        _ => (self.resource(a(2) as i64)?, a(3)),
+                    };
                     let count = match a(4) {
                         0 => None,
                         id => Some(self.resource(id as i64)?),
                     };
-                    self.list.ExecuteIndirect(
-                        &signature,
-                        a(1) as u32,
-                        &arguments,
-                        a(3),
-                        count.as_ref(),
-                        a(5),
-                    );
+                    self.list
+                        .ExecuteIndirect(&signature, a(1) as u32, &buffer, offset, count.as_ref(), a(5));
                 }
                 other => self.warn(format!("{other} is not replayed")),
             }
@@ -2162,8 +2212,14 @@ impl Backend for D3d12 {
         }
         match kind.as_str() {
             "draw" | "dispatch" => {
+                // Before the event records anything: reading its argument records runs the open list.
+                let arguments = if call == "ExecuteIndirect" {
+                    self.indirect_arguments(c, seq, &a)?
+                } else {
+                    indirect::Arguments::AsRecorded
+                };
                 self.count_begin(list)?;
-                self.draw(c, seq, &kind, &call, &a, rules)?;
+                self.draw(c, seq, &kind, &call, &a, rules, arguments)?;
                 self.count_end()?;
             }
             "copy" if call == "ResolveQueryData" => self.resolve_queries(&a)?,

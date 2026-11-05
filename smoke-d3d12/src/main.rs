@@ -11,6 +11,7 @@ mod cb_copied;
 mod compute_first;
 mod contents;
 mod graphics;
+mod indirect;
 mod modern;
 mod passes;
 mod planes;
@@ -183,6 +184,7 @@ unsafe fn hardware() {
         // The game's size: at Elden Ring's 2560x1440 every copy of the race was wrong.
         planes::capture(&device, &queue, &fence, &chain, (2560, 1440));
         finish(&queue, &fence, 44);
+        indirect::capture(&device, &queue, &fence, &chain, 45);
         drop(chain);
         DestroyWindow(hwnd).unwrap();
     }
@@ -549,6 +551,7 @@ unsafe fn run() {
         finish(&queue, &fence, 44);
         queries::capture(&device, &queue, &fence, &chain);
         finish(&queue, &fence, 47);
+        indirect::capture(&device, &queue, &fence, &chain, 48);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

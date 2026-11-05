@@ -31,11 +31,18 @@
 //! it, before the list's next command: each resource from the state or layout it was written in (UNORDERED_ACCESS,
 //! or what this list's own barriers left it in) to COPY_SOURCE and back. A buffer is copied whole, a texture the
 //! subresources its view covers.
+//!
+//! The argument records of an ExecuteIndirect whose command signature puts GPU addresses in them (vertex and index
+//! buffer views, root CBVs, SRVs and UAVs) are copied right before it, with its count: the records it may run from
+//! the argument offset, from the states the buffers are in (what this list's own barriers left them in; otherwise
+//! COMMON or promoted to read states, from which a copy reads with no barrier). They are read at the Present that
+//! closes the capture, for the buffers the addresses are in (see [`super::indirect`]).
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 use locum_capture::d3d12 as model;
 use locum_capture::layout::Sub;
@@ -158,10 +165,70 @@ pub fn created_in_layout(resource: u64) {
     layouts().insert(resource);
 }
 
-/// A list's copies are retired when it is reset or destroyed; resources are forgotten when destroyed.
+/// Each command signature's record layout, or why locum cannot read its records.
+fn signatures() -> MutexGuard<'static, HashMap<u64, Result<model::indirect::Layout, String>>> {
+    static SIGNATURES: OnceLock<Mutex<HashMap<u64, Result<model::indirect::Layout, String>>>> =
+        OnceLock::new();
+    SIGNATURES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// A command signature was made with `description` (`stride` and `arguments`, as `d12_objects` keeps them).
+pub fn command_signature(id: u64, description: &Value) {
+    signatures().insert(id, model::indirect::layout(description));
+}
+
+/// A list's copies are retired when it is reset or destroyed; resources and signatures are forgotten when destroyed.
 pub fn destroyed(id: u64) {
     retire(id);
     layouts().remove(&id);
+    signatures().remove(&id);
+}
+
+/// An armed frame's copy of argument records, and the fence value locum signalled after the latest execution of its
+/// list.
+struct Records {
+    data: Arc<Readback>,
+    fence: ID3D12Fence,
+    value: u64,
+}
+// Free-threaded D3D12 objects.
+unsafe impl Send for Records {}
+
+fn records() -> MutexGuard<'static, HashMap<u64, Records>> {
+    static RECORDS: OnceLock<Mutex<HashMap<u64, Records>>> = OnceLock::new();
+    RECORDS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The argument records the armed frame's submissions copied, by copy, taken at the Present that closes it: each
+/// copy's bytes once the GPU has run the latest execution of its list, or why there are none. The GPU is given
+/// `patience` for all of them.
+pub fn argument_records(patience: Duration) -> HashMap<u64, Result<Vec<u8>, String>> {
+    let taken: Vec<(u64, Records)> = records().drain().collect();
+    let deadline = Instant::now() + patience;
+    taken
+        .into_iter()
+        .map(|(id, r)| {
+            let done = loop {
+                if unsafe { r.fence.GetCompletedValue() } >= r.value {
+                    break Ok(());
+                }
+                if Instant::now() >= deadline {
+                    break Err(format!(
+                        "the GPU had not run its list {} s after the frame's Present",
+                        patience.as_secs()
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            (id, done.and_then(|()| unsafe { r.data.read() }))
+        })
+        .collect()
 }
 
 pub fn retire(list: u64) {
@@ -187,6 +254,8 @@ pub fn sweep() {
 pub struct Submitted {
     pub all: Vec<u64>,
     pub read: Vec<u64>,
+    /// The copies of argument records in lists the armed frame executes (also in `all`).
+    pub arguments: Vec<u64>,
     pub results: Option<super::readback::Results>,
     pub submission: u64,
     /// Locum's copy lists, each with the position in the application's array of the list it follows.
@@ -375,6 +444,7 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
     let Submitted {
         all,
         read: wanted,
+        arguments,
         results,
         submission,
         inserted,
@@ -394,6 +464,20 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
         for id in &wanted {
             if let Some(copy) = c.get(id) {
                 read.push((*id, copy.data.clone()));
+            }
+        }
+        // A list executed again copies its records again: the latest execution's are read.
+        let mut r = records();
+        for id in &arguments {
+            if let Some(copy) = c.get(id) {
+                r.insert(
+                    *id,
+                    Records {
+                        data: copy.data.clone(),
+                        fence: fence.clone(),
+                        value,
+                    },
+                );
             }
         }
     }
@@ -583,6 +667,8 @@ pub struct Pass {
     enhanced: bool,
     /// The outputs copied, taken at each command (see [`Pass::outputs`]).
     outputs: Vec<model::Output>,
+    /// The argument records copied, taken at each command (see [`Pass::arguments`]).
+    arguments: Vec<model::Arguments>,
 }
 // Free-threaded D3D12 objects; a list's pass is used by whoever records the list, one at a time.
 unsafe impl Send for Pass {}
@@ -643,12 +729,18 @@ impl Pass {
             due: Vec::new(),
             enhanced: false,
             outputs: Vec::new(),
+            arguments: Vec::new(),
         })
     }
 
     /// The outputs copied since last asked.
     pub fn outputs(&mut self) -> Vec<model::Output> {
         std::mem::take(&mut self.outputs)
+    }
+
+    /// The argument records copied since last asked.
+    pub fn arguments(&mut self) -> Vec<model::Arguments> {
+        std::mem::take(&mut self.arguments)
     }
 
     /// What the list's continuing draws and other writes were, for the submissions that decide pending ends.
@@ -741,6 +833,9 @@ impl Pass {
             | "DispatchMesh"
             | "ExecuteIndirect"
             | "ExecuteBundle" => {
+                if call == "ExecuteIndirect" {
+                    unsafe { self.copy_arguments(list, a, at) };
+                }
                 let set = views(&self.targets);
                 for t in &mut self.targets {
                     t.drawn = true;
@@ -1119,6 +1214,91 @@ impl Pass {
                 self.predication(),
             )
         }
+    }
+}
+
+impl Pass {
+    /// Before ExecuteIndirect (recorded arguments `a`: signature, most records, argument buffer and offset, count
+    /// buffer and offset), `at` commands into the list: when its signature puts GPU addresses in its records, the
+    /// records it may run and its count are copied.
+    unsafe fn copy_arguments(&mut self, list: &ID3D12GraphicsCommandList, a: &Value, at: usize) {
+        let u = |i: usize| a[i].as_u64().unwrap_or(0);
+        let layout = match signatures().get(&u(0)) {
+            Some(Ok(l)) if l.addresses.is_empty() => return,
+            Some(Ok(l)) => Ok(l.clone()),
+            Some(Err(why)) => Err(format!("its command signature has {why}")),
+            None => Err("locum did not see its command signature made".to_string()),
+        };
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let mut arguments = model::Arguments {
+            id,
+            command: at,
+            counted: u(4) != 0,
+            ..Default::default()
+        };
+        let copied = layout.and_then(|layout| {
+            arguments.layout = layout;
+            unsafe { self.copy_records(list, &mut arguments, [u(1), u(2), u(3), u(4), u(5)]) }
+        });
+        match copied {
+            Ok(readback) => keep(id, readback),
+            Err(why) => arguments.gap = Some(why),
+        }
+        self.arguments.push(arguments);
+    }
+
+    /// Copies the records `arguments` describes and its count: `max` records of `buffer` from `offset` (as many as
+    /// it holds), then 4 bytes of `count` (none) from `count_offset`.
+    unsafe fn copy_records(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        arguments: &mut model::Arguments,
+        [max, buffer, offset, count, count_offset]: [u64; 5],
+    ) -> Result<Readback, String> {
+        let real = |id: u64| {
+            super::real(id)
+                .and_then(|r| r.cast::<ID3D12Resource>().ok())
+                .ok_or_else(|| format!("#{id} was destroyed before it was copied"))
+        };
+        let records = real(buffer)?;
+        let width = unsafe { records.GetDesc() }.Width;
+        arguments.bytes = max
+            .saturating_mul(arguments.layout.stride as u64)
+            .min(width.saturating_sub(offset));
+        let mut ranges = vec![(buffer, records, offset, arguments.bytes)];
+        if count != 0 {
+            ranges.push((count, real(count)?, count_offset, 4));
+        }
+        let ranges: Vec<_> = ranges
+            .into_iter()
+            .map(|(id, r, offset, len)| {
+                let access = self.read_access(id, &r);
+                (r, offset, len, access)
+            })
+            .collect();
+        unsafe {
+            ranges_into(
+                &self.device,
+                list,
+                &ranges,
+                D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT,
+                self.predication(),
+            )
+        }
+    }
+
+    /// The state or layout a buffer ExecuteIndirect reads is in, for a copy from it: what this list's barriers left
+    /// it in; the buffer access an enhanced barrier gives it in a list that records them; or None, where a copy reads
+    /// it with no barrier (an upload buffer is always in GENERIC_READ, and any other this list has not moved is COMMON
+    /// or promoted to read states, which COPY_SOURCE joins).
+    fn read_access(&self, id: u64, real: &ID3D12Resource) -> Option<Access> {
+        if let Some(&(_, access)) = self.known.get(&id).and_then(|k| k.last()) {
+            return Some(access);
+        }
+        let mut heap = D3D12_HEAP_PROPERTIES::default();
+        let upload = unsafe { real.GetHeapProperties(Some(&mut heap), None) }.is_ok()
+            && heap.Type == D3D12_HEAP_TYPE_UPLOAD;
+        (self.enhanced && !upload).then_some(Access::Layout(LAYOUT_COMMON))
     }
 }
 
@@ -1540,6 +1720,74 @@ unsafe fn output_into(
     })
 }
 
+/// Records into `list` the copy of byte ranges of buffers, one after another into one readback buffer: each
+/// (buffer, offset, bytes) from the state or layout it is in (None, one a copy reads from with no barrier), or with
+/// enhanced barriers from buffer access `access`, suspending the list's predication `predicate` around it.
+unsafe fn ranges_into(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    ranges: &[(ID3D12Resource, u64, u64, Option<Access>)],
+    access: D3D12_BARRIER_ACCESS,
+    predicate: Option<(ID3D12Resource, u64, i32)>,
+) -> Result<Readback, String> {
+    let bytes: u64 = ranges.iter().map(|r| r.2).sum();
+    if bytes > OUTPUT_BYTES {
+        return Err(format!(
+            "{} MiB of records, more than one copy's {} MiB",
+            bytes >> 20,
+            OUTPUT_BYTES >> 20
+        ));
+    }
+    // A buffer named twice (records and count in one) moves once.
+    let mut moved: Vec<(&ID3D12Resource, Access)> = Vec::new();
+    for (r, _, _, a) in ranges {
+        if let Some(a) = a
+            && !moved.iter().any(|(m, _)| m.as_raw() == r.as_raw())
+        {
+            moved.push((r, *a));
+        }
+    }
+    let mut to_copy = Vec::new();
+    let mut back = Vec::new();
+    for (r, a) in moved {
+        let subs = [(ALL_SUBRESOURCES as u32, a)];
+        to_copy.push(barriers(r, &subs, true, access)?);
+        back.push(barriers(r, &subs, false, access)?);
+    }
+    for b in &to_copy {
+        b.possible(list)?;
+    }
+    let readback = unsafe { readback_buffer(device, bytes, OUTPUT_BUDGET) }?;
+    unsafe {
+        if predicate.is_some() {
+            list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+        }
+        for b in &to_copy {
+            b.issue(list);
+        }
+        let mut at = 0;
+        for (r, offset, len, _) in ranges {
+            if *len > 0 {
+                list.CopyBufferRegion(&readback, at, r, *offset, *len);
+            }
+            at += len;
+        }
+        for b in &back {
+            b.issue(list);
+        }
+        if let Some((r, offset, op)) = &predicate {
+            list.SetPredication(r, *offset, D3D12_PREDICATION_OP(*op));
+        }
+    }
+    Ok(Readback {
+        readback,
+        footprints: Vec::new(),
+        layout: locum_capture::layout::buffer(bytes as u32),
+        joined: None,
+        bytes,
+    })
+}
+
 /// A checkpoint of a bound target before command `at`, with a new id.
 fn checkpoint(t: &Bound, at: usize, gap: Option<&str>) -> model::Checkpoint {
     model::Checkpoint {
@@ -1707,7 +1955,8 @@ impl Barriers {
 
 /// The transitions of a resource's subresources, each from its state or layout, to COPY_SOURCE (`to_copy`) or back.
 /// A buffer has one, `ALL_SUBRESOURCES`; where it is moved by enhanced barriers (a layout given), it has no layout
-/// and only its access changes. `common` is how a subresource in the COMMON layout was used.
+/// and only its access changes, from and back to `common`. `common` is also how a subresource in the COMMON layout
+/// was used.
 ///
 /// A legacy transition from COPY_SOURCE straight back to a state that allows no write does not hold back the list's
 /// later writes: on an NVIDIA driver the game's next barrier into a write state and the draw after it overlap the
@@ -1754,11 +2003,11 @@ fn barriers(
             }
             Access::State(s) => out.legacy.push(transition(sub, COPY_SOURCE, s)),
             Access::Layout(_) if buffer => {
-                let written = (D3D12_BARRIER_SYNC_ALL, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+                let used = (D3D12_BARRIER_SYNC_ALL, common);
                 let (before, after) = if to_copy {
-                    (written, (copy.0, copy.1))
+                    (used, (copy.0, copy.1))
                 } else {
-                    ((copy.0, copy.1), written)
+                    ((copy.0, copy.1), used)
                 };
                 out.buffers.push(D3D12_BUFFER_BARRIER {
                     SyncBefore: before.0,

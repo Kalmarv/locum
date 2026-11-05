@@ -147,8 +147,8 @@ contents. locum's own copies run whatever predicate the game has set.
 - `meta`: the API, frame, process, request, counts and the machine it ran on (`environment`, below); `gaps`: what
   could not be recorded, and why;
 - `resources` and `subresources`: every live resource with its description, upload hash, whether the frame used or
-  wrote it, and the key of its contents as the frame began with where they came from (`first-use` or `upload`) and
-  any doubt about them;
+  wrote it, and the key of its contents as the frame began with where they came from (`first-use`, `upload`, or on
+  Direct3D 12 `after-frame`, below) and any doubt about them;
 - `views` and `states` (rasterizer, blend, depth-stencil, sampler, input layout), with their descriptions;
 - `events`: everything on the GPU's timeline in order: draws, dispatches, clears, copies, updates and maps (with the
   key of the bytes written), resolves and mip generation, each with its context, command list and call stack;
@@ -474,6 +474,14 @@ as on Direct3D 11: a shader or solid rule compiles to DXIL (`ps_6_0`, with the S
 pipeline, and a constant rule rewrites a root constant, or a copy of the constant buffer a root view or table points
 at.
 
+An ExecuteIndirect whose signature puts GPU addresses in its records runs on a copy of them. Just before it, replay
+reads its count and records as its own GPU holds them then (records a dispatch of the frame wrote are read after it
+wrote them), finds each address in the buffer whose recorded `gpu_address` range holds it, and writes the address of
+that buffer as replay made it at the same offset; where placed buffers share the memory, the one replay made is
+used. A signature that sets root arguments is made against its root signature. An address in no buffer the capture
+describes, or in one replay did not make, skips the ExecuteIndirect and says why; a capture from before buffers'
+addresses were recorded (2026-11-05) skips them all.
+
 Queries are replayed. An occlusion or pipeline-statistics query must begin and end in one command list, and each
 event replays in a list of its own, so while a game's query is open, each draw and dispatch of the game's list it was
 begun in runs with a query of replay's own around it, and their counts are added up: occlusion samples and each
@@ -687,8 +695,23 @@ attachments a render pass discards or suspends into another list, and copies pas
 `d3d12-targets` gaps. The budget is spent as the copies are recorded, in the order the game records its lists, not
 in pass order, so the passes past it are not only the frame's last; `passes` marks each pass whose targets were not
 read back after its draws, and says where they were (with the later pass a continued pass ends in) or why not.
-ExecuteIndirect counts as a draw or a dispatch by its command signature's last argument. Each submission records the
-descriptor definitions that changed
+ExecuteIndirect counts as a draw or a dispatch by its command signature's last argument. A signature can set a vertex
+or index buffer view or a root CBV, SRV or UAV per record, each a GPU address in the argument buffer, and a buffer the
+frame reads only through those is named by no command it records, so no submission is seen to use it first. In an
+instrumented list, the records such an ExecuteIndirect may run (its most records from the argument offset, as many
+as the buffer holds) and its count are copied right before it, from the states the buffers are in (what the list's
+own barriers left them in; otherwise COMMON or promoted to read states, which a copy reads with no barrier). At the
+Present that closes the capture, locum waits for those copies (up to 10 s), reads the records the count lets run, and
+finds every address in the live buffers: the event reads each buffer its records name (`event_resources`, so a plan
+makes them), and a buffer the frame used no other way is copied whole then, on the queue of the first ExecuteIndirect
+naming it, before the game's next submission from that thread: `content_source` `after-frame`, its first use the
+submission of that ExecuteIndirect. Nothing the frame recorded writes such a buffer (a command that did would name
+it), so it holds what it held as the frame began, unless a shader wrote it through a view or another thread's
+submission came between. A list executed again in the frame copies its records again; the last execution's are
+read. Records locum cannot read (a DispatchRays or incrementing-constant argument, a signature it did not see made,
+more than 64 MiB) and addresses in no live buffer are `d3d12-indirect-arguments` gaps; bundles are not instrumented.
+Each buffer's description keeps its GPU address (`gpu_address`). Each submission records the descriptor definitions
+that changed
 since the previous one (all of them at the first; `empty` marks a slot emptied), so `d12_submission_descriptors`
 holds changes, not whole heaps. The CLI and viewer project these into their
 draw, resource, binding and pipeline views. Display order across queues is not a GPU execution order; queue order
@@ -745,7 +768,8 @@ An unrecognized PSO stream type logs its first occurrence once per type per proc
 `cargo xtask smoke --api d3d12` runs a program through it on WARP with the debug layer on (copies, dispatches, fences,
 pipeline states and libraries, placed resources, barriers, swap chain present and resize); `cargo xtask smoke --api
 d3d12 --hardware` runs what WARP cannot show on the default adapter, at the game's size (a copy's order against the
-list's next draw), and verifies the capture there; `--debug` also verifies the UAV fixture with `verify --debug` (no
+list's next draw), and an ExecuteIndirect whose records name a vertex buffer and a root CBV by address, written by
+the CPU and by a dispatch, and verifies both captures there; `--debug` also verifies the UAV fixture with `verify --debug` (no
 validation errors, outputs compared as without it); `cargo xtask smoke` stays the Direct3D 11 suite. The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
 
 ## Crash investigation

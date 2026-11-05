@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::db;
 mod bindings;
 mod graphics;
+pub mod indirect;
 
 pub use bindings::reproject;
 
@@ -46,6 +47,10 @@ pub struct List {
     /// What its draws, dispatches and UAV clears wrote through UAVs, copied inside it right after each.
     #[serde(skip)]
     pub outputs: Vec<Output>,
+    /// The argument records of its ExecuteIndirects whose signatures put GPU addresses in them, copied inside it
+    /// right before each.
+    #[serde(skip)]
+    pub arguments: Vec<Arguments>,
     /// The targets (resource, subresource) this generation draws to before writing them any other way, with the
     /// views bound at the first such draw: where an earlier list left the copy of a pass with the same views
     /// waiting, this one continues the pass.
@@ -93,6 +98,45 @@ pub struct Output {
     pub gap: Option<String>,
 }
 
+/// The argument records of an ExecuteIndirect (the command at `command`) whose signature puts GPU addresses in them,
+/// with its count when it has a count buffer, copied inside its list right before it: `bytes` of records from the
+/// argument offset, then the count's 4 bytes. They are read after the frame, for the buffers the addresses are in.
+#[derive(Clone, Debug, Default)]
+pub struct Arguments {
+    pub id: u64,
+    pub command: usize,
+    pub layout: indirect::Layout,
+    pub bytes: u64,
+    pub counted: bool,
+    /// Why no copy was made.
+    pub gap: Option<String>,
+}
+
+impl Arguments {
+    /// The records the copied bytes `copy` hold that the call runs: as many as fit, and no more than its count.
+    pub fn records(&self, copy: &[u8]) -> usize {
+        let fit = (self.bytes as usize) / self.layout.stride.max(1);
+        let count = self
+            .counted
+            .then(|| copy.get(self.bytes as usize..self.bytes as usize + 4))
+            .flatten()
+            .map_or(usize::MAX, |c| {
+                u32::from_le_bytes(c.try_into().expect("4 bytes")) as usize
+            });
+        fit.min(count)
+    }
+}
+
+/// An ExecuteIndirect event whose argument records were copied (copy `arguments.id`), executed in `submission` on
+/// `queue`.
+#[derive(Clone, Debug)]
+pub struct Indirect {
+    pub event: u64,
+    pub submission: u64,
+    pub queue: u64,
+    pub arguments: Arguments,
+}
+
 /// Kept beside each live list, rather than under the process-wide identity lock.
 #[derive(Default)]
 pub struct Recording {
@@ -138,6 +182,10 @@ impl Recording {
 
     pub fn output(&mut self, output: Output) {
         Arc::make_mut(&mut self.current).outputs.push(output);
+    }
+
+    pub fn arguments(&mut self, arguments: Arguments) {
+        Arc::make_mut(&mut self.current).arguments.push(arguments);
     }
 
     /// What the generation's pass tracking learned of the targets it continues and the resources it names.
@@ -250,6 +298,8 @@ pub struct Prepared {
     checkpoints: BTreeMap<u64, Result<String, String>>,
     /// Checkpoints a list's Close made whose pass the next list submitted with it continued: no copy, and no gap.
     continued: BTreeSet<u64>,
+    /// The resources only ExecuteIndirect argument records name, whose contents were copied after the frame.
+    after_frame: BTreeSet<u64>,
 }
 
 /// A resource's contents as its first use in the frame found them, copied on the GPU just before the submission that
@@ -276,6 +326,27 @@ impl Prepared {
     /// A resource's contents before its first use.
     pub fn set_first_use(&mut self, resource: u64, first_use: FirstUse) {
         self.first_use.insert(resource, first_use);
+    }
+    /// The frame's ExecuteIndirect events whose argument records were copied.
+    pub fn indirect(&self) -> &[Indirect] {
+        &self.projection.indirect
+    }
+    /// What the argument records of ExecuteIndirect event `event` name: the event reads `resources`, which the frame
+    /// therefore uses.
+    pub fn named_by_arguments(&mut self, capture: &mut db::Capture, event: u64, resources: &[u64]) {
+        if let Some(e) = capture.events.iter_mut().find(|e| e.seq == event) {
+            e.reads.extend(resources);
+            e.reads.sort_unstable();
+            e.reads.dedup();
+        }
+        for r in capture.resources.iter_mut().filter(|r| resources.contains(&r.id)) {
+            r.used = true;
+        }
+    }
+    /// Resource `resource`'s first-use contents were copied after the frame: nothing the frame recorded names it but
+    /// argument records.
+    pub fn copied_after_frame(&mut self, resource: u64) {
+        self.after_frame.insert(resource);
     }
     /// Upload copies a submission made, read back after the frame (in one batch or several).
     pub fn add_uploads(&mut self, submission: u64, uploads: Vec<(u64, Value)>) {
@@ -386,6 +457,16 @@ impl Prepared {
                     Some("upload bytes as the GPU reached the frame's first captured submission".into());
             } else if let Some(first) = self.first_use.get(&resource.id) {
                 match &first.content {
+                    Ok((key, subs)) if self.after_frame.contains(&resource.id) => {
+                        resource.content = Some(key.clone());
+                        resource.content_source = Some("after-frame");
+                        resource.content_note = Some(
+                            "copied after the frame: only ExecuteIndirect argument records name it, so no command \
+                             the frame recorded wrote it (a shader could, through a view)"
+                                .into(),
+                        );
+                        hashes.clone_from(subs);
+                    }
                     Ok((key, subs)) => {
                         // Exact: d12_first_use says which submission it was copied before.
                         resource.content = Some(key.clone());
@@ -501,6 +582,9 @@ impl Prepared {
         }
         for (why, count) in self.projection.unrecorded.iter().chain(&unrecorded) {
             capture.gap("d3d12-results", why, *count);
+        }
+        for (why, count) in &self.projection.unread_arguments {
+            capture.gap("d3d12-indirect-arguments", why, *count);
         }
         let target_bytes: u64 = capture
             .targets
@@ -693,6 +777,10 @@ pub struct Projection {
     outputs: Vec<(u64, u64, u64, Option<u32>)>,
     /// Outputs no copy was made for, by reason; draws and dispatches in lists that copied none (not instrumented).
     unrecorded: BTreeMap<String, u64>,
+    /// The ExecuteIndirect events whose argument records were copied.
+    indirect: Vec<Indirect>,
+    /// ExecuteIndirects with addresses in their records that no copy was made for, by reason.
+    unread_arguments: BTreeMap<String, u64>,
 }
 
 /// Counts of the frame's direct-list executions and their checkpoints.
@@ -875,6 +963,7 @@ impl Frame {
             first_use: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
             continued: Default::default(),
+            after_frame: BTreeSet::new(),
         }
     }
 
@@ -1093,7 +1182,51 @@ impl Projection {
             drawn: BTreeMap::new(),
             outputs: Vec::new(),
             unrecorded: BTreeMap::new(),
+            indirect: Vec::new(),
+            unread_arguments: BTreeMap::new(),
             pass_ends: PassEnds::default(),
+        }
+    }
+
+    /// The argument records a list copied, each on the event of its ExecuteIndirect (`seqs`, the events of the list's
+    /// commands). Every execution of a generation copies them again: read after the frame, they hold its last.
+    fn arguments(&mut self, list: &List, seqs: &[u64], submission: &Submission) {
+        for a in &list.arguments {
+            match (&a.gap, seqs.get(a.command)) {
+                (None, Some(&event)) => self.indirect.push(Indirect {
+                    event,
+                    submission: submission.id,
+                    queue: submission.queue,
+                    arguments: a.clone(),
+                }),
+                (Some(why), _) => *self.unread_arguments.entry(why.clone()).or_default() += 1,
+                (None, None) => {
+                    *self
+                        .unread_arguments
+                        .entry("its command was not projected".into())
+                        .or_default() += 1
+                }
+            }
+        }
+        // Those no copy was made at, whose records hold addresses or cannot be read: the list was not instrumented.
+        let uncopied = list.commands.iter().enumerate().filter(|(index, c)| {
+            c.call == "ExecuteIndirect"
+                && !list.arguments.iter().any(|a| a.command == *index)
+                && self
+                    .objects
+                    .get(&c.args[0].as_u64().unwrap_or(0))
+                    .is_none_or(|s| indirect::layout(s).map_or(true, |l| !l.addresses.is_empty()))
+        });
+        let uncopied = uncopied.count() as u64;
+        if uncopied > 0 {
+            *self
+                .unread_arguments
+                .entry(
+                    "its list was not instrumented (recorded before the capture was armed, a compute or copy list, \
+                     or a bundle)"
+                        .into(),
+                )
+                .or_default() += uncopied;
         }
     }
 
@@ -1407,6 +1540,7 @@ impl Projection {
         }
         self.checkpoints(capture, list, list.commands.len(), first);
         self.outputs(list, list.commands.len(), &seqs, first);
+        self.arguments(list, &seqs, submission);
         if depth == 0 && list.kind == 0 && last_draw.is_some() {
             if list.instrumented {
                 self.pass_ends.lists_instrumented += 1;
@@ -1727,5 +1861,102 @@ mod tests {
                 .unwrap(),
             u64::MAX.to_le_bytes()
         );
+    }
+
+    #[test]
+    fn indirect_records_are_found_on_their_events_or_are_gaps() {
+        let object = |id, kind, description| Object {
+            id,
+            kind,
+            device: 1,
+            description,
+        };
+        let execute = |signature: u64| Command {
+            call: "ExecuteIndirect",
+            args: json!([signature, 2, 8, 0, 0, 0]),
+            bundle: None,
+            diagnostic: None,
+        };
+        // A signature whose records set a root CBV, one of draws alone, and the buffer the records name.
+        let objects = vec![
+            object(
+                5,
+                "ID3D12CommandSignature",
+                json!({"stride": 24, "arguments": [{"type": 6, "root_parameter": 0}, {"type": 0}]}),
+            ),
+            object(
+                6,
+                "ID3D12CommandSignature",
+                json!({"stride": 16, "arguments": [{"type": 0}]}),
+            ),
+            object(
+                9,
+                "ID3D12Resource",
+                json!({"dimension": 1, "width": 256, "height": 1, "mips": 1}),
+            ),
+        ];
+        // Instrumented: its records copied before its ExecuteIndirect. Recorded before arming: neither copied.
+        let mut copied = Recording::new(1, 0, 10, 0, false);
+        copied.record(execute(5));
+        copied.arguments(Arguments {
+            id: 40,
+            command: 0,
+            layout: indirect::layout(&objects[0].description).unwrap(),
+            bytes: 48,
+            counted: false,
+            gap: None,
+        });
+        copied.close();
+        let mut uncopied = Recording::new(2, 0, 11, 0, false);
+        uncopied.record(execute(5));
+        uncopied.record(execute(6));
+        uncopied.close();
+        let frame = Frame {
+            objects,
+            submissions: vec![Submission {
+                id: 3,
+                queue: 7,
+                queue_seq: 1,
+                cpu_seq: 1,
+                lists: vec![copied.snapshot(), uncopied.snapshot()],
+                descriptors: Vec::new(),
+                uploads: Vec::new(),
+            }],
+            ..Frame::default()
+        };
+        let mut c = db::Capture::default();
+        let mut prepared = frame.prepare(&mut c);
+        let found = prepared.indirect().to_vec();
+        assert_eq!(found.len(), 1);
+        let (event, submission, queue) = (found[0].event, found[0].submission, found[0].queue);
+        assert_eq!((submission, queue, found[0].arguments.id), (3, 7, 40));
+        assert_eq!(
+            c.events.iter().find(|e| e.seq == event).unwrap().call,
+            "ExecuteIndirect"
+        );
+        // The draws-only signature's records name nothing: no gap for it.
+        let gaps: Vec<_> = prepared.projection.unread_arguments.iter().collect();
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].0.starts_with("its list was not instrumented"));
+        assert_eq!(*gaps[0].1, 1);
+        // What the records name: the event reads it, and the frame uses it.
+        assert!(!c.resources.iter().find(|r| r.id == 9).unwrap().used);
+        prepared.named_by_arguments(&mut c, event, &[9]);
+        assert!(
+            c.events
+                .iter()
+                .find(|e| e.seq == event)
+                .unwrap()
+                .reads
+                .contains(&9)
+        );
+        assert!(c.resources.iter().find(|r| r.id == 9).unwrap().used);
+        // Its records: two fit 48 bytes, and a count would lower that.
+        let mut a = found[0].arguments.clone();
+        assert_eq!(a.records(&[0; 48]), 2);
+        a.counted = true;
+        let mut bytes = vec![0u8; 52];
+        bytes[48..].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(a.records(&bytes), 1);
     }
 }

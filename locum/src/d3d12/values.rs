@@ -71,11 +71,10 @@ pub unsafe fn created_command_signature(
             v
         })
         .collect();
-    super::journal::describe(
-        id(unsafe { *out }),
-        device,
-        json!({"stride":d.ByteStride,"node_mask":d.NodeMask,"root_signature":id(root),"arguments":arguments}),
-    );
+    let description =
+        json!({"stride":d.ByteStride,"node_mask":d.NodeMask,"root_signature":id(root),"arguments":arguments});
+    super::passes::command_signature(id(unsafe { *out }), &description);
+    super::journal::describe(id(unsafe { *out }), device, description);
 }
 
 /// How a resource begins: in a legacy resource state, or (created through the enhanced-barrier creators) in a layout.
@@ -138,7 +137,11 @@ pub unsafe fn created_resource(device: u64, out: *mut *mut c_void, initial: Init
         }
     };
     if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
-        super::journal::resource_address(id, unsafe { resource.GetGPUVirtualAddress() }, d.Width);
+        // Kept in the description too: ExecuteIndirect's argument records hold the game's addresses, which replay,
+        // its buffers elsewhere, maps back to (buffer, offset) by these.
+        let address = unsafe { resource.GetGPUVirtualAddress() };
+        description["gpu_address"] = json!(address);
+        super::journal::resource_address(id, address, d.Width);
     }
     super::journal::track(id, &description, initial);
     super::journal::describe(id, device, description);

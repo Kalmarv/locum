@@ -302,23 +302,33 @@ fn hardware_smoke(stage: &std::path::Path, log: &std::path::Path) {
         "D3D12 hardware smoke failed: {}",
         result.status
     );
-    let capture = log.join("captures").join(format!("planes-{pid}"));
-    let output = Command::new(stage.join("locum-cli.exe"))
-        .arg("verify")
-        .arg(&capture)
-        .env("LOCUM_DIR", log)
-        .output()
-        .expect("verify the planes capture");
-    let text =
-        String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
-    println!("--- locum-cli verify {}\n{text}", capture.display());
-    assert!(
-        text.contains("2 of 2 targets identical"),
-        "planes: both draws' depth-stencil replay as copied"
-    );
-    println!(
-        "ok   D3D12 hardware: a split-plane depth-stencil copied between two passes holds what the first left"
-    );
+    // Each capture verified on the adapter it was made on: both its targets the fixture's.
+    for (name, what) in [
+        (
+            "planes",
+            "a split-plane depth-stencil copied between two passes holds what the first left",
+        ),
+        (
+            "indirect",
+            "ExecuteIndirect with GPU addresses in its records replays as the game's",
+        ),
+    ] {
+        let capture = log.join("captures").join(format!("{name}-{pid}"));
+        let output = Command::new(stage.join("locum-cli.exe"))
+            .arg("verify")
+            .arg(&capture)
+            .env("LOCUM_DIR", log)
+            .output()
+            .unwrap_or_else(|e| panic!("verify the {name} capture: {e}"));
+        let text =
+            String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        println!("--- locum-cli verify {}\n{text}", capture.display());
+        assert!(
+            output.status.success() && text.contains("2 of 2 targets identical"),
+            "{name}: both draws replay as the fixture drew them"
+        );
+        println!("ok   D3D12 hardware: {what}");
+    }
 }
 
 /// Replays the fixture's captures with locum-cli on WARP: verify, a rule, and contents at an event.
@@ -360,6 +370,7 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
         "reserved",
         "planes",
         "queries",
+        "indirect",
     ] {
         let (_, text) = run(&["verify", "--warp", &capture(name)]);
         assert!(
@@ -392,6 +403,15 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
         "results: the tickets' outputs: {ordered}"
     );
     println!("ok   D3D12 verify: what dispatches and a clear wrote through UAVs replays as the game's");
+    // ExecuteIndirect records naming a vertex buffer and a root CBV by GPU address, written by the CPU and by a
+    // dispatch: replay runs them on its own buffers' addresses, and the vertex buffer only the records name has the
+    // contents the capture copied after the frame.
+    let (ok, text) = run(&["verify", "--warp", &capture("indirect")]);
+    assert!(
+        ok && text.contains("2 of 2 targets identical"),
+        "indirect: both ExecuteIndirect draws replay as the game's"
+    );
+    println!("ok   D3D12 verify: ExecuteIndirect with GPU addresses in its records replays as the game's");
     // Under the debug layer, with a pass under GPU-based validation of its own: the dispatches write a texture made
     // for simultaneous access as a UAV, which that validation takes for an error the spec does not make it.
     if debug {
