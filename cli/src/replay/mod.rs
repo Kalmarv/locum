@@ -12,6 +12,7 @@ mod d3d12;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use locum_capture::environment::Environment;
 use locum_capture::format;
 use locum_capture::rules::{self, Rule};
 use locum_capture::texels::{self, Range};
@@ -33,6 +34,8 @@ pub trait Backend {
     fn write(&mut self, c: &Capture, id: i64, contents: &[u8]) -> Result<(), String>;
     /// What it could not do as recorded, once each.
     fn warnings(&self) -> Vec<String>;
+    /// The adapter, driver and runtime it replays on.
+    fn environment(&self) -> locum_capture::environment::Environment;
     /// The errors the API's validation reported so far (none without it).
     fn validation(&self) -> Vec<String> {
         Vec::new()
@@ -1233,6 +1236,8 @@ pub fn verify(
         planned.as_secs_f64(),
         started.elapsed().as_secs_f64()
     );
+    let ends = ends(c, &b.environment());
+    out!("{ends}");
     let written = recorded(c);
     // Draws and dispatches are named by their number, as targets are.
     let numbered: HashMap<i64, (i64, String)> = c
@@ -1439,18 +1444,42 @@ pub fn verify(
         failed.push(format!("{clears_differing} clear outputs differ"));
     }
     if !failed.is_empty() {
-        return Err(failed.join("; "));
+        return Err(format!("{} ({ends})", failed.join("; ")));
     }
     if compared + outputs_same + clears_same + settled_same + reordered == 0 {
-        return Err("no target or event output was compared".into());
+        return Err(format!("no target or event output was compared ({ends})"));
     }
     if !incomplete.is_empty() {
         return Err(format!(
-            "every target identical, but the capture is incomplete ({} reasons above)",
+            "every target identical, but the capture is incomplete ({} reasons above) ({ends})",
             incomplete.len()
         ));
     }
+    out!("verified: every target and output compared is the game's ({ends})");
     Ok(())
+}
+
+/// Where the capture was made and where it is replayed. Bit-exact comparisons hold between the same adapter and
+/// driver; another can differ in the last bits (NVIDIA and WARP clear to a fractional UNORM colour differently).
+fn ends(c: &Capture, replay: &Environment) -> String {
+    let captured = c.meta("environment").and_then(|e| Environment::parse(&e));
+    let at = captured.as_ref().map_or_else(
+        || "an adapter the capture does not record".into(),
+        Environment::line,
+    );
+    let on = replay.line();
+    if at == on {
+        return format!("captured and replayed on {on}");
+    }
+    let mut s = format!("captured on {at}; replayed on {on}");
+    if let (Some(a), Some(b)) = (
+        captured.as_ref().and_then(|e| e.adapter.as_ref()),
+        &replay.adapter,
+    ) && (a.vendor, a.device, &a.driver) != (b.vendor, b.device, &b.driver)
+    {
+        s += " (another adapter or driver than the capture's)";
+    }
+    s
 }
 
 #[cfg(test)]

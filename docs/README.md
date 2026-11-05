@@ -144,7 +144,8 @@ contents. locum's own copies run whatever predicate the game has set.
 
 `capture.db` has these tables (`capture/src/db.rs` has the schema with comments):
 
-- `meta`: the API, frame, process, request and counts; `gaps`: what could not be recorded, and why;
+- `meta`: the API, frame, process, request, counts and the machine it ran on (`environment`, below); `gaps`: what
+  could not be recorded, and why;
 - `resources` and `subresources`: every live resource with its description, upload hash, whether the frame used or
   wrote it, and the key of its contents as the frame began with where they came from (`first-use` or `upload`) and
   any doubt about them;
@@ -404,6 +405,16 @@ or outputs skipped, a repeated list's earlier executions, the memory dump) are l
 `--out <dir>` it writes the replay's and the game's bytes of everything that differs there
 (`event-<seq>-<resource>.{replay,game}.bin`, `draw-<n>-<target>.{replay,game}.bin`), and for a target in a format it
 can decode, both pictures and one of where they differ (`.replay.png`, `.game.png`, `.diff.png`).
+
+`meta.environment` (JSON) records what the frame ran on: the adapter (description, vendor, device, subsystem and
+revision ids, LUID, video memory, whether it is a software adapter), its driver version as DXGI reports it and the
+user-mode driver the kernel names (path and file version), the Windows version with its update build revision and
+release, the executable (path, bytes, SHA-256, file version), and for Direct3D 12 the D3D12Core.dll loaded (path,
+version, whether it is an Agility SDK's rather than the system's) and the `D3D12SDKVersion` and `D3D12SDKPath` the
+executable exports. `info` shows it. `verify` prints both ends before it compares, `captured and replayed on X` or
+`captured on X; replayed on Y`, flagged where the vendor, device or driver differ, and repeats it with its result:
+a difference on another adapter or driver can be the driver's, not the capture's. Captures from before 2026-11-05 do
+not record it; `info` says so.
 
 A capture taken while a rule in `overrides.txt` changed or skipped one of its draws records the draw as the game
 asked for it, not as the GPU ran it: an `overrides` gap names the draw, the event and the rule, and verify fails even

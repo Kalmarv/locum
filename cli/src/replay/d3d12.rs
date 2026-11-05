@@ -17,6 +17,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::mem::ManuallyDrop;
 
+use locum_capture::environment;
 use locum_capture::layout::{self, Footprint, Sub};
 use locum_capture::rules::{self, Action, Rule};
 use serde_json::Value;
@@ -2295,6 +2296,20 @@ impl Backend for D3d12 {
 
     fn write(&mut self, _c: &Capture, id: i64, contents: &[u8]) -> Result<(), String> {
         self.put(id, contents)
+    }
+
+    fn environment(&self) -> environment::Environment {
+        let luid = unsafe { self.device.GetAdapterLuid() };
+        let adapter = unsafe { CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) }
+            .and_then(|f| unsafe { f.EnumAdapterByLuid::<IDXGIAdapter>(luid) })
+            .ok()
+            .map(|a| environment::adapter(&a, environment::Api::D3d12));
+        environment::Environment {
+            adapter,
+            os: Some(environment::os()),
+            exe: None,
+            d3d12: Some(environment::d3d12_runtime()),
+        }
     }
 
     fn warnings(&self) -> Vec<String> {

@@ -3,6 +3,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use locum_capture::environment::Environment;
+
 use crate::describe::mib;
 use crate::open::{self, Capture};
 use crate::out;
@@ -51,6 +53,59 @@ pub fn captures(dir: &Path, blobs: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
+/// The machine the capture was made on: adapter, driver, Windows, the Direct3D 12 runtime and the executable.
+fn environment(c: &Capture) {
+    let Some(e) = c.meta("environment").and_then(|e| Environment::parse(&e)) else {
+        out!(
+            "  environment: not recorded (locum before 2026-11-05 did not record the adapter, driver or exe hash)"
+        );
+        return;
+    };
+    match &e.adapter {
+        Some(a) => {
+            out!(
+                "  adapter: {}{}, LUID {}, {} video memory",
+                e.adapter_line(),
+                if a.software { " (software)" } else { "" },
+                a.luid,
+                mib(a.video_memory)
+            );
+            if let Some(umd) = &a.umd {
+                out!(
+                    "  user-mode driver: {} {}",
+                    umd.path,
+                    umd.version.as_deref().unwrap_or("(no version)")
+                );
+            }
+        }
+        None => out!("  adapter: not found"),
+    }
+    if let Some(os) = &e.os {
+        match &os.release {
+            Some(r) => out!("  Windows {} ({r})", os.version),
+            None => out!("  Windows {}", os.version),
+        }
+    }
+    if let Some(r) = &e.d3d12 {
+        let asked = match (r.sdk_version, &r.sdk_path) {
+            (Some(v), Some(p)) => format!("; the exe asks for Agility SDK {v} at {p}"),
+            (Some(v), None) => format!("; the exe asks for Agility SDK {v}"),
+            _ => String::new(),
+        };
+        let path = r.core.as_ref().map_or("not loaded", |c| c.path.as_str());
+        out!("  Direct3D 12: {}, {path}{asked}", r.line());
+    }
+    if let Some(x) = &e.exe {
+        out!(
+            "  exe: {} {}, {} bytes, sha256 {}",
+            x.path,
+            x.version.as_deref().unwrap_or("(no version)"),
+            x.bytes,
+            x.sha256
+        );
+    }
+}
+
 pub fn info(c: &Capture) -> Result<(), String> {
     let counts = c.meta_json("counts");
     let request = c.meta_json("request");
@@ -68,6 +123,7 @@ pub fn info(c: &Capture) -> Result<(), String> {
         c.meta("api").unwrap_or_default(),
         c.meta("locum").unwrap_or_default()
     );
+    environment(c);
     if request.is_null() {
         out!("  request: not recorded (locum before the request was kept)");
     } else {

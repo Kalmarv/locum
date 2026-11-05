@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use locum_capture::db::{self, Capture};
 use locum_capture::stacks::{self, Interner};
-use locum_capture::{hash, writer};
+use locum_capture::{environment, hash, writer};
 use serde_json::json;
 use windows::Win32::Graphics::Direct3D11::*;
 
@@ -572,6 +572,11 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
         capture.meta("memory", memory.to_string());
     }
     capture.meta("locum", env!("CARGO_PKG_VERSION"));
+    // The adapter the frame was drawn on; the executable is hashed on the writer thread, below.
+    let adapter = unsafe { immediate.GetDevice() }
+        .ok()
+        .and_then(|d| environment::device_adapter(&d))
+        .map(|a| environment::adapter(&a, environment::Api::D3d11));
     capture.meta("blobs", settings().blobs.root().display());
     capture.meta(
         "time",
@@ -694,6 +699,17 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     log!("{summary}");
     log!("  the frame, {}", crate::cost::line());
     writer::run(move || {
+        let mut capture = capture;
+        capture.meta(
+            "environment",
+            environment::Environment {
+                adapter,
+                os: Some(environment::os()),
+                exe: environment::exe(),
+                d3d12: None,
+            }
+            .json(),
+        );
         let t = std::time::Instant::now();
         match db::write(&path, &capture) {
             Ok(()) => log!(

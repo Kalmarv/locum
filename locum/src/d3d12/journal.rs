@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use super::cost::Counter;
-use locum_capture::{d3d12 as model, db, writer};
+use locum_capture::{d3d12 as model, db, environment, writer};
 use serde_json::{Value, json};
 use windows::core::HRESULT;
 
@@ -928,6 +928,35 @@ pub unsafe fn slice<'a, T>(pointer: *const T, len: usize) -> &'a [T] {
     }
 }
 
+/// The adapter a captured frame ran on: the device's that made the back buffer it presented, else the first
+/// device's. Asked of the real DXGI, so the game's factories see nothing.
+fn adapter(presented: Option<u64>) -> Option<environment::Adapter> {
+    use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+    use windows::Win32::Graphics::Dxgi::{IDXGIAdapter, IDXGIFactory4};
+    use windows::core::{GUID, Interface};
+    let device = presented.map(owner_device).filter(|&d| d != 0).or_else(|| {
+        let s = state();
+        let mut devices: Vec<u64> = s
+            .objects
+            .values()
+            .filter(|o| o.kind.starts_with("ID3D12Device"))
+            .map(|o| o.id)
+            .collect();
+        devices.sort_unstable();
+        devices.first().copied()
+    })?;
+    let device: ID3D12Device = super::real(device)?.cast().ok()?;
+    let luid = unsafe { device.GetAdapterLuid() };
+    type Factory = unsafe extern "system" fn(u32, *const GUID, *mut *mut c_void) -> HRESULT;
+    let create =
+        unsafe { crate::system::export::<Factory>(crate::system::system().dxgi, c"CreateDXGIFactory2") }?;
+    let mut raw = std::ptr::null_mut();
+    unsafe { create(0, &IDXGIFactory4::IID, &mut raw) }.ok().ok()?;
+    let factory = unsafe { IDXGIFactory4::from_raw(raw) };
+    let adapter: IDXGIAdapter = unsafe { factory.EnumAdapterByLuid(luid) }.ok()?;
+    Some(environment::adapter(&adapter, environment::Api::D3d12))
+}
+
 /// At each Present; `presented` is the back buffer it shows, looked up while a capture is armed.
 pub fn present(frame_number: u64, presented: Option<u64>) {
     static REPORT: OnceLock<Mutex<Instant>> = OnceLock::new();
@@ -1028,6 +1057,8 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                 .unwrap_or_default(),
         );
         capture.meta("blobs", crate::settings::settings().blobs.root().display());
+        // The adapter the frame was drawn on; the executable is hashed on the writer thread, below.
+        let adapter = adapter(presented);
         capture.meta("capture_status", "incomplete");
         capture.meta(
             "verification_scope",
@@ -1040,6 +1071,16 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         // Direct3D 11's: runners wait for them.
         super::readback::then(move || {
             writer::run(move || {
+                capture.meta(
+                    "environment",
+                    environment::Environment {
+                        adapter,
+                        os: Some(environment::os()),
+                        exe: environment::exe(),
+                        d3d12: Some(environment::d3d12_runtime()),
+                    }
+                    .json(),
+                );
                 for batch in std::mem::take(&mut *results.lock().unwrap_or_else(|e| e.into_inner())) {
                     prepared.add_uploads(batch.submission, batch.uploads);
                     for (resource, first) in batch.contents {

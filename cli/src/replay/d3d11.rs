@@ -5,8 +5,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::CString;
 
-use locum_capture::layout;
 use locum_capture::rules::{self, Action, Rule};
+use locum_capture::{environment, layout};
 use serde_json::Value;
 use windows::Win32::Foundation::{HMODULE, RECT};
 use windows::Win32::Graphics::Direct3D::*;
@@ -1395,6 +1395,15 @@ impl Backend for D3d11 {
             };
         }
         Ok(())
+    }
+
+    fn environment(&self) -> environment::Environment {
+        environment::Environment {
+            adapter: environment::device_adapter(&self.device)
+                .map(|a| environment::adapter(&a, environment::Api::D3d11)),
+            os: Some(environment::os()),
+            ..Default::default()
+        }
     }
 
     fn warnings(&self) -> Vec<String> {
