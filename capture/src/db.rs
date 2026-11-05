@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bumped when a table changes meaning.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -363,8 +363,15 @@ fn opt_i64(v: Option<u64>) -> Option<i64> {
     v.map(|v| v as i64)
 }
 
-/// Writes `capture` to a new database at `path` (to a temporary file first, renamed into place when complete).
+/// Writes `capture` to a new database at `path` (to a temporary file first, renamed into place when complete). The
+/// blob store its `blobs` meta names lists it first, so a collection of that store keeps what it names.
 pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
+    if let Some((_, store)) = capture.meta.iter().find(|(k, _)| k == "blobs") {
+        crate::blobs::Blobs::new(store).register(path).map_err(|e| {
+            let e = std::io::Error::other(format!("listing it in the blob store {store}: {e}"));
+            rusqlite::Error::ToSqlConversionFailure(Box::new(e))
+        })?;
+    }
     let temp = path.with_extension("db.part");
     let _ = std::fs::remove_file(&temp);
     let mut db = Connection::open(&temp)?;
@@ -616,4 +623,86 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
 /// The stage names in the order of [`Draw::shaders`].
 pub fn stage_names() -> [&'static str; 6] {
     STAGES
+}
+
+/// Copies the capture database `from` to `to`, listing the copy in the blob store it names as [`write`] lists a
+/// capture: a copy made otherwise is not listed, and collecting the store would drop the blobs only the copy names.
+pub fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    let db = Connection::open_with_flags(from, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(std::io::Error::other)?;
+    let store: Option<String> = db
+        .query_row("SELECT value FROM meta WHERE key = 'blobs'", [], |r| r.get(0))
+        .optional()
+        .map_err(std::io::Error::other)?;
+    drop(db);
+    if let Some(store) = store {
+        crate::blobs::Blobs::new(store).register(to)?;
+    }
+    std::fs::copy(from, to)?;
+    Ok(())
+}
+
+/// Every blob key a capture names, wherever in it: each run of exactly 32 lowercase hex digits in any text of any
+/// table, so a column added later, or a key inside JSON, is found without being listed here. A text that only looks
+/// like a key keeps a blob that need not be kept, never the other way round.
+pub fn keys(db: &Connection, into: &mut std::collections::HashSet<String>) -> rusqlite::Result<()> {
+    let tables: Vec<String> = db
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for table in tables {
+        let mut s = db.prepare(&format!("SELECT * FROM \"{}\"", table.replace('"', "\"\"")))?;
+        let n = s.column_count();
+        let mut rows = s.query([])?;
+        while let Some(row) = rows.next()? {
+            for i in 0..n {
+                if let rusqlite::types::ValueRef::Text(text) = row.get_ref(i)? {
+                    key_runs(text, into);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn key_runs(text: &[u8], into: &mut std::collections::HashSet<String>) {
+    let hex = |b: &u8| b.is_ascii_digit() || (b'a'..=b'f').contains(b);
+    let mut i = 0;
+    while i < text.len() {
+        if !hex(&text[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < text.len() && hex(&text[i]) {
+            i += 1;
+        }
+        if i - start == 32 {
+            into.insert(String::from_utf8_lossy(&text[start..i]).into_owned());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_anywhere_in_text() {
+        let db = Connection::open_in_memory().unwrap();
+        let a = crate::hash::key(b"a");
+        let b = crate::hash::key(b"b");
+        let c = crate::hash::key(b"c");
+        db.execute_batch("CREATE TABLE t(x TEXT, y BLOB, z INTEGER); CREATE TABLE u(j TEXT);")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES(?1, ?2, 1)", params![a, c.as_bytes()])
+            .unwrap();
+        // In JSON; beside a 16-digit shader hash and a 33-digit run, which are not keys. c is only in those and in
+        // binary.
+        let json = format!(r#"{{"data":"{b}","shader":"0123456789abcdef","long":"{c}0"}}"#);
+        db.execute("INSERT INTO u VALUES(?1)", [json]).unwrap();
+        let mut found = std::collections::HashSet::new();
+        keys(&db, &mut found).unwrap();
+        assert_eq!(found, [a, b].into_iter().collect());
+    }
 }

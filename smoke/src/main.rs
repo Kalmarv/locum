@@ -1690,7 +1690,7 @@ fn ordered_capture(
     if let [(event, _)] = plain.as_slice() {
         let tampered = dir.join("captures/ordered-tampered");
         std::fs::create_dir_all(&tampered).expect("tampered capture folder");
-        std::fs::copy(&path, tampered.join("capture.db")).expect("copy the capture");
+        locum_capture::db::copy(&path, &tampered.join("capture.db")).expect("copy the capture");
         let mut wrong = squared.clone();
         wrong[0] ^= 1;
         let key = locum_capture::hash::key(&wrong);

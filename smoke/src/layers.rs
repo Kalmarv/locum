@@ -422,9 +422,9 @@ fn budget(
 fn clone_capture(dir: &std::path::Path, source: &str, dest: &str) -> rusqlite::Connection {
     let dest = dir.join("captures").join(dest);
     std::fs::create_dir_all(&dest).unwrap();
-    std::fs::copy(
-        dir.join("captures").join(source).join("capture.db"),
-        dest.join("capture.db"),
+    locum_capture::db::copy(
+        &dir.join("captures").join(source).join("capture.db"),
+        &dest.join("capture.db"),
     )
     .unwrap();
     rusqlite::Connection::open(dest.join("capture.db")).unwrap()

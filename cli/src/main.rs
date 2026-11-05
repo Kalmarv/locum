@@ -19,6 +19,7 @@ mod replay;
 mod resources;
 mod shaders;
 mod states;
+mod store;
 mod table;
 mod trace;
 mod upgrade;
@@ -653,6 +654,12 @@ enum Command {
     /// it: that it parses, that it is this executable's, and where each symbol is found (as exe+RVA, and in which
     /// section). Fails when anything would fail in the game.
     Table { exe: PathBuf, table: PathBuf },
+    /// A blob store shared by every run of a game: what it holds, moving captures onto it, and dropping the blobs no
+    /// capture names.
+    Store {
+        #[command(subcommand)]
+        what: StoreCommand,
+    },
     /// Brings what an older locum derived in a capture up to this one, from the capture's own records: D3D12
     /// bindings projected again (an older projection bound some registers to two descriptors), structured views'
     /// element size, and the programs' debug names in `shaders`. Writes the capture.db in place
@@ -664,6 +671,28 @@ enum Command {
         /// Upgrade a copy written here (a new .db file, its blobs still in the capture's store), not the capture
         #[arg(short, long, conflicts_with = "check")]
         out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreCommand {
+    /// The store's blobs, packs and the captures listed as using it.
+    Info { store: PathBuf },
+    /// Moves the captures under a folder (a run, a run's locum-log, or a folder of runs) onto the store: copies the
+    /// blobs from the stores they use, checks every one arrived, points the captures at the store and lists them
+    /// there, then deletes the stores they used that lie inside the folder.
+    Merge {
+        folder: PathBuf,
+        #[arg(long)]
+        into: PathBuf,
+    },
+    /// Drops the blobs no capture listed as using the store names, and forgets the listed captures since deleted.
+    /// Refused while a game or another locum-cli uses the store.
+    Collect {
+        store: PathBuf,
+        /// Say what would be dropped, and change nothing.
+        #[arg(long)]
+        count: bool,
     },
 }
 
@@ -1190,6 +1219,11 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Table { exe, table } => table::table(&exe, &table),
+        Command::Store { what } => match what {
+            StoreCommand::Info { store } => store::info(&store),
+            StoreCommand::Merge { folder, into } => store::merge(&folder, &into),
+            StoreCommand::Collect { store, count } => store::collect(&store, count),
+        },
         Command::Upgrade {
             capture,
             check,

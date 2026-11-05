@@ -396,9 +396,9 @@ pub(super) fn run(
     checks.check(gaps == 0, "tiles: native mapping/pool capture has no gaps");
     let tampered = dir.join(format!("captures/{label}-omit-alias"));
     std::fs::create_dir_all(&tampered).unwrap();
-    std::fs::copy(
-        dir.join(format!("captures/{label}/capture.db")),
-        tampered.join("capture.db"),
+    locum_capture::db::copy(
+        &dir.join(format!("captures/{label}/capture.db")),
+        &tampered.join("capture.db"),
     )
     .unwrap();
     let bad = rusqlite::Connection::open(tampered.join("capture.db")).unwrap();
@@ -617,9 +617,9 @@ fn packed(
     drop(db);
     let tampered = dir.join(format!("captures/{label}-zero-seeds"));
     std::fs::create_dir_all(&tampered).unwrap();
-    std::fs::copy(
-        dir.join(format!("captures/{label}/capture.db")),
-        tampered.join("capture.db"),
+    locum_capture::db::copy(
+        &dir.join(format!("captures/{label}/capture.db")),
+        &tampered.join("capture.db"),
     )
     .unwrap();
     let bad = rusqlite::Connection::open(tampered.join("capture.db")).unwrap();

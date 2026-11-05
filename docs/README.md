@@ -49,6 +49,20 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
   writing), and `index.db` (table `blobs(key, pack, offset, size)`) says where each one is; stores from before packs
   hold one file per blob, `<2 hex>/<32 hex>`, and are still read. Contents are in a canonical layout: subresources in
   order (mip within array slice), rows packed tightly, blocks for compressed formats.
+
+  One store can serve every run of a game (`blobs DIR` or `LOCUM_BLOBS` naming the same folder): a run then adds only
+  what the store lacks. The index lists the captures using the store (table `captures(path)`), each listed before its
+  `capture.db` is written, and every process using a store holds `store.lock` shared. A `capture.db` copied by hand is
+  not listed: copy one with `locum_capture::db::copy`, or list a folder's copies with `store merge FOLDER --into` the
+  store they use.
+  - `locum-cli store info STORE`: its blobs, packs, and the captures listed;
+  - `locum-cli store merge FOLDER --into STORE`: moves the captures under a folder (a run, a `locum-log`, a folder of
+    runs) onto the store: copies the blobs of the stores they use, checks each arrived, points their `meta.blobs` at
+    it and lists them, then deletes the stores they used that lie inside the folder;
+  - `locum-cli store collect STORE [--count]`: keeps every blob a listed capture names (any 32-digit hex text in it)
+    and drops the rest, rewriting the packs that held them; captures deleted since are forgotten. Deleting a run and
+    collecting gives its space back. Refused while a game or another `locum-cli` has the store open, so a blob a
+    running game found there is never dropped before its capture names it.
 - `settings.txt` (written by you), one per line:
   - `uploads store` (default), `hash` or `off`: whether the data each resource is created with, and each update
     covering a whole subresource, is hashed and stored as it happens. Stored uploads are the game's own textures and
