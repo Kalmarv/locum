@@ -11,7 +11,7 @@ type Row = Record<string, any>;
 
 /** The schema versions this viewer reads, by API: capture/src/db.rs `SCHEMA_VERSION` and `D3D12_SCHEMA_VERSION`. A
  * schema bump that changes no table the viewer queries only raises the upper bound. */
-export const SCHEMAS: Record<string, [number, number]> = { d3d11: [1, 1], d3d12: [2, 5] };
+export const SCHEMAS: Record<string, [number, number]> = { d3d11: [1, 1], d3d12: [2, 6] };
 
 export function schemaReadable(api: string, version: string): boolean {
   const range = SCHEMAS[api];

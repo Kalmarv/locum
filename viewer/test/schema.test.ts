@@ -16,9 +16,9 @@ test("the viewer reads the schema each API's captures are written in", () => {
 
 test("versions outside the range, other APIs and non-numbers are refused", () => {
   expect(schemaReadable("d3d12", "2")).toBe(true);
-  expect(schemaReadable("d3d12", "5")).toBe(true);
+  expect(schemaReadable("d3d12", "6")).toBe(true);
   expect(schemaReadable("d3d12", "1")).toBe(false);
-  expect(schemaReadable("d3d12", "6")).toBe(false);
+  expect(schemaReadable("d3d12", "7")).toBe(false);
   expect(schemaReadable("d3d11", "1")).toBe(true);
   expect(schemaReadable("d3d11", "2")).toBe(false);
   expect(schemaReadable("vulkan", "1")).toBe(false);
