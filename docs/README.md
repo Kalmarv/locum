@@ -74,6 +74,42 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
   Rules apply at the draw, on its own context, and are undone after it. A changed constant is written into a GPU copy
   of the bound buffer, so draws on deferred contexts get theirs when their command list runs. `locum.log` reports how
   often each rule applied every 600 frames.
+- `table.txt` (written by you, for one game): the game's values and functions by name, the way a Cheat Engine table
+  names them, so a run can put the game in the state a capture needs (move the player, start an effect). locum knows
+  no game: a table is game data kept with the game's own files, never in locum, and placed in locum's folder for a
+  run. Read again when it changes. One definition per line, `#` a comment:
+  - `exe sha256 HEX`: the table is for that executable only, and is refused for any other;
+  - `code NAME = PATTERN [+N|-N]`: the address of the one match of a byte pattern (`48 8B ?? 05`, `??` any byte) in
+    the executable's code sections (all of them: a protected executable has two named `.text`), plus or minus N;
+  - `global NAME = PATTERN @ AT END`: the address a RIP-relative operand in the match refers to (its 32-bit
+    displacement at byte AT of the match, its instruction ending at byte END), as for a game's static pointers;
+  - `value NAME TYPE = ADDRESS`: a value (`i8` to `i64`, `u8` to `u64` or `ptr`, `f32`, `f64`, or `bitN`: bit N
+    of the value there, as Cheat Engine's Binary entries with their bit start; setting it keeps the other bits);
+  - `action NAME [PARAM ...]`, its steps, `end`: `buffer NAME SIZE` (zeroed memory for the run, freed after it),
+    `set TYPE ADDRESS VALUE`, `call ADDRESS [ARG ...]` (up to 8 integer or pointer arguments; `result` is what it
+    returned), `wait MS`.
+
+  Addresses and values are expressions: `[x]` reads the pointer at x, `+` and `-` add, numbers are decimal unless
+  written `0x…` or with a `.` (a float), a name is a symbol, value (its address), buffer or `result`, `$p` an
+  action's parameter, `{v}` the current value of `v`. A Cheat Engine path reads the same with its hex offsets written
+  `0x…`: `[[[[Base]+0x100]+0]+0x68]+0x70`. Every name must be defined where it is used (a value's: a symbol or a
+  value, none depending on itself; an action's: those, its parameters, buffers it made before, `result`).
+  `locum-cli table EXE TABLE` checks a table against the executable on disk before a run: that it parses, that
+  it is that executable's, and where each symbol is found.
+- `do` (written by you, then taken: locum removes it): what to do, one line each, run in order on a thread of
+  locum's own (as Cheat Engine's `executeCodeEx` runs a call), stopping at the first line that fails (a line that
+  needs the table, when it did not load, fails with the reason). What each line did goes to `do.out` and the log.
+  Write it whole (rename it into place):
+  - `get NAME`, `set NAME VALUE` (written, then read back), `ACTION [ARG ...]`;
+  - `read TYPE ADDRESS`, `write TYPE ADDRESS VALUE`, `call ADDRESS [ARG ...]`: the same without a table entry;
+  - `check A OP B` (`==` `!=` `<` `<=` `>` `>=`, between spaces): fails unless it holds, so a request repeated
+    until it succeeds waits for a state (`check {map.id} != 0xffffffff`);
+  - `wait MS`; `symbols`: each symbol's address and its offset in the executable.
+
+  Reads and writes touch only memory mapped for them (checked page by page), writes never touch code (nothing is
+  patched: a page that executes is written only where it is a data section of a loaded image, as a protected
+  executable's data is), and calls go only to code in a loaded image. A called function that faults takes the game down, as it
+  would under Cheat Engine. Only run a table against a game offline, with its anti-cheat not running.
 
 locum numbers every resource as it is created and keeps its description, creation stack and upload hash, so a
 capture lists all the resources alive, not only those the frame touched. The capture runs over two frames: the one
@@ -310,6 +346,7 @@ locum-cli draw last 120-180,200 --section cb --name 'envData|g_LightColor'
 locum-cli sql last "SELECT ..."            # anything else (`.tables` lists the tables, `.schema results` one's columns;
                                            # capture/src/db.rs explains each)
 locum-cli hash FILE...                     # the D3D11 shader hash and the blob key locum would give a file's bytes
+locum-cli table game.exe table.txt         # a game-values table checked against the executable, before a run
 locum-cli blob last 507b9612 > b.bin        # a blob's raw bytes by its key (-o FILE writes a file instead)
 locum-cli upgrade last --check             # what an older locum derived, brought up to this one (see below)
 locum-cli upgrade last -o new.db           # the same into a copy, leaving a capture others read as it is

@@ -1,5 +1,6 @@
-//! locum-cli: reads the captures locum writes. A capture is named by its `capture.db`, the folder holding it, its
-//! name under locum's folder (`LOCUM_DIR`, or `%LOCALAPPDATA%\locum`), or `last`.
+//! locum-cli: reads the captures locum writes, and checks the game-values tables it reads. A capture is named by its
+//! `capture.db`, the folder holding it, its name under locum's folder (`LOCUM_DIR`, or `%LOCALAPPDATA%\locum`), or
+//! `last`.
 
 mod bindings;
 mod constants;
@@ -18,6 +19,7 @@ mod replay;
 mod resources;
 mod shaders;
 mod states;
+mod table;
 mod trace;
 mod upgrade;
 mod vertices;
@@ -647,6 +649,10 @@ enum Command {
     /// The hashes locum gives a file's bytes: a Direct3D 11 capture's shader hash (FNV-1a 64 from locum's basis), and
     /// the blob key (XXH3-128) that names contents, uploads and Direct3D 12 shaders.
     Hash { files: Vec<PathBuf> },
+    /// Checks a game-values table (locum's `table.txt`) against the executable on disk, before starting the game for
+    /// it: that it parses, that it is this executable's, and where each symbol is found (as exe+RVA, and in which
+    /// section). Fails when anything would fail in the game.
+    Table { exe: PathBuf, table: PathBuf },
     /// Brings what an older locum derived in a capture up to this one, from the capture's own records: D3D12
     /// bindings projected again (an older projection bound some registers to two descriptors), structured views'
     /// element size, and the programs' debug names in `shaders`. Writes the capture.db in place
@@ -1183,6 +1189,7 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
+        Command::Table { exe, table } => table::table(&exe, &table),
         Command::Upgrade {
             capture,
             check,

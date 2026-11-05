@@ -19,6 +19,7 @@ mod log;
 mod passthrough;
 mod settings;
 mod system;
+mod values;
 mod vtables;
 
 use core::ffi::c_void;
@@ -49,6 +50,7 @@ fn hello() {
             std::process::id()
         );
         crate::crash::install();
+        crate::values::start();
     });
 }
 
