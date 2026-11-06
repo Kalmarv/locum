@@ -3,7 +3,8 @@
 //! `target/release/` or a game's folder those are locum's own stand-ins, so a replay would run through locum's
 //! wrappers. Before any of them is called, [`load`] loads each by full path: from the system folder, or from a
 //! translation layer's folder (`--layer`, DXVK's or vkd3d-proton's DLLs) where it has one. A DLL asked for by name
-//! later is the one already loaded under that name, wherever it came from.
+//! later is the one already loaded under that name, wherever it came from: so what a layer's DLL forwards its exports
+//! to (locum's stand-ins forward to `locum.dll`) is loaded from the layer's folder too, before anything binds them.
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -30,9 +31,17 @@ pub fn system() -> PathBuf {
 }
 
 /// Loads the replay's Direct3D DLLs: those `layer` has from it, the rest of `d3d11.dll`, `dxgi.dll` and `d3d12.dll`
-/// from the system folder. A layer's DLL finds the DLLs it imports beside it. Fails where one cannot be loaded.
+/// from the system folder. A layer's DLL finds the DLLs it imports beside it; the modules it forwards exports to are
+/// found only when something binds those exports (the system's `d3d11.dll` binds `CreateDXGIFactory2` of a layer's
+/// `dxgi.dll` as it loads), from where that importer looks, which is not the layer's folder: so each is loaded from
+/// the layer's folder first. Fails where one cannot be loaded.
 pub fn load(layer: Option<&Path>) -> Result<(), String> {
     let system = system();
+    let load = |from: &Path| {
+        let wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH) }
+            .map_err(|e| format!("load {}: {e}", from.display()))
+    };
     for name in DLLS {
         let from = match layer {
             Some(dir) if dir.join(name).is_file() => dir.join(name),
@@ -40,9 +49,17 @@ pub fn load(layer: Option<&Path>) -> Result<(), String> {
             _ if matches!(name, "d3d12core.dll" | "d3d10core.dll") => continue,
             _ => system.join(name),
         };
-        let wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-        unsafe { LoadLibraryExW(PCWSTR(wide.as_ptr()), None, LOAD_WITH_ALTERED_SEARCH_PATH) }
-            .map_err(|e| format!("load {}: {e}", from.display()))?;
+        let module = load(&from)?;
+        let Some(dir) = layer.filter(|dir| from.parent() == Some(*dir)) else {
+            continue;
+        };
+        // SAFETY: loaded just now, and never freed.
+        for forwarded in unsafe { locum_capture::environment::forwards(module) } {
+            let beside = dir.join(&forwarded);
+            if beside.is_file() {
+                load(&beside)?;
+            }
+        }
     }
     Ok(())
 }

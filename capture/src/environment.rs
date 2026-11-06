@@ -5,7 +5,7 @@
 //! it have none. A probe can fail on one machine and not on another: what one could not learn is left out, and its
 //! part's `missing` says why (the capture also has an `environment` gap for it), so nothing is dropped unsaid.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -15,7 +15,7 @@ use windows::Wdk::Graphics::Direct3D::{
     D3DKMT_CLOSEADAPTER, D3DKMT_OPENADAPTERFROMLUID, D3DKMT_QUERYADAPTERINFO, D3DKMT_UMDFILENAMEINFO,
     KMTQAITYPE_UMDRIVERNAME, KMTUMDVERSION_DX11, KMTUMDVERSION_DX12,
 };
-use windows::Win32::Foundation::{FreeLibrary, LUID, NTSTATUS};
+use windows::Win32::Foundation::{FreeLibrary, HMODULE, LUID, NTSTATUS};
 use windows::Win32::Graphics::Dxgi::{DXGI_ADAPTER_FLAG_SOFTWARE, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice};
 use windows::Win32::System::LibraryLoader::{
     FindResourceW, GetModuleFileNameW, GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_AS_DATAFILE,
@@ -45,7 +45,8 @@ pub struct Environment {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub d3d12: Option<Runtime>,
     /// The Direct3D and DXGI DLLs a replay loaded from outside the system folder, by name: a translation layer
-    /// (DXVK's `d3d11.dll` and `dxgi.dll`, vkd3d-proton's `d3d12.dll`) that `locum-cli conform` put beside it. Not
+    /// (DXVK's `d3d11.dll` and `dxgi.dll`, vkd3d-proton's `d3d12.dll`) that `locum-cli conform` put beside it, and
+    /// the modules they forward exports to (locum's stand-ins forward to `locum.dll`), wherever those came from. Not
     /// probed at capture, where locum's own stand-ins have these names.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub layers: BTreeMap<String, Layer>,
@@ -607,12 +608,13 @@ pub fn exe() -> Result<Exe, String> {
     .clone()
 }
 
-/// The DLLs of [`Environment::layers`] this process loaded from outside the system folder.
+/// The DLLs of [`Environment::layers`] this process loaded from outside the system folder, and what they forward to.
 pub fn layers() -> BTreeMap<String, Layer> {
     let mut system = [0u16; 260];
     let n = unsafe { GetSystemDirectoryW(Some(&mut system)) } as usize;
     let system = String::from_utf16_lossy(&system[..n]).to_ascii_lowercase();
     let mut out = BTreeMap::new();
+    let mut forwarded = BTreeSet::new();
     for name in [
         "d3d11.dll",
         "dxgi.dll",
@@ -620,43 +622,99 @@ pub fn layers() -> BTreeMap<String, Layer> {
         "d3d12core.dll",
         "d3d10core.dll",
     ] {
-        let Ok((module, version)) = loaded(name) else {
-            continue;
-        };
-        let path = Path::new(&module.path);
-        if path
-            .parent()
-            .is_some_and(|f| f.display().to_string().to_ascii_lowercase() == system)
+        if let Some(layer) = layer(name, &system) {
+            if let Ok(module) = unsafe { GetModuleHandleW(&HSTRING::from(name)) } {
+                forwarded.extend(unsafe { forwards(module) });
+            }
+            out.insert(name.to_string(), layer);
+        }
+    }
+    for name in forwarded {
+        if !out.contains_key(&name)
+            && let Some(layer) = layer(&name, &system)
         {
-            continue;
+            out.insert(name, layer);
         }
-        let mut layer = Layer {
-            version: module.version.clone(),
-            ..Default::default()
-        };
-        if let Err(why) = version {
-            layer.missing.insert("version".into(), why);
-        }
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                use sha2::{Digest, Sha256};
-                layer.sha256 = Some(
-                    Sha256::digest(&bytes)
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect(),
-                );
-            }
-            Err(e) => {
-                _ = layer
-                    .missing
-                    .insert("sha256".into(), format!("{}: {e}", path.display()))
-            }
-        }
-        layer.path = module.path;
-        out.insert(name.to_string(), layer);
     }
     out
+}
+
+/// Module `name` as a layer, if this process loaded it from outside the folder `system` (lowercase).
+fn layer(name: &str, system: &str) -> Option<Layer> {
+    let (module, version) = loaded(name).ok()?;
+    let path = Path::new(&module.path);
+    if path
+        .parent()
+        .is_some_and(|f| f.display().to_string().to_ascii_lowercase() == system)
+    {
+        return None;
+    }
+    let mut layer = Layer {
+        version: module.version.clone(),
+        ..Default::default()
+    };
+    if let Err(why) = version {
+        layer.missing.insert("version".into(), why);
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            use sha2::{Digest, Sha256};
+            layer.sha256 = Some(
+                Sha256::digest(&bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect(),
+            );
+        }
+        Err(e) => {
+            _ = layer
+                .missing
+                .insert("sha256".into(), format!("{}: {e}", path.display()))
+        }
+    }
+    layer.path = module.path;
+    Some(layer)
+}
+
+/// The modules `module` forwards exports to, by file name (`locum.dll` for `locum.CreateDXGIFactory2`), from its
+/// export directory as mapped.
+///
+/// # Safety
+/// `module` is a module this process loaded (not as data), and stays loaded while this reads it.
+pub unsafe fn forwards(module: HMODULE) -> BTreeSet<String> {
+    use windows::Win32::System::Diagnostics::Debug::{IMAGE_DIRECTORY_ENTRY_EXPORT, IMAGE_NT_HEADERS64};
+    use windows::Win32::System::SystemServices::{IMAGE_DOS_HEADER, IMAGE_EXPORT_DIRECTORY};
+    let base = module.0 as *const u8;
+    // SAFETY: a loaded module's image is mapped from its base, its headers and export directory as the loader read
+    // them.
+    unsafe {
+        let dos = &*base.cast::<IMAGE_DOS_HEADER>();
+        let nt = &*base.add(dos.e_lfanew as usize).cast::<IMAGE_NT_HEADERS64>();
+        let directory = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT.0 as usize];
+        if directory.VirtualAddress == 0 {
+            return BTreeSet::new();
+        }
+        let exports = &*base
+            .add(directory.VirtualAddress as usize)
+            .cast::<IMAGE_EXPORT_DIRECTORY>();
+        let functions = std::slice::from_raw_parts(
+            base.add(exports.AddressOfFunctions as usize).cast::<u32>(),
+            exports.NumberOfFunctions as usize,
+        );
+        // An export whose address is inside the export directory is a forwarder: `module.export`, as text.
+        let within = directory.VirtualAddress..directory.VirtualAddress + directory.Size;
+        functions
+            .iter()
+            .filter(|rva| within.contains(rva))
+            .filter_map(|&rva| {
+                let text = std::ffi::CStr::from_ptr(base.add(rva as usize).cast())
+                    .to_str()
+                    .ok()?;
+                let (module, _) = text.split_once('.')?;
+                Some(format!("{}.dll", module.to_ascii_lowercase()))
+            })
+            .collect()
+    }
 }
 
 /// The Direct3D 12 runtime this process loaded, and the Agility SDK its executable asks for.
@@ -706,6 +764,18 @@ pub fn d3d12_runtime() -> Runtime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A module's forwarders are read from its export directory: kernel32's `HeapAlloc` is `NTDLL.RtlAllocateHeap`.
+    #[test]
+    fn what_a_module_forwards_to_is_read() {
+        let kernel32 = unsafe { GetModuleHandleW(&HSTRING::from("kernel32.dll")) }.unwrap();
+        let found = unsafe { forwards(kernel32) };
+        assert!(found.contains("ntdll.dll"), "{found:?}");
+        assert!(!found.contains("kernel32.dll"), "{found:?}");
+        // ntdll forwards nothing.
+        let ntdll = unsafe { GetModuleHandleW(&HSTRING::from("ntdll.dll")) }.unwrap();
+        assert_eq!(unsafe { forwards(ntdll) }, BTreeSet::new());
+    }
 
     #[test]
     fn older_and_partial_environments_read() {

@@ -662,9 +662,12 @@ Every replay loads its Direct3D by full path before it calls it: `d3d11.dll`, `d
 system folder, or from the folder `--layer DIR` names where it has them (with its `d3d12core.dll` and `d3d10core.dll`).
 locum-cli delay-loads those three, so DLLs of their names beside it, locum's own stand-ins in `target/release` or a
 game's folder, are not what a replay runs on. `locum-cli --layer C:\dxvk-3.1.1\x64 verify last` replays through
-DXVK, `--layer C:\vkd3d-proton-3.1\x64` through vkd3d-proton. A replay's machine line, in `verify` and its
-`verifications` row, names the Direct3D DLLs it loaded from outside the system folder, by version (where the DLL has
-a version resource; DXVK 3.1.1's say 10.0.17763.1, a stand-in) and the start of its SHA-256, and its folder. DXVK
+DXVK, `--layer C:\vkd3d-proton-3.1\x64` through vkd3d-proton. What a layer's DLL forwards its exports to (locum's
+stand-ins forward to `locum.dll`) is loaded from the layer's folder too, before anything binds it: otherwise the first
+of its name beside locum-cli or on PATH would run. A replay's machine line, in `verify` and its `verifications` row,
+names the Direct3D DLLs it loaded from outside the system folder and the modules they forward to, by version (where
+the DLL has a version resource; DXVK 3.1.1's say 10.0.17763.1, a stand-in) and the start of its SHA-256, and their
+folder. DXVK
 3.1.1 on an RTX 5070 Ti, which it presents with AMD's vendor id and a driver version of its own:
 
 ```

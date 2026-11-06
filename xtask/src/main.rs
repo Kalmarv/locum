@@ -1227,6 +1227,7 @@ fn conform_checks(cli: &Path, stage: &Path, out: &Path, c: &Conformance) -> Vec<
             .arg(&dir)
             .args(warp.then_some("--warp"))
             .env("LOCUM_DIR", &locum_dir)
+            .env("PATH", path_without_locum())
             .output()
             .expect("run locum-cli conform");
         let text =
@@ -1251,8 +1252,11 @@ fn conform_checks(cli: &Path, stage: &Path, out: &Path, c: &Conformance) -> Vec<
         .unwrap_or_default();
     // conform names the layer's folder as Windows makes its path whole.
     let folder = std::path::absolute(&layer).expect("the layer's path");
-    let named =
-        dlls[..needed].iter().all(|d| theirs.contains(d)) && theirs.contains(&*folder.display().to_string());
+    // Every DLL of the layer's in one folder, the layer's: what its stand-ins forward to (`locum.dll`) included.
+    let named = dlls[..needed].iter().all(|d| theirs.contains(d))
+        && theirs.contains("locum.dll ")
+        && theirs.matches(", through ").count() == 1
+        && theirs.contains(&*folder.display().to_string());
     // "N comparisons (...): N the game's in both replays, ..."
     let compared = summary.split(' ').next().unwrap_or_default();
     checks.push((
@@ -1294,6 +1298,14 @@ fn conform_checks(cli: &Path, stage: &Path, out: &Path, c: &Conformance) -> Vec<
         "conform refuses a capture whose replay compares nothing".into(),
     ));
     checks
+}
+
+/// PATH without the folders holding a `locum.dll`: cargo puts its target folders on it, and a layer's stand-ins must
+/// find the `locum.dll` they forward to in the layer's folder, not one a build left there.
+fn path_without_locum() -> std::ffi::OsString {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(std::env::split_paths(&path).filter(|dir| !dir.join("locum.dll").is_file()))
+        .expect("PATH's folders join again")
 }
 
 /// Runs locum-cli on the smoke test's capture and checks what it says about it.

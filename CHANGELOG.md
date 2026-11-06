@@ -4,6 +4,10 @@
 
 - `cargo xtask smoke` runs what cargo built where `CARGO_TARGET_DIR` points, and stages there (`smoke/`,
   `smoke-d3d12/`). Before, it built there but copied `target/release`'s DLLs, so a smoke could pass on old ones.
+- `locum-cli conform` (and `--layer`) loads what a layer's DLLs forward their exports to from the layer's folder:
+  locum's stand-ins forward to `locum.dll`, which was otherwise the first of that name beside locum-cli or on PATH
+  (cargo's target folders under `cargo xtask smoke`), or none, and the layer replay failed to load the system's
+  `d3d11.dll`. The machine line names those modules too.
 
 ## 0.1.4 (2026-11-06)
 
