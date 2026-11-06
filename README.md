@@ -40,12 +40,13 @@ are implemented for Direct3D 11 only.
 
 ### Installation
 
-Each [release](https://github.com/Kalmarv/locum/releases/latest) has two downloads for Windows (x86_64), with
-`SHA256SUMS`:
+Each [release](https://github.com/Kalmarv/locum/releases/latest) has two downloads for Windows (x86_64), each with
+its `.sha256` (and `sha256.sum` for both):
 
-- `locum-dlls-<version>-x86_64-pc-windows-msvc.zip`: `locum.dll`, `d3d11.dll`, `dxgi.dll`, `d3d12.dll` and
-  `nvapi64.dll`, the DLLs that go beside a game
-- `locum-cli-<version>-x86_64-pc-windows-msvc.zip`: `locum-cli.exe` (also `cargo install locum-cli`)
+- [`locum-x86_64-pc-windows-msvc.zip`](https://github.com/Kalmarv/locum/releases/latest/download/locum-x86_64-pc-windows-msvc.zip):
+  `locum.dll`, `d3d11.dll`, `dxgi.dll`, `d3d12.dll` and `nvapi64.dll`, the DLLs that go beside a game
+- [`locum-cli-x86_64-pc-windows-msvc.zip`](https://github.com/Kalmarv/locum/releases/latest/download/locum-cli-x86_64-pc-windows-msvc.zip):
+  `locum-cli.exe` (also `cargo install locum-cli`)
 
 The libraries are on crates.io (`cargo add locum-capture`). To build the DLLs yourself instead, run
 `cargo build --release` in the workspace; they are written to `target/release/`.

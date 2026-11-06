@@ -1,7 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.1.4 (2026-11-06)
 
+- Releases are made by release-plz and dist. The downloads are now `locum-x86_64-pc-windows-msvc.zip` (`locum.dll`,
+  `d3d11.dll`, `dxgi.dll`, `d3d12.dll`, `nvapi64.dll`: the DLLs that go beside a game; was `locum-dlls-<version>-…`)
+  and `locum-cli-x86_64-pc-windows-msvc.zip`, each with a `.sha256`, and `sha256.sum` for both.
 - Direct3D 12 replay on a device that takes more of a heap for a placed resource than the game's GPU did, or another
   alignment, lays the heap out again instead of making the resource committed: what shared memory in the game still
   does, reserved tiles and the frame's tile remaps included. vkd3d-proton on an RTX 5070 Ti sizes 94 of an Elden Ring
