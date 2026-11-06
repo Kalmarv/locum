@@ -11,7 +11,7 @@
   frame's placed resources so; before, they no longer shared memory and verify called the frame incomplete.
 - A placed resource this device will not take at the small alignment the game placed it with is placed at the default.
 
-## 0.1.3
+## 0.1.3 (2026-11-06)
 
 - `locum-cli conform CAPTURE --layer DIR` holds a translation layer (DXVK, vkd3d-proton) to a captured frame: it
   verifies the capture on the system's Direct3D and through the layer's DLLs, and names each comparison the system's
@@ -25,7 +25,7 @@
 - `cargo xtask smoke --api d3d12` starts each run with an empty log folder; captures of every earlier run had piled
   up there (1 GB here).
 
-## 0.1.2
+## 0.1.2 (2026-11-06)
 
 - Each release now has the DLLs that go beside a game as a download, `locum-dlls-<version>-x86_64-pc-windows-msvc.zip`
   (`locum.dll`, `d3d11.dll`, `dxgi.dll`, `d3d12.dll`, `nvapi64.dll`), beside `locum-cli`. The README's Installation
