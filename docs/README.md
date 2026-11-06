@@ -145,10 +145,10 @@ contents. locum's own copies run whatever predicate the game has set.
 `capture.db` has these tables (`capture/src/db.rs` has the schema with comments):
 
 - `meta`: the API, frame, process, request, counts and the machine it ran on (`environment`, below); `gaps`: what
-  could not be recorded, and why;
+  could not be recorded, and why; `verifications`: each time `locum-cli verify` ran on it (below);
 - `resources` and `subresources`: every live resource with its description, upload hash, whether the frame used or
-  wrote it, and the key of its contents as the frame began with where they came from (`first-use`, `upload`, or on
-  Direct3D 12 `after-frame`, below) and any doubt about them;
+  wrote it, and the key of its contents as the frame began with where they came from (`first-use`, `upload`,
+  `tile-events`, or on Direct3D 12 `upload-at-first-submission` and `after-frame`, below) and any doubt about them;
 - `views` and `states` (rasterizer, blend, depth-stencil, sampler, input layout), with their descriptions;
 - `events`: everything on the GPU's timeline in order: draws, dispatches, clears, copies, updates and maps (with the
   key of the bytes written), resolves and mip generation, each with its context, command list and call stack;
@@ -414,7 +414,18 @@ version, whether it is an Agility SDK's rather than the system's) and the `D3D12
 executable exports. `info` shows it. `verify` prints both ends before it compares, `captured and replayed on X` or
 `captured on X; replayed on Y`, flagged where the vendor, device or driver differ, and repeats it with its result:
 a difference on another adapter or driver can be the driver's, not the capture's. Captures from before 2026-11-05 do
-not record it; `info` says so.
+not record it; `info` says so. A probe can fail on one machine and not another (DXGI cannot describe the adapter, the
+kernel names no user-mode driver, the executable cannot be read). What it could not learn is left out, its part's
+`missing` says why, and the capture has an `environment` gap for it (`adapter.driver: CheckInterfaceSupport: …`).
+`info` and the verify line then say `not recorded (why)` where the value would be, and verify notes these gaps
+without counting the capture incomplete: they say what is unknown of the machine, not of the frame. A file with no
+version resource (the smoke fixtures) has no version, and that is no gap.
+
+Each `verify` adds a row to the capture's `verifications`: when, the locum-cli version, its flags (`warp`, `debug`,
+`limit`), the machine it replayed on (JSON, as `meta.environment`; NULL when it stopped before it made a device),
+whether it verified, and its last line. `info` lists them (`verified 2 times:`, then a line each). A capture from
+before 2026-11-06 gets the table the first time verify runs on it; one verify cannot write to says so in a note and
+verifies as before.
 
 A capture taken while a rule in `overrides.txt` changed or skipped one of its draws records the draw as the game
 asked for it, not as the GPU ran it: an `overrides` gap names the draw, the event and the rule, and verify fails even
@@ -480,7 +491,8 @@ wrote them), finds each address in the buffer whose recorded `gpu_address` range
 that buffer as replay made it at the same offset; where placed buffers share the memory, the one replay made is
 used. A signature that sets root arguments is made against its root signature. An address in no buffer the capture
 describes, or in one replay did not make, skips the ExecuteIndirect and says why; a capture from before buffers'
-addresses were recorded (2026-11-05) skips them all.
+addresses were recorded (2026-11-05) skips them all. Mesh and amplification pipelines (their stream's `AS` and `MS`
+subobjects) are rebuilt as any other, so DispatchMesh, direct or indirect, replays.
 
 Queries are replayed. An occlusion or pipeline-statistics query must begin and end in one command list, and each
 event replays in a list of its own, so while a game's query is open, each draw and dispatch of the game's list it was
@@ -702,14 +714,27 @@ instrumented list, the records such an ExecuteIndirect may run (its most records
 as the buffer holds) and its count are copied right before it, from the states the buffers are in (what the list's
 own barriers left them in; otherwise COMMON or promoted to read states, which a copy reads with no barrier). At the
 Present that closes the capture, locum waits for those copies (up to 10 s), reads the records the count lets run, and
-finds every address in the live buffers: the event reads each buffer its records name (`event_resources`, so a plan
-makes them), and a buffer the frame used no other way is copied whole then, on the queue of the first ExecuteIndirect
-naming it, before the game's next submission from that thread: `content_source` `after-frame`, its first use the
-submission of that ExecuteIndirect. Nothing the frame recorded writes such a buffer (a command that did would name
-it), so it holds what it held as the frame began, unless a shader wrote it through a view or another thread's
-submission came between. A list executed again in the frame copies its records again; the last execution's are
-read. Records locum cannot read (a DispatchRays or incrementing-constant argument, a signature it did not see made,
-more than 64 MiB) and addresses in no live buffer are `d3d12-indirect-arguments` gaps; bundles are not instrumented.
+finds every address in the live buffers: the event reads each buffer a view or a root CBV or SRV in its records
+names, and writes each a root UAV in them names (`event_resources` `read` and `write`, so a plan makes them and
+`resource` lists the writer). A buffer the frame used no other way is copied whole then, on the queue of the first
+ExecuteIndirect naming it, before the game's next submission from that thread: `content_source` `after-frame`, its
+first use the submission of that ExecuteIndirect. Nothing the frame recorded writes such a buffer (a command that did
+would name it, and a root UAV in records is counted as writing it), so it holds what it held as the frame began,
+unless a shader wrote it through a descriptor heap it indexes itself or another thread's submission came between. One
+a root UAV in records writes has no contents: what it held as the frame began was not copied, and verify says the
+capture is incomplete.
+
+What a root UAV in records writes is that ExecuteIndirect's output (a `results` row), as a UAV a draw binds is: the
+after-frame copy, where that ExecuteIndirect is the last of the frame to write the buffer and every writer ran on one
+queue; otherwise (written again later, on another queue, not a buffer) a `d3d12-results` gap says which and why. A
+root parameter the records set is neither a binding of the event nor an output place copied after it: what the list
+set there before is stale, and what the records name is in `event_resources`. A list executed again in the frame
+copies its records again; the last execution's are read. Records locum cannot read (a DispatchRays or
+incrementing-constant argument, a signature it did not see made, more than 64 MiB), addresses in no live buffer, an
+ExecuteIndirect of an uninstrumented list whose records hold addresses, and a buffer the after-frame copy cannot be
+made of (no description, a destroyed queue) are `d3d12-indirect-arguments`, `contents` or `d3d12-results` gaps. A
+bundle may run only a signature of one draw or dispatch with no count buffer (the debug layer refuses any other,
+message 744), so a bundle's records never hold addresses and are read as any buffer is.
 Each buffer's description keeps its GPU address (`gpu_address`). Each submission records the descriptor definitions
 that changed
 since the previous one (all of them at the first; `empty` marks a slot emptied), so `d12_submission_descriptors`
@@ -766,11 +791,32 @@ disk I/O without an additional in-memory copy or unbounded writer queue.
 An unrecognized PSO stream type logs its first occurrence once per type per process.
 
 `cargo xtask smoke --api d3d12` runs a program through it on WARP with the debug layer on (copies, dispatches, fences,
-pipeline states and libraries, placed resources, barriers, swap chain present and resize); `cargo xtask smoke --api
-d3d12 --hardware` runs what WARP cannot show on the default adapter, at the game's size (a copy's order against the
-list's next draw), and an ExecuteIndirect whose records name a vertex buffer and a root CBV by address, written by
-the CPU and by a dispatch, and verifies both captures there; `--debug` also verifies the UAV fixture with `verify --debug` (no
-validation errors, outputs compared as without it); `cargo xtask smoke` stays the Direct3D 11 suite. The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
+pipeline states and libraries, placed resources, barriers, swap chain present and resize). Its `indirect` capture
+runs every argument type locum patches: vertex and index buffer views, root CBVs, SRVs and UAVs, root constants and
+DispatchMesh (where the adapter has mesh shaders and a Windows SDK's dxcompiler is found, or `LOCUM_DXCOMPILER`;
+the run says if it skipped them), with records the CPU wrote, records a dispatch wrote at a non-zero offset with a
+count it wrote, lower than the most records (the record past it names no buffer), and a bundle's. What a root UAV in
+records wrote is verified as an output. Its `indirect-gaps` capture holds what cannot be proven: an uninstrumented
+list's records, and a buffer only a root UAV names. verify must call it incomplete and still compare that output.
+Both smokes check `info`, the verify line and the `verifications` row of a capture (every part of the machine
+described, no `environment` gap, both ends named). `cargo xtask smoke --api d3d12 --hardware` runs what WARP cannot
+show on the default adapter, at the game's size (a copy's order against the list's next draw), and the `indirect`
+capture, and verifies both there; `--debug` also verifies the UAV and `indirect` fixtures with `verify --debug` (no
+validation errors, outputs compared as without it); `cargo xtask smoke` stays the Direct3D 11 suite.
+
+### Known problems: Motor Town
+
+Motor Town 0.7.19 (Unreal Engine 5, `-dx12`) captures its main menu (2026-11-05, RTX 5070 Ti, 15,906 and 16,523
+events in two runs), and verify exits 1 on it, as it did before ExecuteIndirect's addresses were captured: every
+target is identical (66 of 66, 68 of 68), but
+
+- the frame's first big dispatch, writing a 48 MiB UAV (Dispatch 5 or 7, #7976 or #7927), differs from the game's in
+  25 to 42 of its 12,582,912 4-byte records, and is not flagged order-dependent;
+- 11 to 19 resources the frame uses are not described in the capture, so replay's views of them are null.
+
+Neither has a known cause yet. Its command signatures are each one DRAW, DRAW_INDEXED or DISPATCH, so no
+ExecuteIndirect of it carries an address, and the ExecuteIndirect change neither causes nor fixes these: one capture
+verified with the CLI before and after gives the same counts. The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
 
 ## Crash investigation
 
