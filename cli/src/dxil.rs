@@ -5,9 +5,9 @@ use windows::Win32::Graphics::{Direct3D::Dxc::*, Direct3D12::*};
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetProcAddress, LoadLibraryW};
 use windows::core::{GUID, HRESULT, Interface, PCWSTR, s};
 
-/// The dx and iridia commits linked, from Cargo.lock (build.rs).
-const DX_REV: &str = env!("LOCUM_DX_REV");
-const IRIDIA_REV: &str = env!("LOCUM_IRIDIA_REV");
+/// The dx and iridia builds linked (`dxil-reader 0.5.0`, or a git build's commit too), from Cargo.lock (build.rs).
+const DX: &str = env!("LOCUM_DX");
+const IRIDIA: &str = env!("LOCUM_IRIDIA");
 type Create = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut core::ffi::c_void) -> HRESULT;
 static COMPILER_IDENTITY: OnceLock<Value> = OnceLock::new();
 
@@ -251,7 +251,7 @@ pub fn evidence(code: &[u8], source: &str) -> Value {
         .ok()
         .and_then(|parts| parts.into_iter().find(|p| &p.kind == b"RDAT"))
         .map(|part| answer(iridia_dxil::subobjects(part.data).map_err(|e| e.to_string())));
-    json!({"source":source,"shader_hash":locum_capture::hash::key(code),"dx_rev":DX_REV,"iridia_rev":IRIDIA_REV,
+    json!({"source":source,"shader_hash":locum_capture::hash::key(code),"dx":DX,"iridia":IRIDIA,
         "scope":"display; resource capture is determined by API state, not these analyses", "microsoft_compiler":answer(version),
         "comparison":if agrees {"agree"} else if checked {"disagreement"} else {"incomplete"},
         "dxil_reader":answer(reader),"dxil_program_ranges":answer(program_ranges),"microsoft":answer(native),"iridia":answer(iridia_ranges),
