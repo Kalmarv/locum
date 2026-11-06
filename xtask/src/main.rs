@@ -342,59 +342,90 @@ fn main() {
         .parent()
         .expect("workspace root")
         .to_path_buf();
+    // `--dlls DIR`: the smoke runs the DLLs in DIR (a release's, say) instead of building them.
+    let dlls = args.windows(2).find(|p| p[0] == "--dlls").map(|p| {
+        let dir = PathBuf::from(&p[1]);
+        dir.canonicalize()
+            .unwrap_or_else(|e| panic!("--dlls {}: {e}", dir.display()))
+    });
     match args.first().map(String::as_str) {
         Some("gen") => generate_all(&root),
         Some("smoke") if args.windows(2).any(|p| p[0] == "--api" && p[1] == "d3d12") => d3d12::smoke(
             &root,
             args.iter().any(|a| a == "--hardware"),
             args.iter().any(|a| a == "--debug"),
+            dlls.as_deref(),
         ),
-        Some("smoke") => smoke(&root, args.iter().any(|a| a == "--debug")),
+        Some("smoke") => smoke(&root, args.iter().any(|a| a == "--debug"), dlls.as_deref()),
         _ => {
-            eprintln!("usage: cargo xtask gen | smoke");
+            eprintln!(
+                "usage: cargo xtask gen | smoke [--debug] [--dlls DIR] | smoke --api d3d12 [--hardware] [--debug] \
+                 [--dlls DIR]"
+            );
             std::process::exit(2);
         }
     }
 }
 
-/// Builds the release DLLs and the smoke program, puts them in `target/smoke/` and runs it there, with locum's log
-/// in `target/smoke/log/`.
-fn smoke(root: &Path, debug: bool) {
-    let status = Command::new(env!("CARGO"))
-        .current_dir(root)
-        .args([
-            "build",
-            "--release",
-            "-p",
-            "locum",
-            "-p",
-            "locum-shim-d3d11",
-            "-p",
-            "locum-shim-dxgi",
-            "-p",
-            "locum-smoke",
-            "-p",
-            "locum-cli",
-        ])
-        .status()
-        .expect("run cargo build");
+/// Builds `packages` for release, leaving out the DLLs' where `dlls` gives them.
+fn build(root: &Path, packages: &[&str], dlls: Option<&Path>) {
+    let mut command = Command::new(env!("CARGO"));
+    command.current_dir(root).args(["build", "--release"]);
+    for p in packages {
+        if dlls.is_none() || !(*p == "locum" || p.starts_with("locum-shim-")) {
+            command.args(["-p", p]);
+        }
+    }
+    let status = command.status().expect("run cargo build");
     assert!(status.success(), "build failed");
-    let release = root.join("target/release");
+}
+
+/// Copies `files` from the release build into `stage`; the DLLs from `dlls` where it is given.
+fn stage_files(root: &Path, stage: &Path, files: &[&str], dlls: Option<&Path>) {
+    for file in files {
+        let from = match dlls {
+            Some(dir) if file.ends_with(".dll") => dir.join(file),
+            _ => root.join("target/release").join(file),
+        };
+        std::fs::copy(&from, stage.join(file)).unwrap_or_else(|e| panic!("copy {}: {e}", from.display()));
+        if dlls.is_some() && file.ends_with(".dll") {
+            println!("smoke: {file} from {}", from.display());
+        }
+    }
+}
+
+/// Builds the release DLLs (or takes those in `dlls`) and the smoke program, puts them in `target/smoke/` and runs it
+/// there, with locum's log in `target/smoke/log/`.
+fn smoke(root: &Path, debug: bool, dlls: Option<&Path>) {
+    build(
+        root,
+        &[
+            "locum",
+            "locum-shim-d3d11",
+            "locum-shim-dxgi",
+            "locum-smoke",
+            "locum-cli",
+        ],
+        dlls,
+    );
     let stage = root.join("target/smoke");
     let log_dir = stage.join("log");
     let _ = std::fs::remove_dir_all(&stage);
     std::fs::create_dir_all(&log_dir).expect("create target/smoke");
-    for file in [
-        "locum.dll",
-        "d3d11.dll",
-        "dxgi.dll",
-        "locum-smoke.exe",
-        "locum-smoke-late.exe",
-        "locum-smoke-overlay.exe",
-        "locum-cli.exe",
-    ] {
-        std::fs::copy(release.join(file), stage.join(file)).unwrap_or_else(|e| panic!("copy {file}: {e}"));
-    }
+    stage_files(
+        root,
+        &stage,
+        &[
+            "locum.dll",
+            "d3d11.dll",
+            "dxgi.dll",
+            "locum-smoke.exe",
+            "locum-smoke-late.exe",
+            "locum-smoke-overlay.exe",
+            "locum-cli.exe",
+        ],
+        dlls,
+    );
     // Captures dump the process's memory with locum-cli, into log/dumps.
     std::fs::write(
         log_dir.join("settings.txt"),

@@ -3,7 +3,7 @@ on:
   push:
   pull_request:
 env:
-  RELEASE_BINS: locum-cli:windows
+  RELEASE_BINS: locum-cli:windows locum-dlls=locum+d3d11+dxgi+d3d12+nvapi64:windows
 jobs:
   check:
     # real-data tests skip without GAME_DATA, so on a runner they check the code, not the games

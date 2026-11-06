@@ -15,7 +15,7 @@ Every step skips what is already done, so a rerun of a failed release finishes i
   release.py build TARGET    build the planned binaries for TARGET into dist/
   release.py publish [--dry-run]   tag, publish and create the Releases (with --dry-run: say what it would do)
 
-Run it from the cargo workspace's folder. Environment: RELEASE_BINS (the binary targets shipped as downloads),
+Run it from the cargo workspace's folder. Environment: RELEASE_BINS (the downloads: see compute_plan),
 RELEASE_DIST (the archives; dist/), PLAN (the plan job's output; computed again when unset), GH_TOKEN (gh),
 CARGO_REGISTRY_TOKEN (cargo publish).
 """
@@ -107,29 +107,59 @@ def version_moved(u, pkgs):
     return v != u["version"]
 
 
+def downloads(spec, pkgs):
+    """RELEASE_BINS's downloads: each word is `name`, one binary or library (cdylib) target shipped alone, or
+    `name=a+b+c`, an archive `name` of the targets a, b and c (all of one release unit); `:windows` / `:linux` after
+    it ships it only for targets whose triple names that. Each is {"bin": archive name, "only", "parts": [{"package",
+    "target", "kind": "bin" or "cdylib"}]}."""
+    shippable = {}
+    for p in pkgs.values():
+        for t in p["targets"]:
+            for kind in ("bin", "cdylib"):
+                if kind in t["kind"]:
+                    shippable.setdefault(t["name"], []).append({"package": p["name"], "target": t["name"],
+                                                                "kind": kind})
+    out, missing = [], []
+    for word in spec.split():
+        name, _, only = word.partition(":")
+        archive, _, listed = name.partition("=")
+        parts = []
+        for target in listed.split("+") if listed else [archive]:
+            found = shippable.get(target, [])
+            if len(found) > 1:
+                sys.exit(f"RELEASE_BINS: {target} is a target of {' and '.join(f['package'] for f in found)}")
+            if found:
+                parts += found
+            else:
+                missing.append(target)
+        out.append({"bin": archive, "only": only, "parts": parts})
+    if missing:
+        sys.exit(f"RELEASE_BINS names binaries or libraries no workspace package has: {' '.join(sorted(missing))}")
+    return out
+
+
 def compute_plan():
     meta = json.loads(run("cargo", "metadata", "--no-deps", "--format-version", "1").stdout)
     members = set(meta["workspace_members"])
     pkgs = {p["name"]: p for p in meta["packages"] if p["id"] in members}
-    # RELEASE_BINS: `bin` (every target) or `bin:windows` / `bin:linux` (only targets whose triple names it)
-    only = dict((w.split(":") + [""])[:2] for w in os.environ.get("RELEASE_BINS", "").split())
-    wanted = set(only)
+    unit_of = {n: "" if inherits_version(p["manifest_path"]) else n for n, p in pkgs.items()}
+    shipped = downloads(os.environ.get("RELEASE_BINS", ""), pkgs)
     head = run("git", "rev-parse", "HEAD").stdout.strip()
 
     units = {}
     for p in pkgs.values():
         publishable = p["publish"] is None or "crates-io" in p["publish"]
-        bins = [t["name"] for t in p["targets"] if "bin" in t["kind"] and t["name"] in wanted]
-        if not publishable and not bins:
-            continue
-        key = "" if inherits_version(p["manifest_path"]) else p["name"]
-        u = units.setdefault(key, {"package": key, "version": p["version"], "crates": [], "bins": []})
-        if publishable:
-            u["crates"].append(p["name"])
-        u["bins"] += [{"package": p["name"], "bin": b, "only": only[b]} for b in bins]
-    missing = wanted - {b["bin"] for u in units.values() for b in u["bins"]}
-    if missing:
-        sys.exit(f"RELEASE_BINS names binaries no workspace package has: {' '.join(sorted(missing))}")
+        key = unit_of[p["name"]]
+        if publishable or any(unit_of[part["package"]] == key for d in shipped for part in d["parts"]):
+            u = units.setdefault(key, {"package": key, "version": p["version"], "crates": [], "bins": []})
+            if publishable:
+                u["crates"].append(p["name"])
+    for d in shipped:
+        keys = {unit_of[part["package"]] for part in d["parts"]}
+        if len(keys) != 1:
+            sys.exit(f"RELEASE_BINS: {d['bin']} holds targets of packages released apart: "
+                     f"{' '.join(sorted(part['package'] for part in d['parts']))}")
+        units[keys.pop()]["bins"].append(d)
 
     # the dependencies crates.io needs first: normal and build ones, and dev ones that carry a version (path-only
     # dev-dependencies are dropped on publish)
@@ -188,7 +218,7 @@ def plan_cmd():
     plan = compute_plan()
     for u in plan:
         log(f"release {u['title']} as {u['tag']}: publish {' '.join(u['publish']) or 'nothing'}; "
-            f"binaries {' '.join(b['bin'] for b in u['bins']) or 'none'}")
+            f"downloads {' '.join(b['bin'] for b in u['bins']) or 'none'}")
     if not plan:
         log("nothing to release: no version moved")
     outputs = {
@@ -209,27 +239,48 @@ def verify_cmd():
         run("cargo", "publish", "--dry-run", *LOCKED, *[a for c in crates for a in ("-p", c)], capture=False)
 
 
+def parts_of(b):
+    """A download's targets (plans from before downloads had parts name one binary)."""
+    return b.get("parts") or [{"package": b["package"], "target": b["bin"], "kind": "bin"}]
+
+
+def artifact(target, part):
+    """The file cargo builds for a part on `target`."""
+    windows = "windows" in target
+    if part["kind"] == "bin":
+        return part["target"] + (".exe" if windows else "")
+    name = part["target"].replace("-", "_")
+    return f"{name}.dll" if windows else f"lib{name}.dylib" if "apple" in target else f"lib{name}.so"
+
+
 def build_cmd(target):
     DIST.mkdir(exist_ok=True)
-    exe = ".exe" if "windows" in target else ""
     for u in load_plan():
         for b in u["bins"]:
             if b.get("only") and b["only"] not in target:
                 continue
-            run("cargo", "build", "--release", *LOCKED, "--target", target, "-p", b["package"], "--bin", b["bin"],
-                capture=False)
-            built = ROOT / "target" / target / "release" / f"{b['bin']}{exe}"
+            parts = parts_of(b)
+            # One build of every part, so each is built with the same features as the others it ships beside
+            libs = sorted({p["package"] for p in parts if p["kind"] == "cdylib"})
+            bins = [p for p in parts if p["kind"] == "bin"]
+            if libs:
+                run("cargo", "build", "--release", *LOCKED, "--target", target, "--lib",
+                    *[a for p in libs for a in ("-p", p)], capture=False)
+            if bins:
+                run("cargo", "build", "--release", *LOCKED, "--target", target,
+                    *[a for p in bins for a in ("-p", p["package"], "--bin", p["target"])], capture=False)
+            built = [ROOT / "target" / target / "release" / artifact(target, p) for p in parts]
             extra = [p for p in sorted(ROOT.iterdir()) if re.match(r"(LICEN[CS]E|COPYING)", p.name, re.I)]
             stem = f"{b['bin']}-{u['version']}-{target}"
-            if exe:
+            if "windows" in target:
                 with zipfile.ZipFile(DIST / f"{stem}.zip", "w", zipfile.ZIP_DEFLATED) as z:
-                    for p in [built, *extra]:
+                    for p in [*built, *extra]:
                         z.write(p, f"{stem}/{p.name}")
             else:
                 with tarfile.open(DIST / f"{stem}.tar.gz", "w:gz") as t:
-                    for p in [built, *extra]:
+                    for p in [*built, *extra]:
                         t.add(p, f"{stem}/{p.name}")
-            log(f"built {stem}")
+            log(f"built {stem}: {' '.join(p.name for p in built)}")
 
 
 def notes(u):

@@ -38,13 +38,15 @@ are implemented for Direct3D 11 only.
 
 ### Installation
 
-Download `locum-cli` for Windows (x86_64) from the [latest release](https://github.com/Kalmarv/locum/releases/latest),
-or install it with `cargo install locum-cli`. The libraries are on crates.io (`cargo add locum-capture`). The DLLs that
-go beside a game are built from the workspace:
+Each [release](https://github.com/Kalmarv/locum/releases/latest) has two downloads for Windows (x86_64), with
+`SHA256SUMS`:
 
-```powershell
-cargo build --release
-```
+- `locum-dlls-<version>-x86_64-pc-windows-msvc.zip`: `locum.dll`, `d3d11.dll`, `dxgi.dll`, `d3d12.dll` and
+  `nvapi64.dll`, the DLLs that go beside a game
+- `locum-cli-<version>-x86_64-pc-windows-msvc.zip`: `locum-cli.exe` (also `cargo install locum-cli`)
+
+The libraries are on crates.io (`cargo add locum-capture`). To build the DLLs yourself instead, run
+`cargo build --release` in the workspace; they are written to `target/release/`.
 
 | Package | What it is |
 |---|---|
@@ -57,12 +59,14 @@ cargo build --release
 | `viewer` | Bun and Preact web viewer for captures |
 | `locum-smoke`, `locum-smoke-d3d12`, `xtask` | Test programs and the `cargo xtask` build tasks |
 
-Copy the DLLs from `target/release/` next to the game's executable (for Unreal games, the one under `Binaries/Win64`):
+Copy the DLLs next to the game's executable (for Unreal games, the one under `Binaries/Win64`), not into a system
+folder:
 
 - Direct3D 11: `locum.dll`, `d3d11.dll`, `dxgi.dll`
 - Direct3D 12: `locum.dll`, `d3d12.dll`, `dxgi.dll`, `nvapi64.dll`
 
-Remove them again when you are done.
+If the game's folder already has a file of one of these names (another tool's `dxgi.dll`, say), set it aside first.
+Remove the DLLs again when you are done.
 
 ### Usage
 

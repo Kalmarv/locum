@@ -184,42 +184,37 @@ pub fn implementation(c: &Class, levels: &[(String, &Vtbl)]) -> String {
     s
 }
 
-/// The D3D12 smoke on WARP, or with `hardware` what only a real GPU shows, on the default adapter.
-pub fn smoke(root: &std::path::Path, hardware: bool, debug: bool) {
+/// The D3D12 smoke on WARP, or with `hardware` what only a real GPU shows, on the default adapter; with the DLLs in
+/// `dlls` where it is given.
+pub fn smoke(root: &std::path::Path, hardware: bool, debug: bool, dlls: Option<&std::path::Path>) {
     use std::process::Command;
-    let status = Command::new(env!("CARGO"))
-        .current_dir(root)
-        .args([
-            "build",
-            "--release",
-            "-p",
+    super::build(
+        root,
+        &[
             "locum",
-            "-p",
             "locum-shim-dxgi",
-            "-p",
             "locum-shim-d3d12",
-            "-p",
             "locum-shim-nvapi64",
-            "-p",
             "locum-smoke-d3d12",
-            "-p",
             "locum-cli",
-        ])
-        .status()
-        .expect("build D3D12 smoke");
-    assert!(status.success(), "D3D12 smoke build failed");
+        ],
+        dlls,
+    );
     let stage = root.join("target/smoke-d3d12");
     std::fs::create_dir_all(&stage).unwrap();
-    for file in [
-        "locum.dll",
-        "dxgi.dll",
-        "d3d12.dll",
-        "nvapi64.dll",
-        "locum-smoke-d3d12.exe",
-        "locum-cli.exe",
-    ] {
-        std::fs::copy(root.join("target/release").join(file), stage.join(file)).unwrap();
-    }
+    super::stage_files(
+        root,
+        &stage,
+        &[
+            "locum.dll",
+            "dxgi.dll",
+            "d3d12.dll",
+            "nvapi64.dll",
+            "locum-smoke-d3d12.exe",
+            "locum-cli.exe",
+        ],
+        dlls,
+    );
     let log = stage.join("log");
     std::fs::create_dir_all(&log).unwrap();
     let old_log = log.join("locum.log");
