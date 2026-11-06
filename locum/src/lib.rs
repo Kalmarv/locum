@@ -15,6 +15,7 @@ mod d3d11;
 mod d3d12;
 mod dump;
 mod dxgi;
+mod faces;
 mod log;
 mod passthrough;
 mod settings;
@@ -102,7 +103,7 @@ unsafe fn give_device(device: *mut c_void, device_out: *mut *mut c_void, context
         Ok(wrapper) => unsafe {
             let w = &*wrapper;
             if !context_out.is_null() {
-                w.AddRef();
+                crate::vtables::context::ContextMethods::AddRef(w.immediate());
                 *context_out = w.immediate_raw();
             }
             if device_out.is_null() {
@@ -268,9 +269,13 @@ pub unsafe extern "system" fn D3D11CreateDeviceAndSwapChain(
     unsafe { give_device(device, &mut ours, context_out) };
     if !swapchain.is_null() {
         let real = unsafe { IUnknown::from_raw(swapchain) };
-        let wrapped = match SwapChain::wrap(real, Device::from_raw(ours), None) {
-            Ok(w) => w.cast(),
-            Err(real) => real.into_raw(),
+        let wrapped = if Device::from_raw(ours).is_some() {
+            match SwapChain::wrap(real, dxgi::Api::D3d11) {
+                Ok(w) => w.cast(),
+                Err(real) => real.into_raw(),
+            }
+        } else {
+            real.into_raw()
         };
         unsafe { *swapchain_out = wrapped };
     }

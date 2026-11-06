@@ -296,20 +296,55 @@ pub fn module_path(module: HMODULE) -> PathBuf {
     PathBuf::from(String::from_utf16_lossy(&buf[..n]))
 }
 
-/// Whether code at `address` belongs to Windows or the graphics driver rather than the game: such callers (the
-/// real d3d11.dll asking dxgi for a factory, for one) get the real objects, unwrapped.
+/// The runtime's own modules a game may ship beside itself: the D3D12 Agility SDK's runtime and debug layer, and
+/// WARP's.
+const RUNTIME_MODULES: [&str; 3] = ["d3d12core.dll", "d3d12sdklayers.dll", "d3d10warp.dll"];
+
+/// Whether code at `address` belongs to Windows, the graphics driver or the D3D runtime rather than the game: such
+/// callers (the real d3d11.dll asking dxgi for a factory, an Agility SDK D3D12Core.dll in the game's folder asking for
+/// one) get the real objects, unwrapped.
 pub fn is_system_caller(address: *const c_void) -> bool {
     let Some(module) = module_of(address) else {
         return false;
     };
-    let path = module_path(module).to_string_lossy().to_lowercase();
-    let system = system().folder.to_string_lossy().to_lowercase();
-    path.starts_with(&system) || path.contains("\\driverstore\\")
+    is_system_module(
+        &module_path(module).to_string_lossy(),
+        &system().folder.to_string_lossy(),
+    )
+}
+
+/// Whether the module at `path` is Windows' (in the system folder `system`), the graphics driver's or the runtime's.
+fn is_system_module(path: &str, system: &str) -> bool {
+    let path = path.to_lowercase();
+    let name = path.rsplit(['\\', '/']).next().unwrap_or_default();
+    path.starts_with(&system.to_lowercase())
+        || path.contains("\\driverstore\\")
+        || RUNTIME_MODULES.contains(&name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An Agility SDK runtime in the game's folder is the runtime, not the game.
+    #[test]
+    fn the_runtime_beside_a_game_is_the_system() {
+        let system = r"C:\Windows\system32";
+        for (path, expected) in [
+            (r"C:\Windows\System32\d3d11.dll", true),
+            (
+                r"C:\Windows\System32\DriverStore\FileRepository\nv.inf_amd64\nvwgf2umx.dll",
+                true,
+            ),
+            (r"D:\Games\Game\D3D12\D3D12Core.dll", true),
+            (r"D:\Games\Game\D3D12\d3d12SDKLayers.dll", true),
+            (r"D:\Games\Game\d3d10warp.dll", true),
+            (r"D:\Games\Game\Game.exe", false),
+            (r"D:\Games\Game\d3d12core.dll.bak\Game.dll", false),
+        ] {
+            assert_eq!(is_system_module(path, system), expected, "{path}");
+        }
+    }
 
     /// The file's export table gives the address the loader gives for an unchanged system DLL.
     #[test]

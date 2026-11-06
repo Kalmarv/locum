@@ -126,7 +126,7 @@ unsafe impl Send for Copy {}
 /// A pass its list's Close left open: the target, and the state each plane is in where the list ends.
 struct Pending {
     list: u64,
-    device: ID3D12Device,
+    device: super::Real<ID3D12Device>,
     target: Bound,
     states: Vec<Access>,
     /// The views bound with it in its pass: a later list continues the pass only with the same.
@@ -182,6 +182,9 @@ pub fn command_signature(id: u64, description: &Value) {
 
 /// A list's copies are retired when it is reset or destroyed; resources and signatures are forgotten when destroyed.
 pub fn destroyed(id: u64) {
+    // A queue's fence holds the device.
+    let fence = fences().remove(&id);
+    drop(fence);
     retire(id);
     layouts().remove(&id);
     signatures().remove(&id);
@@ -400,6 +403,16 @@ impl Submitted {
     }
 }
 
+/// Locum's fence of each application queue that submitted checkpoints, and the value it last signalled, by the queue's
+/// number.
+fn fences() -> MutexGuard<'static, HashMap<u64, (ID3D12Fence, u64)>> {
+    static FENCES: OnceLock<Mutex<HashMap<u64, (ID3D12Fence, u64)>>> = OnceLock::new();
+    FENCES
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
 /// After the application's lists were submitted to the real queue `queue`: locum's fence marks their completion,
 /// and the copies the capture reads are read once it does.
 ///
@@ -409,14 +422,10 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
     if s.all.is_empty() && s.inserted.is_empty() {
         return;
     }
-    static FENCES: OnceLock<Mutex<HashMap<u64, (ID3D12Fence, u64)>>> = OnceLock::new();
     let Some(queue) = (unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }) else {
         return;
     };
-    let mut fences = FENCES
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut fences = fences();
     let (fence, value) = match fences.entry(queue_id) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => {
@@ -550,7 +559,7 @@ struct Bound {
     target: String,
     view: u64,
     resource: u64,
-    real: ID3D12Resource,
+    real: super::Real<ID3D12Resource>,
     /// The view's subresource in each plane the resource has: two for a depth-stencil format.
     subs: Vec<u32>,
     z: u32,
@@ -640,7 +649,7 @@ struct Ended {
 
 /// What an instrumented list generation knows while it is recorded.
 pub struct Pass {
-    device: ID3D12Device,
+    device: super::Real<ID3D12Device>,
     targets: Vec<Bound>,
     /// EndRenderPass was recorded: its targets' pass ends before the next command. A suspending render pass resumes
     /// in another list, and nothing may come between: its targets are not copied.
@@ -703,20 +712,19 @@ fn waits_in(access: Access) -> bool {
 }
 
 impl Pass {
-    /// A pass state for the real graphics list `real` of the direct type, opened with pipeline `pso`, or None for
+    /// A pass state for the real graphics list `list` of the direct type, opened with pipeline `pso`, or None for
     /// other lists.
     ///
     /// # Safety
-    /// `real` is the application's real command list.
-    pub unsafe fn new(real: *mut c_void, pso: u64) -> Option<Pass> {
-        let list = unsafe { ID3D12GraphicsCommandList::from_raw_borrowed(&real) }?;
+    /// `list` is the application's real command list.
+    pub unsafe fn new(list: &ID3D12GraphicsCommandList, pso: u64) -> Option<Pass> {
         if unsafe { list.GetType() } != D3D12_COMMAND_LIST_TYPE_DIRECT {
             return None;
         }
         let mut device: Option<ID3D12Device> = None;
         unsafe { list.GetDevice(&mut device) }.ok()?;
         Some(Pass {
-            device: device?,
+            device: super::Real::new(device?),
             targets: Vec::new(),
             ended: None,
             suspending: false,
@@ -1143,12 +1151,9 @@ impl Pass {
     }
 
     /// The list's predication, with its buffer.
-    fn predication(&self) -> Option<(ID3D12Resource, u64, i32)> {
-        self.predicate.and_then(|(r, offset, op)| {
-            super::real(r)
-                .and_then(|r| r.cast::<ID3D12Resource>().ok())
-                .map(|r| (r, offset, op))
-        })
+    fn predication(&self) -> Option<(super::Real<ID3D12Resource>, u64, i32)> {
+        self.predicate
+            .and_then(|(r, offset, op)| super::real::<ID3D12Resource>(r).map(|r| (r, offset, op)))
     }
 
     /// Copies what the command before `at` wrote through UAVs, recording each output, or why it was not copied.
@@ -1179,9 +1184,7 @@ impl Pass {
         list: &ID3D12GraphicsCommandList,
         w: &super::outputs::Written,
     ) -> Result<Readback, String> {
-        let real = super::real(w.resource)
-            .and_then(|r| r.cast::<ID3D12Resource>().ok())
-            .ok_or("destroyed before it was copied")?;
+        let real = super::real::<ID3D12Resource>(w.resource).ok_or("destroyed before it was copied")?;
         let desc = unsafe { real.GetDesc() };
         let buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
         let sub = w.sub.unwrap_or(0);
@@ -1256,8 +1259,7 @@ impl Pass {
         [max, buffer, offset, count, count_offset]: [u64; 5],
     ) -> Result<Readback, String> {
         let real = |id: u64| {
-            super::real(id)
-                .and_then(|r| r.cast::<ID3D12Resource>().ok())
+            super::real::<ID3D12Resource>(id)
                 .ok_or_else(|| format!("#{id} was destroyed before it was copied"))
         };
         let records = real(buffer)?;
@@ -1466,7 +1468,7 @@ unsafe fn copy_into(
     list: &ID3D12GraphicsCommandList,
     t: &Bound,
     states: &[Access],
-    predicate: Option<(ID3D12Resource, u64, i32)>,
+    predicate: Option<(super::Real<ID3D12Resource>, u64, i32)>,
 ) -> Result<Readback, String> {
     if t.discard {
         return Err("discarded where its render pass ended: undefined".into());
@@ -1549,7 +1551,7 @@ unsafe fn copy_into(
         }
         back.issue(list);
         if let Some((r, offset, op)) = &predicate {
-            list.SetPredication(r, *offset, D3D12_PREDICATION_OP(*op));
+            list.SetPredication(&**r, *offset, D3D12_PREDICATION_OP(*op));
         }
     }
     Ok(Readback {
@@ -1609,7 +1611,7 @@ unsafe fn output_into(
     desc: &D3D12_RESOURCE_DESC,
     sub: Option<u32>,
     access: Access,
-    predicate: Option<(ID3D12Resource, u64, i32)>,
+    predicate: Option<(super::Real<ID3D12Resource>, u64, i32)>,
 ) -> Result<Readback, String> {
     let buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     let (layout, footprints, bytes) = if buffer {
@@ -1708,7 +1710,7 @@ unsafe fn output_into(
         }
         back.issue(list);
         if let Some((r, offset, op)) = &predicate {
-            list.SetPredication(r, *offset, D3D12_PREDICATION_OP(*op));
+            list.SetPredication(&**r, *offset, D3D12_PREDICATION_OP(*op));
         }
     }
     Ok(Readback {
@@ -1726,9 +1728,9 @@ unsafe fn output_into(
 unsafe fn ranges_into(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
-    ranges: &[(ID3D12Resource, u64, u64, Option<Access>)],
+    ranges: &[(super::Real<ID3D12Resource>, u64, u64, Option<Access>)],
     access: D3D12_BARRIER_ACCESS,
-    predicate: Option<(ID3D12Resource, u64, i32)>,
+    predicate: Option<(super::Real<ID3D12Resource>, u64, i32)>,
 ) -> Result<Readback, String> {
     let bytes: u64 = ranges.iter().map(|r| r.2).sum();
     if bytes > OUTPUT_BYTES {
@@ -1744,7 +1746,7 @@ unsafe fn ranges_into(
         if let Some(a) = a
             && !moved.iter().any(|(m, _)| m.as_raw() == r.as_raw())
         {
-            moved.push((r, *a));
+            moved.push((&**r, *a));
         }
     }
     let mut to_copy = Vec::new();
@@ -1768,7 +1770,7 @@ unsafe fn ranges_into(
         let mut at = 0;
         for (r, offset, len, _) in ranges {
             if *len > 0 {
-                list.CopyBufferRegion(&readback, at, r, *offset, *len);
+                list.CopyBufferRegion(&readback, at, &**r, *offset, *len);
             }
             at += len;
         }
@@ -1776,7 +1778,7 @@ unsafe fn ranges_into(
             b.issue(list);
         }
         if let Some((r, offset, op)) = &predicate {
-            list.SetPredication(r, *offset, D3D12_PREDICATION_OP(*op));
+            list.SetPredication(&**r, *offset, D3D12_PREDICATION_OP(*op));
         }
     }
     Ok(Readback {
@@ -1846,7 +1848,7 @@ fn attachment(view: &Value, target: String, ends: [&Value; 2]) -> Option<Bound> 
 fn bound(view: &Value, target: String) -> Option<Bound> {
     let d = &view["definition"];
     let resource = d["resource"].as_u64().filter(|r| *r != 0)?;
-    let real = super::real(resource)?.cast::<ID3D12Resource>().ok()?;
+    let real = super::real::<ID3D12Resource>(resource)?;
     let desc = unsafe { real.GetDesc() };
     if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || desc.Dimension == D3D12_RESOURCE_DIMENSION_UNKNOWN
     {

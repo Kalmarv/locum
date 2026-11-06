@@ -1,17 +1,14 @@
 //! The device and its contexts.
 //!
-//! The immediate context lives inside the device and shares its reference count, as in DXVK: a game that holds only
-//! the immediate context keeps the device alive. A deferred context has its own count and holds one reference to the
-//! device.
+//! Each wrapper is a face of its real object ([`crate::faces`]): its count is the object's, and it is freed when the
+//! object is destroyed. The immediate context lives inside the device, as the real one lives as long as its device.
 //!
 //! The device is also its own DXGI device (`IDXGIDevice` to `IDXGIDevice4`), as in DXVK: the usual way to a swap chain
 //! is device -> IDXGIDevice -> GetAdapter -> GetParent (the factory) -> CreateSwapChain, and every object on that path
 //! has to be locum's for the swap chain to be. The DXGI device lives inside the device like the immediate context.
 
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, Ordering};
-
-use std::sync::OnceLock;
+use core::mem::ManuallyDrop;
 
 use windows::Win32::Foundation::{E_NOINTERFACE, E_POINTER, RECT, S_OK};
 use windows::Win32::Graphics::Direct3D11::*;
@@ -23,41 +20,38 @@ use windows::core::{BOOL, GUID, HRESULT, IUnknown, Interface};
 
 use crate::com::answer_query;
 use crate::d3d11::capture::{self, ops, tiled};
-use crate::d3d11::overrides;
 use crate::d3d11::shaders::{self, Stage};
+use crate::d3d11::{children, overrides};
 use crate::d3d11::{recorder, registry};
-use crate::dxgi::Adapter;
+use crate::faces::{self, Kind, unowned};
 use crate::log::log;
-use crate::vtables::adapter::AdapterMethods;
 use crate::vtables::context::{ContextMethods, real as real_context};
 use crate::vtables::device::{DeviceMethods, real};
-use crate::vtables::dxgi_device::DxgiDeviceMethods;
+use crate::vtables::dxgi_device::{DxgiDeviceMethods, real as real_dxgi_device};
 
 #[repr(C)]
 pub struct Device {
     vtbl: *const ID3D11Device5_Vtbl,
-    refs: AtomicU32,
-    inner: ID3D11Device5,
+    /// The real device, without a reference of locum's.
+    inner: ManuallyDrop<ID3D11Device5>,
     immediate: Context,
     dxgi: DxgiDevice,
-    /// Our wrapper of the device's adapter, with one reference (0 until asked for, 1 if it could not be wrapped).
-    adapter: OnceLock<usize>,
 }
 
-/// The device's `IDXGIDevice4` face. Counts on the device.
+/// The device's `IDXGIDevice4` face.
 #[repr(C)]
 pub struct DxgiDevice {
     vtbl: *const IDXGIDevice4_Vtbl,
-    inner: IDXGIDevice4,
+    inner: ManuallyDrop<IDXGIDevice4>,
     device: *const Device,
 }
 
 #[repr(C)]
 pub struct Context {
     vtbl: *const ID3D11DeviceContext4_Vtbl,
-    /// Deferred contexts only; the immediate context counts on its device.
-    refs: AtomicU32,
-    inner: ID3D11DeviceContext4,
+    /// The real context, without a reference of locum's.
+    inner: ManuallyDrop<ID3D11DeviceContext4>,
+    /// Its device's wrapper, alive while the context is: a context holds its device.
     device: *const Device,
     deferred: bool,
     /// locum's number for the context, in captures.
@@ -110,20 +104,9 @@ impl Context {
         let device = unsafe { &*self.device };
         let mut inner = None;
         unsafe { device.inner.CreateDeferredContext3(0, Some(&mut inner)) }?;
-        let inner = inner.unwrap().cast::<ID3D11DeviceContext4>()?;
-        unsafe { device.AddRef() };
-        let wrapper = Box::into_raw(Box::new(Context {
-            vtbl: &CONTEXT_VTBL,
-            refs: AtomicU32::new(1),
-            inner,
-            device: self.device,
-            deferred: true,
-            id: capture::next_context_id(),
-            coverage: Default::default(),
-            recorder: None,
-            reconstructed: true,
-            rebuild_error: Default::default(),
-        }));
+        let wrapper = device
+            .wrap_context(inner.unwrap().cast()?, None, true)
+            .map_err(|_| windows::core::Error::from(E_NOINTERFACE))?;
         let context = unsafe { ID3D11DeviceContext4::from_raw(wrapper.cast()) };
         if let Err(e) = unsafe { plan.replay(context.as_raw()) } {
             capture::discard_pending(unsafe { (*wrapper).id });
@@ -255,11 +238,6 @@ impl Context {
         }
     }
 
-    /// The real context.
-    pub fn real(&self) -> &ID3D11DeviceContext4 {
-        &self.inner
-    }
-
     /// Records an indirect draw or dispatch if a capture is running: its arguments are the buffer's id and offset.
     unsafe fn draw_indirect(&self, call: &'static str, buffer: *mut c_void, offset: u32) {
         if self.capturing() {
@@ -291,19 +269,18 @@ impl Device {
                 return Err(device);
             }
         };
+        // The caller's reference is the game's, through the wrapper; these are locum's, and given back.
+        let (inner, immediate, dxgi) = (unowned(inner), unowned(immediate), unowned(dxgi));
         let wrapper = Box::into_raw(Box::new(Device {
             vtbl: &DEVICE_VTBL,
-            refs: AtomicU32::new(1),
             inner,
             dxgi: DxgiDevice {
                 vtbl: &DXGI_DEVICE_VTBL,
                 inner: dxgi,
                 device: core::ptr::null(),
             },
-            adapter: OnceLock::new(),
             immediate: Context {
                 vtbl: &CONTEXT_VTBL,
-                refs: AtomicU32::new(0),
                 inner: immediate,
                 device: core::ptr::null(),
                 deferred: false,
@@ -318,7 +295,55 @@ impl Device {
             (*wrapper).immediate.device = wrapper;
             (*wrapper).dxgi.device = wrapper;
         }
+        let address = wrapper as usize;
+        let real = unsafe { (*wrapper).inner.as_raw() };
+        unsafe { faces::register(Kind::Device, address, &[real, (*wrapper).dxgi.inner.as_raw()]) };
+        unsafe {
+            faces::watch(real, move || {
+                log!("device {address:#x} destroyed");
+                faces::forget(address);
+                faces::later(Box::from_raw(address as *mut Device));
+            })
+        };
         log!("wrapped device {:p} as {wrapper:p}", device.as_raw());
+        core::mem::forget(device);
+        Ok(wrapper)
+    }
+
+    /// Wraps a deferred context this device made; the caller's reference to `real` is the wrapper's.
+    fn wrap_context(
+        &self,
+        real: ID3D11DeviceContext,
+        recorder: Option<recorder::Recorder>,
+        reconstructed: bool,
+    ) -> Result<*mut Context, ID3D11DeviceContext> {
+        let inner = match real.cast::<ID3D11DeviceContext4>() {
+            Ok(c) => unowned(c),
+            Err(e) => {
+                log!("deferred context is not an ID3D11DeviceContext4 ({e}): left unwrapped");
+                return Err(real);
+            }
+        };
+        let id = capture::next_context_id();
+        let wrapper = Box::into_raw(Box::new(Context {
+            vtbl: &CONTEXT_VTBL,
+            inner,
+            device: self,
+            deferred: true,
+            id,
+            coverage: Default::default(),
+            recorder,
+            reconstructed,
+            rebuild_error: Default::default(),
+        }));
+        let address = wrapper as usize;
+        unsafe {
+            faces::watch(real.as_raw(), move || {
+                faces::later(tiled::context_destroyed(id));
+                faces::later(Box::from_raw(address as *mut Context));
+            })
+        };
+        core::mem::forget(real);
         Ok(wrapper)
     }
 
@@ -345,24 +370,6 @@ impl Device {
         None
     }
 
-    /// Our wrapper of the device's adapter, made the first time it is asked for.
-    fn adapter(&self) -> Option<&Adapter> {
-        let p = *self.adapter.get_or_init(|| {
-            let real = match unsafe { self.dxgi.inner.GetAdapter() } {
-                Ok(a) => a,
-                Err(e) => {
-                    log!("IDXGIDevice::GetAdapter on the real device failed: {e}");
-                    return 1;
-                }
-            };
-            match Adapter::wrap(real.into(), None) {
-                Ok(w) => w as usize,
-                Err(_) => 1,
-            }
-        });
-        (p > 1).then(|| unsafe { &*(p as *const Adapter) })
-    }
-
     pub fn immediate(&self) -> &Context {
         &self.immediate
     }
@@ -377,7 +384,7 @@ impl Device {
             return;
         }
         unsafe {
-            self.AddRef();
+            self.immediate.AddRef();
             *out = self.immediate_raw();
         }
     }
@@ -388,28 +395,12 @@ impl Device {
             return hr;
         }
         let real = unsafe { ID3D11DeviceContext::from_raw(*out) };
-        match real.cast::<ID3D11DeviceContext4>() {
-            Ok(inner) => {
-                unsafe { self.AddRef() };
-                let wrapper = Box::into_raw(Box::new(Context {
-                    vtbl: &CONTEXT_VTBL,
-                    refs: AtomicU32::new(1),
-                    inner,
-                    device: self,
-                    deferred: true,
-                    id: capture::next_context_id(),
-                    coverage: Default::default(),
-                    recorder: Some(Default::default()),
-                    reconstructed: false,
-                    rebuild_error: Default::default(),
-                }));
-                unsafe { *out = wrapper.cast() };
+        unsafe {
+            *out = match self.wrap_context(real, Some(Default::default()), false) {
+                Ok(wrapper) => wrapper.cast(),
+                Err(real) => real.into_raw(),
             }
-            Err(e) => {
-                log!("deferred context is not an ID3D11DeviceContext4 ({e}): left unwrapped");
-                unsafe { *out = real.into_raw() };
-            }
-        }
+        };
         hr
     }
 }
@@ -443,16 +434,16 @@ unsafe impl DeviceMethods for Device {
     }
 
     unsafe fn AddRef(&self) -> u32 {
-        self.refs.fetch_add(1, Ordering::Relaxed) + 1
+        unsafe { faces::add_ref(self.inner()) }
     }
 
     unsafe fn Release(&self) -> u32 {
-        let left = self.refs.fetch_sub(1, Ordering::AcqRel) - 1;
-        if left == 0 {
-            log!("device {:p} released", self as *const Device);
-            drop(unsafe { Box::from_raw(self as *const Device as *mut Device) });
-        }
-        left
+        unsafe { faces::release(self.inner()) }
+    }
+
+    /// Each object the device makes answers `GetDevice` with this wrapper ([`children`]).
+    unsafe fn made(&self, object: *mut c_void) {
+        unsafe { children::adopt(object) };
     }
 
     unsafe fn GetImmediateContext(&self, a0: *mut *mut c_void) {
@@ -686,16 +677,6 @@ unsafe impl DeviceMethods for Device {
     }
 }
 
-impl Drop for Device {
-    fn drop(&mut self) {
-        if let Some(&p) = self.adapter.get()
-            && p > 1
-        {
-            unsafe { AdapterMethods::Release(&*(p as *const Adapter)) };
-        }
-    }
-}
-
 unsafe impl DxgiDeviceMethods for DxgiDevice {
     fn inner(&self) -> *mut c_void {
         self.inner.as_raw()
@@ -717,22 +698,15 @@ unsafe impl DxgiDeviceMethods for DxgiDevice {
         if a0.is_null() {
             return E_POINTER;
         }
-        match unsafe { (*self.device).adapter() } {
-            Some(adapter) => unsafe {
-                adapter.AddRef();
-                *a0 = adapter as *const Adapter as *mut c_void;
-                S_OK
-            },
-            None => E_NOINTERFACE,
+        unsafe {
+            let hr = real_dxgi_device::GetAdapter(self.inner(), a0);
+            crate::dxgi::give(hr, &windows::Win32::Graphics::Dxgi::IDXGIAdapter::IID, a0)
         }
     }
 
     /// The parent of a DXGI device is its adapter.
     unsafe fn GetParent(&self, a0: *const GUID, a1: *mut *mut c_void) -> HRESULT {
-        match unsafe { (*self.device).adapter() } {
-            Some(adapter) => unsafe { adapter.QueryInterface(a0, a1) },
-            None => E_NOINTERFACE,
-        }
+        unsafe { crate::dxgi::give(real_dxgi_device::GetParent(self.inner(), a0, a1), a0, a1) }
     }
 }
 
@@ -772,25 +746,11 @@ unsafe impl ContextMethods for Context {
     }
 
     unsafe fn AddRef(&self) -> u32 {
-        if self.deferred {
-            self.refs.fetch_add(1, Ordering::Relaxed) + 1
-        } else {
-            unsafe { (*self.device).AddRef() }
-        }
+        unsafe { faces::add_ref(self.inner()) }
     }
 
     unsafe fn Release(&self) -> u32 {
-        if !self.deferred {
-            return unsafe { (*self.device).Release() };
-        }
-        let left = self.refs.fetch_sub(1, Ordering::AcqRel) - 1;
-        if left == 0 {
-            let device = self.device;
-            tiled::context_destroyed(self.id);
-            drop(unsafe { Box::from_raw(self as *const Context as *mut Context) });
-            unsafe { (*device).Release() };
-        }
-        left
+        unsafe { faces::release(self.inner()) }
     }
 
     unsafe fn Draw(&self, a0: u32, a1: u32) {
@@ -1333,6 +1293,9 @@ unsafe impl ContextMethods for Context {
 
     unsafe fn FinishCommandList(&self, a0: BOOL, a1: *mut *mut c_void) -> HRESULT {
         let hr = unsafe { real_context::FinishCommandList(self.inner(), a0, a1) };
+        if hr.is_ok() && !a1.is_null() {
+            unsafe { crate::d3d11::children::adopt(*a1) };
+        }
         if hr.is_ok() {
             let complete = self.coverage.finish();
             if let Some(r) = &self.recorder {

@@ -2,6 +2,7 @@
 //! overrides. Everything API-neutral (the capture format, blob store, formats, rules) is in `locum-capture`.
 
 pub mod capture;
+pub mod children;
 pub mod device;
 pub mod overrides;
 pub mod recorder;

@@ -1779,6 +1779,9 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
     if class.trait_name == "ContextMethods" {
         out.push_str("    /// Called before commands that perform work, including calls with a manual override.\n    fn before_command(&self) {}\n    fn recorder(&self) -> Option<&crate::d3d11::recorder::Recorder> { None }\n");
     }
+    if class.trait_name == "DeviceMethods" {
+        out.push_str("    /// Called with each object a `Create…` or `Open…` made. Not called when it made none: a failure, or\n    /// `S_FALSE` from a call that only validated its arguments (a null out pointer).\n    unsafe fn made(&self, _object: *mut c_void) {}\n");
+    }
     out.push_str("    unsafe fn QueryInterface(&self, iid: *const windows::core::GUID, out: *mut *mut c_void) -> windows::core::HRESULT;\n");
     out.push_str("    unsafe fn AddRef(&self) -> u32;\n");
     out.push_str("    unsafe fn Release(&self) -> u32;\n");
@@ -1856,26 +1859,51 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
                     e.name.as_str(),
                     "Map" | "UpdateSubresource" | "UpdateSubresource1" | "UpdateTiles"
                 );
-            let unsupported = class.trait_name == "ContextMethods"
-                && matches!(
-                    e.name.as_str(),
+            // What a recorded list cannot be rebuilt with: the call is not taped (a nested list would be held alive by
+            // its tape, as no native deferred context holds it), only the gap.
+            let unsupported = (class.trait_name == "ContextMethods")
+                .then(|| match e.name.as_str() {
                     "SwapDeviceContextState"
-                        | "SetHardwareProtectionState"
-                        | "Signal"
-                        | "Wait"
-                        | "SetResourceMinLOD"
-                );
+                    | "SetHardwareProtectionState"
+                    | "Signal"
+                    | "Wait"
+                    | "SetResourceMinLOD" => Some(format!("{} cannot be reconstructed exactly", e.name)),
+                    "ExecuteCommandList" => {
+                        Some("nested command-list readbacks cannot be reconstructed on this runtime".into())
+                    }
+                    _ => None,
+                })
+                .flatten();
             let mut before = observe.to_string();
-            if owning || special || unsupported {
+            if owning || special || unsupported.is_some() {
                 before.push_str("    let object = unsafe { &*(this as *const T) };\n    let recorder = object.recorder();\n    if let Some(r) = recorder { unsafe { r.begin(object.inner()) }; }\n");
             }
             let condition = if e.ret.is_some() { "result.is_ok() && " } else { "" };
             let mut after = String::new();
-            if unsupported {
-                writeln!(after,"    if {condition}let Some(r) = recorder {{ r.gap(\"{} cannot be reconstructed exactly\"); }}",e.name).unwrap();
+            if let Some(reason) = &unsupported {
+                writeln!(
+                    after,
+                    "    if {condition}let Some(r) = recorder {{ r.gap(\"{reason}\"); }}"
+                )
+                .unwrap();
             }
             if owning {
                 writeln!(after,"    if {condition}let Some(r) = recorder {{ r.record(|tape| unsafe {{ tape.{}({}) }}); }}", e.name, args.join(", ")).unwrap();
+            }
+            // A device's children are the runtime's objects; the wrapper sees each as it is made.
+            if class.trait_name == "DeviceMethods"
+                && (e.name.starts_with("Create") || e.name.starts_with("Open"))
+                && e.ret.is_some()
+                && e.params
+                    .last()
+                    .is_some_and(|t| t.replace(' ', "") == "*mut*mutcore::ffi::c_void")
+            {
+                writeln!(
+                    after,
+                    "    if result.is_ok() && !a{n}.is_null() && !unsafe {{ *a{n} }}.is_null() {{ unsafe {{ (*(this as *const T)).made(*a{n}) }}; }}",
+                    n = e.params.len() - 1
+                )
+                .unwrap();
             }
             let call = format!(
                 "unsafe {{ (*(this as *const T)).{}({}) }}",
@@ -1911,9 +1939,16 @@ fn generate(class: &Class, vtbls: &HashMap<String, Vtbl>) -> String {
         } else {
             (ret.to_string(), "")
         };
+        // A release that destroyed the object is over when the wrapper's returns: what the wrapper held of other
+        // objects goes before the game's call does, as the runtime's object's would.
+        let body = if name == "Release" {
+            "    let left = unsafe { (*(this as *const T)).Release() };\n    if left == 0 {\n        crate::faces::bury();\n    }\n    left".to_string()
+        } else {
+            format!("    unsafe {{ (*(this as *const T)).{name}({args}) }}")
+        };
         writeln!(
             out,
-            "unsafe extern \"system\" fn {name}<T: {t}>(this: *mut c_void{params} {{\n    unsafe {{ (*(this as *const T)).{name}({args}) }}\n}}",
+            "unsafe extern \"system\" fn {name}<T: {t}>(this: *mut c_void{params} {{\n{body}\n}}",
             t = class.trait_name,
         )
         .unwrap();

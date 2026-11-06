@@ -78,9 +78,6 @@ impl Recorder {
                 s.so = Some(so);
             }
             Some(tag::ClearState) => s.so = None,
-            Some(tag::ExecuteCommandList) => s
-                .gaps
-                .push("nested command-list readbacks cannot be reconstructed on this runtime"),
             _ => {}
         }
     }

@@ -9,7 +9,8 @@ use std::time::Instant;
 use super::cost::Counter;
 use locum_capture::{d3d12 as model, db, environment, writer};
 use serde_json::{Value, json};
-use windows::core::HRESULT;
+use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList;
+use windows::core::{HRESULT, Interface};
 
 use crate::log::{folder, log};
 
@@ -166,14 +167,16 @@ impl Data {
             && let Some(r) = self.recording.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
         {
             r.reset(allocator, pso);
-            self.instrument(r, real, pso);
+            if let Some(list) = unsafe { ID3D12GraphicsCommandList::from_raw_borrowed(&real) } {
+                self.instrument(r, list, pso);
+            }
         }
         RESET_COST.add(start, 0);
     }
     /// Instruments a generation opened with pipeline `pso` while a capture is armed, if the list is a direct one.
-    fn instrument(&self, recording: &mut model::Recording, real: *mut c_void, pso: u64) {
+    fn instrument(&self, recording: &mut model::Recording, list: &ID3D12GraphicsCommandList, pso: u64) {
         let pass = if super::passes::ARMED.load(std::sync::atomic::Ordering::Acquire) {
-            unsafe { super::passes::Pass::new(real, pso) }
+            unsafe { super::passes::Pass::new(list, pso) }
         } else {
             None
         };
@@ -301,6 +304,7 @@ pub fn destroy(id: u64) {
     }
     super::tiles::destroyed(id);
     super::slots::destroy(id);
+    super::readback::destroyed(id);
     DESTROY_COST.add(start, 0);
 }
 pub fn resource_address(id: u64, address: u64, bytes: u64) {
@@ -457,8 +461,8 @@ pub unsafe fn created_list(
     if let Some(data) = super::data(unsafe { *out }) {
         let (allocator, pso) = (super::id(allocator), super::id(pso));
         let mut recording = model::Recording::new(data.id, kind, allocator, pso, closed);
-        if !closed && let Some(real) = super::real(data.id) {
-            data.instrument(&mut recording, windows::core::Interface::as_raw(&real), pso);
+        if !closed && let Some(list) = super::real::<ID3D12GraphicsCommandList>(data.id) {
+            data.instrument(&mut recording, &list, pso);
         }
         *data.recording.lock().unwrap_or_else(|e| e.into_inner()) = Some(recording);
         describe(
@@ -562,7 +566,7 @@ pub unsafe fn submit(
         let snapshots = first_uses(live, objects, states, touched, unknown.as_deref(), cpu_seq);
         let copies = upload_copies(uploads, first, &lists, constant_buffers.values());
         if !copies.is_empty() || !snapshots.is_empty() {
-            unsafe { super::readback::submit(real, id, copies, snapshots, &live.results) };
+            unsafe { super::readback::submit(queue.id, real, id, copies, snapshots, &live.results) };
         }
         UPLOAD_COST.add(start, 0);
     }
@@ -627,12 +631,10 @@ unsafe fn unknown_wait(waits: &mut Vec<(u64, u64)>, signals: &HashMap<u64, u64>)
 /// Forgets the waits a submitted Signal or the fence's completed value reaches.
 unsafe fn prune(waits: &mut Vec<(u64, u64)>, signals: &HashMap<u64, u64>) {
     use windows::Win32::Graphics::Direct3D12::ID3D12Fence;
-    use windows::core::Interface;
     waits.retain(|&(fence, value)| {
         let signalled = signals.get(&fence).is_some_and(|&v| v >= value);
-        let completed = super::real(fence)
-            .and_then(|f| f.cast::<ID3D12Fence>().ok())
-            .is_none_or(|f| unsafe { f.GetCompletedValue() } >= value);
+        let completed =
+            super::real::<ID3D12Fence>(fence).is_none_or(|f| unsafe { f.GetCompletedValue() } >= value);
         !(signalled || completed)
     });
 }
@@ -959,10 +961,8 @@ fn adapter(presented: Option<u64>) -> Result<environment::Adapter, String> {
             devices.first().copied()
         })
         .ok_or("the process has no D3D12 device")?;
-    let device: ID3D12Device = super::real(device)
-        .ok_or_else(|| format!("device #{device} has no real device"))?
-        .cast()
-        .map_err(|e| format!("device #{device} as an ID3D12Device: {e}"))?;
+    let device =
+        super::real::<ID3D12Device>(device).ok_or_else(|| format!("device #{device} has no real device"))?;
     let luid = unsafe { device.GetAdapterLuid() };
     type Factory = unsafe extern "system" fn(u32, *const GUID, *mut *mut c_void) -> HRESULT;
     let create =

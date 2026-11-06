@@ -114,7 +114,11 @@ unsafe extern "system" fn AddRef<T: Properties12Methods>(this: *mut c_void) -> u
     unsafe { (*(this as *const T)).AddRef() }
 }
 unsafe extern "system" fn Release<T: Properties12Methods>(this: *mut c_void) -> u32 {
-    unsafe { (*(this as *const T)).Release() }
+    let left = unsafe { (*(this as *const T)).Release() };
+    if left == 0 {
+        crate::faces::bury();
+    }
+    left
 }
 unsafe extern "system" fn GetShaderIdentifier<T: Properties12Methods>(
     this: *mut c_void,

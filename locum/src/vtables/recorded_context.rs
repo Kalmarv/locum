@@ -56,37 +56,36 @@ pub mod tag {
     pub const GenerateMips: u32 = 43;
     pub const SetResourceMinLOD: u32 = 44;
     pub const ResolveSubresource: u32 = 45;
-    pub const ExecuteCommandList: u32 = 46;
-    pub const HSSetShaderResources: u32 = 47;
-    pub const HSSetShader: u32 = 48;
-    pub const HSSetSamplers: u32 = 49;
-    pub const HSSetConstantBuffers: u32 = 50;
-    pub const DSSetShaderResources: u32 = 51;
-    pub const DSSetShader: u32 = 52;
-    pub const DSSetSamplers: u32 = 53;
-    pub const DSSetConstantBuffers: u32 = 54;
-    pub const CSSetShaderResources: u32 = 55;
-    pub const CSSetUnorderedAccessViews: u32 = 56;
-    pub const CSSetShader: u32 = 57;
-    pub const CSSetSamplers: u32 = 58;
-    pub const CSSetConstantBuffers: u32 = 59;
-    pub const ClearState: u32 = 60;
-    pub const CopySubresourceRegion1: u32 = 61;
-    pub const DiscardResource: u32 = 62;
-    pub const DiscardView: u32 = 63;
-    pub const VSSetConstantBuffers1: u32 = 64;
-    pub const HSSetConstantBuffers1: u32 = 65;
-    pub const DSSetConstantBuffers1: u32 = 66;
-    pub const GSSetConstantBuffers1: u32 = 67;
-    pub const PSSetConstantBuffers1: u32 = 68;
-    pub const CSSetConstantBuffers1: u32 = 69;
-    pub const ClearView: u32 = 70;
-    pub const DiscardView1: u32 = 71;
-    pub const UpdateTileMappings: u32 = 72;
-    pub const CopyTileMappings: u32 = 73;
-    pub const CopyTiles: u32 = 74;
-    pub const ResizeTilePool: u32 = 75;
-    pub const TiledResourceBarrier: u32 = 76;
+    pub const HSSetShaderResources: u32 = 46;
+    pub const HSSetShader: u32 = 47;
+    pub const HSSetSamplers: u32 = 48;
+    pub const HSSetConstantBuffers: u32 = 49;
+    pub const DSSetShaderResources: u32 = 50;
+    pub const DSSetShader: u32 = 51;
+    pub const DSSetSamplers: u32 = 52;
+    pub const DSSetConstantBuffers: u32 = 53;
+    pub const CSSetShaderResources: u32 = 54;
+    pub const CSSetUnorderedAccessViews: u32 = 55;
+    pub const CSSetShader: u32 = 56;
+    pub const CSSetSamplers: u32 = 57;
+    pub const CSSetConstantBuffers: u32 = 58;
+    pub const ClearState: u32 = 59;
+    pub const CopySubresourceRegion1: u32 = 60;
+    pub const DiscardResource: u32 = 61;
+    pub const DiscardView: u32 = 62;
+    pub const VSSetConstantBuffers1: u32 = 63;
+    pub const HSSetConstantBuffers1: u32 = 64;
+    pub const DSSetConstantBuffers1: u32 = 65;
+    pub const GSSetConstantBuffers1: u32 = 66;
+    pub const PSSetConstantBuffers1: u32 = 67;
+    pub const CSSetConstantBuffers1: u32 = 68;
+    pub const ClearView: u32 = 69;
+    pub const DiscardView1: u32 = 70;
+    pub const UpdateTileMappings: u32 = 71;
+    pub const CopyTileMappings: u32 = 72;
+    pub const CopyTiles: u32 = 73;
+    pub const ResizeTilePool: u32 = 74;
+    pub const TiledResourceBarrier: u32 = 75;
 }
 impl Tape {
     pub unsafe fn VSSetConstantBuffers(&mut self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
@@ -423,11 +422,6 @@ impl Tape {
         unsafe { self.object(a2) };
         self.put(a3);
         self.put(a4);
-    }
-    pub unsafe fn ExecuteCommandList(&mut self, a0: *mut core::ffi::c_void, a1: windows::core::BOOL) {
-        self.tag(tag::ExecuteCommandList);
-        unsafe { self.object(a0) };
-        self.put(a1);
     }
     pub unsafe fn HSSetShaderResources(&mut self, a0: u32, a1: u32, a2: *const *mut core::ffi::c_void) {
         self.tag(tag::HSSetShaderResources);
@@ -1065,12 +1059,6 @@ pub unsafe fn call(tag: u32, r: &mut Reader, context: *mut c_void) -> windows::c
             let a3: u32 = r.get();
             let a4: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT = r.get();
             unsafe { crate::vtables::context::real::ResolveSubresource(context, a0, a1, a2, a3, a4) };
-            Ok(())
-        }
-        tag::ExecuteCommandList => {
-            let a0 = r.object();
-            let a1: windows::core::BOOL = r.get();
-            unsafe { crate::vtables::context::real::ExecuteCommandList(context, a0, a1) };
             Ok(())
         }
         tag::HSSetShaderResources => {

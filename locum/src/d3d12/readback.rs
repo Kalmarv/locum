@@ -79,11 +79,11 @@ const ALIGN: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
 enum Item {
     Upload {
         copy: Copy,
-        resource: ID3D12Resource,
+        resource: super::Real<ID3D12Resource>,
     },
     Contents {
         snapshot: Snapshot,
-        resource: ID3D12Resource,
+        resource: super::Real<ID3D12Resource>,
         /// Per D3D12 subresource: its footprint (offset relative to the item), rows and row bytes; empty for a
         /// buffer.
         footprints: Vec<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)>,
@@ -113,8 +113,10 @@ struct Pending {
 /// cannot be made are in `results` at once, with the reason.
 ///
 /// # Safety
-/// `queue` is the application's real queue, called from its ExecuteCommandLists before the application's lists.
+/// `queue` is the application's real queue (number `queue_id`), called from its ExecuteCommandLists before the
+/// application's lists.
 pub unsafe fn submit(
+    queue_id: u64,
     queue: *mut c_void,
     submission: u64,
     copies: Vec<Copy>,
@@ -176,7 +178,18 @@ pub unsafe fn submit(
             )
         };
         if !chunks.is_empty() {
-            unsafe { beside(queue, &device, submission, chunks, start, results, &mut failed) };
+            unsafe {
+                beside(
+                    queue_id,
+                    queue,
+                    &device,
+                    submission,
+                    chunks,
+                    start,
+                    results,
+                    &mut failed,
+                )
+            };
         }
     }
     if !failed.uploads.is_empty() || !failed.contents.is_empty() {
@@ -208,7 +221,7 @@ unsafe fn place(
     let mut chunk_bytes = 0;
     for item in items {
         let placed = match item {
-            Ok(copy) => match super::real(copy.resource).and_then(|r| r.cast::<ID3D12Resource>().ok()) {
+            Ok(copy) => match super::real::<ID3D12Resource>(copy.resource) {
                 Some(resource) => {
                     let len = copy.len;
                     Ok((Item::Upload { copy, resource }, len))
@@ -249,7 +262,6 @@ unsafe fn place(
 /// application's queue signals `ready` where its next work begins and waits for `done`, which the helper signals once
 /// its copies are made.
 struct Helper {
-    device: usize,
     queue: ID3D12CommandQueue,
     ready: ID3D12Fence,
     done: ID3D12Fence,
@@ -261,8 +273,10 @@ unsafe impl Send for Helper {}
 
 /// Makes `chunks` on a direct queue of locum's, between the application queue's work submitted so far and the
 /// submission about to follow: the copies see what that submission will, and it waits for them. The helper queue and
-/// its fences live as long as the process, so no wait can outlive a fence.
+/// its fences live as long as the application's queue (number `queue_id`), so no wait can outlive a fence.
+#[allow(clippy::too_many_arguments)]
 unsafe fn beside(
+    queue_id: u64,
     queue: &ID3D12CommandQueue,
     device: &ID3D12Device,
     submission: u64,
@@ -271,22 +285,10 @@ unsafe fn beside(
     results: &Results,
     failed: &mut Batch,
 ) {
-    static HELPERS: OnceLock<Mutex<std::collections::HashMap<usize, Helper>>> = OnceLock::new();
-    let mut helpers = HELPERS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let key = queue.as_raw() as usize;
-    let device_key = device.as_raw() as usize;
-    if helpers.get(&key).is_some_and(|h| h.device != device_key) {
-        // The application's queue was destroyed and another made at its address on another device.
-        helpers.remove(&key);
-    }
-    let helper = match helpers.entry(key) {
+    let mut helpers = helpers();
+    let helper = match helpers.entry(queue_id) {
         std::collections::hash_map::Entry::Occupied(e) => Ok(e.into_mut()),
-        std::collections::hash_map::Entry::Vacant(e) => {
-            unsafe { helper(device, device_key) }.map(|h| e.insert(h))
-        }
+        std::collections::hash_map::Entry::Vacant(e) => unsafe { helper(device) }.map(|h| e.insert(h)),
     };
     let helper = match helper {
         Ok(h) => h,
@@ -337,7 +339,22 @@ unsafe fn beside(
     }
 }
 
-unsafe fn helper(device: &ID3D12Device, device_key: usize) -> Result<Helper, String> {
+/// The helper of each application queue that has one, by the queue's number.
+fn helpers() -> std::sync::MutexGuard<'static, std::collections::HashMap<u64, Helper>> {
+    static HELPERS: OnceLock<Mutex<std::collections::HashMap<u64, Helper>>> = OnceLock::new();
+    HELPERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Object `id` was destroyed: if it was a queue with a helper, the helper goes (it holds the device).
+pub fn destroyed(id: u64) {
+    let helper = helpers().remove(&id);
+    drop(helper);
+}
+
+unsafe fn helper(device: &ID3D12Device) -> Result<Helper, String> {
     let queue = unsafe {
         device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
             Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
@@ -347,7 +364,6 @@ unsafe fn helper(device: &ID3D12Device, device_key: usize) -> Result<Helper, Str
     .map_err(|e| format!("helper queue: CreateCommandQueue: {e}"))?;
     let fence = || unsafe { device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) };
     Ok(Helper {
-        device: device_key,
         queue,
         ready: fence().map_err(|e| format!("helper queue: CreateFence: {e}"))?,
         done: fence().map_err(|e| format!("helper queue: CreateFence: {e}"))?,
@@ -447,7 +463,7 @@ unsafe fn contents(
     kind: D3D12_COMMAND_LIST_TYPE,
     snapshot: Snapshot,
 ) -> Result<(Item, u64), (Snapshot, String)> {
-    let Some(resource) = super::real(snapshot.resource).and_then(|r| r.cast::<ID3D12Resource>().ok()) else {
+    let Some(resource) = super::real::<ID3D12Resource>(snapshot.resource) else {
         return Err((snapshot, "no live resource".into()));
     };
     if let Some(reason) = snapshot.states.iter().find_map(|s| unreadable(*s, kind)) {
@@ -688,12 +704,12 @@ unsafe fn record(
     for p in &placed {
         match &p.item {
             Item::Upload { copy, resource } => unsafe {
-                list.CopyBufferRegion(&readback, p.at, resource, copy.offset, copy.len)
+                list.CopyBufferRegion(&readback, p.at, &**resource, copy.offset, copy.len)
             },
             Item::Contents {
                 resource, footprints, ..
             } if footprints.is_empty() => unsafe {
-                list.CopyBufferRegion(&readback, p.at, resource, 0, p.bytes)
+                list.CopyBufferRegion(&readback, p.at, &**resource, 0, p.bytes)
             },
             Item::Contents {
                 resource, footprints, ..

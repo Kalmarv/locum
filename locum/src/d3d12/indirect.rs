@@ -90,7 +90,7 @@ pub unsafe fn after_frame(
             });
     }
     for ((submission, queue), snapshots) in by_queue {
-        let Some(real) = super::real(queue).and_then(|q| q.cast::<ID3D12CommandQueue>().ok()) else {
+        let Some(real) = super::real::<ID3D12CommandQueue>(queue) else {
             let failed = snapshots
                 .iter()
                 .map(|s| {
@@ -114,6 +114,6 @@ pub unsafe fn after_frame(
                 });
             continue;
         };
-        unsafe { super::readback::submit(real.as_raw(), submission, Vec::new(), snapshots, results) };
+        unsafe { super::readback::submit(queue, real.as_raw(), submission, Vec::new(), snapshots, results) };
     }
 }

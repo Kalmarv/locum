@@ -181,7 +181,11 @@ unsafe extern "system" fn AddRef<T: Heap12Methods>(this: *mut c_void) -> u32 {
     unsafe { (*(this as *const T)).AddRef() }
 }
 unsafe extern "system" fn Release<T: Heap12Methods>(this: *mut c_void) -> u32 {
-    unsafe { (*(this as *const T)).Release() }
+    let left = unsafe { (*(this as *const T)).Release() };
+    if left == 0 {
+        crate::faces::bury();
+    }
+    left
 }
 unsafe extern "system" fn GetPrivateData<T: Heap12Methods>(
     this: *mut c_void,

@@ -2874,7 +2874,11 @@ unsafe extern "system" fn AddRef<T: ContextMethods>(this: *mut c_void) -> u32 {
     unsafe { (*(this as *const T)).AddRef() }
 }
 unsafe extern "system" fn Release<T: ContextMethods>(this: *mut c_void) -> u32 {
-    unsafe { (*(this as *const T)).Release() }
+    let left = unsafe { (*(this as *const T)).Release() };
+    if left == 0 {
+        crate::faces::bury();
+    }
+    left
 }
 unsafe extern "system" fn GetDevice<T: ContextMethods>(this: *mut c_void, a0: *mut *mut core::ffi::c_void) {
     unsafe { (*(this as *const T)).GetDevice(a0) }
@@ -3687,7 +3691,7 @@ unsafe extern "system" fn ExecuteCommandList<T: ContextMethods>(
     }
     unsafe { (*(this as *const T)).ExecuteCommandList(a0, a1) };
     if let Some(r) = recorder {
-        r.record(|tape| unsafe { tape.ExecuteCommandList(a0, a1) });
+        r.gap("nested command-list readbacks cannot be reconstructed on this runtime");
     }
 }
 unsafe extern "system" fn HSSetShaderResources<T: ContextMethods>(

@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- A wrapper is another face of the real object: its `AddRef` and `Release` are the object's, one wrapper is made per
+  object, and it is freed when the object is destroyed. A game sees the counts it would see without locum: a child
+  holds its device, the immediate context's first reference holds the device, a back buffer holds its swap chain, an
+  adapter its factory. Before, each wrapper counted on its own, and a Direct3D 12 heap a placed resource lived in was
+  freed when the game released it, so a later call on it crashed (vkd3d's `test_create_placed_resource`).
+- `GetDevice` on what a Direct3D 11 device made (a buffer, a texture's DXGI surface, a class instance) answers with
+  locum's device, and every way to the adapter and factory (`IDXGIDevice::GetAdapter`, `IDXGIAdapter::GetParent`, an
+  output's `GetParent`) with locum's wrappers. Before, it handed out the real device, and what a game made with that
+  passed locum by.
+- A wrapper answers only to the interfaces its real object answers to: a factory from `CreateDXGIFactory` refuses
+  `IDXGIFactory1`, as the system's does.
+- `D3D11CreateDevice` and `D3D11CreateDeviceAndSwapChain` clear the out pointers they are given and make nothing when
+  given none to fill, as the system's do.
+- The Agility SDK's `D3D12Core.dll` and `d3d12SDKLayers.dll`, and `d3d10warp.dll`, in a game's folder are the
+  runtime: the factories they ask DXGI for are the real ones.
+- What a Direct3D 12 capture makes beside a game's queue (a helper queue, fences) goes when the queue is destroyed.
+  Before, it lived as long as the process and held the device.
+- A command list run on a deferred context is not held by that context's recording. Before, the recording held it
+  (and so its device) for as long as the list being recorded, or the context, lived.
+- The first present that reports the device removed (or reset) logs the device's reason.
 - `cargo xtask smoke` runs what cargo built where `CARGO_TARGET_DIR` points, and stages there (`smoke/`,
   `smoke-d3d12/`). Before, it built there but copied `target/release`'s DLLs, so a smoke could pass on old ones.
 - `locum-cli conform` (and `--layer`) loads what a layer's DLLs forward their exports to from the layer's folder:

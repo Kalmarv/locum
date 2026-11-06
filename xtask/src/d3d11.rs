@@ -25,10 +25,7 @@ pub fn recorded(name: &str) -> bool {
             || ["VS", "HS", "DS", "GS", "PS", "CS"]
                 .iter()
                 .any(|s| name.starts_with(&format!("{s}Set")))
-            || matches!(
-                name,
-                "Begin" | "End" | "SetPredication" | "SetResourceMinLOD" | "ExecuteCommandList"
-            ))
+            || matches!(name, "Begin" | "End" | "SetPredication" | "SetResourceMinLOD"))
 }
 fn count(name: &str, i: usize) -> String {
     if name.ends_with("SetShader") {

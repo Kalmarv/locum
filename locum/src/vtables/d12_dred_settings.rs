@@ -110,7 +110,11 @@ unsafe extern "system" fn AddRef<T: DredSettings12Methods>(this: *mut c_void) ->
     unsafe { (*(this as *const T)).AddRef() }
 }
 unsafe extern "system" fn Release<T: DredSettings12Methods>(this: *mut c_void) -> u32 {
-    unsafe { (*(this as *const T)).Release() }
+    let left = unsafe { (*(this as *const T)).Release() };
+    if left == 0 {
+        crate::faces::bury();
+    }
+    left
 }
 unsafe extern "system" fn SetAutoBreadcrumbsEnablement<T: DredSettings12Methods>(
     this: *mut c_void,

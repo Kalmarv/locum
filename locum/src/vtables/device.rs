@@ -17,6 +17,9 @@ use core::ffi::c_void;
 pub unsafe trait DeviceMethods: Sized {
     /// The wrapped object, an `ID3D11Device5`.
     fn inner(&self) -> *mut c_void;
+    /// Called with each object a `Create…` or `Open…` made. Not called when it made none: a failure, or
+    /// `S_FALSE` from a call that only validated its arguments (a null out pointer).
+    unsafe fn made(&self, _object: *mut c_void) {}
     unsafe fn QueryInterface(
         &self,
         iid: *const windows::core::GUID,
@@ -1556,7 +1559,11 @@ unsafe extern "system" fn AddRef<T: DeviceMethods>(this: *mut c_void) -> u32 {
     unsafe { (*(this as *const T)).AddRef() }
 }
 unsafe extern "system" fn Release<T: DeviceMethods>(this: *mut c_void) -> u32 {
-    unsafe { (*(this as *const T)).Release() }
+    let left = unsafe { (*(this as *const T)).Release() };
+    if left == 0 {
+        crate::faces::bury();
+    }
+    left
 }
 unsafe extern "system" fn CreateBuffer<T: DeviceMethods>(
     this: *mut c_void,
@@ -1564,7 +1571,11 @@ unsafe extern "system" fn CreateBuffer<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateBuffer(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateBuffer(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateTexture1D<T: DeviceMethods>(
     this: *mut c_void,
@@ -1572,7 +1583,11 @@ unsafe extern "system" fn CreateTexture1D<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateTexture1D(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateTexture1D(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateTexture2D<T: DeviceMethods>(
     this: *mut c_void,
@@ -1580,7 +1595,11 @@ unsafe extern "system" fn CreateTexture2D<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateTexture2D(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateTexture2D(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateTexture3D<T: DeviceMethods>(
     this: *mut c_void,
@@ -1588,7 +1607,11 @@ unsafe extern "system" fn CreateTexture3D<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateTexture3D(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateTexture3D(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateShaderResourceView<T: DeviceMethods>(
     this: *mut c_void,
@@ -1596,7 +1619,11 @@ unsafe extern "system" fn CreateShaderResourceView<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_SHADER_RESOURCE_VIEW_DESC,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateShaderResourceView(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateShaderResourceView(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateUnorderedAccessView<T: DeviceMethods>(
     this: *mut c_void,
@@ -1604,7 +1631,11 @@ unsafe extern "system" fn CreateUnorderedAccessView<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_UNORDERED_ACCESS_VIEW_DESC,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateUnorderedAccessView(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateUnorderedAccessView(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateRenderTargetView<T: DeviceMethods>(
     this: *mut c_void,
@@ -1612,7 +1643,11 @@ unsafe extern "system" fn CreateRenderTargetView<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_RENDER_TARGET_VIEW_DESC,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateRenderTargetView(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateRenderTargetView(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateDepthStencilView<T: DeviceMethods>(
     this: *mut c_void,
@@ -1620,7 +1655,11 @@ unsafe extern "system" fn CreateDepthStencilView<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_DEPTH_STENCIL_VIEW_DESC,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateDepthStencilView(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateDepthStencilView(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateInputLayout<T: DeviceMethods>(
     this: *mut c_void,
@@ -1630,7 +1669,11 @@ unsafe extern "system" fn CreateInputLayout<T: DeviceMethods>(
     a3: usize,
     a4: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateInputLayout(a0, a1, a2, a3, a4) }
+    let result = unsafe { (*(this as *const T)).CreateInputLayout(a0, a1, a2, a3, a4) };
+    if result.is_ok() && !a4.is_null() && !unsafe { *a4 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a4) };
+    }
+    result
 }
 unsafe extern "system" fn CreateVertexShader<T: DeviceMethods>(
     this: *mut c_void,
@@ -1639,7 +1682,11 @@ unsafe extern "system" fn CreateVertexShader<T: DeviceMethods>(
     a2: *mut core::ffi::c_void,
     a3: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateVertexShader(a0, a1, a2, a3) }
+    let result = unsafe { (*(this as *const T)).CreateVertexShader(a0, a1, a2, a3) };
+    if result.is_ok() && !a3.is_null() && !unsafe { *a3 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a3) };
+    }
+    result
 }
 unsafe extern "system" fn CreateGeometryShader<T: DeviceMethods>(
     this: *mut c_void,
@@ -1648,7 +1695,11 @@ unsafe extern "system" fn CreateGeometryShader<T: DeviceMethods>(
     a2: *mut core::ffi::c_void,
     a3: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateGeometryShader(a0, a1, a2, a3) }
+    let result = unsafe { (*(this as *const T)).CreateGeometryShader(a0, a1, a2, a3) };
+    if result.is_ok() && !a3.is_null() && !unsafe { *a3 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a3) };
+    }
+    result
 }
 unsafe extern "system" fn CreateGeometryShaderWithStreamOutput<T: DeviceMethods>(
     this: *mut c_void,
@@ -1662,7 +1713,13 @@ unsafe extern "system" fn CreateGeometryShaderWithStreamOutput<T: DeviceMethods>
     a7: *mut core::ffi::c_void,
     a8: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateGeometryShaderWithStreamOutput(a0, a1, a2, a3, a4, a5, a6, a7, a8) }
+    let result = unsafe {
+        (*(this as *const T)).CreateGeometryShaderWithStreamOutput(a0, a1, a2, a3, a4, a5, a6, a7, a8)
+    };
+    if result.is_ok() && !a8.is_null() && !unsafe { *a8 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a8) };
+    }
+    result
 }
 unsafe extern "system" fn CreatePixelShader<T: DeviceMethods>(
     this: *mut c_void,
@@ -1671,7 +1728,11 @@ unsafe extern "system" fn CreatePixelShader<T: DeviceMethods>(
     a2: *mut core::ffi::c_void,
     a3: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreatePixelShader(a0, a1, a2, a3) }
+    let result = unsafe { (*(this as *const T)).CreatePixelShader(a0, a1, a2, a3) };
+    if result.is_ok() && !a3.is_null() && !unsafe { *a3 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a3) };
+    }
+    result
 }
 unsafe extern "system" fn CreateHullShader<T: DeviceMethods>(
     this: *mut c_void,
@@ -1680,7 +1741,11 @@ unsafe extern "system" fn CreateHullShader<T: DeviceMethods>(
     a2: *mut core::ffi::c_void,
     a3: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateHullShader(a0, a1, a2, a3) }
+    let result = unsafe { (*(this as *const T)).CreateHullShader(a0, a1, a2, a3) };
+    if result.is_ok() && !a3.is_null() && !unsafe { *a3 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a3) };
+    }
+    result
 }
 unsafe extern "system" fn CreateDomainShader<T: DeviceMethods>(
     this: *mut c_void,
@@ -1689,7 +1754,11 @@ unsafe extern "system" fn CreateDomainShader<T: DeviceMethods>(
     a2: *mut core::ffi::c_void,
     a3: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateDomainShader(a0, a1, a2, a3) }
+    let result = unsafe { (*(this as *const T)).CreateDomainShader(a0, a1, a2, a3) };
+    if result.is_ok() && !a3.is_null() && !unsafe { *a3 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a3) };
+    }
+    result
 }
 unsafe extern "system" fn CreateComputeShader<T: DeviceMethods>(
     this: *mut c_void,
@@ -1698,69 +1767,109 @@ unsafe extern "system" fn CreateComputeShader<T: DeviceMethods>(
     a2: *mut core::ffi::c_void,
     a3: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateComputeShader(a0, a1, a2, a3) }
+    let result = unsafe { (*(this as *const T)).CreateComputeShader(a0, a1, a2, a3) };
+    if result.is_ok() && !a3.is_null() && !unsafe { *a3 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a3) };
+    }
+    result
 }
 unsafe extern "system" fn CreateClassLinkage<T: DeviceMethods>(
     this: *mut c_void,
     a0: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateClassLinkage(a0) }
+    let result = unsafe { (*(this as *const T)).CreateClassLinkage(a0) };
+    if result.is_ok() && !a0.is_null() && !unsafe { *a0 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a0) };
+    }
+    result
 }
 unsafe extern "system" fn CreateBlendState<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_BLEND_DESC,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateBlendState(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateBlendState(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreateDepthStencilState<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_DEPTH_STENCIL_DESC,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateDepthStencilState(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateDepthStencilState(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreateRasterizerState<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_RASTERIZER_DESC,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateRasterizerState(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateRasterizerState(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreateSamplerState<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_SAMPLER_DESC,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateSamplerState(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateSamplerState(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreateQuery<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_QUERY_DESC,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateQuery(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateQuery(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreatePredicate<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_QUERY_DESC,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreatePredicate(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreatePredicate(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreateCounter<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_COUNTER_DESC,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateCounter(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateCounter(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreateDeferredContext<T: DeviceMethods>(
     this: *mut c_void,
     a0: u32,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateDeferredContext(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateDeferredContext(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn OpenSharedResource<T: DeviceMethods>(
     this: *mut c_void,
@@ -1768,7 +1877,11 @@ unsafe extern "system" fn OpenSharedResource<T: DeviceMethods>(
     a1: *const windows::core::GUID,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).OpenSharedResource(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).OpenSharedResource(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CheckFormatSupport<T: DeviceMethods>(
     this: *mut c_void,
@@ -1875,21 +1988,33 @@ unsafe extern "system" fn CreateDeferredContext1<T: DeviceMethods>(
     a0: u32,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateDeferredContext1(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateDeferredContext1(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreateBlendState1<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_BLEND_DESC1,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateBlendState1(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateBlendState1(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreateRasterizerState1<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_RASTERIZER_DESC1,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateRasterizerState1(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateRasterizerState1(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreateDeviceContextState<T: DeviceMethods>(
     this: *mut c_void,
@@ -1901,7 +2026,11 @@ unsafe extern "system" fn CreateDeviceContextState<T: DeviceMethods>(
     a5: *mut windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL,
     a6: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateDeviceContextState(a0, a1, a2, a3, a4, a5, a6) }
+    let result = unsafe { (*(this as *const T)).CreateDeviceContextState(a0, a1, a2, a3, a4, a5, a6) };
+    if result.is_ok() && !a6.is_null() && !unsafe { *a6 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a6) };
+    }
+    result
 }
 unsafe extern "system" fn OpenSharedResource1<T: DeviceMethods>(
     this: *mut c_void,
@@ -1909,7 +2038,11 @@ unsafe extern "system" fn OpenSharedResource1<T: DeviceMethods>(
     a1: *const windows::core::GUID,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).OpenSharedResource1(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).OpenSharedResource1(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn OpenSharedResourceByName<T: DeviceMethods>(
     this: *mut c_void,
@@ -1918,7 +2051,11 @@ unsafe extern "system" fn OpenSharedResourceByName<T: DeviceMethods>(
     a2: *const windows::core::GUID,
     a3: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).OpenSharedResourceByName(a0, a1, a2, a3) }
+    let result = unsafe { (*(this as *const T)).OpenSharedResourceByName(a0, a1, a2, a3) };
+    if result.is_ok() && !a3.is_null() && !unsafe { *a3 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a3) };
+    }
+    result
 }
 unsafe extern "system" fn GetImmediateContext2<T: DeviceMethods>(
     this: *mut c_void,
@@ -1931,7 +2068,11 @@ unsafe extern "system" fn CreateDeferredContext2<T: DeviceMethods>(
     a0: u32,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateDeferredContext2(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateDeferredContext2(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn GetResourceTiling<T: DeviceMethods>(
     this: *mut c_void,
@@ -1960,7 +2101,11 @@ unsafe extern "system" fn CreateTexture2D1<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateTexture2D1(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateTexture2D1(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateTexture3D1<T: DeviceMethods>(
     this: *mut c_void,
@@ -1968,14 +2113,22 @@ unsafe extern "system" fn CreateTexture3D1<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_SUBRESOURCE_DATA,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateTexture3D1(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateTexture3D1(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateRasterizerState2<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_RASTERIZER_DESC2,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateRasterizerState2(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateRasterizerState2(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn CreateShaderResourceView1<T: DeviceMethods>(
     this: *mut c_void,
@@ -1983,7 +2136,11 @@ unsafe extern "system" fn CreateShaderResourceView1<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_SHADER_RESOURCE_VIEW_DESC1,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateShaderResourceView1(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateShaderResourceView1(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateUnorderedAccessView1<T: DeviceMethods>(
     this: *mut c_void,
@@ -1991,7 +2148,11 @@ unsafe extern "system" fn CreateUnorderedAccessView1<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_UNORDERED_ACCESS_VIEW_DESC1,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateUnorderedAccessView1(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateUnorderedAccessView1(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateRenderTargetView1<T: DeviceMethods>(
     this: *mut c_void,
@@ -1999,14 +2160,22 @@ unsafe extern "system" fn CreateRenderTargetView1<T: DeviceMethods>(
     a1: *const windows::Win32::Graphics::Direct3D11::D3D11_RENDER_TARGET_VIEW_DESC1,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateRenderTargetView1(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).CreateRenderTargetView1(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateQuery1<T: DeviceMethods>(
     this: *mut c_void,
     a0: *const windows::Win32::Graphics::Direct3D11::D3D11_QUERY_DESC1,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateQuery1(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateQuery1(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn GetImmediateContext3<T: DeviceMethods>(
     this: *mut c_void,
@@ -2019,7 +2188,11 @@ unsafe extern "system" fn CreateDeferredContext3<T: DeviceMethods>(
     a0: u32,
     a1: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateDeferredContext3(a0, a1) }
+    let result = unsafe { (*(this as *const T)).CreateDeferredContext3(a0, a1) };
+    if result.is_ok() && !a1.is_null() && !unsafe { *a1 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a1) };
+    }
+    result
 }
 unsafe extern "system" fn WriteToSubresource<T: DeviceMethods>(
     this: *mut c_void,
@@ -2059,7 +2232,11 @@ unsafe extern "system" fn OpenSharedFence<T: DeviceMethods>(
     a1: *const windows::core::GUID,
     a2: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).OpenSharedFence(a0, a1, a2) }
+    let result = unsafe { (*(this as *const T)).OpenSharedFence(a0, a1, a2) };
+    if result.is_ok() && !a2.is_null() && !unsafe { *a2 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a2) };
+    }
+    result
 }
 unsafe extern "system" fn CreateFence<T: DeviceMethods>(
     this: *mut c_void,
@@ -2068,7 +2245,11 @@ unsafe extern "system" fn CreateFence<T: DeviceMethods>(
     a2: *const windows::core::GUID,
     a3: *mut *mut core::ffi::c_void,
 ) -> windows::core::HRESULT {
-    unsafe { (*(this as *const T)).CreateFence(a0, a1, a2, a3) }
+    let result = unsafe { (*(this as *const T)).CreateFence(a0, a1, a2, a3) };
+    if result.is_ok() && !a3.is_null() && !unsafe { *a3 }.is_null() {
+        unsafe { (*(this as *const T)).made(*a3) };
+    }
+    result
 }
 
 /// The `ID3D11Device5` vtable whose entries call `T`'s methods.

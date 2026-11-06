@@ -285,7 +285,8 @@ static BLOB: ID3DBlob_Vtbl = ID3DBlob_Vtbl {
 unsafe fn object<T>(mock: &mut T) -> super::super::Object {
     super::super::Object {
         vtable: core::ptr::null(),
-        real: unsafe { IUnknown::from_raw((mock as *mut T).cast()) },
+        real: core::mem::ManuallyDrop::new(unsafe { IUnknown::from_raw((mock as *mut T).cast()) }),
+        watched: false,
         identity: 0,
         data: Arc::new(super::super::journal::Data::new(17)),
     }

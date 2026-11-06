@@ -51,9 +51,7 @@ fn real(wrapped: *mut c_void) -> Option<ID3D12Resource> {
 /// Reserved resource `id`'s tile numbering and page table as captures record them ([`Layout::json`],
 /// [`Pages::runs`]); one never mapped has an empty page table.
 pub fn pages(id: u64) -> Result<(Value, Value), String> {
-    let resource = super::real(id)
-        .and_then(|r| r.cast::<ID3D12Resource>().ok())
-        .ok_or("no live resource")?;
+    let resource = super::real::<ID3D12Resource>(id).ok_or("no live resource")?;
     with_entry(id, &resource, |e| match &e.error {
         Some(error) => Err(error.clone()),
         None => Ok((e.layout.json(), json!(e.pages.runs()))),
@@ -248,7 +246,7 @@ fn settle(e: &mut Entry, changed: Result<(), String>) -> Result<Value, String> {
 /// resources tier 1 an unmapped tile reads undefined values.
 pub fn unreadable(resource: u64) -> Option<String> {
     static TIERS: Mutex<Option<HashMap<usize, i32>>> = Mutex::new(None);
-    let resource = super::real(resource).and_then(|r| r.cast::<ID3D12Resource>().ok())?;
+    let resource = super::real::<ID3D12Resource>(resource)?;
     let mut device: Option<ID3D12Device> = None;
     unsafe { resource.GetDevice(&mut device) }.ok()?;
     let device = device?;

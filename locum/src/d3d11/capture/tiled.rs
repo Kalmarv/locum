@@ -306,9 +306,10 @@ static PENDING: Mutex<BTreeMap<u32, Vec<Change>>> = Mutex::new(BTreeMap::new());
 fn pending() -> std::sync::MutexGuard<'static, BTreeMap<u32, Vec<Change>>> {
     PENDING.lock().unwrap_or_else(|e| e.into_inner())
 }
-pub fn context_destroyed(id: u32) {
-    let old = pending().remove(&id);
-    drop(old);
+/// Forgets a destroyed deferred context's changes, handing them back: they hold resources, which the caller releases
+/// when that is safe (not inside the context's destruction).
+pub fn context_destroyed(id: u32) -> Option<Vec<Change>> {
+    pending().remove(&id)
 }
 /// Successful mapping calls are tracked outside captures too. Deferred changes wait for execution.
 /// # Safety

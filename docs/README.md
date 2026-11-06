@@ -13,6 +13,19 @@ How locum works, the files it writes and reads, what a capture holds, and every 
 - `locum.dll` loads its own two DLLs, then the real `d3d11.dll` and `dxgi.dll` from the system folder, and wraps the
   device, its contexts, the DXGI factory and the swap chains in objects of its own. Loading its own first keeps a
   game that loads `d3d11.dll` late, by name, on locum's.
+- A wrapper is another face of the real object under it. Its `AddRef` and `Release` are the object's, so a game sees
+  the counts it would see without locum: a child holds its device, the immediate context's first reference holds the
+  device, a back buffer holds its swap chain, a placed resource keeps its heap usable after the game released the
+  heap. locum keeps no reference of its own to a game's object. One wrapper is made per object, the first time the
+  object comes past, and is found again by any of the object's pointers. The wrapper is freed when the object is
+  destroyed, which the object says by releasing the private-data interface locum set on it. The objects a Direct3D 11
+  device makes (resources, views, shaders, states, queries, command lists) are the runtime's own, unwrapped: each
+  class's `GetDevice`, and the `GetParent` and `GetDevice` of a resource's DXGI faces, is pointed at locum's, which
+  answers with locum's device. Every way from a device to its adapter and factory (`IDXGIDevice::GetAdapter`,
+  `IDXGIAdapter::GetParent`, an output's `GetParent`) ends at locum's wrappers, so a swap chain made from a factory
+  found that way is locum's. A wrapper answers only to the interfaces the real object answers to: a factory from
+  `CreateDXGIFactory` refuses `IDXGIFactory1`, as the system's does. Direct3D 12's debug and configuration
+  interfaces take no private data, so locum counts their references itself, and the last release frees them.
 - The wrappers are generated. The `windows` crate publishes each interface's vtable as a `#[repr(C)]` struct with the
   exact ABI; `cargo xtask gen` reads those structs and writes `locum/src/vtables/`: one forwarding thunk per method
   and a trait whose default methods call the real object. A wrapper overrides only the methods it cares about.
@@ -21,8 +34,9 @@ How locum works, the files it writes and reads, what a capture holds, and every 
 
 locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
 
-- `locum.log`: what was wrapped, the frame rate every 600 frames, and each interface the game asked for that locum
-  passes to the real object unwrapped.
+- `locum.log`: what was wrapped, the frame rate every 600 frames, each interface the game asked for that locum
+  passes to the real object unwrapped, and, the first time a present says the device was removed, the reason the
+  device gives (`DXGI_ERROR_DEVICE_HUNG`, say).
 - `shaders/<hash>.<stage>.dxbc`: the bytecode of every shader the game creates, once per distinct shader. On
   Direct3D 11 the hash is FNV-1a 64 of the bytecode from the offset basis `1469598103934665603` (the standard basis
   with its last digit dropped, kept so hashes match earlier captures of these games), 16 hex digits; on Direct3D 12 it
@@ -79,7 +93,8 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
   - `dumps DIR`: where the dumps go (default the capture's folder). They hold all of the game's memory: keep them
     private.
 - `overrides.txt` (written by you): rules that change what is drawn, read when a device is made, again when the file
-  changes, and dropped when it is removed. One per line:
+  changes, and dropped when it is removed. What a rule makes the first time it applies (a shader, a constant buffer)
+  holds the device until the rules are read again or dropped. One per line:
   - `skip vs=<hash>`: draws with that shader bound are not drawn (`skip cs=<hash>`: dispatches are not run);
   - `solid vs=<hash> R G B A`: those draws get a pixel shader writing that colour to every target;
   - `shader ps=<hash> FILE`: that shader is replaced by the bytecode in FILE (relative to the folder);
@@ -751,7 +766,11 @@ from beside `locum.dll`, a DLL that exports nothing; Windows gives any later loa
 searches only System32, the module already loaded under the name, and the game finds no NVAPI, as on another
 vendor's GPU. The log says `NVAPI hidden`, or that NVAPI was loaded before Direct3D 12. Every command-list method is recorded with its
 arguments; `cargo xtask gen` fails for a method that has no capture entry. The log records the first use of each interface
-and method, with periodic counts and journal timings. Object identities remain in memory and in captures.
+and method, with periodic counts and journal timings. Object identities remain in memory and in captures. Each
+object's wrappers (one per interface the game asked for) are faces of it, counting on its own count and freed when
+it is destroyed. Releases go through one lock, locum's own references to the game's objects included, so a capture
+looking an object up by number never takes a reference to one being destroyed. What a capture makes beside a
+game's queue (a direct queue of locum's, fences) holds the device until that queue is destroyed.
 
 The inspection foundation records command lists continuously, so lists and bundles recorded before a capture request
 retain their original generations. A request arms at the next non-test Present and closes at the following Present.

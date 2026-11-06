@@ -89,7 +89,11 @@ unsafe extern "system" fn AddRef<T: Sharing12Methods>(this: *mut c_void) -> u32 
     unsafe { (*(this as *const T)).AddRef() }
 }
 unsafe extern "system" fn Release<T: Sharing12Methods>(this: *mut c_void) -> u32 {
-    unsafe { (*(this as *const T)).Release() }
+    let left = unsafe { (*(this as *const T)).Release() };
+    if left == 0 {
+        crate::faces::bury();
+    }
+    left
 }
 unsafe extern "system" fn Present<T: Sharing12Methods>(
     this: *mut c_void,

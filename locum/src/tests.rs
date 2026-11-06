@@ -204,3 +204,237 @@ fn a_factory_answers_to_what_the_systems_does() {
         }
     }
 }
+
+/// The count `AddRef` gives back, the reference it took given back.
+unsafe fn count(object: *mut c_void) -> u32 {
+    let n = unsafe { crate::faces::add_ref(object) };
+    unsafe { crate::faces::release(object) };
+    n
+}
+
+/// What a game sees of a WARP device `create` makes and its family: the counts a child, the immediate context and
+/// the way through DXGI to the factory leave on the device; whether each way back (a child's `GetDevice`, a
+/// resource's DXGI `GetDevice`, the factory found twice) answers with what the game already holds; and the factory's
+/// table, to tell whose it is.
+fn family(create: CreateDeviceFn) -> (Vec<u32>, *const c_void) {
+    use windows::Win32::Graphics::Direct3D11::*;
+    use windows::Win32::Graphics::Dxgi::{IDXGIDevice, IDXGIFactory1, IDXGIResource};
+    let mut seen = Vec::new();
+    let table;
+    unsafe {
+        let mut raw = core::ptr::null_mut();
+        create(
+            core::ptr::null_mut(),
+            D3D_DRIVER_TYPE_WARP,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_FLAG(0),
+            core::ptr::null(),
+            0,
+            D3D11_SDK_VERSION,
+            &mut raw,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+        .ok()
+        .unwrap();
+        let device = ID3D11Device::from_raw(raw);
+        seen.push(count(device.as_raw()));
+        let mut buffer = None;
+        device
+            .CreateBuffer(
+                &D3D11_BUFFER_DESC {
+                    ByteWidth: 16,
+                    BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                    ..Default::default()
+                },
+                None,
+                Some(&mut buffer),
+            )
+            .unwrap();
+        let buffer = buffer.unwrap();
+        seen.push(count(device.as_raw()));
+        // Without an out pointer a create only checks its arguments: S_FALSE, and nothing made.
+        let checked = (Interface::vtable(&device).CreateBuffer)(
+            device.as_raw(),
+            &D3D11_BUFFER_DESC {
+                ByteWidth: 16,
+                BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                ..Default::default()
+            },
+            core::ptr::null(),
+            core::ptr::null_mut(),
+        );
+        seen.push(checked.0 as u32);
+        seen.push(count(device.as_raw()));
+        let parent = buffer.GetDevice().unwrap();
+        seen.push((parent.as_raw() == device.as_raw()) as u32);
+        drop(parent);
+        let resource: IDXGIResource = buffer.cast().unwrap();
+        let parent: ID3D11Device = resource.GetDevice().unwrap();
+        seen.push((parent.as_raw() == device.as_raw()) as u32);
+        drop(parent);
+        drop(resource);
+        let context = device.GetImmediateContext().unwrap();
+        seen.push(count(device.as_raw()));
+        seen.push(count(context.as_raw()));
+        let again = device.GetImmediateContext().unwrap();
+        seen.push((again.as_raw() == context.as_raw()) as u32);
+        seen.push(count(context.as_raw()));
+        let parent = again.GetDevice().unwrap();
+        seen.push((parent.as_raw() == device.as_raw()) as u32);
+        drop((parent, again, context));
+        seen.push(count(device.as_raw()));
+        let factory = |device: &ID3D11Device| {
+            let adapter = device.cast::<IDXGIDevice>().unwrap().GetAdapter().unwrap();
+            adapter.GetParent::<IDXGIFactory1>().unwrap()
+        };
+        let first = factory(&device);
+        let second = factory(&device);
+        seen.push((first.as_raw() == second.as_raw()) as u32);
+        seen.push(count(first.as_raw()));
+        table = *(first.as_raw() as *const *const c_void);
+        drop((first, second));
+        drop(buffer);
+        seen.push(count(device.as_raw()));
+        seen.push(crate::faces::release(device.into_raw()));
+    }
+    crate::faces::bury();
+    (seen, table)
+}
+
+/// Through locum, a device's family counts and answers as the runtime's does, and its way to the factory ends at
+/// locum's factory.
+#[test]
+fn a_device_family_is_the_runtimes() {
+    let system_create = unsafe { export::<CreateDeviceFn>(system().d3d11, c"D3D11CreateDevice") }.unwrap();
+    let (native, _) = family(system_create);
+    let (ours, table) = family(D3D11CreateDevice);
+    assert_eq!(ours, native, "through locum, against the runtime alone");
+    assert_eq!(
+        crate::system::module_of(table),
+        crate::system::module_of(family as *const c_void),
+        "the factory found from the device is locum's"
+    );
+}
+
+/// The first output of the first adapter of a factory `create` makes, with that adapter; `None` on a machine with no
+/// display.
+fn first_output(
+    create: CreateFactoryFn,
+) -> Option<(
+    windows::Win32::Graphics::Dxgi::IDXGIAdapter,
+    windows::Win32::Graphics::Dxgi::IDXGIOutput,
+)> {
+    use windows::Win32::Graphics::Dxgi::IDXGIFactory1;
+    let mut raw = core::ptr::null_mut();
+    unsafe { create(&IDXGIFactory1::IID, &mut raw) }.ok().unwrap();
+    let factory = unsafe { IDXGIFactory1::from_raw(raw) };
+    let adapter = unsafe { factory.EnumAdapters(0) }.unwrap();
+    let output = unsafe { adapter.EnumOutputs(0) }.ok()?;
+    Some((adapter, output))
+}
+
+/// An output locum hands out gives locum's adapter back; one of the runtime's own, whose table locum changed for
+/// it, still gives the runtime's adapter.
+#[test]
+fn an_output_gives_back_its_own_adapter() {
+    use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
+    let Some((ours, output)) = first_output(CreateDXGIFactory1) else {
+        eprintln!("no display: nothing to check");
+        return;
+    };
+    let parent: IDXGIAdapter = unsafe { output.GetParent() }.unwrap();
+    assert_eq!(parent.as_raw(), ours.as_raw(), "locum's output, locum's adapter");
+    let system_create = unsafe { export::<CreateFactoryFn>(system().dxgi, c"CreateDXGIFactory1") }.unwrap();
+    let (theirs, output) = first_output(system_create).unwrap();
+    assert_eq!(
+        unsafe { *(output.as_raw() as *const *const c_void) },
+        unsafe { *(first_output(CreateDXGIFactory1).unwrap().1.as_raw() as *const *const c_void) },
+        "the two outputs share the runtime's table"
+    );
+    let parent: IDXGIAdapter = unsafe { output.GetParent() }.unwrap();
+    assert_eq!(
+        parent.as_raw(),
+        theirs.as_raw(),
+        "the runtime's output, the runtime's adapter"
+    );
+    drop((parent, output, theirs, ours));
+    crate::faces::bury();
+}
+
+/// The counts a WARP device `create` makes is left with through deferred contexts and their command lists: one
+/// recorded with state kept and one without, run on the immediate context, and one recorded on a second deferred
+/// context and run on the first.
+fn deferred_counts(create: CreateDeviceFn) -> Vec<u32> {
+    use windows::Win32::Graphics::Direct3D11::*;
+    let mut seen = Vec::new();
+    unsafe {
+        let mut raw = core::ptr::null_mut();
+        create(
+            core::ptr::null_mut(),
+            D3D_DRIVER_TYPE_WARP,
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_FLAG(0),
+            core::ptr::null(),
+            0,
+            D3D11_SDK_VERSION,
+            &mut raw,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        )
+        .ok()
+        .unwrap();
+        let device = ID3D11Device::from_raw(raw);
+        let mut buffer = None;
+        device
+            .CreateBuffer(
+                &D3D11_BUFFER_DESC {
+                    ByteWidth: 16,
+                    BindFlags: D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+                    ..Default::default()
+                },
+                None,
+                Some(&mut buffer),
+            )
+            .unwrap();
+        let immediate = device.GetImmediateContext().unwrap();
+        seen.push(count(device.as_raw()));
+        let mut deferred = None;
+        device.CreateDeferredContext(0, Some(&mut deferred)).unwrap();
+        let deferred = deferred.unwrap();
+        seen.push(count(device.as_raw()));
+        deferred.PSSetConstantBuffers(0, Some(&[buffer.clone()]));
+        let (mut kept, mut cleared) = (None, None);
+        deferred.FinishCommandList(true, Some(&mut kept)).unwrap();
+        deferred.FinishCommandList(false, Some(&mut cleared)).unwrap();
+        seen.push(count(device.as_raw()));
+        immediate.ExecuteCommandList(kept.as_ref(), true);
+        immediate.ExecuteCommandList(kept.as_ref(), false);
+        drop((kept, cleared));
+        seen.push(count(device.as_raw()));
+        let mut second = None;
+        device.CreateDeferredContext(0, Some(&mut second)).unwrap();
+        let second = second.unwrap();
+        second.PSSetConstantBuffers(0, Some(&[buffer.clone()]));
+        let mut list = None;
+        second.FinishCommandList(false, Some(&mut list)).unwrap();
+        deferred.ExecuteCommandList(list.as_ref(), true);
+        deferred.ExecuteCommandList(list.as_ref(), false);
+        drop((list, second));
+        seen.push(count(device.as_raw()));
+        drop(deferred);
+        seen.push(count(device.as_raw()));
+        drop((buffer, immediate));
+        seen.push(count(device.as_raw()));
+        seen.push(crate::faces::release(device.into_raw()));
+    }
+    crate::faces::bury();
+    seen
+}
+
+/// Through locum, deferred contexts and their command lists leave the device the counts the runtime's do.
+#[test]
+fn deferred_contexts_count_as_the_runtimes() {
+    let system_create = unsafe { export::<CreateDeviceFn>(system().d3d11, c"D3D11CreateDevice") }.unwrap();
+    assert_eq!(deferred_counts(D3D11CreateDevice), deferred_counts(system_create));
+}

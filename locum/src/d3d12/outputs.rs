@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use serde_json::Value;
 use windows::Win32::Graphics::Direct3D12::*;
-use windows::core::Interface;
 
 use super::descriptors::Description;
 
@@ -442,9 +441,7 @@ fn covered(resource: u64, view: Result<Option<Description>, String>) -> Result<V
     if resource == 0 {
         return Ok(Vec::new());
     }
-    let real = super::real(resource)
-        .and_then(|r| r.cast::<ID3D12Resource>().ok())
-        .ok_or("destroyed before it was written")?;
+    let real = super::real::<ID3D12Resource>(resource).ok_or("destroyed before it was written")?;
     let desc = unsafe { real.GetDesc() };
     if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
         return Ok(vec![Written { resource, sub: None }]);

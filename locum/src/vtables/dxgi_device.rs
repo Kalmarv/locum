@@ -373,7 +373,11 @@ unsafe extern "system" fn AddRef<T: DxgiDeviceMethods>(this: *mut c_void) -> u32
     unsafe { (*(this as *const T)).AddRef() }
 }
 unsafe extern "system" fn Release<T: DxgiDeviceMethods>(this: *mut c_void) -> u32 {
-    unsafe { (*(this as *const T)).Release() }
+    let left = unsafe { (*(this as *const T)).Release() };
+    if left == 0 {
+        crate::faces::bury();
+    }
+    left
 }
 unsafe extern "system" fn SetPrivateData<T: DxgiDeviceMethods>(
     this: *mut c_void,
