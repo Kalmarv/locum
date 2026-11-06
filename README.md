@@ -16,6 +16,8 @@ viewer read.
 - Lists, filters, exports (DDS, PNG, raw) and queries captures with `locum-cli`, including plain SQL
 - Traces a target's output lane back to the texture channels, constants and vertex attributes it came from
 - Replays a draw or a whole frame offline on the GPU or on WARP and verifies every target against the game's
+- Holds a translation layer (DXVK, vkd3d-proton) to a captured frame: replays it on the system's Direct3D and through the
+  layer, and names what only the layer draws differently or cannot do
 - Changes draws with rules (skip, solid colour, replacement shader, constant), live in Direct3D 11 games or in replay
 - Names textures, buffers and shader programs after the game's own files through indexes of DDS files, shaders and key lists
 - Diffs two captures draw by draw
@@ -98,6 +100,8 @@ Other commands:
 - `locum-cli export last 812 -o tex.dds`: a resource's contents as the frame began
 - `locum-cli replay last 120 --rule "skip ps=9f2c"`: a draw replayed with a rule, before and after
 - `locum-cli diff before after`: two captures compared draw by draw
+- `locum-cli conform last --layer C:\dxvk\x64`: the frame through a translation layer's DLLs, compared with the
+  system's replay and the game's
 - `locum-cli --index files.db join last`: what each resource was made from
 - `locum-cli sql last "SELECT ..."`: any query on the capture
 

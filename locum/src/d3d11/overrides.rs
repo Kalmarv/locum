@@ -77,9 +77,14 @@ pub fn poll(frame: u64) {
             );
         }
     }
-    if !frame.is_multiple_of(30) {
-        return;
+    if frame.is_multiple_of(30) {
+        reload();
     }
+}
+
+/// Reads `overrides.txt` again if it changed since it was last read. Also when a device is made: a program that never
+/// presents (an offscreen renderer, a replay) gets its rules too.
+pub fn reload() {
     let Some(dir) = folder() else { return };
     let path = dir.join("overrides.txt");
     let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();

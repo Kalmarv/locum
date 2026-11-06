@@ -44,6 +44,26 @@ pub struct Environment {
     /// The Direct3D 12 runtime the process loaded (none for Direct3D 11).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub d3d12: Option<Runtime>,
+    /// The Direct3D and DXGI DLLs a replay loaded from outside the system folder, by name: a translation layer
+    /// (DXVK's `d3d11.dll` and `dxgi.dll`, vkd3d-proton's `d3d12.dll`) that `locum-cli conform` put beside it. Not
+    /// probed at capture, where locum's own stand-ins have these names.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub layers: BTreeMap<String, Layer>,
+}
+
+/// A DLL of a translation layer: where it was loaded from, its version and its SHA-256 (layers often have no version
+/// resource, and a build is known by its bytes).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Layer {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// `version` or `sha256`, when it could not be read, and why.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub missing: Missing,
 }
 
 /// An adapter as DXGI describes it, and its driver.
@@ -114,7 +134,8 @@ pub struct Runtime {
     /// The `D3D12Core.dll` loaded in the process.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub core: Option<Module>,
-    /// The core is not the system's: an Agility SDK the game ships.
+    /// The core is not the system's, and the executable asks for an Agility SDK: one the game ships. A core from
+    /// elsewhere that nothing asked for is a translation layer's (see [`Environment::layers`]).
     pub agility: bool,
     /// What the executable exports as `D3D12SDKVersion` and `D3D12SDKPath`, which ask for an Agility SDK.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -184,6 +205,9 @@ impl Environment {
         if let Some(r) = &self.d3d12 {
             add("d3d12", &r.missing);
         }
+        for (name, l) in &self.layers {
+            add(&format!("layers.{name}"), &l.missing);
+        }
         out
     }
 
@@ -217,6 +241,24 @@ impl Environment {
         if let Some(r) = &self.d3d12 {
             s += &format!(", {}", r.line());
         }
+        // Each folder's layer DLLs, with what tells their build apart.
+        let mut folders = BTreeMap::<String, Vec<String>>::new();
+        for (name, l) in &self.layers {
+            let folder = Path::new(&l.path)
+                .parent()
+                .map_or_else(String::new, |p| p.display().to_string());
+            // A layer's version resource can be a stand-in (DXVK's say 10.0.17763.1): its bytes tell builds apart.
+            let build = match (&l.version, &l.sha256) {
+                (Some(v), Some(h)) => format!("{v} sha256 {}", &h[..h.len().min(12)]),
+                (Some(v), None) => v.clone(),
+                (None, Some(h)) => format!("sha256 {}", &h[..h.len().min(12)]),
+                (None, None) => "of an unknown build".into(),
+            };
+            folders.entry(folder).or_default().push(format!("{name} {build}"));
+        }
+        for (folder, names) in folders {
+            s += &format!(", through {} from {folder}", names.join(", "));
+        }
         s
     }
 }
@@ -233,8 +275,16 @@ impl Runtime {
                     None => "of an unknown version".into(),
                 },
             );
+        let folder = self
+            .core
+            .as_ref()
+            .and_then(|c| Path::new(&c.path).parent().map(Path::to_path_buf));
         if self.agility {
             format!("D3D12Core {version} (Agility SDK)")
+        } else if let Some(folder) = folder
+            .filter(|f| !f.ends_with("System32") && !f.ends_with("system32") && !f.ends_with("SYSTEM32"))
+        {
+            format!("D3D12Core {version} (from {})", folder.display())
         } else {
             format!("D3D12Core {version} (system)")
         }
@@ -557,6 +607,58 @@ pub fn exe() -> Result<Exe, String> {
     .clone()
 }
 
+/// The DLLs of [`Environment::layers`] this process loaded from outside the system folder.
+pub fn layers() -> BTreeMap<String, Layer> {
+    let mut system = [0u16; 260];
+    let n = unsafe { GetSystemDirectoryW(Some(&mut system)) } as usize;
+    let system = String::from_utf16_lossy(&system[..n]).to_ascii_lowercase();
+    let mut out = BTreeMap::new();
+    for name in [
+        "d3d11.dll",
+        "dxgi.dll",
+        "d3d12.dll",
+        "d3d12core.dll",
+        "d3d10core.dll",
+    ] {
+        let Ok((module, version)) = loaded(name) else {
+            continue;
+        };
+        let path = Path::new(&module.path);
+        if path
+            .parent()
+            .is_some_and(|f| f.display().to_string().to_ascii_lowercase() == system)
+        {
+            continue;
+        }
+        let mut layer = Layer {
+            version: module.version.clone(),
+            ..Default::default()
+        };
+        if let Err(why) = version {
+            layer.missing.insert("version".into(), why);
+        }
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                use sha2::{Digest, Sha256};
+                layer.sha256 = Some(
+                    Sha256::digest(&bytes)
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect(),
+                );
+            }
+            Err(e) => {
+                _ = layer
+                    .missing
+                    .insert("sha256".into(), format!("{}: {e}", path.display()))
+            }
+        }
+        layer.path = module.path;
+        out.insert(name.to_string(), layer);
+    }
+    out
+}
+
 /// The Direct3D 12 runtime this process loaded, and the Agility SDK its executable asks for.
 pub fn d3d12_runtime() -> Runtime {
     let mut missing = Missing::new();
@@ -575,7 +677,7 @@ pub fn d3d12_runtime() -> Runtime {
     let mut system = [0u16; 260];
     let n = unsafe { GetSystemDirectoryW(Some(&mut system)) } as usize;
     let system = String::from_utf16_lossy(&system[..n]).to_ascii_lowercase();
-    let agility = core.as_ref().is_some_and(|c| {
+    let elsewhere = core.as_ref().is_some_and(|c| {
         let folder = Path::new(&c.path)
             .parent()
             .map(|p| p.display().to_string().to_ascii_lowercase());
@@ -594,7 +696,7 @@ pub fn d3d12_runtime() -> Runtime {
     });
     Runtime {
         core,
-        agility,
+        agility: elsewhere && sdk_version.is_some(),
         sdk_version,
         sdk_path,
         missing,
@@ -647,6 +749,51 @@ mod tests {
         let e = Environment::probe(Err("none".into()), Api::D3d11, false);
         assert_eq!((e.exe.as_ref(), e.d3d12.as_ref()), (None, None));
         assert_eq!(e.gaps(), vec![("adapter".to_string(), "none".to_string())]);
+    }
+
+    #[test]
+    fn layers_are_named_by_folder_and_build() {
+        let mut e = Environment::default();
+        assert_eq!(e.line(), "an adapter not recorded");
+        e.layers.insert(
+            "d3d11.dll".into(),
+            Layer {
+                path: r"C:\dxvk\x64\d3d11.dll".into(),
+                sha256: Some("0123456789abcdef".repeat(4)),
+                ..Default::default()
+            },
+        );
+        e.layers.insert(
+            "dxgi.dll".into(),
+            Layer {
+                path: r"C:\dxvk\x64\dxgi.dll".into(),
+                version: Some("2.7.1.0".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            e.line(),
+            r"an adapter not recorded, through d3d11.dll sha256 0123456789ab, dxgi.dll 2.7.1.0 from C:\dxvk\x64"
+        );
+        // A core from elsewhere that nothing asked for is said with its folder, not called an Agility SDK.
+        let core = |path: &str| Runtime {
+            core: Some(Module {
+                path: path.into(),
+                version: Some("1.2".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            core(r"C:\vkd3d\d3d12core.dll").line(),
+            r"D3D12Core 1.2 (from C:\vkd3d)"
+        );
+        assert_eq!(
+            core(r"C:\Windows\System32\D3D12Core.dll").line(),
+            "D3D12Core 1.2 (system)"
+        );
+        assert!(Environment::parse(&e.json()).is_some_and(|p| p == e));
+        // A replay with no layer loaded has none: the test executable loads no Direct3D DLL from elsewhere.
+        assert_eq!(layers(), BTreeMap::new());
     }
 
     #[test]

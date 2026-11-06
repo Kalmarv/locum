@@ -21,8 +21,8 @@ iridia.workspace = true
 iridia-dxbc.workspace = true
 iridia-dxil.workspace = true
 clap = { version = "4.6.7", features = ["derive"] }
-locum-capture = { version = "0.1.2", path = "../capture" }
-locum-d3d11 = { version = "0.1.2", path = "../d3d11" }
+locum-capture = { version = "0.1.3", path = "../capture" }
+locum-d3d11 = { version = "0.1.3", path = "../d3d11" }
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 png = "0.18.1"
@@ -46,5 +46,6 @@ windows = { workspace = true, features = [
     "Win32_System_Kernel",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }

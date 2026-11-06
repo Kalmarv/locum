@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.3
+
+- `locum-cli conform CAPTURE --layer DIR` holds a translation layer (DXVK, vkd3d-proton) to a captured frame: it
+  verifies the capture on the system's Direct3D and through the layer's DLLs, and names each comparison the system's
+  replay passes and the layer's fails, what the layer's never reached, and what only it could not make. The docs'
+  "Translation layers" section says what it found in DXVK 3.1.1 and vkd3d-proton 3.1.
+- `--layer DIR` on any command replays through the Direct3D DLLs in DIR, and a replay's machine line names them.
+- Replays run on the system's Direct3D, not on DLLs beside locum-cli. Before, a locum-cli in `target/release` (or
+  beside a game) loaded locum's own stand-ins there and replayed through locum's wrappers.
+- `verify --report FILE` writes every comparison it made as JSON.
+- `overrides.txt` is read when a device is made, so a program that never presents gets its rules.
+- `cargo xtask smoke --api d3d12` starts each run with an empty log folder; captures of every earlier run had piled
+  up there (1 GB here).
+
 ## 0.1.2
 
 - Each release now has the DLLs that go beside a game as a download, `locum-dlls-<version>-x86_64-pc-windows-msvc.zip`

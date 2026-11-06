@@ -499,6 +499,34 @@ fn smoke(root: &Path, debug: bool, dlls: Option<&Path>) {
         println!("{}  adversarial: {what}", if passed { "ok  " } else { "FAIL" });
         environment_ok &= passed;
     }
+    // locum's stand-ins as a translation layer, conform held to the adversarial capture's three draws, all of one
+    // pixel shader. Its reusable list draws red, then green; a rule draws white instead, a finding at each of the two.
+    // The third draw's target is read after the clear that follows it, which no rule changes.
+    let ps = on(&["sql", "SELECT hash FROM shaders WHERE stage = 'ps'"])
+        .lines()
+        .nth(1)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let rule = format!("solid ps={ps} 1 1 1 1\n");
+    let mut conform_ok = true;
+    let captures = log_dir.join("captures");
+    for (passed, what) in conform_checks(
+        &cli,
+        &stage,
+        &log_dir.join("conform"),
+        &Conformance {
+            capture: &captures.join("adversarial"),
+            nothing: &captures.join("series-1"),
+            dlls: &["d3d11.dll", "dxgi.dll", "locum.dll"],
+            needed: 2,
+            rule: Some((&rule, 2)),
+            warp: false,
+        },
+    ) {
+        println!("{} {what}", if passed { "ok  " } else { "FAIL" });
+        conform_ok &= passed;
+    }
     // The ordered capture's dispatch writes its records in whatever order the GPU runs its threads; WARP runs them
     // in another order than the GPU did. Both replays must still be bit for bit the game's.
     let mut ordered_ok = true;
@@ -901,6 +929,7 @@ fn smoke(root: &Path, debug: bool, dlls: Option<&Path>) {
         || !cli_ok
         || !adversarial_ok
         || !environment_ok
+        || !conform_ok
         || !ordered_ok
         || !rows_ok
     {
@@ -1121,7 +1150,136 @@ fn environment_checks(run: &dyn Fn(&[&str]) -> String, verify: &str, api: &str) 
                     .any(|l| l.contains(" UTC, locum-cli ") && l.contains(": verified: every target")),
             "the verification is kept in the capture with the adapter it replayed on, and info lists it",
         ),
+        (
+            verify.contains("replayed on ") && !verify.contains(", through "),
+            "verify replayed on the system's Direct3D, not on the DLLs beside locum-cli",
+        ),
     ]
+}
+
+/// A capture to hold `locum-cli conform` to, replayed through locum's own stand-ins as a translation layer.
+struct Conformance<'a> {
+    /// A capture whose verify compares targets, and one whose compares none.
+    capture: &'a Path,
+    nothing: &'a Path,
+    /// The stand-ins: the API's DLLs (the first `needed`), then what they load.
+    dlls: &'a [&'a str],
+    needed: usize,
+    /// An overrides.txt line changing every draw `capture` compares, and how many draws that is.
+    rule: Option<(&'a str, usize)>,
+    /// Both replays on WARP.
+    warp: bool,
+}
+
+/// What `locum-cli conform` must say of `c`'s captures through its stand-ins, copied from `stage` into a folder of
+/// their own under `out`. With no rule the layer draws the game's frame and is named by its DLLs and folder, and the
+/// system's replay by none; with the rule each draw it changes is a finding and conform fails; a layer without one of
+/// the API's DLLs, or a capture with nothing to compare, is refused. Each check, with what it shows.
+fn conform_checks(cli: &Path, stage: &Path, out: &Path, c: &Conformance) -> Vec<(bool, String)> {
+    let Conformance {
+        capture,
+        nothing,
+        dlls,
+        needed,
+        rule,
+        warp,
+    } = *c;
+    let _ = std::fs::remove_dir_all(out);
+    let layer = out.join("layer");
+    let lacking = out.join("lacking");
+    std::fs::create_dir_all(&layer).expect("create the layer folder");
+    std::fs::create_dir_all(&lacking).expect("create the lacking layer folder");
+    for (i, dll) in dlls.iter().enumerate() {
+        std::fs::copy(stage.join(dll), layer.join(dll)).unwrap_or_else(|e| panic!("copy {dll}: {e}"));
+        // The lacking layer has all but the first.
+        if i > 0 {
+            std::fs::copy(stage.join(dll), lacking.join(dll)).unwrap_or_else(|e| panic!("copy {dll}: {e}"));
+        }
+    }
+    // Each run in a folder of its own, with locum's settings, log and overrides.txt (`rules`) in it.
+    let run = |name: &str, capture: &Path, layer: &Path, rules: &str| -> (bool, String) {
+        let dir = out.join(name);
+        let locum_dir = dir.join("locum");
+        std::fs::create_dir_all(&locum_dir).expect("create locum's folder");
+        if !rules.is_empty() {
+            std::fs::write(locum_dir.join("overrides.txt"), rules).expect("write overrides.txt");
+        }
+        let output = Command::new(cli)
+            .arg("conform")
+            .arg(capture)
+            .arg("--layer")
+            .arg(layer)
+            .arg("-o")
+            .arg(&dir)
+            .args(warp.then_some("--warp"))
+            .env("LOCUM_DIR", &locum_dir)
+            .output()
+            .expect("run locum-cli conform");
+        let text =
+            String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+        println!(
+            "--- locum-cli conform {} ({name}, exit {:?})\n{text}",
+            capture.display(),
+            output.status.code()
+        );
+        (output.status.success(), text)
+    };
+    let mut checks = Vec::new();
+    let (ok, text) = run("plain", capture, &layer, "");
+    // "...; N findings about the layer (system: <the system's end>; layer: <the layer's end>)"
+    let summary = text
+        .lines()
+        .find(|l| l.contains(" comparisons ("))
+        .unwrap_or_default();
+    let (system, theirs) = summary
+        .split_once("(system: ")
+        .and_then(|(_, ends)| ends.split_once("; layer: "))
+        .unwrap_or_default();
+    // conform names the layer's folder as Windows makes its path whole.
+    let folder = std::path::absolute(&layer).expect("the layer's path");
+    let named =
+        dlls[..needed].iter().all(|d| theirs.contains(d)) && theirs.contains(&*folder.display().to_string());
+    // "N comparisons (...): N the game's in both replays, ..."
+    let compared = summary.split(' ').next().unwrap_or_default();
+    checks.push((
+        ok && summary.contains("; 0 findings about the layer")
+            && compared != "0"
+            && summary.contains(&format!("): {compared} the game's in both replays, "))
+            && !system.is_empty()
+            && !system.contains(", through ")
+            && theirs.contains(", through ")
+            && named,
+        format!(
+            "conform through locum's {}: the game's frame, the layer named by its DLLs and folder, the system's \
+             replay on the system's Direct3D",
+            dlls[..needed].join(" and ")
+        ),
+    ));
+    if let Some((rule, draws)) = rule {
+        let (ok, text) = run("rule", capture, &layer, rule);
+        let differs = text
+            .lines()
+            .filter(|l| l.starts_with("LAYER DIFFERS draw "))
+            .count();
+        checks.push((
+            !ok && differs == draws && text.contains(&format!("{draws} findings about the layer")),
+            format!(
+                "conform through locum's stand-ins with `{}`: each of the {draws} draws it changes a finding",
+                rule.trim()
+            ),
+        ));
+    }
+    let (ok, text) = run("lacking", capture, &lacking, "");
+    checks.push((
+        !ok && text.contains(&format!("has no {}", dlls[0])),
+        format!("conform refuses a layer without {}", dlls[0]),
+    ));
+    let (ok, text) = run("nothing", nothing, &layer, "");
+    checks.push((
+        !ok && text.contains("the system's replay compared nothing with the game's"),
+        "conform refuses a capture whose replay compares nothing".into(),
+    ));
+    checks
 }
 
 /// Runs locum-cli on the smoke test's capture and checks what it says about it.

@@ -92,7 +92,11 @@ type CreateDeviceAndSwapChainFn = unsafe extern "system" fn(
 /// `device`'s reference.
 unsafe fn give_device(device: *mut c_void, device_out: *mut *mut c_void, context_out: *mut *mut c_void) {
     let real = unsafe { ID3D11Device::from_raw(device) };
-    match Device::wrap(real) {
+    let wrapped = Device::wrap(real);
+    if wrapped.is_ok() {
+        d3d11::overrides::reload();
+    }
+    match wrapped {
         Ok(wrapper) => unsafe {
             let w = &*wrapper;
             if !context_out.is_null() {

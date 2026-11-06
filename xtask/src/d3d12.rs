@@ -215,12 +215,10 @@ pub fn smoke(root: &std::path::Path, hardware: bool, debug: bool, dlls: Option<&
         ],
         dlls,
     );
+    // Each run's log, captures and blobs, not every earlier run's.
     let log = stage.join("log");
+    let _ = std::fs::remove_dir_all(&log);
     std::fs::create_dir_all(&log).unwrap();
-    let old_log = log.join("locum.log");
-    if old_log.is_file() {
-        std::fs::remove_file(&old_log).unwrap();
-    }
     if hardware {
         return hardware_smoke(&stage, &log);
     }
@@ -245,7 +243,7 @@ pub fn smoke(root: &std::path::Path, hardware: bool, debug: bool, dlls: Option<&
         "D3D12 WARP smoke failed: {}",
         result.status
     );
-    let log = std::fs::read_to_string(old_log).unwrap();
+    let log = std::fs::read_to_string(log.join("locum.log")).unwrap();
     assert!(
         !log.contains("D3D12 object "),
         "per-object logging must not return"
@@ -437,6 +435,25 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
     for (passed, what) in super::environment_checks(&on, &text, "d3d12") {
         assert!(passed, "indirect: {what}");
         println!("ok   D3D12 verify: {what}");
+    }
+    // locum's stand-ins as a translation layer, on WARP as the captures were made: conform held to the indirect
+    // capture's draws and outputs, and refusing the graphics capture, whose replay compares nothing.
+    let (indirect, graphics) = (capture("indirect"), capture("graphics"));
+    for (passed, what) in super::conform_checks(
+        &stage.join("locum-cli.exe"),
+        stage,
+        &log.join("conform"),
+        &super::Conformance {
+            capture: std::path::Path::new(&indirect),
+            nothing: std::path::Path::new(&graphics),
+            dlls: &["d3d12.dll", "dxgi.dll", "locum.dll", "nvapi64.dll"],
+            needed: 1,
+            rule: None,
+            warp: true,
+        },
+    ) {
+        assert!(passed, "conform: {what}");
+        println!("ok   D3D12 {what}");
     }
     println!(
         "ok   D3D12 verify: ExecuteIndirect with GPU addresses in its records replays as the game's ({indirect_targets} \

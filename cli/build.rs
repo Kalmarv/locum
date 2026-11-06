@@ -1,9 +1,15 @@
-//! The dx and iridia builds this build links, from the Cargo.lock it resolves with, for `shader-file --evidence`; and
-//! an 8 MiB main-thread stack: clap's parser for this many commands needs more than Windows' default 1 MiB in debug
-//! builds.
+//! The dx and iridia builds this build links, from the Cargo.lock it resolves with, for `shader-file --evidence`; an
+//! 8 MiB main-thread stack: clap's parser for this many commands needs more than Windows' default 1 MiB in debug
+//! builds; and Direct3D's DLLs delay-loaded.
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
         println!("cargo:rustc-link-arg-bins=/STACK:8388608");
+        // Loaded by full path before their first call (src/runtime.rs), so neither locum's stand-ins nor anything
+        // else of those names beside the executable is used: the tests too, which replay.
+        for dll in ["d3d11.dll", "dxgi.dll", "d3d12.dll"] {
+            println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
+        }
+        println!("cargo:rustc-link-arg=delayimp.lib");
     }
     // the workspace's lock in the repository, the package's own once published (a package with binaries carries one)
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

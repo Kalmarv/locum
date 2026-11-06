@@ -1400,7 +1400,9 @@ impl Backend for D3d11 {
     fn environment(&self) -> environment::Environment {
         let adapter = environment::device_adapter(&self.device)
             .and_then(|a| environment::adapter(&a, environment::Api::D3d11));
-        environment::Environment::probe(adapter, environment::Api::D3d11, false)
+        let mut e = environment::Environment::probe(adapter, environment::Api::D3d11, false);
+        e.layers = environment::layers();
+        e
     }
 
     fn warnings(&self) -> Vec<String> {

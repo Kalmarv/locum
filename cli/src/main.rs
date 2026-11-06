@@ -3,6 +3,7 @@
 //! `last`.
 
 mod bindings;
+mod conform;
 mod constants;
 mod describe;
 mod diff;
@@ -17,6 +18,7 @@ mod open;
 mod pixels;
 mod replay;
 mod resources;
+mod runtime;
 mod shaders;
 mod states;
 mod store;
@@ -44,6 +46,10 @@ struct Cli {
     /// `export` and `target`: say nothing of what was written (warnings still), for piping `-o -`.
     #[arg(long, short, global = true)]
     quiet: bool,
+    /// Replay through the Direct3D DLLs in this folder (a translation layer: DXVK's `d3d11.dll` and `dxgi.dll`,
+    /// vkd3d-proton's `d3d12.dll` and `d3d12core.dll`) instead of the system's.
+    #[arg(long, global = true)]
+    layer: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -532,6 +538,27 @@ enum Command {
         /// the targets and where they differ.
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Write every comparison (what, the game's or not, how, the replay's bytes' key), the result and the machine
+        /// replayed on to this JSON file.
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
+    /// How a translation layer draws the frame: replays it through the system's Direct3D and through the DLLs in
+    /// the folder `--layer` names (DXVK's d3d11.dll and dxgi.dll, vkd3d-proton's d3d12.dll and d3d12core.dll),
+    /// compares each with the game's targets and outputs, and says where the layer's differs while the system's does
+    /// not. Needs `--layer`.
+    Conform {
+        capture: String,
+        /// Where the two replays' reports, outputs and pictures of what differs go.
+        #[arg(short, long, default_value = "conform")]
+        out: PathBuf,
+        /// Compare at most this many targets in each replay.
+        #[arg(long)]
+        limit: Option<i64>,
+        /// Replay both on WARP, the software rasterizer, where the layer has it (locum's stand-ins do; DXVK and
+        /// vkd3d-proton run on Vulkan devices only).
+        #[arg(long)]
+        warp: bool,
     },
     /// Writes a full-memory minidump of a process from a snapshot of it (locum runs this at a capture: settings.txt
     /// `dumper`).
@@ -757,7 +784,16 @@ fn sql(c: &open::Capture, query: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Whether `command` replays in this process, on the Direct3D [`runtime::load`] loads: every command but `conform`,
+/// whose replays are processes of their own.
+fn replays_here(command: &Command) -> bool {
+    !matches!(command, Command::Conform { .. })
+}
+
 fn run(cli: Cli) -> Result<(), String> {
+    if replays_here(&cli.command) {
+        runtime::load(cli.layer.as_deref())?;
+    }
     export::QUIET.store(cli.quiet, std::sync::atomic::Ordering::Relaxed);
     let blobs = cli.blobs.as_deref();
     let indexes = join::paths(&cli.index);
@@ -1126,7 +1162,27 @@ fn run(cli: Cli) -> Result<(), String> {
             debug,
             limit,
             out,
-        } => replay::verify(&open(&capture)?, warp, debug, limit, out.as_deref()),
+            report,
+        } => replay::verify(
+            &open(&capture)?,
+            warp,
+            debug,
+            limit,
+            out.as_deref(),
+            report.as_deref(),
+        ),
+        Command::Conform {
+            capture,
+            out,
+            limit,
+            warp,
+        } => {
+            let layer = cli
+                .layer
+                .as_deref()
+                .ok_or("conform needs --layer DIR, the folder of the translation layer's DLLs")?;
+            conform::conform(&open(&capture)?, layer, &out, limit, warp, blobs)
+        }
         Command::Dump {
             pid,
             out,
@@ -1247,5 +1303,28 @@ fn main() -> ExitCode {
             eprintln!("locum-cli: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command, replays_here};
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn the_arguments_are_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn conform_takes_the_layer_every_replay_does() {
+        let cli = Cli::try_parse_from(["locum-cli", "conform", "last", "--layer", "dxvk"]).unwrap();
+        assert!(matches!(cli.command, Command::Conform { .. }));
+        assert_eq!(cli.layer.as_deref(), Some(std::path::Path::new("dxvk")));
+        // conform's replays load the layer, each in a process of its own; conform itself does not.
+        assert!(!replays_here(&cli.command));
+        let cli = Cli::try_parse_from(["locum-cli", "--layer", "dxvk", "verify", "last"]).unwrap();
+        assert_eq!(cli.layer.as_deref(), Some(std::path::Path::new("dxvk")));
+        assert!(replays_here(&cli.command));
     }
 }

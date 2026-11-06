@@ -702,8 +702,45 @@ impl std::fmt::Display for Settled {
 /// One output of an event, compared.
 struct Compared {
     resource: i64,
+    sub: Option<u32>,
     ordered: bool,
     settled: Settled,
+    /// The XXH3-128 key of replay's bytes.
+    replay: String,
+}
+
+/// Every comparison a verify made, its result, and the machine it replayed on: what `verify --report` writes, and
+/// what `conform` compares across two replays.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Report {
+    pub checks: Vec<Checked>,
+    /// Why an identical replay would not prove the frame (verify's `incomplete:` lines).
+    pub incomplete: Vec<String>,
+    pub ok: bool,
+    /// verify's last line.
+    pub result: String,
+    pub environment: Option<Environment>,
+}
+
+/// One comparison of replay's bytes with the game's.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Checked {
+    /// What it compared, the same in every replay of the capture: `target <draw> <name> <sub> <plane>` or
+    /// `output <event> #<resource> <sub>`.
+    pub key: String,
+    /// `target`, `output` (of a draw or dispatch), `clear` or `ordered` (an order-dependent output).
+    pub kind: String,
+    pub event: i64,
+    /// What verify calls it: `draw 7 rt0 #208 texture2d 8x8 R8G8B8A8_UNORM` or `Dispatch 3 (event 40) #12`.
+    pub what: String,
+    /// The game's bytes, or for an order-dependent output the game's records.
+    pub identical: bool,
+    /// How it compared, in verify's words.
+    pub detail: String,
+    /// The XXH3-128 key of replay's bytes.
+    pub replay: String,
 }
 
 /// Writes bytes `verify --out` keeps.
@@ -833,8 +870,10 @@ fn settle(
         }
         out.push(Compared {
             resource: w.resource,
+            sub: w.sub,
             ordered: w.ordered,
             settled,
+            replay: locum_capture::hash::key(&mine),
         });
     }
     Ok(out)
@@ -1132,9 +1171,19 @@ pub fn verify(
     debug: bool,
     limit: Option<i64>,
     keep: Option<&Path>,
+    report_to: Option<&Path>,
 ) -> Result<(), String> {
-    let mut replayed = None;
-    let result = verified(c, warp, debug, limit, keep, &mut replayed);
+    let mut report = Report::default();
+    let result = verified(c, warp, debug, limit, keep, &mut report);
+    report.ok = result.is_ok();
+    report.result = match &result {
+        Ok(line) | Err(line) => line.clone(),
+    };
+    if let Some(path) = report_to {
+        let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+        std::fs::write(path, json).map_err(|e| format!("{}: {e}", path.display()))?;
+    }
+    let replayed = report.environment.clone();
     let verification = locum_capture::db::Verification {
         time: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1154,15 +1203,15 @@ pub fn verify(
     Ok(())
 }
 
-/// [`verify`]'s replay and comparisons: its last line, `verified: …` or why not. `replayed` is the machine the replay
-/// ran on, once it has made its device.
+/// [`verify`]'s replay and comparisons: its last line, `verified: …` or why not. `report` gets each comparison, what
+/// keeps the capture from being complete, and the machine the replay ran on once it has made its device.
 fn verified(
     c: &Capture,
     warp: bool,
     debug: bool,
     limit: Option<i64>,
     keep: Option<&Path>,
-    replayed: &mut Option<Environment>,
+    report: &mut Report,
 ) -> Result<String, String> {
     if let Some(dir) = keep {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -1274,7 +1323,7 @@ fn verified(
     let environment = b.environment();
     let captured = c.meta("environment").and_then(|e| Environment::parse(&e));
     let ends = ends(captured.as_ref(), &environment);
-    *replayed = Some(environment);
+    report.environment = Some(environment);
     out!("{ends}");
     let written = recorded(c);
     // Draws and dispatches are named by their number, as targets are.
@@ -1309,6 +1358,28 @@ fn verified(
             settle(c, b.as_mut(), &written, seq, true, keep).map_err(|e| format!("event {seq}: {e}"))?
         {
             let resource = out.resource;
+            let kind = if out.ordered {
+                "ordered"
+            } else if numbered.contains_key(&seq) {
+                "output"
+            } else {
+                "clear"
+            };
+            report.checks.push(Checked {
+                key: format!(
+                    "output {seq} #{resource} {}",
+                    out.sub.map_or(String::new(), |s| s.to_string())
+                ),
+                kind: kind.into(),
+                event: seq,
+                what: format!("{who} #{resource}"),
+                identical: matches!(
+                    out.settled,
+                    Settled::Identical | Settled::Reordered { .. } | Settled::Sliced { .. }
+                ),
+                detail: out.settled.to_string(),
+                replay: out.replay.clone(),
+            });
             match (out.ordered, out.settled) {
                 (true, Settled::Identical) => settled_same += 1,
                 (false, Settled::Identical) => {
@@ -1382,6 +1453,15 @@ fn verified(
                     diff_png(&file("diff.png"), fmt, &x, &game, mine, range)?;
                 }
             }
+            report.checks.push(Checked {
+                key: format!("target {draw} {name} {sub} {z}"),
+                kind: "target".into(),
+                event: seq,
+                what: format!("draw {draw} {name} {s}"),
+                identical: d.differ == 0,
+                detail: d.to_string(),
+                replay: locum_capture::hash::key(mine),
+            });
             out!("draw {draw:>5} {name:<6} {s} (event {seq}): {d}");
         }
     }
@@ -1477,6 +1557,7 @@ fn verified(
     for i in &incomplete {
         out!("incomplete: {i}");
     }
+    report.incomplete = incomplete.clone();
     if limit.is_some_and(|l| compared >= l) {
         out!("(stopped after {compared} comparisons: --limit)");
     }

@@ -78,8 +78,8 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
     the dump is written from the snapshot while the game runs on;
   - `dumps DIR`: where the dumps go (default the capture's folder). They hold all of the game's memory: keep them
     private.
-- `overrides.txt` (written by you): rules that change what is drawn, read again when the file changes and dropped when
-  it is removed. One per line:
+- `overrides.txt` (written by you): rules that change what is drawn, read when a device is made, again when the file
+  changes, and dropped when it is removed. One per line:
   - `skip vs=<hash>`: draws with that shader bound are not drawn (`skip cs=<hash>`: dispatches are not run);
   - `solid vs=<hash> R G B A`: those draws get a pixel shader writing that colour to every target;
   - `shader ps=<hash> FILE`: that shader is replaced by the bytecode in FILE (relative to the folder);
@@ -649,6 +649,83 @@ and `vertices` say when a draw ran in a later one, which can read what the CPU w
 PNGs of depth and other one-channel images are stretched from their smallest to largest value, float colour is
 tone-mapped, and `--range LO:HI` sets the mapping.
 
+## Translation layers
+
+Every replay loads its Direct3D by full path before it calls it: `d3d11.dll`, `dxgi.dll` and `d3d12.dll` from the
+system folder, or from the folder `--layer DIR` names where it has them (with its `d3d12core.dll` and `d3d10core.dll`).
+locum-cli delay-loads those three, so DLLs of their names beside it, locum's own stand-ins in `target/release` or a
+game's folder, are not what a replay runs on. `locum-cli --layer C:\dxvk-3.1.1\x64 verify last` replays through
+DXVK, `--layer C:\vkd3d-proton-3.1\x64` through vkd3d-proton. A replay's machine line, in `verify` and its
+`verifications` row, names the Direct3D DLLs it loaded from outside the system folder, by version (where the DLL has
+a version resource; DXVK 3.1.1's say 10.0.17763.1, a stand-in) and the start of its SHA-256, and its folder. DXVK
+3.1.1 on an RTX 5070 Ti, which it presents with AMD's vendor id and a driver version of its own:
+
+```
+NVIDIA GeForce RTX 5070 Ti (1002:73df), driver 35.0.65535.65535, Windows 10.0.26200.9711, through d3d10core.dll
+10.0.17763.1 sha256 beffdd081dce, d3d11.dll 10.0.17763.1 sha256 0a203b6255c8, dxgi.dll 10.0.17763.1 sha256
+e3c1178eb7f0 from C:\dxvk-3.1.1\x64
+```
+
+`meta.environment`'s `layers` records each (path, version, SHA-256).
+
+`verify --report FILE` writes every comparison it made as JSON: `checks`, each with a key that is the same in every
+replay of the capture (`target <draw> <name> <sub> <plane>`, `output <event> #<resource> <sub>`), its kind (`target`,
+`clear`, `output`, `ordered`), the event, what verify calls it, whether it is the game's, how it compared and the
+XXH3-128 key of the replay's bytes; `incomplete` (verify's `incomplete:` lines); `ok`; `result` (its last line); and
+`environment`, the machine it replayed on.
+
+`locum-cli conform` holds a translation layer to the game's frame, for whoever writes one:
+
+```
+locum-cli conform last --layer C:\dxvk-3.1.1\x64 -o dxvk           # a Direct3D 11 capture through DXVK
+locum-cli conform mt --layer C:\vkd3d-proton-3.1\x64 -o vkd3d      # a Direct3D 12 capture through vkd3d-proton
+```
+
+It verifies the capture twice, each in a locum-cli process of its own (a process has one `d3d11.dll`): on the
+system's Direct3D, then with `--layer` through the layer's DLLs. Then it takes the two reports comparison by comparison:
+
+- `LAYER DIFFERS`: the system's replay is the game's and the layer's is not. The same capture, events and resources
+  gave the game's bytes on the system's runtime and other bytes through the layer; the layer is the one to explain it.
+- `LAYER STOPPED`: what the system's replay compared and the layer's never reached (it failed or crashed at an event,
+  which the line names).
+- `LAYER COULD NOT`: what the layer's replay found incomplete and the system's did not (a command signature or
+  resource it could not make, with the HRESULT).
+- `note:` a comparison both replays fail (the capture, replay or driver already differs from the game), saying whether
+  their bytes are the same, or one only the layer's replay passes.
+
+It ends with the counts and both machine lines, and exits with success only when there are no findings. It refuses a
+layer folder without the capture's API's DLLs (`d3d11.dll` and `dxgi.dll`, or `d3d12.dll`), a capture whose replay
+compares nothing (a frame with no targets read back has nothing to hold the layer to), a system replay that loaded
+Direct3D DLLs from outside the system folder, and a layer replay that did not load the layer's. `-o` (default
+`conform`) gets `system.json` and `layer.json` (each verify's `--report`), `system.txt` and `layer.txt` (what each
+printed) and `system/` and `layer/`: each verify's `--out` (the bytes and pictures of what differs from the game's),
+and the folder it ran in, so the layer's logs and caches (DXVK's `*_d3d11.log`, vkd3d-proton's pipeline cache) are
+there. `--limit` goes to both verifies, and so do the layer's settings in the environment (`DXVK_CONFIG`,
+`VKD3D_CONFIG`). `--warp` replays both on WARP, which locum's stand-ins have and DXVK and vkd3d-proton do not.
+
+What conform found on this machine (RTX 5070 Ti, driver 32.0.16.1074, 2026-11-06), on the smoke captures:
+
+- DXVK 3.1.1: 51 of the 60 Direct3D 11 captures have no findings, and five compare nothing. The four `tiles-*` captures
+  have two findings each: the draw after `CopyTileMappings` (event 5) and the one after a `CopyTiles` from a buffer
+  into a tiled texture (`D3D11_TILE_COPY_LINEAR_BUFFER_TO_SWIZZLED_TILED_RESOURCE`, event 11) read zeros through DXVK,
+  where the system's runtime reads the copied tiles. DXVK's log says nothing of it.
+- vkd3d-proton 3.1: `indirect` (made on WARP or on the GPU) has five findings. Its command signatures with a root CBV
+  (VBV + CBV + DRAW) and a root UAV (UAV + CONSTANT + DISPATCH) fail with `E_NOTIMPL`, and the three draws they would
+  have drawn are not the game's. vkd3d-proton's log says why: `Root parameter 0 is not a raw VA. Cannot implement
+  command signature which updates root descriptor.` With `VKD3D_CONFIG=force_raw_va_cbv` all nine comparisons are the
+  game's and there are no findings. `indirect-gaps` has the same one.
+- vkd3d-proton 3.1 on an Elden Ring frame (6092, 14,475 events, 338 comparisons): the system's replay is the game's
+  in every one; through vkd3d-proton 133 of 161 targets and 16 of 170 outputs differ. The first is a shadow map's
+  depth at draw 423 (1,127 of 33,554,432 texels, by up to 0.0027); from the G-buffer at draw 882 on, most targets
+  differ. vkd3d-proton also sizes 94 of the frame's placed resources larger than the game's GPU did, so the layer's
+  replay made them committed (a `LAYER COULD NOT`). Making the same 94 committed on the system's runtime leaves every
+  target and output the game's, so that is not why the others differ.
+
+Both smokes run conform with locum's own stand-ins as the layer: through them the frame is the game's, the layer is
+named and the system's replay is not; with a `solid` rule in their `overrides.txt` each draw it changes is a
+`LAYER DIFFERS` and conform fails (Direct3D 11); a layer without its API's DLL, and a capture that compares nothing, are
+refused.
+
 ## Direct3D 12 (in progress)
 
 A third DLL, `d3d12.dll`, passes every Direct3D 12 call through to the system's, as `d3d11.dll` does for Direct3D 11;
@@ -806,6 +883,7 @@ described, no `environment` gap, both ends named). `cargo xtask smoke --api d3d1
 show on the default adapter, at the game's size (a copy's order against the list's next draw), and the `indirect`
 capture, and verifies both there; `--debug` also verifies every capture of the WARP run with `verify --debug` (no
 validation errors, each verify's result and last line as without it); `cargo xtask smoke` stays the Direct3D 11 suite.
+The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
 
 ### Known problems: Motor Town
 
@@ -819,7 +897,7 @@ target is identical (66 of 66, 68 of 68), but
 
 Neither has a known cause yet. Its command signatures are each one DRAW, DRAW_INDEXED or DISPATCH, so no
 ExecuteIndirect of it carries an address, and the ExecuteIndirect change neither causes nor fixes these: one capture
-verified with the CLI before and after gives the same counts. The wrappers are generated: `cargo xtask gen` (policy in `xtask/src/d3d12.rs`).
+verified with the CLI before and after gives the same counts.
 
 ## Crash investigation
 

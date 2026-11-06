@@ -2396,7 +2396,9 @@ impl Backend for D3d12 {
                 )
             })
             .and_then(|a| environment::adapter(&a, environment::Api::D3d12));
-        environment::Environment::probe(adapter, environment::Api::D3d12, false)
+        let mut e = environment::Environment::probe(adapter, environment::Api::D3d12, false);
+        e.layers = environment::layers();
+        e
     }
 
     fn warnings(&self) -> Vec<String> {
