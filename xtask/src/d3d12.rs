@@ -200,7 +200,7 @@ pub fn smoke(root: &std::path::Path, hardware: bool, debug: bool, dlls: Option<&
         ],
         dlls,
     );
-    let stage = root.join("target/smoke-d3d12");
+    let stage = super::target_dir(root).join("smoke-d3d12");
     std::fs::create_dir_all(&stage).unwrap();
     super::stage_files(
         root,

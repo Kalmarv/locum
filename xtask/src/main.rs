@@ -367,6 +367,18 @@ fn main() {
     }
 }
 
+/// Where cargo builds this workspace: `CARGO_TARGET_DIR` (from `root` if relative), else `root/target`.
+fn target_dir(root: &Path) -> PathBuf {
+    target_dir_from(root, std::env::var_os("CARGO_TARGET_DIR"))
+}
+
+fn target_dir_from(root: &Path, set: Option<std::ffi::OsString>) -> PathBuf {
+    match set {
+        Some(dir) if !dir.is_empty() => root.join(dir),
+        _ => root.join("target"),
+    }
+}
+
 /// Builds `packages` for release, leaving out the DLLs' where `dlls` gives them.
 fn build(root: &Path, packages: &[&str], dlls: Option<&Path>) {
     let mut command = Command::new(env!("CARGO"));
@@ -380,12 +392,14 @@ fn build(root: &Path, packages: &[&str], dlls: Option<&Path>) {
     assert!(status.success(), "build failed");
 }
 
-/// Copies `files` from the release build into `stage`; the DLLs from `dlls` where it is given.
+/// Copies `files` from the release build (the one [`build`] made, in [`target_dir`]) into `stage`; the DLLs from `dlls`
+/// where it is given.
 fn stage_files(root: &Path, stage: &Path, files: &[&str], dlls: Option<&Path>) {
+    let release = target_dir(root).join("release");
     for file in files {
         let from = match dlls {
             Some(dir) if file.ends_with(".dll") => dir.join(file),
-            _ => root.join("target/release").join(file),
+            _ => release.join(file),
         };
         std::fs::copy(&from, stage.join(file)).unwrap_or_else(|e| panic!("copy {}: {e}", from.display()));
         if dlls.is_some() && file.ends_with(".dll") {
@@ -394,8 +408,8 @@ fn stage_files(root: &Path, stage: &Path, files: &[&str], dlls: Option<&Path>) {
     }
 }
 
-/// Builds the release DLLs (or takes those in `dlls`) and the smoke program, puts them in `target/smoke/` and runs it
-/// there, with locum's log in `target/smoke/log/`.
+/// Builds the release DLLs (or takes those in `dlls`) and the smoke program, puts them in `smoke/` in the target
+/// directory and runs it there, with locum's log in `smoke/log/`.
 fn smoke(root: &Path, debug: bool, dlls: Option<&Path>) {
     build(
         root,
@@ -408,10 +422,10 @@ fn smoke(root: &Path, debug: bool, dlls: Option<&Path>) {
         ],
         dlls,
     );
-    let stage = root.join("target/smoke");
+    let stage = target_dir(root).join("smoke");
     let log_dir = stage.join("log");
     let _ = std::fs::remove_dir_all(&stage);
-    std::fs::create_dir_all(&log_dir).expect("create target/smoke");
+    std::fs::create_dir_all(&log_dir).expect("create the smoke folder");
     stage_files(
         root,
         &stage,
@@ -1926,4 +1940,22 @@ fn rustfmt(path: &Path) {
         .status()
         .expect("run rustfmt");
     assert!(status.success(), "rustfmt failed on {}", path.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The smokes stage what cargo built: where `CARGO_TARGET_DIR` says, absolute or from the workspace.
+    #[test]
+    fn the_target_directory_is_cargos() {
+        let root = Path::new(r"C:\work\locum");
+        assert_eq!(target_dir_from(root, None), root.join("target"));
+        assert_eq!(target_dir_from(root, Some("".into())), root.join("target"));
+        assert_eq!(target_dir_from(root, Some("out".into())), root.join("out"));
+        assert_eq!(
+            target_dir_from(root, Some(r"D:\scratch".into())),
+            PathBuf::from(r"D:\scratch")
+        );
+    }
 }

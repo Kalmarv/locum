@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `cargo xtask smoke` runs what cargo built where `CARGO_TARGET_DIR` points, and stages there (`smoke/`,
+  `smoke-d3d12/`). Before, it built there but copied `target/release`'s DLLs, so a smoke could pass on old ones.
+
 ## 0.1.4 (2026-11-06)
 
 - Releases are made by release-plz and dist. The downloads are now `locum-x86_64-pc-windows-msvc.zip` (`locum.dll`,
