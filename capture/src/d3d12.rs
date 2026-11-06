@@ -100,7 +100,9 @@ pub struct Output {
 
 /// The argument records of an ExecuteIndirect (the command at `command`) whose signature puts GPU addresses in them,
 /// with its count when it has a count buffer, copied inside its list right before it: `bytes` of records from the
-/// argument offset, then the count's 4 bytes. They are read after the frame, for the buffers the addresses are in.
+/// argument offset, then the count's 4 bytes. They are read after the frame, for the buffers the addresses are in. A
+/// bundle's ExecuteIndirect has none: D3D12 lets a bundle run only a signature of one draw or dispatch, without a
+/// count buffer, so its records name nothing and are read as any buffer is.
 #[derive(Clone, Debug, Default)]
 pub struct Arguments {
     pub id: u64,
@@ -298,8 +300,44 @@ pub struct Prepared {
     checkpoints: BTreeMap<u64, Result<String, String>>,
     /// Checkpoints a list's Close made whose pass the next list submitted with it continued: no copy, and no gap.
     continued: BTreeSet<u64>,
-    /// The resources only ExecuteIndirect argument records name, whose contents were copied after the frame.
-    after_frame: BTreeSet<u64>,
+    /// What ExecuteIndirect argument records named (see [`Prepared::named_by_arguments`]).
+    named: Named,
+}
+
+/// What the frame's ExecuteIndirect argument records named, read after the frame, and the copies made then.
+#[derive(Default)]
+struct Named {
+    /// Each buffer the records name, with the submission and queue of the first ExecuteIndirect naming it.
+    first: BTreeMap<u64, (u64, u64)>,
+    /// (event, buffer): a root UAV in the event's records names the buffer, so the event may write it.
+    writes: BTreeSet<(u64, u64)>,
+    /// Each buffer copied after the frame, and what the copy is for.
+    planned: BTreeMap<u64, AfterFrame>,
+    /// The buffers whose copy after the frame is their contents as the frame began.
+    contents: BTreeSet<u64>,
+    /// What ExecuteIndirect events wrote through root UAVs their records set: (event, buffer) and the key of the
+    /// buffer's bytes after the frame, or why there are none.
+    outputs: BTreeMap<(u64, u64), Result<String, String>>,
+    /// Such writes no copy holds, by reason.
+    uncopied: BTreeMap<String, u64>,
+}
+
+/// What a copy of a buffer after the frame is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterFrame {
+    /// Its contents as the frame began: only records name it, and nothing the frame recorded writes it.
+    Contents,
+    /// What ExecuteIndirect event `0` wrote to it through a root UAV its records set: no later event writes it.
+    Output(u64),
+}
+
+/// A buffer to copy whole after the frame (see [`Prepared::after_frame`]), on `queue`, filed at `submission`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AfterFrameCopy {
+    pub resource: u64,
+    pub submission: u64,
+    pub queue: u64,
+    pub layout: Vec<crate::layout::Sub>,
 }
 
 /// A resource's contents as its first use in the frame found them, copied on the GPU just before the submission that
@@ -331,22 +369,172 @@ impl Prepared {
     pub fn indirect(&self) -> &[Indirect] {
         &self.projection.indirect
     }
-    /// What the argument records of ExecuteIndirect event `event` name: the event reads `resources`, which the frame
-    /// therefore uses.
-    pub fn named_by_arguments(&mut self, capture: &mut db::Capture, event: u64, resources: &[u64]) {
+    /// What the argument records of ExecuteIndirect `indirect` name: the event reads `reads`, and reads and may write
+    /// `writes`, which a root UAV in them names. The frame therefore uses them all, and writes `writes`.
+    pub fn named_by_arguments(
+        &mut self,
+        capture: &mut db::Capture,
+        indirect: &Indirect,
+        reads: &[u64],
+        writes: &[u64],
+    ) {
+        let event = indirect.event;
         if let Some(e) = capture.events.iter_mut().find(|e| e.seq == event) {
-            e.reads.extend(resources);
+            e.reads.extend(reads.iter().chain(writes));
             e.reads.sort_unstable();
             e.reads.dedup();
+            e.writes.extend(writes);
+            e.writes.sort_unstable();
+            e.writes.dedup();
         }
-        for r in capture.resources.iter_mut().filter(|r| resources.contains(&r.id)) {
+        for r in capture
+            .resources
+            .iter_mut()
+            .filter(|r| reads.contains(&r.id) || writes.contains(&r.id))
+        {
             r.used = true;
+            r.written |= writes.contains(&r.id);
         }
+        for &r in reads.iter().chain(writes) {
+            self.named
+                .first
+                .entry(r)
+                .or_insert((indirect.submission, indirect.queue));
+        }
+        self.named.writes.extend(writes.iter().map(|&w| (event, w)));
     }
-    /// Resource `resource`'s first-use contents were copied after the frame: nothing the frame recorded names it but
-    /// argument records.
-    pub fn copied_after_frame(&mut self, resource: u64) {
-        self.after_frame.insert(resource);
+
+    /// The buffers to copy whole after the frame, once every ExecuteIndirect's records are known
+    /// ([`Prepared::named_by_arguments`]); `copied` says whether a resource's contents were copied (or given up)
+    /// before the frame first used it.
+    ///
+    /// A buffer only records name has no copy from before its first use, since no submission was seen to use it. If
+    /// nothing the frame recorded writes it (records' root UAVs included), what it holds after the frame is what it
+    /// held as the frame began: copied on the queue of the first ExecuteIndirect naming it, as its contents at that
+    /// one's submission. If the frame writes it, what it held as the frame began is not known.
+    ///
+    /// What an ExecuteIndirect wrote through a root UAV its records set was not copied right after it, since which
+    /// buffer that is is learned only now. Where no later event of the frame writes the buffer, and every event that
+    /// writes it ran on that ExecuteIndirect's queue, the buffer after the frame holds what it wrote: copied on that
+    /// queue, as its output. Otherwise its output is not known.
+    pub fn after_frame(
+        &mut self,
+        capture: &db::Capture,
+        copied: impl Fn(u64) -> bool,
+    ) -> Vec<AfterFrameCopy> {
+        let queues: HashMap<u64, u64> = self
+            .projection
+            .locations
+            .iter()
+            .map(|&(seq, _, _, queue)| (seq, queue))
+            .collect();
+        let submissions: HashMap<u64, u64> = self
+            .projection
+            .indirect
+            .iter()
+            .map(|i| (i.event, i.submission))
+            .collect();
+        let mut writers = BTreeMap::<u64, Vec<u64>>::new();
+        for e in &capture.events {
+            for &r in &e.writes {
+                writers.entry(r).or_default().push(e.seq);
+            }
+        }
+        let descriptions: BTreeMap<u64, &Value> = self
+            .frame
+            .objects
+            .iter()
+            .map(|o| (o.id, &o.description))
+            .collect();
+        let mut planned = BTreeMap::<u64, (AfterFrame, u64, u64)>::new();
+        for (&resource, &(submission, queue)) in &self.named.first {
+            if copied(resource) {
+                continue;
+            }
+            let why = if writers.contains_key(&resource) {
+                "only ExecuteIndirect argument records name it, and a root UAV in them lets the frame write it: what it \
+                 held as the frame began was not copied (after the frame it holds what the frame wrote)"
+            } else {
+                match descriptions.get(&resource) {
+                    None => "only ExecuteIndirect argument records name it, and its description is not known",
+                    // An upload buffer's contents are its copy at the frame's first submission; only the GPU writes a
+                    // readback buffer (as `contents` says).
+                    Some(d) if matches!(d["heap_properties"]["type"].as_u64(), Some(2 | 3)) => continue,
+                    Some(d) if d["dimension"] != 1 => {
+                        "an argument record's address names it, but it is not a buffer"
+                    }
+                    Some(_) => {
+                        planned.insert(resource, (AfterFrame::Contents, submission, queue));
+                        continue;
+                    }
+                }
+            };
+            self.first_use.insert(
+                resource,
+                FirstUse {
+                    submission,
+                    states: serde_json::json!([]),
+                    content: Err(why.into()),
+                },
+            );
+        }
+        for &(event, resource) in &self.named.writes {
+            let queue = queues.get(&event).copied();
+            let all = writers.get(&resource).map_or(&[][..], Vec::as_slice);
+            let why = if all.iter().any(|&w| w > event) {
+                "the frame writes it again later"
+            } else if all.iter().any(|w| queues.get(w) != queue.as_ref()) {
+                "the frame also writes it on another queue"
+            } else if descriptions.get(&resource).is_none_or(|d| d["dimension"] != 1) {
+                "it is not a buffer locum knows"
+            } else if let (Some(queue), Some(&submission)) = (queue, submissions.get(&event)) {
+                planned.insert(resource, (AfterFrame::Output(event), submission, queue));
+                continue;
+            } else {
+                "its event's queue is not known"
+            };
+            *self
+                .named
+                .uncopied
+                .entry(format!(
+                    "an ExecuteIndirect wrote it through a root UAV its records set, which is learned only after the \
+                     frame, and {why}: what that ExecuteIndirect wrote was not copied"
+                ))
+                .or_default() += 1;
+        }
+        let mut out = Vec::new();
+        for (resource, (purpose, submission, queue)) in planned {
+            // A buffer always has one.
+            let Some(layout) = descriptions.get(&resource).and_then(|d| layout(d)) else {
+                continue;
+            };
+            self.named.planned.insert(resource, purpose);
+            out.push(AfterFrameCopy {
+                resource,
+                submission,
+                queue,
+                layout,
+            });
+        }
+        out
+    }
+
+    /// A copy [`Prepared::after_frame`] asked for, made after the frame: its bytes, or why there are none.
+    pub fn set_after_frame(&mut self, resource: u64, copy: FirstUse) {
+        match self.named.planned.get(&resource) {
+            Some(AfterFrame::Contents) => {
+                if copy.content.is_ok() {
+                    self.named.contents.insert(resource);
+                }
+                self.first_use.insert(resource, copy);
+            }
+            Some(&AfterFrame::Output(event)) => {
+                self.named
+                    .outputs
+                    .insert((event, resource), copy.content.map(|(key, _)| key));
+            }
+            None => {}
+        }
     }
     /// Upload copies a submission made, read back after the frame (in one batch or several).
     pub fn add_uploads(&mut self, submission: u64, uploads: Vec<(u64, Value)>) {
@@ -457,12 +645,13 @@ impl Prepared {
                     Some("upload bytes as the GPU reached the frame's first captured submission".into());
             } else if let Some(first) = self.first_use.get(&resource.id) {
                 match &first.content {
-                    Ok((key, subs)) if self.after_frame.contains(&resource.id) => {
+                    Ok((key, subs)) if self.named.contents.contains(&resource.id) => {
                         resource.content = Some(key.clone());
                         resource.content_source = Some("after-frame");
                         resource.content_note = Some(
-                            "copied after the frame: only ExecuteIndirect argument records name it, so no command \
-                             the frame recorded wrote it (a shader could, through a view)"
+                            "copied after the frame: only ExecuteIndirect argument records name it, and nothing the \
+                             frame recorded writes it, root UAVs in those records included (a shader indexing the \
+                             descriptor heap itself could)"
                                 .into(),
                         );
                         hashes.clone_from(subs);
@@ -553,34 +742,65 @@ impl Prepared {
             .map(|d| (d.event, d.shaders.iter().flatten().cloned().collect()))
             .collect();
         let mut order_dependent = BTreeMap::<String, bool>::new();
+        let mut ordered = |event: u64| {
+            programs.get(&event).is_some_and(|keys| {
+                keys.iter().any(|k| {
+                    *order_dependent.entry(k.clone()).or_insert_with(|| {
+                        blobs
+                            .get(k)
+                            .ok()
+                            .and_then(|code| crate::dxbc::order_dependent(&code).ok().flatten())
+                            .is_some()
+                    })
+                })
+            })
+        };
         let mut unrecorded = BTreeMap::<String, u64>::new();
-        for &(id, event, resource, sub) in &self.projection.outputs {
-            match self.checkpoints.get(&id) {
-                Some(Ok(key)) => {
-                    let ordered = programs.get(&event).is_some_and(|keys| {
-                        keys.iter().any(|k| {
-                            *order_dependent.entry(k.clone()).or_insert_with(|| {
-                                blobs
-                                    .get(k)
-                                    .ok()
-                                    .and_then(|code| crate::dxbc::order_dependent(&code).ok().flatten())
-                                    .is_some()
-                            })
-                        })
-                    });
-                    capture.results.push(db::Output {
-                        event,
-                        resource,
-                        sub,
-                        content: key.clone(),
-                        ordered,
-                    });
-                }
-                Some(Err(why)) => *unrecorded.entry(why.clone()).or_default() += 1,
+        // What draws, dispatches and clears wrote through views the list bound, copied right after each; then what
+        // ExecuteIndirects wrote through root UAVs their records set, copied after the frame.
+        let copies = self
+            .projection
+            .outputs
+            .iter()
+            .map(|&(id, event, resource, sub)| {
+                let content = self.checkpoints.get(&id).cloned();
+                (event, resource, sub, content)
+            })
+            .chain(
+                self.named
+                    .outputs
+                    .iter()
+                    .map(|(&(event, resource), content)| (event, resource, None, Some(content.clone()))),
+            );
+        for (event, resource, sub, content) in copies {
+            match content {
+                Some(Ok(key)) => capture.results.push(db::Output {
+                    event,
+                    resource,
+                    sub,
+                    content: key,
+                    ordered: ordered(event),
+                }),
+                Some(Err(why)) => *unrecorded.entry(why).or_default() += 1,
                 None => *unrecorded.entry("copy not read back".into()).or_default() += 1,
             }
         }
-        for (why, count) in self.projection.unrecorded.iter().chain(&unrecorded) {
+        // A copy asked for after the frame and never filed was not read back.
+        let filed = |r: &u64, event: u64| self.named.outputs.contains_key(&(event, *r));
+        for (resource, purpose) in &self.named.planned {
+            if let AfterFrame::Output(event) = purpose
+                && !filed(resource, *event)
+            {
+                *unrecorded.entry("copy not read back".into()).or_default() += 1;
+            }
+        }
+        for (why, count) in self
+            .projection
+            .unrecorded
+            .iter()
+            .chain(&self.named.uncopied)
+            .chain(&unrecorded)
+        {
             capture.gap("d3d12-results", why, *count);
         }
         for (why, count) in &self.projection.unread_arguments {
@@ -963,7 +1183,7 @@ impl Frame {
             first_use: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
             continued: Default::default(),
-            after_frame: BTreeSet::new(),
+            named: Named::default(),
         }
     }
 
@@ -1222,8 +1442,8 @@ impl Projection {
             *self
                 .unread_arguments
                 .entry(
-                    "its list was not instrumented (recorded before the capture was armed, a compute or copy list, \
-                     or a bundle)"
+                    "its list was not instrumented (recorded before the capture was armed, or a compute or copy \
+                     list)"
                         .into(),
                 )
                 .or_default() += uncopied;
@@ -1468,6 +1688,14 @@ impl Projection {
                 if kind == "draw" {
                     last_draw = Some(n);
                 }
+                let from_records = match command.call {
+                    "ExecuteIndirect" => self
+                        .objects
+                        .get(&command.args[0].as_u64().unwrap_or(0))
+                        .map(indirect::root_parameters)
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
                 bindings::project(
                     capture,
                     n,
@@ -1475,6 +1703,7 @@ impl Projection {
                     pipeline,
                     &self.objects,
                     &self.descriptors,
+                    &from_records,
                 );
                 for b in capture.bindings[bound..].iter().filter(|b| b.stage == "om") {
                     if let Some(view) = b.view {
@@ -1871,13 +2100,22 @@ mod tests {
             device: 1,
             description,
         };
-        let execute = |signature: u64| Command {
-            call: "ExecuteIndirect",
-            args: json!([signature, 2, 8, 0, 0, 0]),
-            bundle: None,
+        let command = |call, args, bundle| Command {
+            call,
+            args,
+            bundle,
             diagnostic: None,
         };
-        // A signature whose records set a root CBV, one of draws alone, and the buffer the records name.
+        let execute = |signature: u64| command("ExecuteIndirect", json!([signature, 2, 8, 0, 0, 0]), None);
+        let buffer = |id| {
+            object(
+                id,
+                "ID3D12Resource",
+                json!({"dimension": 1, "width": 256, "height": 1, "mips": 1, "heap_properties": {"type": 1}}),
+            )
+        };
+        // Signatures whose records set a root CBV, of draws alone, and whose records set a root UAV; and the buffers
+        // the records name.
         let objects = vec![
             object(
                 5,
@@ -1890,26 +2128,51 @@ mod tests {
                 json!({"stride": 16, "arguments": [{"type": 0}]}),
             ),
             object(
-                9,
-                "ID3D12Resource",
-                json!({"dimension": 1, "width": 256, "height": 1, "mips": 1}),
+                8,
+                "ID3D12CommandSignature",
+                json!({"stride": 20, "arguments": [{"type": 8, "root_parameter": 0}, {"type": 2}]}),
             ),
+            buffer(9),
+            buffer(10),
+            buffer(11),
+            buffer(12),
         ];
-        // Instrumented: its records copied before its ExecuteIndirect. Recorded before arming: neither copied.
-        let mut copied = Recording::new(1, 0, 10, 0, false);
-        copied.record(execute(5));
-        copied.arguments(Arguments {
-            id: 40,
-            command: 0,
-            layout: indirect::layout(&objects[0].description).unwrap(),
+        let copy = |id, command, signature: usize| Arguments {
+            id,
+            command,
+            layout: indirect::layout(&objects[signature].description).unwrap(),
             bytes: 48,
             counted: false,
             gap: None,
-        });
+        };
+        // A bundle may run only a signature of draws or dispatches alone: its records name nothing, so it copies none.
+        let mut bundle = Recording::new(3, 1, 12, 0, false);
+        bundle.record(execute(6));
+        bundle.close();
+        // Instrumented: its records copied before each ExecuteIndirect.
+        let mut copied = Recording::new(1, 0, 10, 0, false);
+        copied.instrument();
+        copied.record(execute(5));
+        copied.record(execute(8));
+        copied.record(command(
+            "ExecuteBundle",
+            json!({"list": 3}),
+            Some(bundle.snapshot()),
+        ));
+        copied.record(execute(8));
+        for a in [copy(40, 0, 0), copy(41, 1, 2), copy(42, 3, 2)] {
+            copied.arguments(a);
+        }
         copied.close();
+        // Recorded before arming: none copied.
         let mut uncopied = Recording::new(2, 0, 11, 0, false);
         uncopied.record(execute(5));
         uncopied.record(execute(6));
+        uncopied.record(command(
+            "ExecuteBundle",
+            json!({"list": 3}),
+            Some(bundle.snapshot()),
+        ));
         uncopied.close();
         let frame = Frame {
             objects,
@@ -1927,30 +2190,107 @@ mod tests {
         let mut c = db::Capture::default();
         let mut prepared = frame.prepare(&mut c);
         let found = prepared.indirect().to_vec();
-        assert_eq!(found.len(), 1);
-        let (event, submission, queue) = (found[0].event, found[0].submission, found[0].queue);
-        assert_eq!((submission, queue, found[0].arguments.id), (3, 7, 40));
         assert_eq!(
-            c.events.iter().find(|e| e.seq == event).unwrap().call,
-            "ExecuteIndirect"
+            found.iter().map(|i| i.arguments.id).collect::<Vec<_>>(),
+            vec![40, 41, 42]
         );
-        // The draws-only signature's records name nothing: no gap for it.
+        assert!(found.iter().all(|i| (i.submission, i.queue) == (3, 7)));
+        let event = |i: usize| found[i].event;
+        let call = |seq: u64| c.events.iter().find(|e| e.seq == seq).unwrap().call;
+        assert!((0..3).all(|i| call(event(i)) == "ExecuteIndirect"));
+        // The last is after the bundle's events.
+        assert_eq!(call(event(2) - 2), "ExecuteBundle");
+        // The draws-only signature's records name nothing: no gap for them, in the bundles or the uncopied list. The
+        // uncopied list's root CBV records are a gap.
         let gaps: Vec<_> = prepared.projection.unread_arguments.iter().collect();
         assert_eq!(gaps.len(), 1);
         assert!(gaps[0].0.starts_with("its list was not instrumented"));
         assert_eq!(*gaps[0].1, 1);
-        // What the records name: the event reads it, and the frame uses it.
+
+        // What the records name. #9 is read only through them; #10 written only through them; #11 written through
+        // two ExecuteIndirects' records; #12 written through the last's, and used otherwise (copied before).
         assert!(!c.resources.iter().find(|r| r.id == 9).unwrap().used);
-        prepared.named_by_arguments(&mut c, event, &[9]);
-        assert!(
-            c.events
-                .iter()
-                .find(|e| e.seq == event)
-                .unwrap()
-                .reads
-                .contains(&9)
+        prepared.named_by_arguments(&mut c, &found[0], &[9], &[]);
+        prepared.named_by_arguments(&mut c, &found[1], &[], &[10, 11]);
+        prepared.named_by_arguments(&mut c, &found[2], &[], &[11, 12]);
+        let e = |seq: u64| c.events.iter().find(|e| e.seq == seq).unwrap();
+        assert!(e(event(0)).reads.contains(&9) && e(event(0)).writes.is_empty());
+        assert_eq!(e(event(1)).writes, vec![10, 11]);
+        assert!(e(event(1)).reads.contains(&10));
+        let r = |id: u64| c.resources.iter().find(|r| r.id == id).unwrap();
+        assert!(r(9).used && !r(9).written);
+        assert!(r(10).used && r(10).written);
+
+        let copies = prepared.after_frame(&c, |r| r == 12);
+        let planned: Vec<_> = copies
+            .iter()
+            .map(|a| (a.resource, a.submission, a.queue))
+            .collect();
+        assert_eq!(planned, vec![(9, 3, 7), (10, 3, 7), (11, 3, 7), (12, 3, 7)]);
+        // #10 and #11 began the frame as nothing recorded says: written, and named only by records.
+        for id in [10, 11] {
+            let first = &prepared.first_use[&id];
+            assert!(
+                first
+                    .content
+                    .as_ref()
+                    .is_err_and(|why| why.contains("a root UAV in them lets the frame write it")),
+                "#{id}"
+            );
+        }
+        let ok = |key: &str| FirstUse {
+            submission: 3,
+            states: json!([]),
+            content: Ok((key.to_string(), vec![key.to_string()])),
+        };
+        prepared.set_after_frame(9, ok("k9"));
+        prepared.set_after_frame(
+            10,
+            FirstUse {
+                content: Err("readback budget".into()),
+                ..ok("")
+            },
         );
-        assert!(c.resources.iter().find(|r| r.id == 9).unwrap().used);
+        prepared.set_after_frame(11, ok("k11"));
+        prepared.set_after_frame(12, ok("k12"));
+        prepared.set_first_use(12, ok("k12-before"));
+        let dir = std::env::temp_dir().join(format!("locum-indirect-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        prepared.contents(&mut c, &crate::blobs::Blobs::new(&dir));
+        let r = |id: u64| c.resources.iter().find(|r| r.id == id).unwrap();
+        // #9's copy after the frame is its contents; #10's and #11's are not known; #12's are its first use.
+        assert_eq!(
+            (r(9).content.as_deref(), r(9).content_source),
+            (Some("k9"), Some("after-frame"))
+        );
+        for id in [10, 11] {
+            assert_eq!(r(id).content, None);
+            assert!(r(id).content_note.as_ref().unwrap().contains("root UAV"));
+        }
+        assert_eq!(r(12).content.as_deref(), Some("k12-before"));
+        // Outputs: the last ExecuteIndirect's, of #11 and #12. The first writing #11 wrote it again later, and #10's
+        // copy failed: gaps.
+        let mut outputs: Vec<_> = c
+            .results
+            .iter()
+            .map(|o| (o.event, o.resource, o.content.as_str()))
+            .collect();
+        outputs.sort();
+        assert_eq!(outputs, vec![(event(2), 11, "k11"), (event(2), 12, "k12")]);
+        let gaps: Vec<_> = c
+            .gaps
+            .iter()
+            .filter(|g| g.what == "d3d12-results")
+            .map(|g| (g.detail.clone(), g.count))
+            .collect();
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert!(gaps.contains(&("readback budget".into(), 1)));
+        assert!(
+            gaps.iter()
+                .any(|(why, n)| why.contains("writes it again later") && *n == 1)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
         // Its records: two fit 48 bytes, and a count would lower that.
         let mut a = found[0].arguments.clone();
         assert_eq!(a.records(&[0; 48]), 2);

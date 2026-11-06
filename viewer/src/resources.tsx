@@ -5,7 +5,7 @@ import { useMemo, useRef, useState, useEffect } from "preact/hooks";
 import { cached, get } from "./api";
 import { Thumb, Viewer, type Picture } from "./image";
 import { BytesView, EventLink, KV, Section, Stack, useCtx } from "./parts";
-import { href, Loading, mib, short, useAsync, compact } from "./util";
+import { href, Loading, mib, short, sourceWords, useAsync, compact } from "./util";
 import { formatName } from "../server/format";
 
 type ResRow = [number, string, number, number, number, number, number, number, number, number, number, number, number, number, number, number, string | null, number, number, number];
@@ -119,7 +119,7 @@ function ResourceView({ rid }: { rid: number }) {
             ["size", `${mib(x.bytes)} (${x.bytes.toLocaleString()} bytes in the canonical layout)`],
             ["created", `frame ${x.created_frame ?? "?"}`],
             ["this frame", `${x.used ? "used" : "not used"}${x.written ? ", written" : ""}`],
-            ["contents", x.content ? <span>{short(x.content, 32)} <span class="muted">({x.content_source}{x.contentPresent ? "" : ", not in the store"})</span>{x.content_note ? <div class="warn">{x.content_note}</div> : null}</span>
+            ["contents", x.content ? <span>{short(x.content, 32)} <span class="muted">({sourceWords(x.content_source)}{x.contentPresent ? "" : ", not in the store"})</span>{x.content_note ? <div class="warn">{x.content_note}</div> : null}</span>
               : <span class="muted">{x.content_note ?? "not captured"}</span>],
             ["upload", x.upload ? <span>{short(x.upload, 32)} <span class="muted">({x.upload_stored ? "stored" : "hash only"})</span></span> : <span class="muted">none</span>],
             ["updated", x.update_count ? `${x.update_count} times, last in frame ${x.updated_frame}` : "never"],

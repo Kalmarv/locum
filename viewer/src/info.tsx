@@ -3,7 +3,7 @@
 import { useState } from "preact/hooks";
 import { get, post, type Info } from "./api";
 import { KV, Section, useCtx } from "./parts";
-import { mib, useAsync } from "./util";
+import { mib, sourceWords, useAsync } from "./util";
 
 export function InfoPage({ info }: { info: Info }) {
   const m = info.meta;
@@ -23,7 +23,7 @@ export function InfoPage({ info }: { info: Info }) {
           <Stat label="list executions" value={info.lists.executions} sub={`${info.lists.submissions} submissions, ${info.lists.generations} recorded generations`} /> :
           <Stat label="command lists spliced" value={info.lists.spliced} sub={`${info.lists.recordedBefore} recorded the frame before, ${info.lists.unrecorded} executed without a recording`} />}
         <Stat label="constant buffer contents" value={info.constants.distinct} sub={`${info.constants.failures} copies failed`} />
-        <Stat label="resources live" value={info.resources.live} sub={`${info.resources.used} used (${info.resources.written} written); contents for ${info.resources.contents} (${mib(info.resources.contentBytes)}): ${info.resources.sources.map(([s, n]) => `${s} ${n}`).join(", ")}`} />
+        <Stat label="resources live" value={info.resources.live} sub={`${info.resources.used} used (${info.resources.written} written); contents for ${info.resources.contents} (${mib(info.resources.contentBytes)}): ${info.resources.sources.map(([s, n]) => `${n} ${sourceWords(s === "none" ? null : s)}`).join("; ")}`} />
         <Stat label="uploads" value={info.uploads.total} sub={`${info.uploads.stored} stored, ${info.uploads.hashOnly} hash only; ${info.uploads.none} have no upload hash`} />
         <Stat label="targets read back" value={info.targets.count} sub={info.targets.bytes == null ? "size and skips not counted" : `${mib(info.targets.bytes)}, ${info.targets.skipped} skipped`} />
         <Stat label="shaders" value={info.shaders.count} sub={`${info.shaders.withBytecode} with bytecode`} />

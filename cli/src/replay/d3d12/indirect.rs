@@ -157,7 +157,7 @@ impl D3d12 {
         // Every address the records hold, placed: the game's buffer and offset, and that buffer as replay made it.
         let mut placed: HashMap<u64, u64> = HashMap::new();
         let mut unplaced = None;
-        addresses(&records_bytes, layout, records as usize, |game| {
+        addresses(&records_bytes, layout, records as usize, |game, _| {
             if placed.contains_key(&game) || unplaced.is_some() {
                 return;
             }

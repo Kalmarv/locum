@@ -6,6 +6,8 @@
 //! with a capture armed, its pipeline, root signatures and root arguments are followed, and at each draw or dispatch
 //! every register its programs declare is looked up where the root signature puts it: the root view's buffer, or the
 //! descriptor its table's slot holds then. A buffer is copied whole; a texture, the subresources its view covers.
+//! An ExecuteIndirect's command signature can set root parameters per record: those come from its records, not
+//! from what the list set, and what a root UAV in them names is found after the frame (see [`super::indirect`]).
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
@@ -152,9 +154,22 @@ pub fn root(id: u64, decoded: &Value) {
     roots().insert(id, Arc::new(places));
 }
 
+/// By command signature: the root parameters its records set.
+fn signatures() -> MutexGuard<'static, HashMap<u64, Arc<Vec<u32>>>> {
+    static SIGNATURES: OnceLock<Mutex<HashMap<u64, Arc<Vec<u32>>>>> = OnceLock::new();
+    lock(&SIGNATURES)
+}
+
+/// A command signature made, from its description.
+pub fn signature(id: u64, description: &Value) {
+    let set = locum_capture::d3d12::indirect::root_parameters(description);
+    signatures().insert(id, Arc::new(set));
+}
+
 pub fn destroyed(id: u64) {
     pipelines().remove(&id);
     roots().remove(&id);
+    signatures().remove(&id);
 }
 
 /// One subresource (or a whole buffer, `sub` None) a command wrote.
@@ -256,6 +271,14 @@ impl Bound {
                     gaps.push("its pipeline's programs are not known".into());
                     return (out, gaps);
                 };
+                // What an ExecuteIndirect's records set comes from them.
+                let from_records = match call {
+                    "ExecuteIndirect" => signatures()
+                        .get(&a[0].as_u64().unwrap_or(0))
+                        .cloned()
+                        .unwrap_or_default(),
+                    _ => Arc::default(),
+                };
                 for &k in kinds {
                     let compute = k == 1;
                     let Some(places) = roots().get(&self.roots[k]).cloned() else {
@@ -275,7 +298,7 @@ impl Bound {
                                 continue;
                             }
                             for register in first..=last {
-                                match self.resolve(&places, k, stage, space, register) {
+                                match self.resolve(&places, k, stage, space, register, &from_records) {
                                     Ok(Some(w)) => out.extend(w),
                                     Ok(None) => {}
                                     Err(why) => gaps.push(why),
@@ -293,7 +316,8 @@ impl Bound {
     }
 
     /// The subresources register `u{register}` of `space` names for `stage`, by root signature `places` and the
-    /// arguments of kind `k`; None where nothing is bound there (a null view).
+    /// arguments of kind `k`; None where nothing is bound there (a null view), or where the root parameter is one of
+    /// `from_records`, which an ExecuteIndirect's records set.
     fn resolve(
         &self,
         places: &[Place],
@@ -301,6 +325,7 @@ impl Bound {
         stage: &str,
         space: u32,
         register: u32,
+        from_records: &[u32],
     ) -> Result<Option<Vec<Written>>, String> {
         // D3D12_SHADER_VISIBILITY: all, vertex, hull, domain, geometry, pixel, amplification, mesh.
         let visible = match stage {
@@ -321,6 +346,9 @@ impl Bound {
                     && (p.first..=p.last).contains(&register)
             })
             .ok_or_else(|| format!("u{register} space {space} is in no root parameter"))?;
+        if from_records.contains(&place.parameter) {
+            return Ok(None);
+        }
         let Some(arg) = self.args[k].get(&place.parameter) else {
             return Err(format!(
                 "root parameter {} was not set in this list",

@@ -137,6 +137,20 @@ export function short(hash: string | null | undefined, n = 12): string {
   return hash ? hash.slice(0, n) : "-";
 }
 
+/** Where a resource's contents as the frame began came from (`resources.content_source`), in words; a source this
+ *  viewer does not know, as the capture names it. */
+export function sourceWords(source: string | null | undefined): string {
+  switch (source) {
+    case "first-use": return "copied just before the frame first used it";
+    case "upload": return "the data it was created with";
+    case "upload-at-first-submission": return "the upload heap's bytes as the GPU reached the frame's first captured submission";
+    case "after-frame": return "copied after the frame: only ExecuteIndirect argument records name it";
+    case "tile-events": return "none copied: the frame's tile operations give it its contents";
+    case null: case undefined: return "none";
+    default: return source;
+  }
+}
+
 /** JSON on one line, compact. */
 export function compact(v: unknown): string {
   return JSON.stringify(v, (_, x) => (typeof x === "number" && !Number.isInteger(x) ? Number(x.toPrecision(7)) : x))

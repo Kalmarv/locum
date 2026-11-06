@@ -286,10 +286,6 @@ pub fn track(id: u64, description: &Value, initial: super::states::Access) {
     };
     state().states.create(id, description, initial, planes);
 }
-/// Object `id`'s description, as it was made.
-pub fn description(id: u64) -> Option<Value> {
-    state().objects.get(&id).map(|o| o.description.clone())
-}
 pub fn owner_device(id: u64) -> u64 {
     state().objects.get(&id).map_or(0, |o| o.device)
 }
@@ -1080,8 +1076,10 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
             "command history, first-use contents, pass-end targets and what draws, dispatches and clears wrote through UAVs",
         );
         let mut prepared = frame.finish(&mut capture, projection);
-        // Before the game's next submission on this thread: the buffers only argument records name are copied now.
-        unsafe { super::indirect::after_frame(&mut prepared, &mut capture, &used, &results) };
+        // Before the game's next submission on this thread: what argument records name is copied now, its results
+        // apart from the frame's own copies.
+        let after_frame = super::readback::Results::default();
+        unsafe { super::indirect::after_frame(&mut prepared, &mut capture, &used, &after_frame) };
         let t = std::time::Instant::now();
         // The copies finish on the GPU soon after the frame and the collector reads them in order: the capture is
         // written after the last, off the game's threads. The same "capture written" / "capture NOT written" lines as
@@ -1108,6 +1106,11 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                     }
                     for id in batch.continued {
                         prepared.set_continued(id);
+                    }
+                }
+                for batch in std::mem::take(&mut *after_frame.lock().unwrap_or_else(|e| e.into_inner())) {
+                    for (resource, copy) in batch.contents {
+                        prepared.set_after_frame(resource, copy);
                     }
                 }
                 prepared.contents(&mut capture, &crate::settings::settings().blobs);

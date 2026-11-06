@@ -302,38 +302,69 @@ fn hardware_smoke(stage: &std::path::Path, log: &std::path::Path) {
         "D3D12 hardware smoke failed: {}",
         result.status
     );
-    // Each capture verified on the adapter it was made on: both its targets the fixture's.
-    for (name, what) in [
-        (
-            "planes",
-            "a split-plane depth-stencil copied between two passes holds what the first left",
-        ),
-        (
-            "indirect",
-            "ExecuteIndirect with GPU addresses in its records replays as the game's",
-        ),
-    ] {
-        let capture = log.join("captures").join(format!("{name}-{pid}"));
-        let output = Command::new(stage.join("locum-cli.exe"))
-            .arg("verify")
-            .arg(&capture)
-            .env("LOCUM_DIR", log)
-            .output()
-            .unwrap_or_else(|e| panic!("verify the {name} capture: {e}"));
-        let text =
-            String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
-        println!("--- locum-cli verify {}\n{text}", capture.display());
-        assert!(
-            output.status.success() && text.contains("2 of 2 targets identical"),
-            "{name}: both draws replay as the fixture drew them"
-        );
-        println!("ok   D3D12 hardware: {what}");
-    }
+    // Each capture verified on the adapter it was made on.
+    let capture = |name: &str| {
+        log.join("captures")
+            .join(format!("{name}-{pid}"))
+            .display()
+            .to_string()
+    };
+    let (ok, text) = cli(stage, log, &["verify", &capture("planes")]);
+    assert!(
+        ok && text.contains("2 of 2 targets identical"),
+        "planes: both draws replay as the fixture drew them"
+    );
+    println!(
+        "ok   D3D12 hardware: a split-plane depth-stencil copied between two passes holds what the first left"
+    );
+    let (ok, text) = cli(stage, log, &["verify", &capture("indirect")]);
+    indirect_verified(ok, &text, targets(stage, log, &capture("indirect")));
+    println!("ok   D3D12 hardware: ExecuteIndirect with GPU addresses in its records replays as the game's");
+}
+
+/// Runs locum-cli with `args`, printing what it says: whether it succeeded, and what it said.
+fn cli(stage: &std::path::Path, log: &std::path::Path, args: &[&str]) -> (bool, String) {
+    let output = std::process::Command::new(stage.join("locum-cli.exe"))
+        .args(args)
+        .env("LOCUM_DIR", log)
+        .output()
+        .unwrap_or_else(|e| panic!("locum-cli {args:?}: {e}"));
+    let text =
+        String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
+    println!("--- locum-cli {}\n{text}", args.join(" "));
+    (output.status.success(), text)
+}
+
+/// How many targets capture `capture` read back.
+fn targets(stage: &std::path::Path, log: &std::path::Path, capture: &str) -> usize {
+    let (ok, text) = cli(stage, log, &["sql", capture, "SELECT count(*) FROM targets"]);
+    assert!(ok, "locum-cli sql {capture}");
+    text.lines()
+        .nth(1)
+        .and_then(|l| l.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{capture}: a count of targets: {text}"))
+}
+
+/// What verify must say of the fixture's `indirect` capture (`targets` of them, 4 or, with mesh dispatches, 5): each
+/// target the game's, the copier's two outputs and what the root UAVs in records wrote the game's, nothing missing.
+fn indirect_verified(ok: bool, text: &str, targets: usize) {
+    assert!(targets >= 4, "indirect: {targets} targets read back");
+    assert!(
+        text.contains(&format!("{targets} of {targets} targets identical")),
+        "indirect: every ExecuteIndirect's target replays as the game's"
+    );
+    assert!(
+        text.contains("what draws and dispatches wrote through UAVs: 3 identical to the game's, 0 different"),
+        "indirect: what the root UAVs in records wrote is compared, and the game's"
+    );
+    assert!(
+        ok && text.contains("verified: every target and output compared is the game's"),
+        "indirect: the capture is complete"
+    );
 }
 
 /// Replays the fixture's captures with locum-cli on WARP: verify, a rule, and contents at an event.
 fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
-    use std::process::Command;
     let log = stage.join("log");
     let capture = |name: &str| {
         log.join("captures")
@@ -341,17 +372,7 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
             .display()
             .to_string()
     };
-    let run = |args: &[&str]| {
-        let output = Command::new(stage.join("locum-cli.exe"))
-            .args(args)
-            .env("LOCUM_DIR", &log)
-            .output()
-            .unwrap_or_else(|e| panic!("locum-cli {args:?}: {e}"));
-        let text =
-            String::from_utf8_lossy(&output.stdout).into_owned() + &String::from_utf8_lossy(&output.stderr);
-        println!("--- locum-cli {}\n{text}", args.join(" "));
-        (output.status.success(), text)
-    };
+    let run = |args: &[&str]| cli(stage, &log, args);
     let sql = |name: &str, query: &str| -> String {
         let (ok, text) = run(&["sql", &capture(name), query]);
         assert!(ok, "locum-cli sql {query}");
@@ -403,15 +424,31 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
         "results: the tickets' outputs: {ordered}"
     );
     println!("ok   D3D12 verify: what dispatches and a clear wrote through UAVs replays as the game's");
-    // ExecuteIndirect records naming a vertex buffer and a root CBV by GPU address, written by the CPU and by a
-    // dispatch: replay runs them on its own buffers' addresses, and the vertex buffer only the records name has the
-    // contents the capture copied after the frame.
+    // ExecuteIndirect records naming buffers by GPU address (vertex and index buffer views, root CBVs, SRVs and
+    // UAVs), with root constants, written by the CPU, by a dispatch with a count, and run by a bundle: replay runs them
+    // on its own buffers' addresses, the buffers only the records name have the contents the capture copied after the
+    // frame, and what a root UAV in them wrote is compared.
+    let indirect_targets = targets(stage, &log, &capture("indirect"));
     let (ok, text) = run(&["verify", "--warp", &capture("indirect")]);
-    assert!(
-        ok && text.contains("2 of 2 targets identical"),
-        "indirect: both ExecuteIndirect draws replay as the game's"
+    indirect_verified(ok, &text, indirect_targets);
+    println!(
+        "ok   D3D12 verify: ExecuteIndirect with GPU addresses in its records replays as the game's ({indirect_targets} \
+         targets)"
     );
-    println!("ok   D3D12 verify: ExecuteIndirect with GPU addresses in its records replays as the game's");
+    // What cannot be proven is said: an uninstrumented list's records are a gap, and a buffer only a root UAV names
+    // has no contents as the frame began, though what it was written is compared.
+    let (ok, text) = run(&["verify", "--warp", &capture("indirect-gaps")]);
+    assert!(!ok, "indirect-gaps: verify must not call the capture complete");
+    for said in [
+        "incomplete: capture gap: d3d12-indirect-arguments its list was not instrumented",
+        "resources the frame used have no contents",
+        "what draws and dispatches wrote through UAVs: 1 identical to the game's, 0 different",
+    ] {
+        assert!(text.contains(said), "indirect-gaps: verify says {said:?}");
+    }
+    println!(
+        "ok   D3D12 verify: ExecuteIndirect records it could not read, and contents it could not know, are gaps"
+    );
     // Under the debug layer, with a pass under GPU-based validation of its own: the dispatches write a texture made
     // for simultaneous access as a UAV, which that validation takes for an error the spec does not make it.
     if debug {
@@ -432,6 +469,20 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
             "results: verify --debug compares as verify does"
         );
         println!("ok   D3D12 verify --debug: no validation errors, and the outputs compared as without it");
+        let (ok, text) = run(&["verify", "--warp", "--debug", &capture("indirect")]);
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("validated in ") && l.ends_with(": 0 errors")),
+            "indirect: GPU-based validation found errors"
+        );
+        assert!(
+            !text.contains("D3D12 validation"),
+            "indirect: the debug layer found errors"
+        );
+        indirect_verified(ok, &text, indirect_targets);
+        println!(
+            "ok   D3D12 verify --debug: ExecuteIndirect with addresses in its records, no validation errors"
+        );
     }
     // Passes' targets, drawn from root constants across lists, are the fixture's bit for bit.
     let (_, text) = run(&["verify", "--warp", &capture("passes")]);

@@ -552,6 +552,7 @@ unsafe fn run() {
         queries::capture(&device, &queue, &fence, &chain);
         finish(&queue, &fence, 47);
         indirect::capture(&device, &queue, &fence, &chain, 48);
+        indirect::gaps(&device, &queue, &fence, &chain, 53);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

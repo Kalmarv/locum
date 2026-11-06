@@ -74,6 +74,7 @@ pub unsafe fn created_command_signature(
     let description =
         json!({"stride":d.ByteStride,"node_mask":d.NodeMask,"root_signature":id(root),"arguments":arguments});
     super::passes::command_signature(id(unsafe { *out }), &description);
+    super::outputs::signature(id(unsafe { *out }), &description);
     super::journal::describe(id(unsafe { *out }), device, description);
 }
 

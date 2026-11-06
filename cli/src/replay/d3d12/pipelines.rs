@@ -34,6 +34,8 @@ const NODE_MASK: u32 = 18;
 const CACHED: u32 = 19;
 const FLAGS: u32 = 20;
 const DEPTH_STENCIL1: u32 = 21;
+const AS: u32 = 24;
+const MS: u32 = 25;
 
 /// The subobject a stage's shader goes in, by the stage numbers rules use (vs hs ds gs ps cs).
 pub fn shader_type(stage: usize) -> u32 {
@@ -219,7 +221,7 @@ pub fn make(
     for (ty, v) in &objects {
         match *ty {
             ROOT => s.push(*ty, root.as_raw()),
-            VS | PS | DS | HS | GS | CS => {
+            VS | PS | DS | HS | GS | CS | AS | MS => {
                 let code = if let Some(i) = v["replaced"].as_u64() {
                     replaced[i as usize].1.clone()
                 } else if let Some(key) = v["blob"].as_str() {

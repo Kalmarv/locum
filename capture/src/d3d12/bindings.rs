@@ -5,6 +5,9 @@ use crate::{db, hash};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+/// The bindings draw `draw` makes. `from_records` are the root parameters an ExecuteIndirect's argument records set
+/// (see [`super::indirect::root_parameters`]): the call does not use what the list set there, so they bind nothing
+/// here, and what their records name is added to the event after the frame.
 pub(super) fn project(
     c: &mut db::Capture,
     draw: u64,
@@ -12,6 +15,7 @@ pub(super) fn project(
     p: &Pipeline,
     objects: &BTreeMap<u64, Value>,
     descriptors: &BTreeMap<(u64, u32), Descriptor>,
+    from_records: &[u32],
 ) {
     let (root, args) = if compute {
         (p.compute_root, &p.compute_args)
@@ -49,7 +53,7 @@ pub(super) fn project(
     let Some(parameters) = root["decoded"]["parameters"].as_array() else {
         return;
     };
-    for (&index, arg) in args {
+    for (&index, arg) in args.iter().filter(|(i, _)| !from_records.contains(i)) {
         let Some(parameter) = parameters.get(index as usize) else {
             continue;
         };
@@ -227,12 +231,22 @@ pub fn reproject(conn: &rusqlite::Connection) -> rusqlite::Result<db::Capture> {
             Some((seq, args["submission"].as_u64()?))
         })
         .collect();
-    let draws: Vec<(u64, i64, String, String)> = conn
+    type Row = (u64, i64, String, String, String, String);
+    let draws: Vec<Row> = conn
         .prepare(
-            "SELECT s.draw, d.event, e.kind, s.root_args_json FROM d12_draw_state s JOIN draws d ON d.n = s.draw \
-             JOIN events e ON e.seq = d.event ORDER BY d.event",
+            "SELECT s.draw, d.event, e.kind, s.root_args_json, e.call, e.args FROM d12_draw_state s \
+             JOIN draws d ON d.n = s.draw JOIN events e ON e.seq = d.event ORDER BY d.event",
         )?
-        .query_map([], |r| Ok((u(r.get(0)?), r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .query_map([], |r| {
+            Ok((
+                u(r.get(0)?),
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let args = |v: &Value| -> BTreeMap<u32, Value> {
         v.as_object()
@@ -244,7 +258,7 @@ pub fn reproject(conn: &rusqlite::Connection) -> rusqlite::Result<db::Capture> {
     let mut capture = db::Capture::default();
     let mut descriptors: BTreeMap<(u64, u32), Descriptor> = BTreeMap::new();
     let mut next = submits.iter().peekable();
-    for (draw, event, kind, state) in draws {
+    for (draw, event, kind, state, call, call_args) in draws {
         while let Some((_, submission)) = next.next_if(|(seq, _)| *seq < event) {
             for d in changes
                 .get(submission)
@@ -268,6 +282,14 @@ pub fn reproject(conn: &rusqlite::Connection) -> rusqlite::Result<db::Capture> {
             compute_args: args(&state["compute_args"]),
             ..Pipeline::default()
         };
+        let from_records = if call == "ExecuteIndirect" {
+            serde_json::from_str::<Value>(&call_args)
+                .ok()
+                .and_then(|a| objects.get(&a[0].as_u64()?).map(super::indirect::root_parameters))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         project(
             &mut capture,
             draw,
@@ -275,6 +297,7 @@ pub fn reproject(conn: &rusqlite::Connection) -> rusqlite::Result<db::Capture> {
             &pipeline,
             &objects,
             &descriptors,
+            &from_records,
         );
     }
     Ok(capture)
@@ -450,7 +473,7 @@ mod tests {
             ..Pipeline::default()
         };
         let mut capture = db::Capture::default();
-        project(&mut capture, 1, false, &pipeline, &objects, &descriptors);
+        project(&mut capture, 1, false, &pipeline, &objects, &descriptors, &[]);
         let mut bound: Vec<_> = capture
             .bindings
             .iter()
