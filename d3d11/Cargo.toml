@@ -11,7 +11,7 @@ keywords = ["direct3d", "d3d11", "capture", "graphics", "debugging"]
 categories = ["development-tools::debugging", "graphics"]
 
 [dependencies]
-locum-capture = { version = "0.1.0", path = "../capture" }
+locum-capture = { version = "0.1.1", path = "../capture" }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
@@ -21,3 +21,5 @@ windows = { workspace = true, features = [
 
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
+# docs.rs has no MSVC tools to build the bundled SQLite; documentation needs no linking, so take the linked path there
+cargo-args = ["--config", "env.LIBSQLITE3_SYS_USE_PKG_CONFIG=\"1\""]

@@ -14,8 +14,8 @@ categories = ["development-tools::debugging", "graphics"]
 crate-type = ["cdylib"]
 
 [dependencies]
-locum-capture = { version = "0.1.0", path = "../capture" }
-locum-d3d11 = { version = "0.1.0", path = "../d3d11" }
+locum-capture = { version = "0.1.1", path = "../capture" }
+locum-d3d11 = { version = "0.1.1", path = "../d3d11" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 windows = { workspace = true, features = [
@@ -40,3 +40,5 @@ windows = { workspace = true, features = [
 
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
+# docs.rs has no MSVC tools to build the bundled SQLite; documentation needs no linking, so take the linked path there
+cargo-args = ["--config", "env.LIBSQLITE3_SYS_USE_PKG_CONFIG=\"1\""]
