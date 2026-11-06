@@ -1,5 +1,7 @@
 # locum
 
+[![crates.io: locum](https://img.shields.io/crates/v/locum?label=locum)](https://crates.io/crates/locum) [![crates.io: locum-capture](https://img.shields.io/crates/v/locum-capture?label=locum-capture)](https://crates.io/crates/locum-capture) [![docs.rs](https://img.shields.io/docsrs/locum)](https://docs.rs/locum) [![CI](https://img.shields.io/github/actions/workflow/status/Kalmarv/locum/ci.yml?branch=main&label=CI)](https://github.com/Kalmarv/locum/actions/workflows/ci.yml) [![release](https://img.shields.io/github/v/release/Kalmarv/locum)](https://github.com/Kalmarv/locum/releases/latest)
+
 A frame capture and replay tool for Direct3D 11 and Direct3D 12 games on Windows. It runs as stand-in system DLLs in
 the game's folder and writes each captured frame to a SQLite database, which a command-line tool and a local web
 viewer read.
@@ -36,7 +38,9 @@ are implemented for Direct3D 11 only.
 
 ### Installation
 
-None of the packages are published. Build the workspace from source:
+Each [release](https://github.com/Kalmarv/locum/releases) has `locum-cli` for Windows (x86_64), with `SHA256SUMS`;
+`cargo install locum-cli` builds it too. The libraries are on crates.io (`cargo add locum-capture`). The DLLs that go
+beside a game are built from the workspace:
 
 ```powershell
 cargo build --release
@@ -100,3 +104,16 @@ are described in [docs/README.md](docs/README.md).
 `cargo xtask smoke --api d3d12` does the same for Direct3D 12, and `bun test` runs the viewer's tests.
 [docs/README.md](docs/README.md) is the full reference, and [viewer/README.md](viewer/README.md) covers the viewer.
 locum is licensed under [GPL-3.0-or-later](LICENSE).
+
+## Releasing
+
+A release is a commit that changes a version. Once every CI job has passed on main, CI's release job
+(`.github/release.py`) publishes each crate whose version crates.io does not have yet, in dependency order (trusted
+publishing: no token is stored anywhere), tags the commit `v<version>` (`<package>-v<version>` for a package with a
+version of its own) and creates the GitHub Release with the commits since the previous release as its notes and the binaries attached (`<bin>-<version>-<target>.zip` / `.tar.gz` with `SHA256SUMS`).
+A commit that changes no version only runs CI.
+
+1. Bump the version when a change is worth releasing: a patch (0.x.Y) for fixes and data or manifest additions, a minor
+   (0.X.0) for new API or any breaking change before 1.0. Run `cargo check` so `Cargo.lock` follows.
+2. Push to main. Never publish by hand; a new crate's first release is the one exception (the token holder makes it,
+   then the crate gets its trusted-publishing config).

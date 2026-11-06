@@ -6,12 +6,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["direct3d", "d3d11", "capture", "graphics", "debugging"]
+categories = ["development-tools::debugging", "graphics"]
 
 [dependencies]
-locum-capture = { path = "../capture" }
+locum-capture = { version = "0.1.0", path = "../capture" }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi_Common",
 ] }
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"

@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["direct3d", "d3d11", "capture", "graphics", "debugging"]
+categories = ["development-tools::debugging", "graphics"]
 
 [[bin]]
 name = "locum-cli"
@@ -18,8 +21,8 @@ iridia.workspace = true
 iridia-dxbc.workspace = true
 iridia-dxil.workspace = true
 clap = { version = "4.6.7", features = ["derive"] }
-locum-capture = { path = "../capture" }
-locum-d3d11 = { path = "../d3d11" }
+locum-capture = { version = "0.1.0", path = "../capture" }
+locum-d3d11 = { version = "0.1.0", path = "../d3d11" }
 memchr = "2.8.3"
 memmap2 = "0.9.12"
 png = "0.18.1"

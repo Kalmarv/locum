@@ -6,13 +6,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["direct3d", "d3d11", "capture", "graphics", "debugging"]
+categories = ["development-tools::debugging", "graphics"]
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-locum-capture = { path = "../capture" }
-locum-d3d11 = { path = "../d3d11" }
+locum-capture = { version = "0.1.0", path = "../capture" }
+locum-d3d11 = { version = "0.1.0", path = "../d3d11" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 windows = { workspace = true, features = [
@@ -34,3 +37,6 @@ windows = { workspace = true, features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"

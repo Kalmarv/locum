@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "../README.md"
+keywords = ["direct3d", "d3d11", "capture", "graphics", "debugging"]
+categories = ["development-tools::debugging", "graphics"]
 
 [dependencies]
 dxbc-reader.workspace = true
@@ -30,3 +33,6 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 texture2ddecoder = "0.1.2"
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
