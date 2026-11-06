@@ -92,7 +92,7 @@ fn dxil(bytecode: &[u8]) -> Result<Option<OrderDependence>, String> {
                 continue;
             }
             let op = match &inst.op {
-                Op::Call { function, args }
+                Op::Call { function, args, .. }
                     if module.name(*function).is_some_and(|n| n.starts_with("dx.op.")) =>
                 {
                     match args.first().and_then(|&a| constant(a)) {
