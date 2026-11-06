@@ -42,6 +42,9 @@ CREATE TABLE resources(
   written INTEGER NOT NULL DEFAULT 0,
   content TEXT,                    -- key of its contents when the frame began
   content_source TEXT,             -- first-use (copied just before the timeline first touched it) | upload |
+                                   -- tile-events (D3D11: the frame's tile operations give it its contents) |
+                                   -- upload-at-first-submission (D3D12 upload heap, as the GPU reached the frame's
+                                   -- first captured submission) |
                                    -- after-frame (named only by ExecuteIndirect argument records)
   content_note TEXT                -- why content is missing, or how it may differ
 );
@@ -112,6 +115,45 @@ CREATE INDEX resources_upload ON resources(upload);
 CREATE INDEX resources_content ON resources(content);
 CREATE INDEX subresources_hash ON subresources(hash);
 "#;
+
+/// What `locum-cli verify` found each time it ran on the capture, in order: when (Unix seconds), the locum-cli that
+/// ran it, its flags (JSON: `warp`, `debug`, `limit`), the machine it replayed on (JSON, as `meta.environment`; NULL
+/// when it stopped before it made a device), whether it verified, and its last line. Made with the capture; verify
+/// makes it in captures from before it.
+pub const VERIFICATIONS: &str = r#"
+CREATE TABLE IF NOT EXISTS verifications(time INTEGER NOT NULL, locum TEXT NOT NULL, flags TEXT NOT NULL,
+  environment TEXT, ok INTEGER NOT NULL, result TEXT NOT NULL);
+"#;
+
+/// A row of `verifications`.
+#[derive(Clone, Debug)]
+pub struct Verification {
+    pub time: u64,
+    pub locum: String,
+    pub flags: serde_json::Value,
+    pub environment: Option<crate::environment::Environment>,
+    pub ok: bool,
+    pub result: String,
+}
+
+/// Adds `v` to the `verifications` of the capture at `path`, making the table where it has none.
+pub fn verification(path: &Path, v: &Verification) -> rusqlite::Result<()> {
+    let db = Connection::open(path)?;
+    db.busy_timeout(std::time::Duration::from_secs(5))?;
+    db.execute_batch(VERIFICATIONS)?;
+    db.execute(
+        "INSERT INTO verifications VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            v.time as i64,
+            v.locum,
+            v.flags.to_string(),
+            v.environment.as_ref().map(|e| e.json()),
+            v.ok,
+            v.result
+        ],
+    )?;
+    Ok(())
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Module {
@@ -356,6 +398,15 @@ impl Capture {
             count,
         });
     }
+
+    /// The machine the frame ran on, as `meta.environment`; each part a probe could not learn is an `environment`
+    /// gap, `<part>: <why>`.
+    pub fn environment(&mut self, environment: &crate::environment::Environment) {
+        for (part, why) in environment.gaps() {
+            self.gap("environment", format!("{part}: {why}"), 1);
+        }
+        self.meta("environment", environment.json());
+    }
 }
 
 const STAGES: [&str; 6] = ["vs", "hs", "ds", "gs", "ps", "cs"];
@@ -378,6 +429,7 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
     let mut db = Connection::open(&temp)?;
     db.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA page_size=65536;")?;
     db.execute_batch(SCHEMA)?;
+    db.execute_batch(VERIFICATIONS)?;
     let tx = db.transaction()?;
     {
         let mut s = tx.prepare("INSERT INTO meta VALUES(?1, ?2)")?;

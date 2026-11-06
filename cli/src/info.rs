@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use locum_capture::environment::Environment;
+use locum_capture::environment::{Environment, Missing};
 
 use crate::describe::mib;
 use crate::open::{self, Capture};
@@ -53,7 +53,8 @@ pub fn captures(dir: &Path, blobs: Option<&Path>) -> Result<(), String> {
     Ok(())
 }
 
-/// The machine the capture was made on: adapter, driver, Windows, the Direct3D 12 runtime and the executable.
+/// The machine the capture was made on: adapter, driver, Windows, the Direct3D 12 runtime and the executable; what
+/// was not learned of them, and why.
 fn environment(c: &Capture) {
     let Some(e) = c.meta("environment").and_then(|e| Environment::parse(&e)) else {
         out!(
@@ -61,6 +62,20 @@ fn environment(c: &Capture) {
         );
         return;
     };
+    // A part's value, or that it was not recorded and why.
+    let or = |value: Option<&str>, missing: &Missing, part: &str| match value {
+        Some(v) => v.to_string(),
+        None => match missing.get(part) {
+            Some(why) => format!("(not recorded: {why})"),
+            None => "(not recorded)".into(),
+        },
+    };
+    // A file's version: none, when the file has no version resource.
+    let version =
+        |value: Option<&str>, missing: &Missing, part: &str| match (value, missing.contains_key(part)) {
+            (None, false) => "(no version resource)".to_string(),
+            _ => or(value, missing, part),
+        };
     match &e.adapter {
         Some(a) => {
             out!(
@@ -70,21 +85,29 @@ fn environment(c: &Capture) {
                 a.luid,
                 mib(a.video_memory)
             );
-            if let Some(umd) = &a.umd {
-                out!(
+            match &a.umd {
+                Some(umd) => out!(
                     "  user-mode driver: {} {}",
                     umd.path,
-                    umd.version.as_deref().unwrap_or("(no version)")
-                );
+                    version(umd.version.as_deref(), &a.missing, "umd.version")
+                ),
+                None => out!("  user-mode driver: {}", or(None, &a.missing, "umd")),
             }
         }
-        None => out!("  adapter: not found"),
+        None => out!("  adapter: {}", or(None, &e.missing, "adapter")),
     }
-    if let Some(os) = &e.os {
-        match &os.release {
-            Some(r) => out!("  Windows {} ({r})", os.version),
-            None => out!("  Windows {}", os.version),
+    match &e.os {
+        Some(os) => {
+            let release = os
+                .release
+                .as_ref()
+                .map_or_else(|| or(None, &os.missing, "release"), |r| format!("({r})"));
+            out!("  Windows {} {release}", os.version);
+            if let Some(why) = os.missing.get("version") {
+                out!("  Windows version incomplete (its unread parts are 0): {why}");
+            }
         }
+        None => out!("  Windows: {}", or(None, &e.missing, "os")),
     }
     if let Some(r) = &e.d3d12 {
         let asked = match (r.sdk_version, &r.sdk_path) {
@@ -92,17 +115,53 @@ fn environment(c: &Capture) {
             (Some(v), None) => format!("; the exe asks for Agility SDK {v}"),
             _ => String::new(),
         };
-        let path = r.core.as_ref().map_or("not loaded", |c| c.path.as_str());
+        let path = or(r.core.as_ref().map(|c| c.path.as_str()), &r.missing, "core");
         out!("  Direct3D 12: {}, {path}{asked}", r.line());
     }
-    if let Some(x) = &e.exe {
-        out!(
+    match &e.exe {
+        Some(x) => out!(
             "  exe: {} {}, {} bytes, sha256 {}",
             x.path,
-            x.version.as_deref().unwrap_or("(no version)"),
+            version(x.version.as_deref(), &x.missing, "version"),
             x.bytes,
             x.sha256
+        ),
+        None => out!("  exe: {}", or(None, &e.missing, "exe")),
+    }
+}
+
+/// Each time `verify` ran on the capture: when, with what flags, on what machine, and what it found.
+fn verifications(c: &Capture) {
+    if !c.has_table("verifications") {
+        out!("  verified: never (no verify has run on it since locum-cli recorded verifications)");
+        return;
+    }
+    let rows: Vec<(String, String, String, Option<String>, String)> = c.rows(
+        "SELECT datetime(time, 'unixepoch'), locum, flags, environment, result FROM verifications ORDER BY rowid",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    );
+    if rows.is_empty() {
+        out!("  verified: never");
+        return;
+    }
+    out!("  verified {} times:", rows.len());
+    for (time, locum, flags, environment, result) in rows {
+        let flags: serde_json::Value = serde_json::from_str(&flags).unwrap_or_default();
+        let mut given = String::new();
+        for flag in ["warp", "debug"] {
+            if flags[flag] == true {
+                given += &format!(" --{flag}");
+            }
+        }
+        if let Some(limit) = flags["limit"].as_i64() {
+            given += &format!(" --limit {limit}");
+        }
+        let on = environment.and_then(|e| Environment::parse(&e)).map_or_else(
+            || "before it made a device".into(),
+            |e| format!("on {}", e.line()),
         );
+        out!("    {time} UTC, locum-cli {locum}{given}, {on}: {result}");
     }
 }
 
@@ -124,6 +183,7 @@ pub fn info(c: &Capture) -> Result<(), String> {
         c.meta("locum").unwrap_or_default()
     );
     environment(c);
+    verifications(c);
     if request.is_null() {
         out!("  request: not recorded (locum before the request was kept)");
     } else {

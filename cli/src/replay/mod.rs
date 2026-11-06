@@ -1116,12 +1116,16 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
 /// Gaps that are checks the capture could not make or keep (targets or outputs not read back, a command list's earlier
 /// executions, the CPU's memory), not inputs the replay lacks: shown, but they leave the proof complete.
 const CHECKS: &str = "'evidence', 'targets', 'outputs', 'memory', 'd3d12-targets', 'd3d12-results'";
+/// Gaps that say what is not known of the machine the frame ran on (a probe failed): neither a check nor a want of
+/// what the replay needs, so verify notes them.
+const NOTED: &str = "'environment'";
 
 /// Replays the whole frame and compares every target the capture read back with the replay's at the same point. Fails
 /// unless every target compared is identical and nothing kept the capture or the replay from being complete.
 /// With `keep`, each output and target that differs is written there: the replay's and the game's bytes
 /// (`event-<seq>-<resource>.{replay,game}.bin`, `draw-<n>-<target>.{replay,game}.bin`), and for a target its two
-/// pictures and where they differ (`.replay.png`, `.game.png`, `.diff.png`).
+/// pictures and where they differ (`.replay.png`, `.game.png`, `.diff.png`). Each run is a row of the capture's
+/// `verifications`: when, its flags, the machine it replayed on and its result.
 pub fn verify(
     c: &Capture,
     warp: bool,
@@ -1129,6 +1133,37 @@ pub fn verify(
     limit: Option<i64>,
     keep: Option<&Path>,
 ) -> Result<(), String> {
+    let mut replayed = None;
+    let result = verified(c, warp, debug, limit, keep, &mut replayed);
+    let verification = locum_capture::db::Verification {
+        time: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        locum: env!("CARGO_PKG_VERSION").into(),
+        flags: serde_json::json!({"warp": warp, "debug": debug, "limit": limit}),
+        environment: replayed,
+        ok: result.is_ok(),
+        result: match &result {
+            Ok(line) | Err(line) => line.clone(),
+        },
+    };
+    if let Err(e) = locum_capture::db::verification(&c.path, &verification) {
+        out!("note: this verification is not recorded in the capture: {e}");
+    }
+    out!("{}", result?);
+    Ok(())
+}
+
+/// [`verify`]'s replay and comparisons: its last line, `verified: …` or why not. `replayed` is the machine the replay
+/// ran on, once it has made its device.
+fn verified(
+    c: &Capture,
+    warp: bool,
+    debug: bool,
+    limit: Option<i64>,
+    keep: Option<&Path>,
+    replayed: &mut Option<Environment>,
+) -> Result<String, String> {
     if let Some(dir) = keep {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -1236,7 +1271,10 @@ pub fn verify(
         planned.as_secs_f64(),
         started.elapsed().as_secs_f64()
     );
-    let ends = ends(c, &b.environment());
+    let environment = b.environment();
+    let captured = c.meta("environment").and_then(|e| Environment::parse(&e));
+    let ends = ends(captured.as_ref(), &environment);
+    *replayed = Some(environment);
     out!("{ends}");
     let written = recorded(c);
     // Draws and dispatches are named by their number, as targets are.
@@ -1389,8 +1427,20 @@ pub fn verify(
     ) {
         out!("not compared: {note}");
     }
+    for note in c.rows(
+        &format!(
+            "SELECT what, coalesce(detail, ''), count FROM gaps WHERE what IN ({NOTED}) ORDER BY what, detail"
+        ),
+        [],
+        |r| Ok(format!("{} {}", r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    ) {
+        out!("note: capture gap: {note}");
+    }
     let mut incomplete: Vec<String> = c.rows(
-        &format!("SELECT what, coalesce(detail, ''), count FROM gaps WHERE what NOT IN ({CHECKS}) ORDER BY what, detail"),
+        &format!(
+            "SELECT what, coalesce(detail, ''), count FROM gaps WHERE what NOT IN ({CHECKS}, {NOTED}) ORDER BY what, \
+             detail"
+        ),
         [],
         |r| {
             Ok(format!(
@@ -1455,15 +1505,16 @@ pub fn verify(
             incomplete.len()
         ));
     }
-    out!("verified: every target and output compared is the game's ({ends})");
-    Ok(())
+    Ok(format!(
+        "verified: every target and output compared is the game's ({ends})"
+    ))
 }
 
-/// Where the capture was made and where it is replayed. Bit-exact comparisons hold between the same adapter and
-/// driver; another can differ in the last bits (NVIDIA and WARP clear to a fractional UNORM colour differently).
-fn ends(c: &Capture, replay: &Environment) -> String {
-    let captured = c.meta("environment").and_then(|e| Environment::parse(&e));
-    let at = captured.as_ref().map_or_else(
+/// Where the capture was made (`captured`, its `meta.environment`) and where it is replayed. Bit-exact comparisons
+/// hold between the same adapter and driver; another can differ in the last bits (NVIDIA and WARP clear to a
+/// fractional UNORM colour differently).
+fn ends(captured: Option<&Environment>, replay: &Environment) -> String {
+    let at = captured.map_or_else(
         || "an adapter the capture does not record".into(),
         Environment::line,
     );
@@ -1472,10 +1523,8 @@ fn ends(c: &Capture, replay: &Environment) -> String {
         return format!("captured and replayed on {on}");
     }
     let mut s = format!("captured on {at}; replayed on {on}");
-    if let (Some(a), Some(b)) = (
-        captured.as_ref().and_then(|e| e.adapter.as_ref()),
-        &replay.adapter,
-    ) && (a.vendor, a.device, &a.driver) != (b.vendor, b.device, &b.driver)
+    if let (Some(a), Some(b)) = (captured.and_then(|e| e.adapter.as_ref()), &replay.adapter)
+        && (a.vendor, a.device, &a.driver) != (b.vendor, b.device, &b.driver)
     {
         s += " (another adapter or driver than the capture's)";
     }
@@ -1484,7 +1533,57 @@ fn ends(c: &Capture, replay: &Environment) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Length, same_records, sliced};
+    use super::{Length, ends, same_records, sliced};
+    use locum_capture::environment::{Adapter, Environment, Os};
+
+    #[test]
+    fn both_ends_are_named() {
+        let on = |description: &str, driver: Option<&str>| Environment {
+            adapter: Some(Adapter {
+                description: description.into(),
+                vendor: 0x10de,
+                device: 0x2c05,
+                driver: driver.map(Into::into),
+                ..Default::default()
+            }),
+            os: Some(Os {
+                version: "10.0.26200.9711".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let a = on("RTX", Some("32.0.16.1074"));
+        assert_eq!(
+            ends(Some(&a), &a),
+            "captured and replayed on RTX (10de:2c05), driver 32.0.16.1074, Windows 10.0.26200.9711"
+        );
+        // Another driver is flagged; an end not recorded says so, and why where it is known.
+        let b = on("RTX", Some("32.0.16.1100"));
+        assert!(ends(Some(&a), &b).ends_with("(another adapter or driver than the capture's)"));
+        assert!(
+            ends(None, &a).starts_with("captured on an adapter the capture does not record; replayed on RTX")
+        );
+        let mut lost = on("RTX", None);
+        lost.adapter
+            .as_mut()
+            .unwrap()
+            .missing
+            .insert("driver".into(), "CheckInterfaceSupport: E_FAIL".into());
+        assert_eq!(
+            ends(Some(&a), &lost),
+            "captured on RTX (10de:2c05), driver 32.0.16.1074, Windows 10.0.26200.9711; replayed on RTX (10de:2c05), \
+             driver not recorded (CheckInterfaceSupport: E_FAIL), Windows 10.0.26200.9711 (another adapter or driver \
+             than the capture's)"
+        );
+        let none = Environment {
+            missing: [("adapter".to_string(), "EnumAdapterByLuid: not found".to_string())].into(),
+            ..Default::default()
+        };
+        assert!(
+            ends(Some(&a), &none)
+                .ends_with("replayed on an adapter not recorded (EnumAdapterByLuid: not found)")
+        );
+    }
 
     #[test]
     fn records_in_another_order_are_the_same_records() {

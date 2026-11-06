@@ -431,6 +431,17 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
     let indirect_targets = targets(stage, &log, &capture("indirect"));
     let (ok, text) = run(&["verify", "--warp", &capture("indirect")]);
     indirect_verified(ok, &text, indirect_targets);
+    // Where it was made and verified, as `info` and verify say, and the verification kept in it.
+    let on = |args: &[&str]| {
+        let indirect = capture("indirect");
+        let mut given = vec![args[0], indirect.as_str()];
+        given.extend_from_slice(&args[1..]);
+        run(&given).1
+    };
+    for (passed, what) in super::environment_checks(&on, &text, "d3d12") {
+        assert!(passed, "indirect: {what}");
+        println!("ok   D3D12 verify: {what}");
+    }
     println!(
         "ok   D3D12 verify: ExecuteIndirect with GPU addresses in its records replays as the game's ({indirect_targets} \
          targets)"

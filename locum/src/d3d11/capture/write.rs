@@ -574,9 +574,9 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     capture.meta("locum", env!("CARGO_PKG_VERSION"));
     // The adapter the frame was drawn on; the executable is hashed on the writer thread, below.
     let adapter = unsafe { immediate.GetDevice() }
-        .ok()
+        .map_err(|e| format!("ID3D11DeviceContext::GetDevice: {e}"))
         .and_then(|d| environment::device_adapter(&d))
-        .map(|a| environment::adapter(&a, environment::Api::D3d11));
+        .and_then(|a| environment::adapter(&a, environment::Api::D3d11));
     capture.meta("blobs", settings().blobs.root().display());
     capture.meta(
         "time",
@@ -700,16 +700,11 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
     log!("  the frame, {}", crate::cost::line());
     writer::run(move || {
         let mut capture = capture;
-        capture.meta(
-            "environment",
-            environment::Environment {
-                adapter,
-                os: Some(environment::os()),
-                exe: environment::exe(),
-                d3d12: None,
-            }
-            .json(),
-        );
+        capture.environment(&environment::Environment::probe(
+            adapter,
+            environment::Api::D3d11,
+            true,
+        ));
         let t = std::time::Instant::now();
         match db::write(&path, &capture) {
             Ok(()) => log!(

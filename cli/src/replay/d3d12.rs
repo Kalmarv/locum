@@ -2358,14 +2358,14 @@ impl Backend for D3d12 {
         let luid = unsafe { self.device.GetAdapterLuid() };
         let adapter = unsafe { CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) }
             .and_then(|f| unsafe { f.EnumAdapterByLuid::<IDXGIAdapter>(luid) })
-            .ok()
-            .map(|a| environment::adapter(&a, environment::Api::D3d12));
-        environment::Environment {
-            adapter,
-            os: Some(environment::os()),
-            exe: None,
-            d3d12: Some(environment::d3d12_runtime()),
-        }
+            .map_err(|e| {
+                format!(
+                    "EnumAdapterByLuid({:08x}:{:08x}): {e}",
+                    luid.HighPart, luid.LowPart
+                )
+            })
+            .and_then(|a| environment::adapter(&a, environment::Api::D3d12));
+        environment::Environment::probe(adapter, environment::Api::D3d12, false)
     }
 
     fn warnings(&self) -> Vec<String> {

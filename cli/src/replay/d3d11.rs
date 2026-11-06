@@ -1398,12 +1398,9 @@ impl Backend for D3d11 {
     }
 
     fn environment(&self) -> environment::Environment {
-        environment::Environment {
-            adapter: environment::device_adapter(&self.device)
-                .map(|a| environment::adapter(&a, environment::Api::D3d11)),
-            os: Some(environment::os()),
-            ..Default::default()
-        }
+        let adapter = environment::device_adapter(&self.device)
+            .and_then(|a| environment::adapter(&a, environment::Api::D3d11));
+        environment::Environment::probe(adapter, environment::Api::D3d11, false)
     }
 
     fn warnings(&self) -> Vec<String> {

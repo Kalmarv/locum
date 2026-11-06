@@ -442,7 +442,7 @@ fn smoke(root: &Path, debug: bool) {
     );
     let cli = stage.join("locum-cli.exe");
     let cli_ok = cli_checks(&cli, &log_dir);
-    let (adversarial_ok, _) = verified(
+    let (adversarial_ok, adversarial) = verified(
         &cli,
         &log_dir,
         "adversarial",
@@ -450,6 +450,24 @@ fn smoke(root: &Path, debug: bool) {
         debug,
         "adversarial rows6/7: all recorded checkpoints match replay",
     );
+    // Where the capture was made and verified, as `info` and verify say, and the verification kept in it.
+    let mut environment_ok = true;
+    let on = |args: &[&str]| -> String {
+        let out = Command::new(&cli)
+            .arg(args[0])
+            .arg(log_dir.join("captures").join("adversarial"))
+            .args(&args[1..])
+            .env("LOCUM_DIR", &log_dir)
+            .output()
+            .expect("run locum-cli");
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        println!("--- locum-cli {}\n{text}", args.join(" "));
+        text
+    };
+    for (passed, what) in environment_checks(&on, &adversarial, "d3d11") {
+        println!("{}  adversarial: {what}", if passed { "ok  " } else { "FAIL" });
+        environment_ok &= passed;
+    }
     // The ordered capture's dispatch writes its records in whatever order the GPU runs its threads; WARP runs them
     // in another order than the GPU did. Both replays must still be bit for bit the game's.
     let mut ordered_ok = true;
@@ -477,6 +495,17 @@ fn smoke(root: &Path, debug: bool) {
                 .collect();
             counts.len() == 3 && counts.iter().sum::<u32>() == 3
         });
+        // Replayed on WARP, the GPU's capture: both ends named, and that they differ.
+        let ends = text.contains("captured on ")
+            && text.contains("; replayed on Microsoft Basic Render Driver (1414:008c)")
+            && text.contains("(another adapter or driver than the capture's)");
+        if warp {
+            println!(
+                "{} ordered: replayed on WARP, verify says the capture was made on another adapter",
+                if ends { "ok  " } else { "FAIL" }
+            );
+            ordered_ok &= ends;
+        }
         println!(
             "{} ordered: on {device}, each of the dispatch's three outputs was compared with the game's",
             if settled { "ok  " } else { "FAIL" }
@@ -840,6 +869,7 @@ fn smoke(root: &Path, debug: bool) {
         || !overlay_logged
         || !cli_ok
         || !adversarial_ok
+        || !environment_ok
         || !ordered_ok
         || !rows_ok
     {
@@ -992,6 +1022,75 @@ fn verified(cli: &Path, log_dir: &Path, label: &str, warp: bool, debug: bool, wh
     let ok = output.status.success() && all_same;
     println!("{} {what}", if ok { "ok  " } else { "FAIL" });
     (ok, text)
+}
+
+/// What `info` and `verify` must say of where a capture of `api` (`d3d11`, `d3d12`) was made and where `verify` (what
+/// its last run said) replayed it, the same machine: every part of both described, no probe failed, and the
+/// verification a row of the capture's `verifications`. `run` runs locum-cli on the capture (its command, then the
+/// capture, then the rest) and gives what it said. Each check, with what it shows.
+fn environment_checks(run: &dyn Fn(&[&str]) -> String, verify: &str, api: &str) -> Vec<(bool, &'static str)> {
+    let info = run(&["info"]);
+    let line = |prefix: &str| {
+        info.lines()
+            .find(|l| l.trim_start().starts_with(prefix))
+            .unwrap_or_default()
+            .to_string()
+    };
+    let adapter = line("adapter: ");
+    // The lines of the machine: from the adapter's to the verifications'.
+    let environment: String = info
+        .lines()
+        .skip_while(|l| !l.starts_with("  adapter: "))
+        .take_while(|l| !l.starts_with("  verified"))
+        .collect();
+    let sql = |query: &str| {
+        run(&["sql", query])
+            .lines()
+            .nth(1)
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let last = sql(
+        "SELECT ok || ' ' || json_extract(environment, '$.adapter.description') FROM verifications ORDER BY rowid \
+         DESC LIMIT 1",
+    );
+    let described = adapter
+        .strip_prefix("  adapter: ")
+        .and_then(|a| a.split(" (").next())
+        .unwrap_or_default()
+        .to_string();
+    vec![
+        (
+            adapter.contains(", driver ")
+                && adapter.contains(", LUID ")
+                && line("user-mode driver: ").contains('.')
+                && line("Windows ").starts_with("  Windows 10.")
+                && line("exe: ").contains("sha256 ")
+                && (api == "d3d12") == line("Direct3D 12: ").contains("D3D12Core 10."),
+            "info describes the adapter, its driver and user-mode driver, Windows, the exe and (D3D12) the runtime",
+        ),
+        (
+            !environment.contains("not recorded")
+                && sql("SELECT count(*) FROM gaps WHERE what = 'environment'") == "0",
+            "no probe of the machine failed: no part not recorded, no environment gap",
+        ),
+        (
+            !described.is_empty()
+                && verify.contains(&format!("captured and replayed on {described} ("))
+                && verify.contains(
+                    "verified: every target and output compared is the game's (captured and replayed on",
+                ),
+            "verify names the adapter both ends ran on, before it compares and with its result",
+        ),
+        (
+            last == format!("1 {described}")
+                && info
+                    .lines()
+                    .any(|l| l.contains(" UTC, locum-cli ") && l.contains(": verified: every target")),
+            "the verification is kept in the capture with the adapter it replayed on, and info lists it",
+        ),
+    ]
 }
 
 /// Runs locum-cli on the smoke test's capture and checks what it says about it.
