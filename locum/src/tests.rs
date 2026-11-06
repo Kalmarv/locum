@@ -1,10 +1,13 @@
 //! The exports against the system's own: whatever a call hands back through locum, the same call to the real runtime
-//! hands back too (a result, which out pointers hold something).
+//! hands back too (a result, which out pointers hold something, which interfaces answer).
 use super::*;
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::D3D11_SDK_VERSION;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_MODE_DESC, DXGI_SAMPLE_DESC};
-use windows::Win32::Graphics::Dxgi::{DXGI_SWAP_CHAIN_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT};
+use windows::Win32::Graphics::Dxgi::{
+    DXGI_SWAP_CHAIN_DESC, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory, IDXGIFactory1, IDXGIFactory2,
+    IDXGIFactory3, IDXGIFactory4, IDXGIFactory5, IDXGIFactory7, IDXGIObject,
+};
 
 const JUNK: *mut c_void = 0xdead_beef_usize as *mut c_void;
 
@@ -138,6 +141,66 @@ fn device_creation_hands_back_what_the_runtime_does() {
                     desc.is_some()
                 );
             }
+        }
+    }
+}
+
+const FACTORIES: [GUID; 8] = [
+    IDXGIObject::IID,
+    IDXGIFactory::IID,
+    IDXGIFactory1::IID,
+    IDXGIFactory2::IID,
+    IDXGIFactory3::IID,
+    IDXGIFactory4::IID,
+    IDXGIFactory5::IID,
+    IDXGIFactory7::IID,
+];
+
+/// Which of [`FACTORIES`] the factory one of the three entry points makes for `iid` answers to.
+fn answers(entry: u8, system: bool, iid: &GUID) -> Option<Vec<bool>> {
+    let dxgi = crate::system::system().dxgi;
+    let mut factory = core::ptr::null_mut();
+    let hr = unsafe {
+        match (entry, system) {
+            (0, false) => CreateDXGIFactory(iid, &mut factory),
+            (1, false) => CreateDXGIFactory1(iid, &mut factory),
+            (_, false) => CreateDXGIFactory2(0, iid, &mut factory),
+            (0, true) => export::<CreateFactoryFn>(dxgi, c"CreateDXGIFactory").unwrap()(iid, &mut factory),
+            (1, true) => export::<CreateFactoryFn>(dxgi, c"CreateDXGIFactory1").unwrap()(iid, &mut factory),
+            (_, true) => {
+                export::<CreateFactory2Fn>(dxgi, c"CreateDXGIFactory2").unwrap()(0, iid, &mut factory)
+            }
+        }
+    };
+    if hr.is_err() {
+        return None;
+    }
+    let factory = unsafe { IUnknown::from_raw(factory) };
+    Some(
+        FACTORIES
+            .iter()
+            .map(|wanted| {
+                let mut face = core::ptr::null_mut();
+                let hr = unsafe { factory.query(wanted, &mut face) };
+                if hr.is_ok() {
+                    drop(unsafe { IUnknown::from_raw(face) });
+                }
+                hr.is_ok()
+            })
+            .collect(),
+    )
+}
+
+#[test]
+fn a_factory_answers_to_what_the_systems_does() {
+    for entry in 0..3 {
+        for iid in &FACTORIES {
+            assert_eq!(
+                answers(entry, false, iid),
+                answers(entry, true, iid),
+                "factory {entry} made for {}",
+                crate::com::name_of(iid)
+            );
         }
     }
 }

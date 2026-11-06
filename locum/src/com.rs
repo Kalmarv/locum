@@ -18,9 +18,10 @@ pub unsafe fn query(object: *mut c_void, iid: *const GUID, out: *mut *mut c_void
     unsafe { ((**(object as *const *const windows::core::IUnknown_Vtbl)).QueryInterface)(object, iid, out) }
 }
 
-/// Answers `QueryInterface` for a wrapper: `iids` are the interfaces the wrapper itself implements (it hands out
-/// itself); anything else goes to the wrapped object, and the game then holds a real object locum does not see.
-/// Those side doors are logged, once per wrapper kind and interface.
+/// Answers `QueryInterface` for a wrapper: `iids` are the interfaces the wrapper itself implements, and it hands out
+/// itself for those the wrapped object answers too (a factory from `CreateDXGIFactory` is no `IDXGIFactory1`, though
+/// the object behind it is one); anything else goes to the wrapped object, and the game then holds a real object locum
+/// does not see. Those side doors are logged, once per wrapper kind and interface.
 ///
 /// # Safety
 /// `this` must be the wrapper, `inner` the live wrapped object, `add_ref` the wrapper's own `AddRef`.
@@ -38,6 +39,11 @@ pub unsafe fn answer_query(
     }
     let wanted = unsafe { *iid };
     if iids.contains(&wanted) {
+        let hr = unsafe { query(inner, iid, out) };
+        if hr.is_err() {
+            return hr;
+        }
+        drop(unsafe { IUnknown::from_raw(*out) });
         add_ref();
         unsafe { *out = this as *mut c_void };
         return windows::Win32::Foundation::S_OK;
