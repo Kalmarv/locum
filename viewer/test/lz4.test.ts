@@ -6,7 +6,7 @@ import { lz4Block } from "../server/lz4";
 // What the block in lz4-block.bin encodes: a slow ramp (long matches), noise (long literal runs) and "abc" repeated (a
 // match overlapping what it writes). The block was written by lz4_flex through primase-foundations, as locum's blob
 // store compresses a blob.
-function input(): Uint8Array {
+function input(): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(20_000 + 3000 + 3000);
   for (let i = 0; i < 20_000; i++) out[i] = (i / 64) & 255;
   let x = 12345;
