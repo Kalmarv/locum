@@ -1,9 +1,12 @@
 //! ExecuteIndirect's argument records. A command signature can set a vertex or index buffer view or a root CBV, SRV
-//! or UAV per record, and each of those is a GPU virtual address in the argument buffer: capture reads the records to
-//! learn which buffers they name (and which a root UAV lets the call write), and replay rewrites them to its own
-//! buffers' addresses.
+//! or UAV per record, and a DispatchRays argument names its shader tables, and each of those is a GPU virtual address
+//! in the argument buffer: capture reads the records to learn which buffers they name (and which a root UAV lets the
+//! call write), and replay rewrites them to its own buffers' addresses.
+
+use core::mem::offset_of;
 
 use serde_json::Value;
+use windows::Win32::Graphics::Direct3D12::D3D12_DISPATCH_RAYS_DESC;
 
 /// What an address in a record sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,6 +17,9 @@ pub enum Kind {
     ShaderResource,
     /// A root UAV: the call may write what it names.
     UnorderedAccess,
+    /// A shader table of a DispatchRays argument (its ray generation record, or its miss, hit group or callable
+    /// table): the call reads its shader records.
+    ShaderTable,
 }
 
 /// An address's byte offset in a record, and what it sets.
@@ -30,27 +36,49 @@ pub struct Layout {
     pub addresses: Vec<Address>,
 }
 
-/// Each argument type's bytes in a record, and where an address is among them (D3D12's argument structures, packed
+/// The bytes of a DispatchRays argument: the structure's size, its three 4-byte sizes padded to its 8-byte alignment,
+/// as the runtime and vkd3d-proton size it.
+const DISPATCH_RAYS: usize = size_of::<D3D12_DISPATCH_RAYS_DESC>();
+/// Where a DispatchRays argument keeps its tables' addresses (each table's range starts with its address).
+const SHADER_TABLES: [usize; 4] = [
+    offset_of!(D3D12_DISPATCH_RAYS_DESC, RayGenerationShaderRecord),
+    offset_of!(D3D12_DISPATCH_RAYS_DESC, MissShaderTable),
+    offset_of!(D3D12_DISPATCH_RAYS_DESC, HitGroupTable),
+    offset_of!(D3D12_DISPATCH_RAYS_DESC, CallableShaderTable),
+];
+
+/// Each argument type's bytes in a record, and where addresses are among them (D3D12's argument structures, packed
 /// in the order the signature gives them).
-fn argument(a: &Value) -> Result<(usize, Option<Address>), String> {
+fn argument(a: &Value) -> Result<(usize, Vec<Address>), String> {
     let t = a["type"].as_i64().unwrap_or(-1);
-    let at = |kind| Some(Address { at: 0, kind });
+    let at = |kind| vec![Address { at: 0, kind }];
+    let none = Vec::new;
     Ok(match t {
-        0 => (16, None), // DRAW
-        1 => (20, None), // DRAW_INDEXED
-        2 => (12, None), // DISPATCH
+        0 => (16, none()), // DRAW
+        1 => (20, none()), // DRAW_INDEXED
+        2 => (12, none()), // DISPATCH
         // VERTEX_BUFFER_VIEW, INDEX_BUFFER_VIEW: the address, then size and stride or format.
         3 => (16, at(Kind::VertexBuffer)),
         4 => (16, at(Kind::IndexBuffer)),
-        5 => (4 * a["count"].as_u64().unwrap_or(0) as usize, None), // CONSTANT
+        5 => (4 * a["count"].as_u64().unwrap_or(0) as usize, none()), // CONSTANT
         6 => (8, at(Kind::ConstantBuffer)),
         7 => (8, at(Kind::ShaderResource)),
         8 => (8, at(Kind::UnorderedAccess)),
-        10 => (12, None), // DISPATCH_MESH
-        9 => return Err("a DispatchRays argument, whose records locum does not read".into()),
+        // DISPATCH_RAYS
+        9 => (
+            DISPATCH_RAYS,
+            SHADER_TABLES
+                .iter()
+                .map(|&at| Address {
+                    at,
+                    kind: Kind::ShaderTable,
+                })
+                .collect(),
+        ),
+        10 => (12, none()), // DISPATCH_MESH
         // INCREMENTING_CONSTANT: the runtime sets the root constant to each command's index; it has no bytes in a
         // record.
-        11 => (0, None),
+        11 => (0, none()),
         t => return Err(format!("argument type {t}, which locum does not know")),
     })
 }
@@ -60,13 +88,11 @@ pub fn layout(signature: &Value) -> Result<Layout, String> {
     let mut at = 0;
     let mut addresses = Vec::new();
     for a in signature["arguments"].as_array().into_iter().flatten() {
-        let (bytes, address) = argument(a)?;
-        if let Some(address) = address {
-            addresses.push(Address {
-                at: at + address.at,
-                ..address
-            });
-        }
+        let (bytes, here) = argument(a)?;
+        addresses.extend(here.into_iter().map(|address| Address {
+            at: at + address.at,
+            ..address
+        }));
         at += bytes;
     }
     let stride = signature["stride"].as_u64().unwrap_or(0) as usize;
@@ -180,6 +206,20 @@ mod tests {
             }
         );
         assert_eq!(root_parameters(&incrementing), vec![0, 4]);
+        // A DispatchRays argument (104 bytes) names its four tables, after a root constant's 4 bytes.
+        assert_eq!((DISPATCH_RAYS, SHADER_TABLES), (104, [0, 16, 40, 64]));
+        let rays =
+            json!({"stride": 108, "arguments": [{"type": 5, "root_parameter": 1, "count": 1}, {"type": 9}]});
+        assert_eq!(
+            layout(&rays).unwrap(),
+            Layout {
+                stride: 108,
+                addresses: [4, 20, 44, 68].map(|a| at(a, Kind::ShaderTable)).to_vec()
+            }
+        );
+        assert!(
+            layout(&json!({"stride": 104, "arguments": [{"type": 5, "count": 1}, {"type": 9}]})).is_err()
+        );
     }
 
     #[test]

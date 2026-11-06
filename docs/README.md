@@ -514,7 +514,8 @@ that buffer as replay made it at the same offset; where placed buffers share the
 used. A signature that sets root arguments is made against its root signature. An address in no buffer the capture
 describes, or in one replay did not make, skips the ExecuteIndirect and says why; a capture from before buffers'
 addresses were recorded (2026-11-05) skips them all. Mesh and amplification pipelines (their stream's `AS` and `MS`
-subobjects) are rebuilt as any other, so DispatchMesh, direct or indirect, replays.
+subobjects) are rebuilt as any other, so DispatchMesh, direct or indirect, replays. DispatchRays, direct or
+indirect, does not yet (replay makes no state objects), and verify says so.
 
 Queries are replayed. An occlusion or pipeline-statistics query must begin and end in one command list, and each
 event replays in a list of its own, so while a game's query is open, each draw and dispatch of the game's list it was
@@ -816,14 +817,14 @@ attachments a render pass discards or suspends into another list, and copies pas
 in pass order, so the passes past it are not only the frame's last; `passes` marks each pass whose targets were not
 read back after its draws, and says where they were (with the later pass a continued pass ends in) or why not.
 ExecuteIndirect counts as a draw or a dispatch by its command signature's last argument. A signature can set a vertex
-or index buffer view or a root CBV, SRV or UAV per record, each a GPU address in the argument buffer, and a buffer the
-frame reads only through those is named by no command it records, so no submission is seen to use it first. In an
+or index buffer view or a root CBV, SRV or UAV per record, each a GPU address in the argument buffer, and a
+DispatchRays argument names its four shader tables by address; a buffer the frame reads only through those is named by no command it records, so no submission is seen to use it first. In an
 instrumented list, the records such an ExecuteIndirect may run (its most records from the argument offset, as many
 as the buffer holds) and its count are copied right before it, from the states the buffers are in (what the list's
 own barriers left them in; otherwise COMMON or promoted to read states, which a copy reads with no barrier). At the
 Present that closes the capture, locum waits for those copies (up to 10 s), reads the records the count lets run, and
-finds every address in the live buffers: the event reads each buffer a view or a root CBV or SRV in its records
-names, and writes each a root UAV in them names (`event_resources` `read` and `write`, so a plan makes them and
+finds every address in the live buffers: the event reads each buffer a view, a root CBV or SRV or a shader
+table in its records names, and writes each a root UAV in them names (`event_resources` `read` and `write`, so a plan makes them and
 `resource` lists the writer). A buffer the frame used no other way is copied whole then, on the queue of the first
 ExecuteIndirect naming it, before the game's next submission from that thread: `content_source` `after-frame`, its
 first use the submission of that ExecuteIndirect. Nothing the frame recorded writes such a buffer (a command that did
@@ -840,7 +841,7 @@ set there before is stale, and what the records name is in `event_resources`. A 
 copies its records again; the last execution's are read. An incrementing constant has no bytes in a record: the
 runtime sets its root constant to each command's index (from 0), and replay's runtime does the same, so it replays
 where the replay device has ExecuteIndirect tier 1.1 (verify says so where it has not). Records locum cannot read (a
-DispatchRays argument, a signature it did not see made, more than 64 MiB), addresses in no live buffer, an
+signature it did not see made, more than 64 MiB), addresses in no live buffer, an
 ExecuteIndirect of an uninstrumented list whose records hold addresses, and a buffer the after-frame copy cannot be
 made of (no description, a destroyed queue) are `d3d12-indirect-arguments`, `contents` or `d3d12-results` gaps. A
 bundle may run only a signature of one draw or dispatch with no count buffer (the debug layer refuses any other,

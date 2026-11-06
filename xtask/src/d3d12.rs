@@ -313,6 +313,33 @@ fn hardware_smoke(stage: &std::path::Path, log: &std::path::Path) {
     let (ok, text) = cli(stage, log, &["verify", &capture("indirect")]);
     indirect_verified(ok, &text, targets(stage, log, &capture("indirect")));
     println!("ok   D3D12 hardware: ExecuteIndirect with GPU addresses in its records replays as the game's");
+    let said = String::from_utf8_lossy(&result.stdout);
+    rays_verified(stage, log, &capture("indirect-rays"), &said, "hardware");
+}
+
+/// What verify says of the fixture's `indirect-rays` capture, made where the device has raytracing tier 1.1 (`said`:
+/// what the smoke printed, which says why where it made none): replay runs no DispatchRays, and says so. Whether the
+/// capture read the shader table the records name, the fixture checked in it.
+fn rays_verified(stage: &std::path::Path, log: &std::path::Path, capture: &str, said: &str, on: &str) {
+    if let Some(why) = said
+        .lines()
+        .find_map(|l| l.strip_prefix("indirect-rays SKIPPED: "))
+    {
+        println!("SKIP D3D12 {on}: ExecuteIndirect of DispatchRays not captured: {why}");
+        return;
+    }
+    assert!(
+        std::path::Path::new(capture).is_dir(),
+        "indirect-rays: the smoke neither made the capture nor said why"
+    );
+    let (ok, text) = cli(stage, log, &["verify", capture]);
+    assert!(
+        !ok && text.contains("DispatchRays is not replayed"),
+        "indirect-rays: verify says replay runs no DispatchRays"
+    );
+    println!(
+        "ok   D3D12 {on}: ExecuteIndirect of DispatchRays captured, its shader table read; replay says it runs none"
+    );
 }
 
 /// Runs locum-cli with `args`, printing what it says: whether it succeeded, and what it said.
@@ -473,6 +500,8 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
     println!(
         "ok   D3D12 verify: ExecuteIndirect records it could not read, and contents it could not know, are gaps"
     );
+    let said = std::fs::read_to_string(stage.join("stdout.txt")).expect("the WARP smoke's output");
+    rays_verified(stage, &log, &capture("indirect-rays"), &said, "verify");
     // Under the debug layer, with a pass under GPU-based validation of its own: the dispatches write a texture made
     // for simultaneous access as a UAV, which that validation takes for an error the spec does not make it.
     if debug {

@@ -185,6 +185,9 @@ unsafe fn hardware() {
         planes::capture(&device, &queue, &fence, &chain, (2560, 1440));
         finish(&queue, &fence, 44);
         indirect::capture(&device, &queue, &fence, &chain, 45);
+        if let Err(why) = indirect::rays(&device, &queue, &fence, &chain, 50) {
+            println!("indirect-rays SKIPPED: {why}");
+        }
         drop(chain);
         DestroyWindow(hwnd).unwrap();
     }
@@ -553,6 +556,9 @@ unsafe fn run() {
         finish(&queue, &fence, 47);
         indirect::capture(&device, &queue, &fence, &chain, 48);
         indirect::gaps(&device, &queue, &fence, &chain, 53);
+        if let Err(why) = indirect::rays(&device, &queue, &fence, &chain, 57) {
+            println!("indirect-rays SKIPPED: {why}");
+        }
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

@@ -28,6 +28,10 @@
   locum's stand-ins forward to `locum.dll`, which was otherwise the first of that name beside locum-cli or on PATH
   (cargo's target folders under `cargo xtask smoke`), or none, and the layer replay failed to load the system's
   `d3d11.dll`. The machine line names those modules too.
+- An ExecuteIndirect whose command signature runs DispatchRays has its records read, as other records with addresses
+  are: the shader tables they name are among its reads, so a plan makes them, and a table nothing else in the frame
+  names is copied after it. Before, its records were a `d3d12-indirect-arguments` gap. Replay does not run
+  DispatchRays yet, and verify says so.
 
 ## 0.1.4 (2026-11-06)
 

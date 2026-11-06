@@ -22,6 +22,9 @@
 //!
 //! The `indirect-gaps` capture holds what cannot be proven: an ExecuteIndirect of a list recorded before the capture
 //! was armed, and a buffer only a root UAV in records names, whose contents as the frame began nobody copied.
+//!
+//! The `indirect-rays` capture runs a DispatchRays argument, where the device has raytracing tier 1.1: its record
+//! names the ray generation shader table, which nothing else names, so the capture reads the table from the record.
 use super::*;
 
 const RGBA8: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -309,8 +312,8 @@ unsafe fn compute_pso(
     pso
 }
 
-/// DXIL for `profile` (`ms_6_5`), from `LOCUM_DXCOMPILER` or the newest Windows SDK's `dxcompiler.dll` (which signs
-/// it with the `dxil.dll` beside it); or why there is none.
+/// DXIL for `profile` (`ms_6_5`, or a library's `lib_6_3`), from `LOCUM_DXCOMPILER` or the newest Windows SDK's
+/// `dxcompiler.dll` (which signs it with the `dxil.dll` beside it); or why there is none.
 fn dxil(source: &str, profile: &str) -> std::result::Result<Vec<u8>, String> {
     use windows::Win32::Graphics::Direct3D::Dxc::*;
     let path = match std::env::var_os("LOCUM_DXCOMPILER") {
@@ -347,7 +350,13 @@ fn dxil(source: &str, profile: &str) -> std::result::Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())?;
     let compiler = unsafe { IDxcCompiler3::from_raw(raw) };
     let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
-    let args = [wide("-E"), wide("main"), wide("-T"), wide(profile)];
+    // A library (`lib_6_3`) has no entry point: its shaders are exports.
+    let entry = if profile.starts_with("lib_") {
+        &[][..]
+    } else {
+        &["-E", "main"][..]
+    };
+    let args: Vec<Vec<u16>> = entry.iter().chain(&["-T", profile]).map(|a| wide(a)).collect();
     let args: Vec<PCWSTR> = args.iter().map(|w| PCWSTR(w.as_ptr())).collect();
     let buffer = DxcBuffer {
         Ptr: source.as_ptr().cast(),
@@ -1333,5 +1342,241 @@ pub(super) unsafe fn gaps(
         println!(
             "D3D12 ExecuteIndirect gaps: an uninstrumented list's records, and a buffer only a root UAV names: {label}"
         );
+    }
+}
+
+/// The `indirect-rays` capture's ray generation shader: each ray writes its index into the UAV, so a dispatch that ran
+/// is seen.
+const RAYS: &str = r#"
+RWByteAddressBuffer written : register(u0);
+
+[shader("raygeneration")]
+void Ray()
+{
+    uint2 at = DispatchRaysIndex().xy;
+    written.Store((at.y * DispatchRaysDimensions().x + at.x) * 4, 0x52590000 | (at.y << 8) | at.x);
+}
+"#;
+/// The rays the indirect DispatchRays casts, wide and high.
+const RAYS_CAST: (u32, u32) = (4, 2);
+/// A record of signature G: DISPATCH_RAYS (`D3D12_DISPATCH_RAYS_DESC`, its three sizes padded to 8 bytes).
+const STRIDE_G: usize = 104;
+
+/// What ray `(x, y)` writes.
+fn ray(x: u32, y: u32) -> u32 {
+    0x5259_0000 | (y << 8) | x
+}
+
+/// A raytracing pipeline of [`RAYS`] with `root` as its global root signature, where the device has raytracing tier
+/// 1.1 (ExecuteIndirect of DispatchRays) and DXIL can be compiled; or why not.
+unsafe fn rays_pipeline(
+    device: &ID3D12Device,
+    root: &ID3D12RootSignature,
+) -> std::result::Result<ID3D12StateObject, String> {
+    unsafe {
+        let mut o5 = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS5,
+                (&mut o5 as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS5).cast(),
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS5>() as u32,
+            )
+            .map_err(|e| format!("CheckFeatureSupport(OPTIONS5): {e}"))?;
+        if o5.RaytracingTier.0 < D3D12_RAYTRACING_TIER_1_1.0 {
+            return Err(format!(
+                "raytracing tier {}.{}, not 1.1",
+                o5.RaytracingTier.0 / 10,
+                o5.RaytracingTier.0 % 10
+            ));
+        }
+        let library = dxil(RAYS, "lib_6_3")?;
+        let dxil_library = D3D12_DXIL_LIBRARY_DESC {
+            DXILLibrary: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: library.as_ptr().cast(),
+                BytecodeLength: library.len(),
+            },
+            NumExports: 0,
+            pExports: core::ptr::null_mut(),
+        };
+        let mut global = D3D12_GLOBAL_ROOT_SIGNATURE {
+            pGlobalRootSignature: ManuallyDrop::new(Some(root.clone())),
+        };
+        let shader = D3D12_RAYTRACING_SHADER_CONFIG {
+            MaxPayloadSizeInBytes: 4,
+            MaxAttributeSizeInBytes: 8,
+        };
+        let pipeline = D3D12_RAYTRACING_PIPELINE_CONFIG {
+            MaxTraceRecursionDepth: 1,
+        };
+        let subobject = |kind, desc: *const c_void| D3D12_STATE_SUBOBJECT {
+            Type: kind,
+            pDesc: desc,
+        };
+        let subobjects = [
+            subobject(
+                D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
+                (&dxil_library as *const D3D12_DXIL_LIBRARY_DESC).cast(),
+            ),
+            subobject(
+                D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE,
+                (&global as *const D3D12_GLOBAL_ROOT_SIGNATURE).cast(),
+            ),
+            subobject(
+                D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG,
+                (&shader as *const D3D12_RAYTRACING_SHADER_CONFIG).cast(),
+            ),
+            subobject(
+                D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG,
+                (&pipeline as *const D3D12_RAYTRACING_PIPELINE_CONFIG).cast(),
+            ),
+        ];
+        let made = device
+            .cast::<ID3D12Device5>()
+            .map_err(|e| format!("ID3D12Device5: {e}"))
+            .and_then(|d| {
+                d.CreateStateObject(&D3D12_STATE_OBJECT_DESC {
+                    Type: D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+                    NumSubobjects: subobjects.len() as u32,
+                    pSubobjects: subobjects.as_ptr(),
+                })
+                .map_err(|e| format!("CreateStateObject: {e}"))
+            });
+        ManuallyDrop::drop(&mut global.pGlobalRootSignature);
+        made
+    }
+}
+
+/// The `indirect-rays` capture: an ExecuteIndirect of signature G, whose record names a ray generation shader table in
+/// a default heap that nothing else names, where the device can (see [`rays_pipeline`]). Fence values `first` to
+/// `first + 3` are used.
+pub(super) unsafe fn rays(
+    device: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    fence: &ID3D12Fence,
+    chain: &IDXGISwapChain1,
+    first: u64,
+) -> std::result::Result<(), String> {
+    unsafe {
+        use graphics::transition;
+        let root = root_signature(
+            device,
+            &[root_view(D3D12_ROOT_PARAMETER_TYPE_UAV, 0)],
+            D3D12_ROOT_SIGNATURE_FLAG_NONE,
+        );
+        let pipeline = rays_pipeline(device, &root)?;
+        let properties: ID3D12StateObjectProperties = pipeline.cast().unwrap();
+        let identifier = properties.GetShaderIdentifier(w!("Ray"));
+        assert!(!identifier.is_null(), "Ray's shader identifier");
+        let mut record = core::slice::from_raw_parts(
+            identifier.cast::<u8>(),
+            D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as usize,
+        )
+        .to_vec();
+        record.resize(D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT as usize, 0);
+        let table = default_buffer(device, record.len() as u64, false);
+        let staging = upload(device, &record, record.len() as u64);
+        fill(
+            device,
+            queue,
+            fence,
+            first,
+            &[(&table, &staging, record.len() as u64)],
+        );
+        let (width, height) = RAYS_CAST;
+        let bytes = u64::from(width * height * 4);
+        let target = default_buffer(device, bytes, true);
+        let desc = D3D12_DISPATCH_RAYS_DESC {
+            RayGenerationShaderRecord: D3D12_GPU_VIRTUAL_ADDRESS_RANGE {
+                StartAddress: table.GetGPUVirtualAddress(),
+                SizeInBytes: u64::from(D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES),
+            },
+            Width: width,
+            Height: height,
+            Depth: 1,
+            ..Default::default()
+        };
+        assert_eq!(size_of::<D3D12_DISPATCH_RAYS_DESC>(), STRIDE_G);
+        let args = upload(
+            device,
+            core::slice::from_raw_parts((&desc as *const D3D12_DISPATCH_RAYS_DESC).cast(), STRIDE_G),
+            256,
+        );
+        let g = signature(
+            device,
+            &[argument(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS, 0, 0)],
+            STRIDE_G,
+            None,
+        );
+
+        let label = format!("indirect-rays-{}", std::process::id());
+        request(&label);
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        let allocator: ID3D12CommandAllocator = device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            .unwrap();
+        let list: ID3D12GraphicsCommandList4 = device
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+            .unwrap();
+        transition(
+            &list,
+            &table,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        );
+        transition(
+            &list,
+            &target,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+        list.SetComputeRootSignature(&root);
+        list.SetComputeRootUnorderedAccessView(0, target.GetGPUVirtualAddress());
+        list.SetPipelineState1(&pipeline);
+        list.ExecuteIndirect(&g, 1, &args, 0, None, 0);
+        transition(
+            &list,
+            &target,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        list.Close().unwrap();
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        finish(queue, fence, first + 1);
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        let out = read_buffer(device, queue, fence, first + 2, &target, bytes);
+        for y in 0..height {
+            for x in 0..width {
+                let at = ((y * width + x) * 4) as usize;
+                let word = u32::from_le_bytes(out[at..at + 4].try_into().unwrap());
+                assert_eq!(word, ray(x, y), "ray ({x}, {y})");
+            }
+        }
+
+        let db = written(&label);
+        let ei = "d.call = 'ExecuteIndirect'";
+        check(
+            &db,
+            &[
+                (
+                    "SELECT count(*) FROM gaps WHERE what = 'd3d12-indirect-arguments'",
+                    0,
+                ),
+                // The shader table only the record names: read by the ExecuteIndirect, its contents copied after the
+                // frame.
+                (
+                    &format!(
+                        "SELECT count(*) FROM event_resources e JOIN draws d ON d.event = e.event JOIN resources r \
+                         ON r.id = e.resource WHERE {ei} AND e.access = 'read' AND r.width = {} AND \
+                         r.content_source = 'after-frame'",
+                        record.len()
+                    ),
+                    1,
+                ),
+            ],
+        );
+        finish(queue, fence, first + 3);
+        debug_errors(device);
+        println!("D3D12 ExecuteIndirect of DispatchRays: every ray written, its shader table read: {label}");
+        Ok(())
     }
 }

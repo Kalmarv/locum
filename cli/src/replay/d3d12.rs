@@ -1102,12 +1102,14 @@ impl D3d12 {
                                     .is_ok();
                                     match known {
                                         true if o.ExecuteIndirectTier.0 < D3D12_EXECUTE_INDIRECT_TIER_1_1.0 => format!(
-                                            " (it has an incrementing constant, which needs ExecuteIndirect tier 1.1;                                              the replay device's is {}.{})",
+                                            " (it has an incrementing constant, which needs ExecuteIndirect tier 1.1; \
+                                             the replay device's is {}.{})",
                                             o.ExecuteIndirectTier.0 / 10,
                                             o.ExecuteIndirectTier.0 % 10
                                         ),
                                         true => String::new(),
-                                        false => " (it has an incrementing constant, which needs ExecuteIndirect tier                                                    1.1; the replay device's runtime knows no tiers)"
+                                        false => " (it has an incrementing constant, which needs ExecuteIndirect tier \
+                                                  1.1; the replay device's runtime knows no tiers)"
                                             .into(),
                                     }
                                 } else {

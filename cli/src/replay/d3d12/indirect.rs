@@ -102,6 +102,16 @@ impl D3d12 {
             // signature() says so.
             return Ok(Arguments::AsRecorded);
         };
+        let rays = desc["arguments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|a| a["type"].as_i64() == Some(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS.0 as i64));
+        if rays {
+            // As a DispatchRays call is (see `draw`).
+            self.warn("DispatchRays is not replayed");
+            return Ok(Arguments::Skip);
+        }
         let layout = match layout(&desc) {
             Ok(l) => l,
             Err(e) => {
