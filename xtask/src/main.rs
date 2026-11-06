@@ -860,7 +860,8 @@ fn smoke(root: &Path, debug: bool, dlls: Option<&Path>) {
     for warp in [false, true] {
         rows_ok &= verified(&cli, &log_dir, "row18", warp, debug, "row18: bit-exact replay").0;
     }
-    // Multisampled textures: contents written into every sample, and 7 pass ends read back sample by sample.
+    // Multisampled textures: contents written into every sample, and their pass ends read back sample by sample.
+    let targets = multisampled_targets(&log_dir.join("captures/samples"));
     for warp in [false, true] {
         let (ok, text) = verified(
             &cli,
@@ -870,9 +871,11 @@ fn smoke(root: &Path, debug: bool, dlls: Option<&Path>) {
             debug,
             "samples: multisampled targets bit-exact",
         );
-        let every = text.contains("7 of 7 targets identical") && !text.contains("multisampled");
+        let every = targets >= 7
+            && text.contains(&format!("{targets} of {targets} targets identical"))
+            && !text.contains("multisampled");
         println!(
-            "{} samples: every sample of 7 multisampled targets replays as the game's, depth and stencil too",
+            "{} samples: every sample of {targets} multisampled targets replays as the game's, depth and stencil too",
             if every { "ok  " } else { "FAIL" }
         );
         rows_ok &= ok && every;
@@ -2004,6 +2007,21 @@ fn rustfmt(path: &Path) {
         .status()
         .expect("run rustfmt");
     assert!(status.success(), "rustfmt failed on {}", path.display());
+}
+
+/// How many multisampled targets the `samples` capture in `capture` read back: a pass end a slice of each texture the
+/// fixture drew (7 at least: the formats every device renders to; more as the device renders the optional ones).
+pub fn multisampled_targets(capture: &Path) -> usize {
+    let db = capture.join("capture.db");
+    rusqlite::Connection::open(&db)
+        .and_then(|c| {
+            c.query_row(
+                "SELECT count(*) FROM targets t JOIN resources r ON r.id = t.resource WHERE r.samples = 4",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+        })
+        .unwrap_or_else(|e| panic!("{}: {e}", db.display())) as usize
 }
 
 #[cfg(test)]

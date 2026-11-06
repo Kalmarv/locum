@@ -8,10 +8,11 @@ use super::*;
 mod values;
 use values::*;
 
-/// One multisampled texture of the fixture's, with its views (one a slice).
+/// One multisampled texture of the fixture's, with its views (one a slice) and the pixel shader that draws it.
 struct Texture {
     kind: Kind,
     views: Vec<View>,
+    ps: ID3D11PixelShader,
 }
 
 enum View {
@@ -32,7 +33,7 @@ pub(super) fn run(
         unsafe { device.CreatePixelShader(&code, None, Some(&mut ps)) }?;
         Ok(ps.expect("pixel shader"))
     };
-    let (colour_ps, floats_ps, depth_ps) = (program(COLOUR)?, program(FLOATS)?, program(DEPTH)?);
+    let depth_ps = program(DEPTH)?;
     let mut vertices = None;
     let mut constants = None;
     let mut rasterizer = None;
@@ -90,14 +91,27 @@ pub(super) fn run(
         Ok(state.expect("depth-stencil state"))
     };
     let mut textures = Vec::new();
+    let mut lacking = Vec::new();
     for kind in Kind::ALL {
         let (format, view, slices) = kind.formats();
+        let name = locum_capture::format::name(view.0 as u32);
         let levels = unsafe { device.CheckMultisampleQualityLevels(view, SAMPLES) }?;
-        checks.check(
-            levels > 0,
-            &format!("samples: {view:?} has {SAMPLES} samples here"),
-        );
-        if levels == 0 {
+        let target = if kind.depth() {
+            D3D11_FORMAT_SUPPORT_DEPTH_STENCIL
+        } else {
+            D3D11_FORMAT_SUPPORT_RENDER_TARGET
+        }
+        .0 as u32
+            | D3D11_FORMAT_SUPPORT_MULTISAMPLE_RENDERTARGET.0 as u32;
+        let support = unsafe { device.CheckFormatSupport(view) }.unwrap_or(0);
+        let drawable = levels > 0 && support & target == target;
+        if !drawable && kind.optional() {
+            println!("samples: {name} is no {SAMPLES}-sample render target on this device: not drawn");
+            lacking.push(name);
+            continue;
+        }
+        checks.check(drawable, &format!("samples: {name} has {SAMPLES} samples here"));
+        if !drawable {
             return Ok(());
         }
         let mut texture = None;
@@ -157,7 +171,12 @@ pub(super) fn run(
                 views.push(View::Target(v.expect("view")));
             }
         }
-        textures.push(Texture { kind, views });
+        let ps = if kind.depth() {
+            depth_ps.clone()
+        } else {
+            program(&kind.shader())?
+        };
+        textures.push(Texture { kind, views, ps });
     }
     let (colour_state, depth_only, depth_stencil) = (
         depth_state(false, false)?,
@@ -177,13 +196,12 @@ pub(super) fn run(
             ..Default::default()
         }]));
         for t in &textures {
-            let (ps, state) = match t.kind {
-                Kind::Colour => (&colour_ps, &colour_state),
-                Kind::Floats => (&floats_ps, &colour_state),
-                k if k.stencil() => (&depth_ps, &depth_stencil),
-                _ => (&depth_ps, &depth_only),
+            let state = match t.kind {
+                k if k.stencil() => &depth_stencil,
+                k if k.depth() => &depth_only,
+                _ => &colour_state,
             };
-            c.PSSetShader(ps, None);
+            c.PSSetShader(&t.ps, None);
             for (slice, view) in t.views.iter().enumerate() {
                 match view {
                     View::Target(v) => c.OMSetRenderTargets(Some(&[Some(v.clone())]), None),
@@ -220,7 +238,7 @@ pub(super) fn run(
     replay_rows::finish(checks, swap, &dir, "samples")?;
     let db = rusqlite::Connection::open(dir.join("captures/samples/capture.db")).unwrap();
     let blobs = locum_capture::blobs::Blobs::new(dir.join("blobs"));
-    for kind in Kind::ALL {
+    for kind in textures.iter().map(|t| t.kind) {
         let (format, view, slices) = kind.formats();
         let Ok((id, content, note)) = db.query_row(
             "SELECT id, content, content_note FROM resources WHERE samples = ?1 AND format = ?2",
@@ -239,7 +257,7 @@ pub(super) fn run(
         let bytes = content.as_ref().and_then(|k| blobs.get(k).ok());
         let want: Vec<u8> = (0..slices).flat_map(|slice| kind.slice(slice, false)).collect();
         checks.check(
-            bytes.as_ref() == Some(&want),
+            bytes.as_ref().is_some_and(|b| kind.same(b, &want)),
             &format!(
                 "samples: #{id} ({view:?})'s contents are every sample's bits as the frame before left them ({:?}; \
                  first difference at byte {:?})",
@@ -276,7 +294,8 @@ pub(super) fn run(
             let bytes = blob.and_then(|k| blobs.get(&k).ok());
             let want = kind.slice(slice as u32, true);
             checks.check(
-                (sub, width, height) == (slice as u32, WIDTH, HEIGHT * SAMPLES) && bytes.as_ref() == Some(&want),
+                (sub, width, height) == (slice as u32, WIDTH, HEIGHT * SAMPLES)
+                    && bytes.as_ref().is_some_and(|b| kind.same(b, &want)),
                 &format!(
                     "samples: #{id} ({view:?}) slice {slice}'s pass end is every sample's bits, stacked (first \
                      difference at byte {:?})",
@@ -285,6 +304,20 @@ pub(super) fn run(
             );
         }
     }
+    let drawn: Vec<&str> = textures
+        .iter()
+        .filter(|t| t.kind.optional())
+        .map(|t| locum_capture::format::name(t.kind.formats().1.0 as u32))
+        .collect();
+    println!(
+        "samples: drawn through float views: {}; not render targets here: {}",
+        drawn.join(", "),
+        if lacking.is_empty() {
+            "none".to_string()
+        } else {
+            lacking.join(", ")
+        }
+    );
     Ok(())
 }
 

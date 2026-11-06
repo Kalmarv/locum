@@ -137,6 +137,11 @@ impl Texture {
     }
 }
 
+/// The format's name, as DXGI_FORMAT_'s.
+fn name(format: DXGI_FORMAT) -> String {
+    locum_capture::format::name(format.0 as u32).to_string()
+}
+
 /// Fence values `first` and `first + 1`.
 pub(super) unsafe fn capture(
     device: &ID3D12Device,
@@ -148,7 +153,7 @@ pub(super) unsafe fn capture(
     unsafe {
         let vs = compile(VERTICES.as_bytes(), s!("vs_5_0"));
         let program = |body: &str| compile(format!("{CONSTANTS} {body}").as_bytes(), s!("ps_5_0"));
-        let (colour_ps, floats_ps, depth_ps) = (program(COLOUR), program(FLOATS), program(DEPTH));
+        let depth_ps = program(DEPTH);
         let parameter = D3D12_ROOT_PARAMETER {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
             Anonymous: D3D12_ROOT_PARAMETER_0 {
@@ -189,11 +194,12 @@ pub(super) unsafe fn capture(
                 .unwrap()
         };
         let (rtvs, dsvs) = (
-            heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 3),
+            heap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, 10),
             heap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 4),
         );
         let (mut rtv, mut dsv) = (0usize, 0usize);
         let mut textures = Vec::new();
+        let mut lacking = Vec::new();
         for kind in Kind::ALL {
             let (format, view, slices) = kind.formats();
             let mut levels = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS {
@@ -208,10 +214,35 @@ pub(super) unsafe fn capture(
                     size_of_val(&levels) as u32,
                 )
                 .unwrap();
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: view,
+                ..Default::default()
+            };
+            device
+                .CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+                .unwrap();
+            let target = if kind.depth() {
+                D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL
+            } else {
+                D3D12_FORMAT_SUPPORT1_RENDER_TARGET
+            } | D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET;
+            let drawable = levels.NumQualityLevels > 0 && support.Support1 & target == target;
             assert!(
-                levels.NumQualityLevels > 0,
-                "samples: {view:?} has no {SAMPLES} samples here"
+                drawable || kind.optional(),
+                "samples: {view:?} is no {SAMPLES}-sample target here"
             );
+            if !drawable {
+                println!(
+                    "samples: {} is no {SAMPLES}-sample render target on this device: not drawn",
+                    name(view)
+                );
+                lacking.push(name(view));
+                continue;
+            }
             let flags = if kind.depth() {
                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL
             } else {
@@ -265,21 +296,16 @@ pub(super) unsafe fn capture(
                     views.push(handle);
                 }
             }
-            let pipelines = match kind {
-                Kind::Colour | Kind::Floats => {
-                    let ps = if kind == Kind::Colour {
-                        &colour_ps
-                    } else {
-                        &floats_ps
-                    };
-                    vec![
-                        pipeline(device, &root, (&vs, ps), kind, u32::MAX),
-                        pipeline(device, &root, (&vs, ps), kind, 1 << 3),
-                    ]
-                }
-                _ => (0..SAMPLES)
+            let pipelines = if kind.depth() {
+                (0..SAMPLES)
                     .map(|s| pipeline(device, &root, (&vs, &depth_ps), kind, 1 << s))
-                    .collect(),
+                    .collect()
+            } else {
+                let ps = program(&kind.shader());
+                vec![
+                    pipeline(device, &root, (&vs, &ps), kind, u32::MAX),
+                    pipeline(device, &root, (&vs, &ps), kind, 1 << 3),
+                ]
             };
             textures.push(Texture {
                 kind,
@@ -344,7 +370,7 @@ pub(super) unsafe fn capture(
         }
         let db = rusqlite::Connection::open(&path).unwrap();
         let blobs = locum_capture::blobs::Blobs::new(dir.join("blobs"));
-        for kind in Kind::ALL {
+        for kind in textures.iter().map(|t| t.kind) {
             let (format, view, slices) = kind.formats();
             let (id, content, note): (i64, Option<String>, Option<String>) = db
                 .query_row(
@@ -359,7 +385,7 @@ pub(super) unsafe fn capture(
             let bytes = blobs.get(&content).unwrap();
             let want: Vec<u8> = (0..slices).flat_map(|slice| kind.slice(slice, false)).collect();
             assert!(
-                bytes == want,
+                kind.same(&bytes, &want),
                 "samples: #{id} ({view:?}): its contents are not every sample's bits ({} bytes, {} expected; first \
                  difference at byte {:?})",
                 bytes.len(),
@@ -404,7 +430,7 @@ pub(super) unsafe fn capture(
                 let bytes = blobs.get(&blob.expect("stored")).unwrap();
                 let want = kind.slice(slice as u32, true);
                 assert!(
-                    bytes == want,
+                    kind.same(&bytes, &want),
                     "samples: #{id} ({view:?}) slice {slice}: the pass end is not every sample's bits (first \
                      difference at byte {:?} of {})",
                     bytes.iter().zip(&want).position(|(a, b)| a != b),
@@ -412,11 +438,23 @@ pub(super) unsafe fn capture(
                 );
             }
         }
+        let drawn: Vec<String> = textures
+            .iter()
+            .filter(|t| t.kind.optional())
+            .map(|t| name(t.kind.formats().1))
+            .collect();
+        println!(
+            "D3D12 multisampled textures ({SAMPLES} samples, each different; RGBA8 UINT over 2 slices, R11G11B10, \
+             D24S8, D32S8X24, D32, D16; through float views {}): first-use contents and pass-end targets every \
+             sample's bits; not render targets here: {}",
+            drawn.join(", "),
+            if lacking.is_empty() {
+                "none".to_string()
+            } else {
+                lacking.join(", ")
+            }
+        );
     }
-    println!(
-        "D3D12 multisampled textures ({SAMPLES} samples, each different; RGBA8 UINT over 2 slices, R11G11B10, D24S8, \
-         D32S8X24, D32, D16): first-use contents and pass-end targets every sample's bits"
-    );
 }
 
 /// Copies of `sources` (resource, subresource) into one readback buffer: their footprints, and the buffer.

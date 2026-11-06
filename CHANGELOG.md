@@ -44,6 +44,9 @@
   from it, `export` (PNG, DDS or raw), the viewer and `pixel --draws` (which shows each sample) take them as one image
   of the samples stacked top to bottom; a whole multisampled texture exports to DDS with each slice's samples as array
   slices.
+- The smokes' multisampled textures include every colour format whose samples are read through a float view
+  (B8G8R8A8, B8G8R8X8, B5G6R5, B5G5R5A1, B4G4R4A4, A8, R10G10B10_XR_BIAS) where the device renders it with 4 samples,
+  each sample different, and name those it cannot.
 
 ## 0.1.4 (2026-11-06)
 

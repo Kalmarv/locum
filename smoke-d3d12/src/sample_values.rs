@@ -108,16 +108,31 @@ pub enum Kind {
     D32S8,
     D32,
     D16,
+    // Families with no `uint` member, read through their own float view (`Samples::Floats`) as the R11G11B10 is.
+    Bgra,
+    Bgrx,
+    B5G6R5,
+    B5G5R5A1,
+    B4G4R4A4,
+    A8,
+    Xr,
 }
 
 impl Kind {
-    pub const ALL: [Kind; 6] = [
+    pub const ALL: [Kind; 13] = [
         Kind::Colour,
         Kind::Floats,
         Kind::D24S8,
         Kind::D32S8,
         Kind::D32,
         Kind::D16,
+        Kind::Bgra,
+        Kind::Bgrx,
+        Kind::B5G6R5,
+        Kind::B5G5R5A1,
+        Kind::B4G4R4A4,
+        Kind::A8,
+        Kind::Xr,
     ];
 
     /// The resource's format, the view's, and its slices.
@@ -129,11 +144,84 @@ impl Kind {
             Kind::D32S8 => (DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 1),
             Kind::D32 => (DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_D32_FLOAT, 1),
             Kind::D16 => (DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_D16_UNORM, 1),
+            Kind::Bgra => (DXGI_FORMAT_B8G8R8A8_TYPELESS, DXGI_FORMAT_B8G8R8A8_UNORM, 1),
+            Kind::Bgrx => (DXGI_FORMAT_B8G8R8X8_TYPELESS, DXGI_FORMAT_B8G8R8X8_UNORM, 1),
+            Kind::B5G6R5 => (DXGI_FORMAT_B5G6R5_UNORM, DXGI_FORMAT_B5G6R5_UNORM, 1),
+            Kind::B5G5R5A1 => (DXGI_FORMAT_B5G5R5A1_UNORM, DXGI_FORMAT_B5G5R5A1_UNORM, 1),
+            Kind::B4G4R4A4 => (DXGI_FORMAT_B4G4R4A4_UNORM, DXGI_FORMAT_B4G4R4A4_UNORM, 1),
+            Kind::A8 => (DXGI_FORMAT_A8_UNORM, DXGI_FORMAT_A8_UNORM, 1),
+            Kind::Xr => (
+                DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM,
+                DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM,
+                1,
+            ),
         }
     }
 
+    /// Whether a device may lack it as a multisampled render target (D3D requires the first six): the fixture names
+    /// one it lacks and goes on without it.
+    pub fn optional(self) -> bool {
+        !matches!(
+            self,
+            Kind::Colour | Kind::Floats | Kind::D24S8 | Kind::D32S8 | Kind::D32 | Kind::D16
+        )
+    }
+
+    /// The largest value of each channel (red, green, blue, alpha; 0 for one the format lacks) of a family drawn as
+    /// unorm integers.
+    fn maxima(self) -> Option<[u32; 4]> {
+        Some(match self {
+            Kind::Bgra | Kind::Bgrx => [255, 255, 255, 255],
+            Kind::B5G6R5 => [31, 63, 31, 0],
+            Kind::B5G5R5A1 => [31, 31, 31, 1],
+            Kind::B4G4R4A4 => [15, 15, 15, 15],
+            Kind::A8 => [0, 0, 0, 255],
+            Kind::Xr => [1023, 1023, 1023, 3],
+            _ => return None,
+        })
+    }
+
+    /// The pixel shader that draws a colour family's samples (after [`CONSTANTS`]).
+    pub fn shader(self) -> String {
+        let Some(m) = self.maxima() else {
+            return (if self == Kind::Colour { COLOUR } else { FLOATS }).to_string();
+        };
+        // Each channel's integer as [`Kind::channels`] gives it, then as the float the format stores it from: unorm
+        // over the channel's largest value, XR's colour channels biased (`(v - 384) / 510`).
+        let colour = if self == Kind::Xr {
+            "(float3(v.rgb) - 384.0) / 510.0"
+        } else {
+            "float3(v.rgb) / float3(max(m.rgb, 1))"
+        };
+        format!(
+            "float4 main(float4 p : SV_Position, uint s : SV_SampleIndex) : SV_Target {{ \
+             uint x = (uint)p.x, y = (uint)p.y; uint4 m = uint4({}, {}, {}, {}); \
+             uint base = s * 37 + x * 11 + y * 5 + (alt != 0 && s == 3 ? 101 : 0); \
+             uint4 v = (base + uint4(0, 3, 6, 9)) % (m + 1); \
+             return float4({colour}, float(v.a) / float(max(m.a, 1))); }}",
+            m[0], m[1], m[2], m[3]
+        )
+    }
+
+    /// The channels' integers (red, green, blue, alpha) of sample `s` of texel (x, y), as [`Kind::shader`] draws them.
+    fn channels(self, m: [u32; 4], s: u32, x: u32, y: u32, alt: bool) -> [u32; 4] {
+        let base = s * 37 + x * 11 + y * 5 + if alt && s == 3 { 101 } else { 0 };
+        core::array::from_fn(|i| (base + 3 * i as u32) % (m[i] + 1))
+    }
+
+    /// Whether `got` holds `want`'s bits: every byte, but for B8G8R8X8's X byte, which no view reads (D3D defines
+    /// none for it, and a write leaves there what the GPU puts).
+    pub fn same(self, got: &[u8], want: &[u8]) -> bool {
+        got.len() == want.len()
+            && got
+                .iter()
+                .zip(want)
+                .enumerate()
+                .all(|(i, (a, b))| a == b || (self == Kind::Bgrx && i % 4 == 3))
+    }
+
     pub fn depth(self) -> bool {
-        !matches!(self, Kind::Colour | Kind::Floats)
+        matches!(self, Kind::D24S8 | Kind::D32S8 | Kind::D32 | Kind::D16)
     }
 
     pub fn stencil(self) -> bool {
@@ -155,6 +243,18 @@ impl Kind {
             }
             Kind::D32 => d32(s, x, alt).to_le_bytes().to_vec(),
             Kind::D16 => (d16(s, x, alt) as u16).to_le_bytes().to_vec(),
+            _ => {
+                let m = self.maxima().expect("a unorm family");
+                let [r, g, b, a] = self.channels(m, s, x, y, alt);
+                match self {
+                    Kind::Bgra | Kind::Bgrx => vec![b as u8, g as u8, r as u8, a as u8],
+                    Kind::B5G6R5 => ((b | g << 5 | r << 11) as u16).to_le_bytes().to_vec(),
+                    Kind::B5G5R5A1 => ((b | g << 5 | r << 10 | a << 15) as u16).to_le_bytes().to_vec(),
+                    Kind::B4G4R4A4 => ((b | g << 4 | r << 8 | a << 12) as u16).to_le_bytes().to_vec(),
+                    Kind::A8 => vec![a as u8],
+                    _ => (r | g << 10 | b << 20 | a << 30).to_le_bytes().to_vec(),
+                }
+            }
         }
     }
 

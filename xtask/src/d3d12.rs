@@ -319,8 +319,8 @@ fn hardware_smoke(stage: &std::path::Path, log: &std::path::Path) {
 }
 
 /// What verify says of the fixture's `samples` capture: each multisampled texture's contents written into every
-/// sample, the frame replayed, and its 7 pass ends (two slices of a colour, five other textures) read back sample by
-/// sample, each the game's bit for bit.
+/// sample, the frame replayed, and its pass ends (two slices of a colour, a slice of each other texture the device
+/// renders to) read back sample by sample, each the game's bit for bit.
 fn samples_verified(stage: &std::path::Path, log: &std::path::Path, capture: &str, on: &str) {
     let mut args = vec!["verify"];
     if on == "verify" {
@@ -328,9 +328,12 @@ fn samples_verified(stage: &std::path::Path, log: &std::path::Path, capture: &st
     }
     args.push(capture);
     let (ok, text) = cli(stage, log, &args);
+    let targets = crate::multisampled_targets(std::path::Path::new(capture));
     assert!(
-        ok && text.contains("7 of 7 targets identical") && !text.contains("multisampled"),
-        "samples: every multisampled target replays as the game's, every sample"
+        ok && targets >= 7
+            && text.contains(&format!("{targets} of {targets} targets identical"))
+            && !text.contains("multisampled"),
+        "samples: every multisampled target ({targets}) replays as the game's, every sample"
     );
     println!(
         "ok   D3D12 {on}: multisampled textures' samples written and read back bit for bit, depth and stencil too"
