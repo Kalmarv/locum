@@ -21,7 +21,6 @@ struct Content {
     key: String,
     subs: Vec<String>,
     source: &'static str,
-    note: Option<&'static str>,
 }
 
 /// An immutable resource's contents when its upload is stored: the upload's key and its subresources' keys.
@@ -141,20 +140,17 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             if tile_initialized.contains(&id) {
                 continue;
             }
-            let multisampled = tracked.get(&id).is_some_and(|t| t.dims.samples > 1);
             let c = match read.remove(&id) {
                 Some(r) => r.map(|(key, subs)| Content {
                     key,
                     subs,
                     source: "first-use",
-                    note: multisampled.then_some("multisampled: the copy is the resolve of its samples"),
                 }),
                 None => match upload_of(id) {
                     Some((key, subs)) => Ok(Content {
                         key,
                         subs,
                         source: "upload",
-                        note: None,
                     }),
                     None if tracked.contains_key(&id) => {
                         Err("not copied before the timeline first touched it".into())
@@ -444,7 +440,8 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             written: written.contains(&id),
             ..Default::default()
         };
-        let mut sub_hashes: Vec<Option<String>> = vec![None; subs.len()];
+        let mut sub_hashes: Vec<Option<String>> =
+            vec![None; locum_capture::layout::subresources(&subs).len()];
         if let Some(e) = &entry {
             row.created_frame = e.created_frame;
             row.created_stack = interner.id(&e.created_stack);
@@ -465,7 +462,6 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                 content_bytes += bytes;
                 row.content = Some(c.key);
                 row.content_source = Some(c.source);
-                row.content_note = c.note.map(String::from);
                 for (i, h) in c.subs.into_iter().enumerate() {
                     if let Some(slot) = sub_hashes.get_mut(i)
                         && !h.is_empty()
@@ -488,7 +484,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             }
             None => {}
         }
-        for (sub, hash) in subs.iter().zip(sub_hashes) {
+        for (sub, hash) in locum_capture::layout::subresources(&subs).iter().zip(sub_hashes) {
             if row.used || hash.is_some() {
                 capture.subresources.push(db::Subresource {
                     resource: id,

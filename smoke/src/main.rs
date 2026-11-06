@@ -20,6 +20,7 @@ mod live_capture;
 mod partial_lists;
 mod recorder_bench;
 mod replay_rows;
+mod samples;
 mod series;
 mod tiles;
 
@@ -231,6 +232,8 @@ fn run(checks: &mut Checks) -> Result<()> {
     replay_rows::row17(checks, &device, &immediate, &swapchain)?;
     replay_rows::row18(checks, &device, &immediate, &swapchain)?;
     replay_rows::row21(checks, &device, &immediate, &deferred, &swapchain)?;
+    samples::run(checks, &device, &immediate, &swapchain)?;
+    samples::conversions(checks, &device, &immediate)?;
     drop((swapchain, deferred));
     unsafe { DestroyWindow(hwnd) }?;
     Ok(())

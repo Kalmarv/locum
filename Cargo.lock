@@ -721,6 +721,7 @@ name = "locum-smoke"
 version = "0.1.4"
 dependencies = [
  "locum-capture",
+ "locum-d3d11",
  "rusqlite",
  "serde_json",
  "windows",

@@ -1,5 +1,6 @@
 //! Render and depth targets read back at the end of each pass, in the format the pass drew in (depth as the colour
-//! format of the same bits), into the blob store.
+//! format of the same bits), into the blob store. A multisampled target is read sample by sample
+//! ([`locum_d3d11::samples`]): its samples' images stacked top to bottom, `height` rows each.
 
 use core::ffi::c_void;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -18,6 +19,7 @@ pub struct Target {
     pub view: u64,
     pub resource: u64,
     pub width: u32,
+    /// The rows of all its samples' images: a multisampled target's are stacked, one image a sample.
     pub height: u32,
     /// The format it is read as: the view's, with depth and typeless formats as the readable format of the same bits.
     pub format: i32,
@@ -26,6 +28,8 @@ pub struct Target {
     /// Depth plane within a 3D mip; zero for 2D targets.
     pub z: u32,
     staging: Option<ID3D11Resource>,
+    /// The staging copy's subresources, one image each (a sample's, or the target's).
+    images: u32,
 }
 
 /// A target bound at a draw, kept with the draw so that it can be copied later, on another context.
@@ -227,7 +231,8 @@ unsafe fn copy_one(
         return None;
     };
     let (width, height) = ((d.Width >> mip).max(1), (d.Height >> mip).max(1));
-    let bytes = u64::from(width) * u64::from(height) * u64::from(bits) / 8;
+    let samples = d.SampleDesc.Count.max(1);
+    let bytes = u64::from(width) * u64::from(height) * u64::from(bits) / 8 * u64::from(samples);
     {
         let mut s = state();
         if s.target_bytes + bytes > s.request.max_target_bytes {
@@ -239,42 +244,33 @@ unsafe fn copy_one(
         s.target_bytes += bytes;
     }
 
-    let mut source: ID3D11Resource = resource.clone();
+    let source: ID3D11Resource = resource.clone();
     let sub = if bound.volume {
         mip
     } else {
         mip + slice * d.MipLevels
     };
-    let mut source_sub = sub;
-    if d.SampleDesc.Count > 1 {
-        if depth {
-            skip("multisampled depth");
-            return None;
-        }
-        // A multisampled target is resolved into a one-sample texture first.
-        let resolved = D3D11_TEXTURE2D_DESC {
-            Width: width,
-            Height: height,
-            MipLevels: 1,
-            ArraySize: 1,
-            Format: d.Format,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Usage: D3D11_USAGE_DEFAULT,
-            ..Default::default()
+    let (view, resource) = view_ids(view);
+    let made = |staging, images| Target {
+        target,
+        view,
+        resource,
+        width,
+        height: height * images,
+        format: format.0,
+        sub,
+        z: if bound.volume { slice } else { 0 },
+        staging: Some(staging),
+        images,
+    };
+    if samples > 1 {
+        return match unsafe { copy_samples(c, device, &source, &d, slice) } {
+            Ok(staging) => Some(made(staging, samples)),
+            Err(why) => {
+                skip(&why);
+                None
+            }
         };
-        let mut t = None;
-        if unsafe { device.CreateTexture2D(&resolved, None, Some(&mut t)) }.is_err() {
-            skip("could not make a texture to resolve into");
-            return None;
-        }
-        let t = t?;
-        unsafe {
-            unpredicated(c, || {
-                c.ResolveSubresource(&t, 0, &source, source_sub, view_format)
-            })
-        };
-        source = t.cast().expect("a texture is a resource");
-        source_sub = 0;
     }
     let staging_desc = D3D11_TEXTURE2D_DESC {
         Width: width,
@@ -330,23 +326,50 @@ unsafe fn copy_one(
                 0,
                 0,
                 &source,
-                source_sub,
+                sub,
                 bound.volume.then_some(&region as *const _),
             )
         })
     };
-    let (view, resource) = view_ids(view);
-    Some(Target {
-        target,
-        view,
-        resource,
-        width,
-        height,
-        format: format.0,
-        sub,
-        z: if bound.volume { slice } else { 0 },
-        staging: Some(staging),
-    })
+    Some(made(staging, 1))
+}
+
+/// Copies every sample of slice `slice` of multisampled `source` (described by `d`) into a new staging array, an
+/// image a sample.
+unsafe fn copy_samples(
+    c: &ID3D11DeviceContext4,
+    device: &ID3D11Device,
+    source: &ID3D11Resource,
+    d: &D3D11_TEXTURE2D_DESC,
+    slice: u32,
+) -> Result<ID3D11Resource, String> {
+    let texture: ID3D11Texture2D = source.cast().map_err(|e| e.to_string())?;
+    let images = unsafe { unpredicated(c, || locum_d3d11::samples::read(c, &texture)) }?;
+    let mut images_desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { images.GetDesc(&mut images_desc) };
+    let desc = D3D11_TEXTURE2D_DESC {
+        ArraySize: d.SampleDesc.Count,
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        ..images_desc
+    };
+    let mut staging = None;
+    unsafe { device.CreateTexture2D(&desc, None, Some(&mut staging)) }
+        .map_err(|e| format!("no staging array for the samples ({e})"))?;
+    let staging: ID3D11Resource = staging
+        .ok_or("no staging array")?
+        .cast()
+        .map_err(|e| e.to_string())?;
+    unsafe {
+        unpredicated(c, || {
+            for sample in 0..d.SampleDesc.Count {
+                let image = slice * d.SampleDesc.Count + sample;
+                c.CopySubresourceRegion(&staging, sample, 0, 0, 0, &images, image, None);
+            }
+        })
+    };
+    Ok(staging)
 }
 
 impl Target {
@@ -361,19 +384,21 @@ impl Target {
         let staging = self.staging.take()?;
         let bits = bits_per_pixel(DXGI_FORMAT(self.format)).expect("checked when copied");
         let row = (self.width * bits / 8) as usize;
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { immediate.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }.ok()?;
         let mut out = Vec::with_capacity(row * self.height as usize);
-        for y in 0..self.height as usize {
-            let line = unsafe {
-                core::slice::from_raw_parts(
-                    (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
-                    row,
-                )
-            };
-            out.extend_from_slice(line);
+        for image in 0..self.images {
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            unsafe { immediate.Map(&staging, image, D3D11_MAP_READ, 0, Some(&mut mapped)) }.ok()?;
+            for y in 0..(self.height / self.images) as usize {
+                let line = unsafe {
+                    core::slice::from_raw_parts(
+                        (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
+                        row,
+                    )
+                };
+                out.extend_from_slice(line);
+            }
+            unsafe { immediate.Unmap(&staging, image) };
         }
-        unsafe { immediate.Unmap(&staging, 0) };
         let key = locum_capture::hash::key(&out);
         let bytes = out.len() as u64;
         let blobs = &crate::settings::settings().blobs;

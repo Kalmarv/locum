@@ -137,7 +137,8 @@ struct Made {
     layout: Vec<Sub>,
     joined: Option<u32>,
     /// Where a copy of each D3D12 subresource (planes included) lies in a buffer, as the API gives it and as the
-    /// canonical layout reads it, and that buffer's size.
+    /// canonical layout reads it, and that buffer's size; for a multisampled texture, of each one-sample image its
+    /// samples are copied through.
     placed: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
     footprints: Vec<Footprint>,
     copy_bytes: u64,
@@ -2149,17 +2150,29 @@ impl Backend for D3d12 {
             },
             planes,
         };
+        // A multisampled texture's contents are copied through one-sample images of its samples (see
+        // `locum_capture::d3d12::samples`), whose footprints these are.
+        let copied = if samples > 1 {
+            locum_capture::d3d12::samples::images_desc(&desc)
+                .ok_or_else(|| format!("format {format}: its samples cannot be written or read"))?
+        } else {
+            desc
+        };
         let (placed, footprints, copy_bytes) = if buffer {
             (Vec::new(), Vec::new(), desc.Width)
         } else {
-            let count = extent.count() as usize;
+            let count = if samples > 1 {
+                u32::from(copied.DepthOrArraySize) as usize
+            } else {
+                extent.count() as usize
+            };
             let mut placed = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count];
             let mut rows = vec![0u32; count];
             let mut row_bytes = vec![0u64; count];
             let mut total = 0u64;
             unsafe {
                 self.device.GetCopyableFootprints(
-                    &desc,
+                    &copied,
                     0,
                     count as u32,
                     0,
@@ -2191,8 +2204,9 @@ impl Backend for D3d12 {
         } else {
             0
         };
-        let joined =
-            (planes == 2).then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes));
+        // Sample images hold both planes of a texel.
+        let joined = (planes == 2 && samples == 1)
+            .then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes));
         self.resources.insert(
             id,
             Made {
@@ -2211,10 +2225,13 @@ impl Backend for D3d12 {
             },
         );
         let subs = s.subs();
+        // Captures before samples were read (2026-11-06) hold a multisampled texture's resolve.
+        if samples > 1 && contents.is_some_and(|b| b.len() as u64 == layout::total(&s.resolved_subs())) {
+            self.warn(
+                "multisampled textures start empty (the capture holds their resolve, not their samples)",
+            );
+        }
         match contents.filter(|b| b.len() as u64 == layout::total(&subs)) {
-            Some(_) if samples > 1 => {
-                self.warn("multisampled textures start empty (their contents were read back resolved)");
-            }
             // In shared memory, written when replay reaches the submission they were copied at.
             Some(_) if self.memory.shared.contains(&id) && self.defer(c, id) => {}
             Some(bytes) => self.write(c, id, bytes)?,
@@ -2328,9 +2345,6 @@ impl Backend for D3d12 {
     fn read(&mut self, id: i64) -> Result<Vec<u8>, String> {
         self.first_use_now(id)?;
         let m = self.made(id)?;
-        if m.desc.SampleDesc.Count > 1 {
-            return Err(format!("#{id} is multisampled, which replay cannot read back"));
-        }
         if m.buffer() && m.heap.mapped() {
             let mut p = core::ptr::null_mut();
             let width = m.desc.Width as usize;
@@ -2344,6 +2358,16 @@ impl Backend for D3d12 {
             }
         }
         let (r, buffer, bytes, tracked) = (m.resource.clone(), m.buffer(), m.copy_bytes, m.tracked);
+        // A multisampled texture's samples are drawn into images first, copied from there; it lives until the
+        // flush below has run them.
+        let samples = if m.desc.SampleDesc.Count > 1 {
+            Some(
+                unsafe { locum_capture::d3d12::samples::Reader::new(&self.device, &m.desc, None) }
+                    .map_err(|e| format!("#{id}, its samples: {e}"))?,
+            )
+        } else {
+            None
+        };
         let (readback, p) = self.staging(D3D12_HEAP_TYPE_READBACK, bytes)?;
         let needs = [self.need_all(id, 0x800)];
         unsafe {
@@ -2353,6 +2377,13 @@ impl Backend for D3d12 {
                 if tracked {
                     self.barriers(&needs, false);
                 }
+                let source = match &samples {
+                    Some(reader) => {
+                        reader.record(&self.list, &r);
+                        reader.images().clone()
+                    }
+                    None => r.clone(),
+                };
                 let m = &self.resources[&id];
                 for (i, f) in m.placed.iter().enumerate() {
                     let dst = D3D12_TEXTURE_COPY_LOCATION {
@@ -2361,7 +2392,7 @@ impl Backend for D3d12 {
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *f },
                     };
                     let src = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: borrowed(&r),
+                        pResource: borrowed(&source),
                         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                             SubresourceIndex: i as u32,
@@ -2375,6 +2406,7 @@ impl Backend for D3d12 {
             }
         }
         self.flush()?;
+        drop(samples);
         let data = unsafe { core::slice::from_raw_parts(p.cast_const(), bytes as usize) };
         let m = &self.resources[&id];
         if buffer {
@@ -2452,6 +2484,16 @@ impl D3d12 {
             return self.map_write(id, 0, contents);
         }
         let (r, buffer, bytes, tracked) = (m.resource.clone(), m.buffer(), m.copy_bytes, m.tracked);
+        // A multisampled texture's samples are copied into images, drawn from there; it lives until the flush
+        // below has run them.
+        let samples = if m.desc.SampleDesc.Count > 1 {
+            Some(
+                unsafe { locum_capture::d3d12::samples::Writer::new(&self.device, &m.desc) }
+                    .map_err(|e| format!("#{id}, its samples: {e}"))?,
+            )
+        } else {
+            None
+        };
         let (upload, p) = self.staging(D3D12_HEAP_TYPE_UPLOAD, bytes)?;
         let staged = unsafe { core::slice::from_raw_parts_mut(p, bytes as usize) };
         let needs = [self.need_all(id, 0x400)];
@@ -2466,9 +2508,10 @@ impl D3d12 {
                 if tracked {
                     self.barriers(&needs, false);
                 }
+                let target = samples.as_ref().map_or_else(|| r.clone(), |w| w.images().clone());
                 for (i, f) in m.placed.iter().enumerate() {
                     let dst = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: borrowed(&r),
+                        pResource: borrowed(&target),
                         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                             SubresourceIndex: i as u32,
@@ -2481,11 +2524,16 @@ impl D3d12 {
                     };
                     self.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
                 }
+                if let Some(writer) = &samples {
+                    writer.record(&self.list, &r);
+                }
                 if tracked {
                     self.barriers(&needs, true);
                 }
             }
         }
-        self.flush()
+        let ran = self.flush();
+        drop(samples);
+        ran
     }
 }

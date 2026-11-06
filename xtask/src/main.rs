@@ -860,6 +860,23 @@ fn smoke(root: &Path, debug: bool, dlls: Option<&Path>) {
     for warp in [false, true] {
         rows_ok &= verified(&cli, &log_dir, "row18", warp, debug, "row18: bit-exact replay").0;
     }
+    // Multisampled textures: contents written into every sample, and 7 pass ends read back sample by sample.
+    for warp in [false, true] {
+        let (ok, text) = verified(
+            &cli,
+            &log_dir,
+            "samples",
+            warp,
+            debug,
+            "samples: multisampled targets bit-exact",
+        );
+        let every = text.contains("7 of 7 targets identical") && !text.contains("multisampled");
+        println!(
+            "{} samples: every sample of 7 multisampled targets replays as the game's, depth and stencil too",
+            if every { "ok  " } else { "FAIL" }
+        );
+        rows_ok &= ok && every;
+    }
     for warp in [false, true] {
         rows_ok &= verified(&cli, &log_dir, "row21", warp, debug, "row21: bit-exact replay").0;
         let mut command = Command::new(&cli);

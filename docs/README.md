@@ -66,7 +66,11 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
   contents shrink about threefold, block-compressed textures hardly at all. Stores written before compression keep
   their raw blobs in the table `blobs(key, pack, offset, size)`, and stores from before packs one file per blob,
   `<2 hex>/<32 hex>`; both are still read, and `store collect` rewrites them compressed. Contents are in a canonical
-  layout: subresources in order (mip within array slice), rows packed tightly, blocks for compressed formats.
+  layout: subresources in order (mip within array slice), rows packed tightly, blocks for compressed formats. A
+  multisampled texture's subresource is its samples' images one after another, in sample order, each laid out as one
+  sample's; its `subresources` row, a target read back from it, `export` and the viewer take them as one image of the
+  samples stacked top to bottom. Captures made before samples were read (0.1.4 and earlier) hold a multisampled
+  texture's resolve instead: replay starts such a texture empty, and says so.
 
   One store can serve every run of a game (`blobs DIR` or `LOCUM_BLOBS` naming the same folder): a run then adds only
   what the store lacks. The index lists the captures using the store (table `captures(path)`), each listed before its
@@ -247,6 +251,18 @@ A pass ends where the targets in effect change on the GPU's timeline: an `OMSetR
 targets, a command list whose first draw uses other targets than the draw before it, or the end of the frame. Its
 targets are read there, and the capture records the event they were read after (the pass's last draw, or a clear, copy
 or dispatch after it), which is where verify compares them.
+
+No copy reads or writes one sample of a multisampled texture, so draws do, bit for bit, on both APIs and in both
+directions (capture's reads, replay's writes and reads). Reading copies the texture into a twin of its format family's
+typeless format, and a pixel shader per sample loads each sample's raw bits through the family's UINT view into a
+one-sample image of its own (families with no UINT member, as R11G11B10_FLOAT, load the floats and store them as
+loaded). A depth-stencil's depth is loaded as a float and turned back into its 24 or 32 bits, its stencil as the
+integer it is. Writing draws the images back into a twin sample by sample (the pixel shader's coverage output picks the
+sample), a depth through SV_Depth with depth testing off, a stencil a bit at a time with that bit's write mask, and
+copies the twin into the texture. The smokes write and read every one of D24's 2^24 depths with a stencil each, on WARP
+and the GPU, and check each raw. On Direct3D 11 the draws are recorded on a deferred context and executed with the
+game's state restored; on Direct3D 12 a pass-end target is copied into its twin inside the game's list (a copy, which
+changes none of its state) and drawn out by a list of locum's submitted right after it.
 
 On Direct3D 12 the copy of a pass's targets waits for the next command in its list that names the target (binds,
 clears, moves, copies or resolves it), and is made then: until one does, nothing can change what the target holds.
@@ -787,9 +803,10 @@ COPY_SOURCE and back from the state locum tracks for it, from its creation and e
 `D3D12 states` line counts barriers whose before-state differed from the tracked one. A compute or copy queue's
 barriers cannot name every state (a compute list may not name PIXEL_SHADER_RESOURCE, and enhanced barriers may not
 name a subresource in a legacy state): such a resource is copied on a direct queue of locum's, after the work its
-queue was given so far, and the queue waits for that copy before the game's lists. Multisampled resources, and a
-submission on a queue waiting for a fence nothing has signalled yet, are recorded gaps; a resource only a stale
-descriptor names (destroyed before the submission) is noted as such.
+queue was given so far, and the queue waits for that copy before the game's lists. A multisampled texture is read
+sample by sample, as a Direct3D 11 one is, on a direct queue. A submission on a queue waiting for a
+fence nothing has signalled yet is a recorded gap; a resource only a stale descriptor names (destroyed before the
+submission) is noted as such.
 
 A reserved resource is copied like any other: on tiled resources tier 2 and up an unmapped tile reads zero, as a
 shader reads it (tier 1, where it reads undefined values, is a gap). locum follows every `UpdateTileMappings` and
@@ -811,8 +828,9 @@ state that allows no write is gone back to through COPY_DEST: straight from COPY
 an NVIDIA driver let the list's next barrier into DEPTH_WRITE and the draw after it overlap the copy (Elden Ring's
 split-plane depth-stencil, its stencil copied wrong from row 32 on). Its bytes
 are read after the list's first execution in the frame completes, into `targets` rows on the last draw that had the
-target bound. Lists recorded before the request, a list executed again in the frame, multisampled targets,
-attachments a render pass discards or suspends into another list, and copies past the 3 GiB readback budget are
+target bound. A multisampled target is read sample by sample, its samples stacked in the row. Lists recorded before
+the request, a list executed again in the frame, attachments a render pass discards or suspends into another list,
+and copies past the 3 GiB readback budget are
 `d3d12-targets` gaps. The budget is spent as the copies are recorded, in the order the game records its lists, not
 in pass order, so the passes past it are not only the frame's last; `passes` marks each pass whose targets were not
 read back after its draws, and says where they were (with the later pass a continued pass ends in) or why not.

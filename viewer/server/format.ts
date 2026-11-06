@@ -96,16 +96,21 @@ export interface Sub {
   size: number;
 }
 
+/**
+ * A texture's subresources in the canonical layout. A multisampled texture's (one mip) holds its samples' images one
+ * after another: each is given as one image of them stacked top to bottom, as its targets are read back.
+ */
 export function textureSubs(format: number, width: number, height: number, depth: number, mips: number,
-  array: number): Sub[] | null {
+  array: number, samples = 1): Sub[] | null {
   const l = layout(format);
   if (!l) return null;
   const out: Sub[] = [];
   let offset = 0;
   mips = Math.max(mips, 1);
+  const stacked = Math.max(samples, 1);
   for (let slice = 0; slice < Math.max(array, 1); slice++) {
     for (let mip = 0; mip < mips; mip++) {
-      const w = Math.max(width >> mip, 1), h = Math.max(height >> mip, 1), d = Math.max(depth >> mip, 1);
+      const w = Math.max(width >> mip, 1), h = Math.max(height >> mip, 1) * stacked, d = Math.max(depth >> mip, 1);
       const rowBytes = Math.ceil(w / l.blockWidth) * l.blockBytes, rows = Math.ceil(h / l.blockHeight);
       const size = rowBytes * rows * d;
       out.push({ index: mip + slice * mips, mip, slice, width: w, height: h, depth: d, rowBytes, rows, offset, size });

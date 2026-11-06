@@ -1,6 +1,6 @@
 //! Reading a resource back: a GPU copy into a staging resource on some context, mapped later on the immediate context
-//! and packed into the canonical layout (`locum_capture::layout`). Multisampled colour textures are resolved first;
-//! depth textures are copied through their typeless format.
+//! and packed into the canonical layout (`locum_capture::layout`). A multisampled texture's samples are drawn into
+//! one-sample images first ([`crate::samples`]); depth textures are copied through their typeless format.
 
 use locum_capture::format;
 use locum_capture::layout::{self, Sub};
@@ -12,7 +12,11 @@ use windows::core::Interface;
 #[derive(Clone)]
 pub struct Readback {
     staging: ID3D11Resource,
+    /// The contents' subresources in the canonical layout.
     pub subs: Vec<Sub>,
+    /// The staging resource's subresources, in the same order and of the same bytes: `subs`, but for a multisampled
+    /// texture's, whose samples are each an array slice of their own.
+    staged: Vec<Sub>,
     buffer: bool,
 }
 
@@ -47,6 +51,16 @@ pub fn subs(resource: &ID3D11Resource) -> Result<Vec<Sub>, String> {
         if let Ok(t) = resource.cast::<ID3D11Texture2D>() {
             let mut d = D3D11_TEXTURE2D_DESC::default();
             t.GetDesc(&mut d);
+            if d.SampleDesc.Count > 1 {
+                return layout::multisampled(
+                    d.Format.0 as u32,
+                    d.Width,
+                    d.Height,
+                    d.ArraySize,
+                    d.SampleDesc.Count,
+                )
+                .ok_or_else(|| no_layout(d.Format));
+            }
             return layout::texture(d.Format.0 as u32, d.Width, d.Height, 1, d.MipLevels, d.ArraySize)
                 .ok_or_else(|| no_layout(d.Format));
         }
@@ -154,6 +168,7 @@ pub unsafe fn issue_subresource(
     Ok(Readback {
         staging,
         subs: vec![sub],
+        staged: vec![sub],
         buffer: false,
     })
 }
@@ -209,6 +224,7 @@ pub unsafe fn issue_tiles(
     Ok(Readback {
         staging: buffer.cast().map_err(|e| e.to_string())?,
         subs: layout::buffer(bytes),
+        staged: layout::buffer(bytes),
         buffer: true,
     })
 }
@@ -232,38 +248,23 @@ unsafe fn issue_now(c: &ID3D11DeviceContext, resource: &ID3D11Resource) -> Resul
         unsafe { c.CopyResource(&s, resource) };
         return Ok(Readback {
             staging: s.cast().expect("a buffer is a resource"),
+            staged: subs.clone(),
             subs,
             buffer: true,
         });
     }
+    let mut staged = subs.clone();
     let staging: ID3D11Resource = if let Ok(t) = resource.cast::<ID3D11Texture2D>() {
         let mut d = D3D11_TEXTURE2D_DESC::default();
         unsafe { t.GetDesc(&mut d) };
         let mut source: ID3D11Resource = resource.clone();
         if d.SampleDesc.Count > 1 {
-            if format::is_depth(d.Format.0 as u32) {
-                return Err("multisampled depth cannot be resolved".into());
-            }
-            let typed = DXGI_FORMAT(format::readable(d.Format.0 as u32) as i32);
-            let resolved = D3D11_TEXTURE2D_DESC {
-                MipLevels: 1,
-                Format: typed,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-                Usage: D3D11_USAGE_DEFAULT,
-                BindFlags: 0,
-                CPUAccessFlags: 0,
-                MiscFlags: 0,
-                ..d
-            };
-            let mut r = None;
-            unsafe { device.CreateTexture2D(&resolved, None, Some(&mut r)) }
-                .map_err(|e| format!("texture to resolve into: {e}"))?;
-            let r = r.ok_or("no texture to resolve into")?;
-            for slice in 0..d.ArraySize {
-                unsafe { c.ResolveSubresource(&r, slice, resource, slice, typed) };
-            }
-            source = r.cast().expect("a texture is a resource");
-            d = resolved;
+            // Its samples, each a one-sample image: an array of the same bytes as the canonical layout.
+            let images = unsafe { crate::samples::read(c, &t) }?;
+            unsafe { images.GetDesc(&mut d) };
+            staged = layout::texture(d.Format.0 as u32, d.Width, d.Height, 1, 1, d.ArraySize)
+                .ok_or("the samples' images have no layout")?;
+            source = images.cast().expect("a texture is a resource");
         }
         let sd = D3D11_TEXTURE2D_DESC {
             Format: DXGI_FORMAT(copyable(d.Format.0 as u32) as i32),
@@ -321,6 +322,7 @@ unsafe fn issue_now(c: &ID3D11DeviceContext, resource: &ID3D11Resource) -> Resul
     Ok(Readback {
         staging,
         subs,
+        staged,
         buffer: false,
     })
 }
@@ -332,7 +334,7 @@ impl Readback {
     /// `immediate` must be the immediate context of the device that made the copy.
     pub unsafe fn read(&self, immediate: &ID3D11DeviceContext) -> Result<Vec<u8>, String> {
         let mut bytes = Vec::with_capacity(layout::total(&self.subs) as usize);
-        for sub in &self.subs {
+        for sub in &self.staged {
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             unsafe { immediate.Map(&self.staging, sub.index, D3D11_MAP_READ, 0, Some(&mut mapped)) }
                 .map_err(|e| format!("map of subresource {}: {e}", sub.index))?;

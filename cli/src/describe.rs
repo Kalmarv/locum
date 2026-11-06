@@ -66,8 +66,28 @@ impl Shape {
         self.misc & 4 != 0
     }
 
-    /// The subresources of its contents in the canonical layout (as locum laid them out).
+    /// The subresources of its contents in the canonical layout (as locum laid them out): a multisampled texture's
+    /// one image a sample.
     pub fn subs(&self) -> Vec<locum_capture::layout::Sub> {
+        if self.kind == "buffer" {
+            return locum_capture::layout::buffer(self.width);
+        }
+        if self.samples > 1 {
+            return locum_capture::layout::multisampled(
+                self.format,
+                self.width,
+                self.height,
+                self.array,
+                self.samples,
+            )
+            .unwrap_or_default();
+        }
+        self.resolved_subs()
+    }
+
+    /// The subresources of its contents with one sample: what captures before samples were read (2026-11-06) hold
+    /// of a multisampled texture, its resolve.
+    pub fn resolved_subs(&self) -> Vec<locum_capture::layout::Sub> {
         if self.kind == "buffer" {
             return locum_capture::layout::buffer(self.width);
         }

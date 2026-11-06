@@ -22,6 +22,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 windows = { workspace = true, features = [
     "Wdk_Graphics_Direct3D",
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
@@ -34,6 +35,9 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 texture2ddecoder = "0.1.2"
+
+[target.'cfg(windows)'.build-dependencies]
+windows = { workspace = true, features = ["Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc"] }
 
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"

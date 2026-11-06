@@ -159,6 +159,87 @@ pub fn typeless(format: u32) -> u32 {
     }
 }
 
+/// How a multisampled texture's samples are read out and written back exactly. No copy reads or writes one sample, so
+/// a shader does: it reads each sample through a view of a twin texture (a copy of the texture in its family's
+/// typeless format, with the bind flags the view needs) and writes it to a one-sample image of [`Samples::image`]'s
+/// format, whose texels are the canonical texels' bytes, or the other way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Samples {
+    /// Every bit, through the family's `uint` format of the same channels, `view` (also the images' format).
+    Bits { twin: u32, view: u32 },
+    /// Through `view` (the family's non-sRGB format, also the images'), as the floats it holds exactly: a family
+    /// with no `uint` member (B8G8R8A8, B5G6R5, R11G11B10 and the like).
+    Floats { twin: u32, view: u32 },
+    /// A depth-stencil family Direct3D renders as no colour (D24S8, D32S8X24): the depth through `depth` (24-bit
+    /// unorm, or 32-bit float where `!unorm`), the stencil through `stencil`, written back as depth and stencil.
+    DepthStencil {
+        twin: u32,
+        depth: u32,
+        stencil: u32,
+        unorm: bool,
+    },
+}
+
+impl Samples {
+    /// The typeless (or only) format of the twin the samples are read through and written into.
+    pub fn twin(self) -> u32 {
+        match self {
+            Samples::Bits { twin, .. }
+            | Samples::Floats { twin, .. }
+            | Samples::DepthStencil { twin, .. } => twin,
+        }
+    }
+
+    /// The format of the one-sample images that hold the samples, whose texels are the canonical texels: the view's,
+    /// or for depth-stencil `R32_UINT` (D24S8: depth in the low 24 bits, stencil in the top byte) or `R32G32_UINT`
+    /// (D32S8X24: the float depth's bits, then the stencil).
+    pub fn image(self) -> u32 {
+        match self {
+            Samples::Bits { view, .. } | Samples::Floats { view, .. } => view,
+            Samples::DepthStencil { unorm: true, .. } => 42,
+            Samples::DepthStencil { unorm: false, .. } => 17,
+        }
+    }
+}
+
+/// How the samples of a multisampled texture of `format` are read and written exactly, or None for a format no
+/// multisampled texture has (block-compressed, video).
+pub fn samples(format: u32) -> Option<Samples> {
+    let bits = |twin, view| Some(Samples::Bits { twin, view });
+    let floats = |twin, view| Some(Samples::Floats { twin, view });
+    match typeless(format) {
+        1 => bits(1, 3),
+        5 => bits(5, 7),
+        9 => bits(9, 12),
+        15 => bits(15, 17),
+        19 => Some(Samples::DepthStencil {
+            twin: 19,
+            depth: 21,
+            stencil: 22,
+            unorm: false,
+        }),
+        23 => bits(23, 25),
+        27 => bits(27, 30),
+        33 => bits(33, 36),
+        // D32_FLOAT too: its bits are a 32-bit uint's.
+        39 => bits(39, 42),
+        44 => Some(Samples::DepthStencil {
+            twin: 44,
+            depth: 46,
+            stencil: 47,
+            unorm: true,
+        }),
+        48 => bits(48, 50),
+        // D16_UNORM too.
+        53 => bits(53, 57),
+        60 => bits(60, 62),
+        90 => floats(90, 87),
+        92 => floats(92, 88),
+        f @ (26 | 65 | 85 | 86 | 89 | 115) => floats(f, f),
+        _ => None,
+    }
+}
+
 /// The format's name without the `DXGI_FORMAT_` prefix.
 pub fn name(format: u32) -> &'static str {
     NAMES
@@ -326,6 +407,22 @@ mod tests {
             assert_eq!(name(f), n);
         }
         assert_eq!(by_name("dxgi_format_bc7_unorm"), Some(98));
+    }
+
+    #[test]
+    fn sample_images_hold_the_canonical_texels() {
+        for &(f, n) in NAMES {
+            let Some(s) = samples(f) else { continue };
+            // The images' texels are as wide as the format's, and the twin is of its family.
+            assert_eq!(layout(s.image()), layout(f), "{n}");
+            assert_eq!(typeless(s.twin()), typeless(f), "{n}");
+        }
+        assert_eq!(samples(29), Some(Samples::Bits { twin: 27, view: 30 }));
+        assert_eq!(samples(91), Some(Samples::Floats { twin: 90, view: 87 }));
+        assert_eq!(samples(40), Some(Samples::Bits { twin: 39, view: 42 }));
+        assert_eq!(samples(45).map(Samples::image), Some(42));
+        assert_eq!(samples(20).map(Samples::image), Some(17));
+        assert_eq!(samples(71), None);
     }
 
     #[test]

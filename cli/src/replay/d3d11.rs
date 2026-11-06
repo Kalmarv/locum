@@ -991,11 +991,14 @@ impl Backend for D3d11 {
             }
         }
         let subs = s.subs();
-        let contents = contents.filter(|b| b.len() as u64 == layout::total(&subs));
         let msaa = s.samples > 1;
-        if msaa && contents.is_some() {
-            self.warn("multisampled textures start empty (their contents were read back resolved)");
+        // Captures before samples were read (2026-11-06) hold a multisampled texture's resolve.
+        if msaa && contents.is_some_and(|b| b.len() as u64 == layout::total(&s.resolved_subs())) {
+            self.warn(
+                "multisampled textures start empty (the capture holds their resolve, not their samples)",
+            );
         }
+        let contents = contents.filter(|b| b.len() as u64 == layout::total(&subs));
         let init: Vec<D3D11_SUBRESOURCE_DATA> = match contents {
             Some(bytes) if !msaa => subs
                 .iter()
@@ -1084,6 +1087,9 @@ impl Backend for D3d11 {
             Err(e) => return Err(e.to_string()),
         };
         self.resources.insert(id, made);
+        if let Some(bytes) = contents.filter(|_| msaa) {
+            self.write(c, id, bytes)?;
+        }
         Ok(())
     }
 
@@ -1382,6 +1388,13 @@ impl Backend for D3d11 {
             ));
         }
         let r = self.resource(id)?.clone();
+        if s.samples > 1 {
+            // Drawn sample by sample: no copy writes one.
+            let texture: ID3D11Texture2D = r.cast().map_err(|e| e.to_string())?;
+            let ctx: ID3D11DeviceContext = self.ctx.cast().map_err(|e| e.to_string())?;
+            return unsafe { locum_d3d11::samples::write(&ctx, &texture, contents) }
+                .map_err(|e| format!("#{id}: {e}"));
+        }
         for x in &subs {
             unsafe {
                 self.ctx.UpdateSubresource(

@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 locum-capture = { path = "../capture" }
+locum-d3d11 = { path = "../d3d11" }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde_json = "1"
 windows = { workspace = true, features = [

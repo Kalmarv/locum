@@ -1,6 +1,7 @@
 //! First-use contents: resources in every kind of state an armed frame first finds them in, copied on the GPU before
 //! the frame's first use and checked byte for byte, under the debug layer, which validates locum's own transitions.
-//! A render target the frame clears again must keep its previous colour in the capture; a multisampled one is a gap.
+//! A render target the frame clears again must keep its previous colour in the capture, a multisampled one in every
+//! sample.
 use super::*;
 
 const RGBA8: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -365,6 +366,7 @@ pub(super) unsafe fn capture(
             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         );
         list.ClearRenderTargetView(rtv_b, &[1.0, 0.0, 0.0, 1.0], None);
+        list.ClearRenderTargetView(rtv_f, &[0.0, 1.0, 1.0, 1.0], None);
         list.ClearDepthStencilView(
             dsv,
             D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL,
@@ -604,19 +606,17 @@ pub(super) unsafe fn capture(
             h_data.concat(),
             "H: copied from its layout"
         );
-        let (_, content, _, note) = resource("samples=4");
+        let f_bytes = contents("samples=4");
         assert!(
-            content.is_none() && note.as_deref().is_some_and(|n| n.starts_with("multisampled")),
-            "{note:?}"
+            f_bytes.len() == 8 * 8 * 4 * 4 && f_bytes.chunks(4).all(|t| t == [0, 255, 255, 255]),
+            "F: each of its 4 samples the colour before the frame's clear ({} bytes)",
+            f_bytes.len()
         );
         for (sql, n) in [
-            (
-                "SELECT count(*) FROM gaps WHERE what='contents' AND detail LIKE 'multisampled%'",
-                1,
-            ),
+            ("SELECT count(*) FROM gaps WHERE what='contents'", 0),
             (
                 "SELECT count(*) FROM resources WHERE content_source='first-use'",
-                7,
+                8,
             ),
             // Each resource once, at the first submission of the frame that used it.
             ("SELECT count(DISTINCT submission) FROM d12_first_use", 1),

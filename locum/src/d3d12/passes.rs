@@ -11,6 +11,11 @@
 //! is in RENDER_TARGET or DEPTH_WRITE (the layouts of those names for resources made in a layout), or what this
 //! list's own barriers left it in. Predication is suspended around the copies.
 //!
+//! A multisampled target's copy there is into a twin of locum's (see [`locum_capture::d3d12::samples`]): every
+//! sample is then drawn out of the twin into one-sample images, bit for bit, and those copied into the readback
+//! memory, on a list of locum's submitted right after the application's list, where its first execution while armed
+//! (the one the capture reads) is.
+//!
 //! The readback memory lives as long as the GPU may run the list: until the list is reset or destroyed and a fence
 //! locum signals after its last execution has completed.
 //!
@@ -45,6 +50,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use locum_capture::d3d12 as model;
+use locum_capture::d3d12::samples::Reader;
 use locum_capture::layout::Sub;
 use serde_json::Value;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -82,6 +88,9 @@ struct Readback {
     layout: Vec<Sub>,
     joined: Option<u32>,
     bytes: u64,
+    /// A multisampled target's passes: the copy into its twin is made where the pass ends, the draws of its samples
+    /// and their copy into the readback memory on a list of locum's after ([`Readback::finish`]).
+    samples: Option<Reader>,
 }
 // Free-threaded D3D12 objects.
 unsafe impl Send for Readback {}
@@ -94,6 +103,36 @@ impl Drop for Readback {
 }
 
 impl Readback {
+    /// Records on `list` (a direct list of locum's, run after the one that copied a multisampled target into its
+    /// twin) the draws of its samples and their copy into the readback memory. Nothing for a target of one sample.
+    ///
+    /// # Safety
+    /// This lives until the GPU has run `list`.
+    unsafe fn finish(&self, list: &ID3D12GraphicsCommandList) {
+        let Some(reader) = &self.samples else {
+            return;
+        };
+        unsafe {
+            reader.draw(list);
+            for (image, (f, _, _)) in self.footprints.iter().enumerate() {
+                let dst = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: borrowed(&self.readback),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *f },
+                };
+                let src = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: borrowed(reader.images()),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                        SubresourceIndex: image as u32,
+                    },
+                };
+                list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+            }
+            reader.restore(list);
+        }
+    }
+
     /// The target's bytes in canonical layout, once the GPU has made the copy.
     unsafe fn read(&self) -> Result<Vec<u8>, String> {
         let mut p = core::ptr::null_mut();
@@ -337,6 +376,31 @@ pub unsafe fn ends(s: &mut Submitted, lists: &[Executed]) -> Vec<u64> {
         }
         let mut list: Option<ID3D12GraphicsCommandList> = None;
         let mut reads = Vec::new();
+        // The multisampled targets the list copied into their twins, whose samples are drawn out after it.
+        let mut finished = Vec::new();
+        let multisampled: Vec<(u64, Arc<Readback>)> = {
+            let c = copies();
+            e.list
+                .checkpoints
+                .iter()
+                .filter_map(|k| c.get(&k.id).map(|copy| (k.id, copy.data.clone())))
+                .filter(|(_, data)| data.samples.is_some())
+                .collect()
+        };
+        for (id, data) in multisampled {
+            // The readback memory is made on the real device the list's are.
+            let mut device: Option<ID3D12Device> = None;
+            let device = unsafe { data.readback.GetDevice(&mut device) }
+                .map_err(|e| format!("the device: {e}"))
+                .and_then(|()| device.ok_or_else(|| "no device".to_string()));
+            match device.and_then(|d| unsafe { s.recorder(&d, &mut list) }) {
+                Ok(l) => {
+                    unsafe { data.finish(l) };
+                    finished.push(id);
+                }
+                Err(why) => s.unread(id, why),
+            }
+        }
         for (id, end) in ends {
             let key = (end.target.resource, end.target.subs[0]);
             // The first later list that draws to the target or writes it otherwise.
@@ -353,8 +417,11 @@ pub unsafe fn ends(s: &mut Submitted, lists: &[Executed]) -> Vec<u64> {
                 continued.push(id);
                 continue;
             }
-            let recorded = unsafe { s.recorder(&end.device, &mut list) }
-                .and_then(|l| unsafe { copy_into(&end.device, l, &end.target, &end.states, None) });
+            let recorded = unsafe { s.recorder(&end.device, &mut list) }.and_then(|l| unsafe {
+                let readback = copy_into(&end.device, l, &end.target, &end.states, None)?;
+                readback.finish(l);
+                Ok(readback)
+            });
             match recorded {
                 Ok(readback) => reads.push((id, Arc::new(readback))),
                 Err(why) => s.gaps.push((id, why)),
@@ -364,22 +431,33 @@ pub unsafe fn ends(s: &mut Submitted, lists: &[Executed]) -> Vec<u64> {
             continue;
         };
         match unsafe { list.Close() } {
-            Ok(()) if !reads.is_empty() => {
+            Ok(()) if !reads.is_empty() || !finished.is_empty() => {
                 s.inserted.push((e.at, list));
                 s.reads.extend(reads);
             }
             Ok(()) => {}
-            Err(why) => s.gaps.extend(
-                reads
-                    .into_iter()
-                    .map(|(id, _)| (id, format!("copy list Close: {why}"))),
-            ),
+            Err(why) => {
+                s.gaps.extend(
+                    reads
+                        .into_iter()
+                        .map(|(id, _)| (id, format!("copy list Close: {why}"))),
+                );
+                for id in finished {
+                    s.unread(id, format!("copy list Close: {why}"));
+                }
+            }
         }
     }
     continued
 }
 
 impl Submitted {
+    /// The copy `id` the capture reads from this submission cannot be read, for `why`.
+    fn unread(&mut self, id: u64, why: String) {
+        self.read.retain(|r| *r != id);
+        self.gaps.push((id, why));
+    }
+
     /// A new direct list of locum's for copies after one application list, on the submission's own allocator.
     unsafe fn recorder<'a>(
         &mut self,
@@ -566,6 +644,8 @@ struct Bound {
     format: u32,
     width: u32,
     height: u32,
+    /// Samples a texel: a multisampled target is captured as its samples' images stacked top to bottom.
+    samples: u32,
     depth: bool,
     /// The planes the view only reads: a depth view's READ_ONLY_DEPTH and READ_ONLY_STENCIL flags.
     read_only: [bool; 2],
@@ -1474,15 +1554,24 @@ unsafe fn copy_into(
         return Err("discarded where its render pass ended: undefined".into());
     }
     let desc = unsafe { t.real.GetDesc() };
-    if desc.SampleDesc.Count > 1 {
-        return Err("multisampled target: copying samples out is not supported yet".into());
-    }
     let format = desc.Format.0 as u32;
-    let joined =
-        (t.subs.len() == 2).then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes));
-    let layout = locum_capture::layout::texture(format, t.width, t.height, 1, 1, 1)
+    let count = desc.SampleDesc.Count;
+    // A multisampled target's samples are drawn into one-sample images, one subresource each, read whole: its slice
+    // is the view's (it has one mip).
+    let samples = if count > 1 {
+        Some(unsafe { Reader::new(device, &desc, Some(t.subs[0])) }?)
+    } else {
+        None
+    };
+    let joined = (samples.is_none() && t.subs.len() == 2)
+        .then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes));
+    let layout = locum_capture::layout::multisampled(format, t.width, t.height, 1, count)
         .ok_or_else(|| format!("format {format} has no canonical layout"))?;
     let volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let (copied, copied_subs) = match &samples {
+        Some(reader) => (reader.images_desc(), (0..count).collect()),
+        None => (desc, t.subs.clone()),
+    };
     let subs: Vec<(u32, Access)> = t.subs.iter().copied().zip(states.iter().copied()).collect();
     // A target made for simultaneous access is drawn to in COMMON.
     let common = if t.depth {
@@ -1497,11 +1586,11 @@ unsafe fn copy_into(
     to_copy.possible(list)?;
     let mut footprints = Vec::new();
     let mut bytes = 0u64;
-    for &sub in &t.subs {
+    for &sub in &copied_subs {
         let (mut f, mut rows, mut row_bytes) = (D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), 0u32, 0u64);
         unsafe {
             device.GetCopyableFootprints(
-                &desc,
+                &copied,
                 sub,
                 1,
                 bytes,
@@ -1526,7 +1615,10 @@ unsafe fn copy_into(
             list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
         }
         to_copy.issue(list);
-        for (&sub, (f, _, _)) in t.subs.iter().zip(&footprints) {
+        if let Some(reader) = &samples {
+            reader.copy(list, &t.real);
+        }
+        for (&sub, (f, _, _)) in t.subs.iter().zip(&footprints).filter(|_| samples.is_none()) {
             let dst = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: borrowed(&readback),
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
@@ -1560,6 +1652,7 @@ unsafe fn copy_into(
         layout,
         joined,
         bytes,
+        samples,
     })
 }
 
@@ -1719,6 +1812,7 @@ unsafe fn output_into(
         layout,
         joined: None,
         bytes,
+        samples: None,
     })
 }
 
@@ -1787,6 +1881,7 @@ unsafe fn ranges_into(
         layout: locum_capture::layout::buffer(bytes as u32),
         joined: None,
         bytes,
+        samples: None,
     })
 }
 
@@ -1799,7 +1894,7 @@ fn checkpoint(t: &Bound, at: usize, gap: Option<&str>) -> model::Checkpoint {
         resource: t.resource,
         view: t.view,
         width: t.width,
-        height: t.height,
+        height: t.height * t.samples,
         format: t.format,
         sub: t.subs[0],
         z: t.z,
@@ -1889,6 +1984,7 @@ fn bound(view: &Value, target: String) -> Option<Bound> {
         format,
         width: ((desc.Width >> mip) as u32).max(1),
         height: (desc.Height >> mip).max(1),
+        samples: desc.SampleDesc.Count.max(1),
         depth,
         read_only: [flags & 1 != 0, flags & 2 != 0],
         discard: false,

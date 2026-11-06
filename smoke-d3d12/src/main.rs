@@ -18,6 +18,8 @@ mod planes;
 mod queries;
 mod reserved;
 mod results;
+mod sample_values;
+mod samples;
 
 fn identity<T: Interface, U: Interface>(a: &T, b: &U) {
     assert_eq!(
@@ -188,6 +190,8 @@ unsafe fn hardware() {
         if let Err(why) = indirect::rays(&device, &queue, &fence, &chain, 50) {
             println!("indirect-rays SKIPPED: {why}");
         }
+        samples::capture(&device, &queue, &fence, &chain, 54);
+        samples::conversions(&device, &queue, &fence, 56);
         drop(chain);
         DestroyWindow(hwnd).unwrap();
     }
@@ -559,6 +563,8 @@ unsafe fn run() {
         if let Err(why) = indirect::rays(&device, &queue, &fence, &chain, 57) {
             println!("indirect-rays SKIPPED: {why}");
         }
+        samples::capture(&device, &queue, &fence, &chain, 61);
+        samples::conversions(&device, &queue, &fence, 63);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

@@ -1,7 +1,8 @@
 //! The canonical byte layout of a resource's contents, the one blobs and hashes use: every subresource in
 //! subresource order (`mip + slice * mips`), each as tightly packed rows of blocks with no padding, depth slices one
 //! after another. Row pitches of mapped memory or initial data are removed, so the same texels always give the same
-//! bytes, whatever the driver's pitch.
+//! bytes, whatever the driver's pitch. A multisampled texture's subresource is one image a sample, sample by sample:
+//! the layout has a [`Sub`] for each sample of each array slice.
 
 use crate::format;
 
@@ -12,6 +13,8 @@ pub struct Sub {
     pub index: u32,
     pub mip: u32,
     pub slice: u32,
+    /// Which of a multisampled subresource's samples this is (0 for a texture of one sample).
+    pub sample: u32,
     pub width: u32,
     pub height: u32,
     pub depth: u32,
@@ -48,6 +51,7 @@ pub fn texture(format: u32, width: u32, height: u32, depth: u32, mips: u32, arra
                 index: mip + slice * mips,
                 mip,
                 slice,
+                sample: 0,
                 width: w,
                 height: h,
                 depth: d,
@@ -62,12 +66,61 @@ pub fn texture(format: u32, width: u32, height: u32, depth: u32, mips: u32, arra
     Some(out)
 }
 
+/// A multisampled 2D texture's subresources (it has one mip): each array slice's `samples` images in sample order,
+/// or None for a format without a one-plane block layout. With one sample, as [`texture`].
+pub fn multisampled(format: u32, width: u32, height: u32, array: u32, samples: u32) -> Option<Vec<Sub>> {
+    let images = texture(format, width, height, 1, 1, array.max(1) * samples.max(1))?;
+    Some(
+        images
+            .into_iter()
+            .map(|image| Sub {
+                index: image.slice / samples.max(1),
+                slice: image.slice / samples.max(1),
+                sample: image.slice % samples.max(1),
+                ..image
+            })
+            .collect(),
+    )
+}
+
+/// Subresource `index` of `subs` with all its samples, as one image of them stacked top to bottom (what a
+/// multisampled target is captured as); for a texture of one sample, the subresource.
+pub fn stacked(subs: &[Sub], index: u32) -> Option<Sub> {
+    let mut of = subs.iter().filter(|s| s.index == index);
+    let first = *of.next()?;
+    let samples = 1 + of.count() as u32;
+    Some(Sub {
+        height: first.height * samples,
+        rows: first.rows * samples,
+        size: first.size * u64::from(samples),
+        ..first
+    })
+}
+
+/// One entry a subresource of `subs`, in order: its samples [`stacked`] (the subresources a capture's rows and hashes
+/// name); for a texture of one sample, `subs`.
+pub fn subresources(subs: &[Sub]) -> Vec<Sub> {
+    let mut out: Vec<Sub> = Vec::new();
+    for s in subs {
+        match out.last_mut() {
+            Some(last) if last.index == s.index => {
+                last.height += s.height;
+                last.rows += s.rows;
+                last.size += s.size;
+            }
+            _ => out.push(*s),
+        }
+    }
+    out
+}
+
 /// A buffer as one subresource of `bytes` bytes.
 pub fn buffer(bytes: u32) -> Vec<Sub> {
     vec![Sub {
         index: 0,
         mip: 0,
         slice: 0,
+        sample: 0,
         width: bytes,
         height: 1,
         depth: 1,
@@ -309,6 +362,33 @@ mod tests {
         let mut back = vec![0u8; 1024];
         into_footprints(&layout, Some(4), &planes, &out, &mut back).unwrap();
         assert_eq!(back, data);
+    }
+
+    #[test]
+    fn a_multisampled_slice_is_one_image_a_sample() {
+        // 2x1 RGBA8, 2 slices of 4 samples: slice 0's samples 0-3, then slice 1's, 8 bytes each.
+        let subs = multisampled(28, 2, 1, 2, 4).unwrap();
+        assert_eq!(
+            subs.iter()
+                .map(|s| (s.index, s.slice, s.sample, s.offset, s.size))
+                .collect::<Vec<_>>(),
+            (0..8u32)
+                .map(|i| (i / 4, i / 4, i % 4, u64::from(i) * 8, 8))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(total(&subs), 64);
+        assert_eq!(multisampled(28, 2, 1, 2, 1), texture(28, 2, 1, 1, 1, 2));
+        // Slice 1's samples as one image four rows high, from the second half.
+        let s = stacked(&subs, 1).unwrap();
+        assert_eq!((s.offset, s.size, s.height, s.rows, s.slice), (32, 32, 4, 4, 1));
+        assert_eq!(
+            stacked(&texture(28, 2, 1, 1, 1, 2).unwrap(), 1),
+            texture(28, 2, 1, 1, 1, 2).unwrap().get(1).copied()
+        );
+        // A row and a hash a subresource: each slice's samples stacked.
+        assert_eq!(subresources(&subs), [stacked(&subs, 0).unwrap(), s]);
+        let mips = texture(28, 4, 2, 1, 3, 2).unwrap();
+        assert_eq!(subresources(&mips), mips);
     }
 
     #[test]

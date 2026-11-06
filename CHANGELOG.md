@@ -32,6 +32,18 @@
   are: the shader tables they name are among its reads, so a plan makes them, and a table nothing else in the frame
   names is copied after it. Before, its records were a `d3d12-indirect-arguments` gap. Replay does not run
   DispatchRays yet, and verify says so.
+- Multisampled textures are captured sample by sample, bit for bit, depth and stencil included: their contents and
+  their pass-end targets on both APIs. Before, Direct3D 11 captured their resolve, and Direct3D 12 none of them (a
+  gap). Draws read the samples, since no copy can: a twin of the texture's typeless family, and a pixel shader per
+  sample loading its raw bits (a depth as a float turned back into its 24 or 32 bits) into a one-sample image.
+- Replay writes every sample of a multisampled texture's contents the same way (a draw a sample, depth through
+  SV_Depth, stencil a bit at a time), and reads its targets back sample by sample, so verify compares them. Before,
+  they started empty, and Direct3D 12 replay could not read them back. A capture from 0.1.4 or earlier holds their
+  resolve: replay starts them empty and says so.
+- A multisampled texture's subresource is its samples' images in sample order. Its `subresources` row, a target read
+  from it, `export` (PNG, DDS or raw), the viewer and `pixel --draws` (which shows each sample) take them as one image
+  of the samples stacked top to bottom; a whole multisampled texture exports to DDS with each slice's samples as array
+  slices.
 
 ## 0.1.4 (2026-11-06)
 

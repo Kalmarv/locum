@@ -324,8 +324,8 @@ fn sub_of<'a>(
     bytes: &'a [u8],
     sub: Option<u32>,
 ) -> Option<(&'a [u8], locum_capture::layout::Sub)> {
-    let subs = s.subs();
-    let x = *subs.iter().find(|x| Some(x.index) == sub.or(Some(0)))?;
+    // A multisampled subresource is its samples stacked, as its targets are captured.
+    let x = locum_capture::layout::stacked(&s.subs(), sub.unwrap_or(0))?;
     Some((bytes.get(x.offset as usize..(x.offset + x.size) as usize)?, x))
 }
 

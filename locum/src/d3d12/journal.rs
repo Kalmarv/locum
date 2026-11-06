@@ -696,8 +696,6 @@ fn first_uses(
             Some(why.to_string())
         } else if let Some(why) = reserved.then(|| super::tiles::unreadable(resource)).flatten() {
             Some(why)
-        } else if n("sample_count") > 1 {
-            Some("multisampled: copying samples out is not supported yet".to_string())
         } else if layout.is_none() {
             Some(format!("format {format} has no canonical layout"))
         } else if texture && !simultaneous && !states.tracked(resource) {
@@ -723,10 +721,18 @@ fn first_uses(
             1
         };
         let layout = layout.expect("checked");
+        // A multisampled texture's layout has an image a sample; its samples are drawn out joined (see
+        // `locum_capture::d3d12::samples`).
+        let samples = n("sample_count").max(1);
         snapshots.push(super::readback::Snapshot {
             resource,
-            subresources: if texture { layout.len() as u32 * planes } else { 1 },
-            joined: (planes == 2).then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes)),
+            subresources: if texture {
+                layout.len() as u32 / samples * planes
+            } else {
+                1
+            },
+            joined: (planes == 2 && samples == 1)
+                .then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes)),
             states,
             layout,
         });

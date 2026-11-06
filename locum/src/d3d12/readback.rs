@@ -85,8 +85,10 @@ enum Item {
         snapshot: Snapshot,
         resource: super::Real<ID3D12Resource>,
         /// Per D3D12 subresource: its footprint (offset relative to the item), rows and row bytes; empty for a
-        /// buffer.
+        /// buffer. A multisampled texture's are its samples' images'.
         footprints: Vec<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)>,
+        /// A multisampled texture's passes, which draw its samples into images to copy.
+        samples: Option<locum_capture::d3d12::samples::Reader>,
     },
 }
 
@@ -197,11 +199,13 @@ pub unsafe fn submit(
     }
 }
 
-/// Whether a snapshot's states can be transitioned only on a direct queue, not on a queue of `kind`: a compute list
-/// may not name PIXEL_SHADER_RESOURCE, nor a copy list any read state but COPY_SOURCE.
+/// Whether a snapshot can be made only on a direct queue, not on a queue of `kind`: a multisampled texture's samples
+/// are drawn out, and its states, or any snapshot's, may be ones only a direct list can transition (a compute list
+/// may not name PIXEL_SHADER_RESOURCE, nor a copy list any read state but COPY_SOURCE).
 fn needs_direct(snapshot: &Snapshot, kind: D3D12_COMMAND_LIST_TYPE) -> bool {
+    let drawn = snapshot.layout.iter().any(|s| s.sample > 0);
     kind != D3D12_COMMAND_LIST_TYPE_DIRECT
-        && snapshot.states.iter().any(|s| unreadable(*s, kind).is_some())
+        && (drawn || snapshot.states.iter().any(|s| unreadable(*s, kind).is_some()))
         && snapshot
             .states
             .iter()
@@ -476,11 +480,34 @@ unsafe fn contents(
                 snapshot,
                 resource,
                 footprints: Vec::new(),
+                samples: None,
             },
             desc.Width,
         ));
     }
-    let n = snapshot.subresources as usize;
+    // A multisampled texture is copied as its samples' images.
+    let (samples, desc) = if desc.SampleDesc.Count > 1 {
+        if kind != D3D12_COMMAND_LIST_TYPE_DIRECT {
+            return Err((
+                snapshot,
+                "multisampled: its samples are drawn out, on a direct queue only".into(),
+            ));
+        }
+        match unsafe { locum_capture::d3d12::samples::Reader::new(device, &desc, None) } {
+            Ok(reader) => {
+                let images = reader.images_desc();
+                (Some(reader), images)
+            }
+            Err(why) => return Err((snapshot, format!("multisampled: {why}"))),
+        }
+    } else {
+        (None, desc)
+    };
+    let n = if samples.is_some() {
+        u32::from(desc.DepthOrArraySize) as usize
+    } else {
+        snapshot.subresources as usize
+    };
     let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); n];
     let mut rows = vec![0u32; n];
     let mut row_bytes = vec![0u64; n];
@@ -513,6 +540,7 @@ unsafe fn contents(
                 .zip(row_bytes)
                 .map(|((f, r), b)| (f, r, b))
                 .collect(),
+            samples,
         },
         total,
     ))
@@ -712,8 +740,19 @@ unsafe fn record(
                 list.CopyBufferRegion(&readback, p.at, &**resource, 0, p.bytes)
             },
             Item::Contents {
-                resource, footprints, ..
+                resource,
+                footprints,
+                samples,
+                ..
             } => {
+                // A multisampled texture's samples are drawn into images, which are copied instead.
+                let source: &ID3D12Resource = match samples {
+                    Some(reader) => {
+                        unsafe { reader.record(&list, resource) };
+                        reader.images()
+                    }
+                    None => resource,
+                };
                 for (i, (f, _, _)) in footprints.iter().enumerate() {
                     let mut f = *f;
                     f.Offset += p.at;
@@ -723,7 +762,7 @@ unsafe fn record(
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
                     };
                     let src = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: borrowed(resource),
+                        pResource: borrowed(source),
                         Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
                         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                             SubresourceIndex: i as u32,
@@ -820,8 +859,7 @@ fn collect(pending: Pending) -> Batch {
                 let content =
                     unsafe { canonical(&snapshot.layout, snapshot.joined, &footprints, data, p.bytes) }.map(
                         |bytes| {
-                            let subs = snapshot
-                                .layout
+                            let subs = locum_capture::layout::subresources(&snapshot.layout)
                                 .iter()
                                 .map(|s| {
                                     locum_capture::hash::key(

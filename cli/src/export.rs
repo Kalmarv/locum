@@ -238,12 +238,16 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
     if s.kind == "buffer" && kind != Kind::Raw {
         return Err("a buffer exports as raw bytes (give a file name without .dds or .png)".into());
     }
+    // A multisampled texture's subresource is its samples' images stacked top to bottom, as its targets are read.
     let pick = || -> Result<locum_capture::layout::Sub, String> {
         let index = which.sub.unwrap_or(which.mip + which.slice * s.mips.max(1));
-        subs.iter()
-            .find(|x| x.index == index)
-            .copied()
-            .ok_or_else(|| format!("{s} has no subresource {index}"))
+        locum_capture::layout::stacked(&subs, index).ok_or_else(|| format!("{s} has no subresource {index}"))
+    };
+    let samples = s.samples.max(1);
+    let stacked = if samples > 1 {
+        format!(", its {samples} samples stacked top to bottom")
+    } else {
+        String::new()
     };
     let readable = format::readable(s.format);
     match kind {
@@ -274,9 +278,18 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
                 let texel = format::texel(s.format)
                     .map(|t| format!("; {t}"))
                     .unwrap_or_default();
+                // One subresource of a multisampled texture is its samples' images; all of it, every slice's.
+                let part = which.sub.is_some() || which.mip > 0 || which.slice > 0;
+                let samples = if part {
+                    stacked.clone()
+                } else if samples > 1 {
+                    format!(", each slice's {samples} samples one image after another")
+                } else {
+                    String::new()
+                };
                 told!(
                     out_path,
-                    "{}: {len} bytes ({key}) of {s}, rows tightly packed{texel}",
+                    "{}: {len} bytes ({key}) of {s}, rows tightly packed{texel}{samples}",
                     out_path.display()
                 );
             }
@@ -297,7 +310,8 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
                         height: s.height,
                         depth: s.depth,
                         mips: s.mips,
-                        array: s.array,
+                        // A slice an image a sample: DDS has no samples.
+                        array: s.array * samples,
                         cube: s.cube(),
                     },
                     &bytes,
@@ -319,7 +333,14 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
                 )
             };
             write(out_path, &file)?;
-            if whole {
+            if whole && samples > 1 {
+                told!(
+                    out_path,
+                    "{}: {s} as {}, each slice's {samples} samples as array slices in sample order",
+                    out_path.display(),
+                    format::name(readable)
+                );
+            } else if whole {
                 told!(
                     out_path,
                     "{}: {s} as {}",
@@ -330,7 +351,7 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
                 let sub = pick()?;
                 told!(
                     out_path,
-                    "{}: #{id} mip {} slice {} {}x{} as {}",
+                    "{}: #{id} mip {} slice {} {}x{} as {}{stacked}",
                     out_path.display(),
                     sub.mip,
                     sub.slice,
@@ -354,7 +375,7 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
             png(out_path, image.width, image.height, &picture.rgba8(&image))?;
             told!(
                 out_path,
-                "{}: #{id} mip {} slice {}{} {}x{} {} ({note})",
+                "{}: #{id} mip {} slice {}{} {}x{} {}{stacked} ({note})",
                 out_path.display(),
                 sub.mip,
                 sub.slice,

@@ -34,8 +34,7 @@ pub unsafe fn issue(c: &ID3D11DeviceContext4, resource: &ID3D11Resource) -> Resu
 /// `immediate` must be the immediate context of the device that made the copy.
 pub unsafe fn read(immediate: &ID3D11DeviceContext4, rb: &Readback) -> Read {
     let bytes = unsafe { rb.read(immediate) }?;
-    let hashes = rb
-        .subs
+    let hashes = locum_capture::layout::subresources(&rb.subs)
         .iter()
         .map(|s| key(&bytes[s.offset as usize..(s.offset + s.size) as usize]))
         .collect();

@@ -722,7 +722,7 @@ export class Capture {
       createdStackFrames: this.stack(r.created_stack),
       updatedStackFrames: this.stack(r.updated_stack),
       subresources: subs.length ? subs : (r.kind === "buffer" ? [] : (textureSubs(r.format, shape.width, shape.height,
-        shape.depth, shape.mips, shape.array) ?? []).map(s => ({ resource: id, sub: s.index, mip: s.mip, slice: s.slice,
+        shape.depth, shape.mips, shape.array, shape.samples) ?? []).map(s => ({ resource: id, sub: s.index, mip: s.mip, slice: s.slice,
         width: s.width, height: s.height, depth: s.depth, row_bytes: s.rowBytes, rows: s.rows, offset: s.offset,
         size: s.size, hash: null }))),
       views, events, bindings, targets,
@@ -768,7 +768,7 @@ export class Capture {
     if (!key) return src.kind === "upload" ? "no stored upload" : "contents not captured";
     const s = shapeOf(r);
     if (s.kind === "buffer") return "a buffer has no texels";
-    const subs = textureSubs(s.format, s.width, s.height, s.depth, s.mips, s.array);
+    const subs = textureSubs(s.format, s.width, s.height, s.depth, s.mips, s.array, s.samples);
     const sub: Sub | undefined = subs?.[src.sub];
     if (!sub) return `no subresource ${src.sub}`;
     const sliceBytes = sub.rowBytes * sub.rows;

@@ -56,11 +56,14 @@ pub struct Dims {
 }
 
 impl Dims {
-    /// The subresources of its contents in the canonical layout (a multisampled texture's as resolved), or None
-    /// for a format without one.
+    /// The subresources of its contents in the canonical layout (a multisampled texture's one image a sample), or
+    /// None for a format without one.
     pub fn subs(&self) -> Option<Vec<Sub>> {
         if self.kind == "buffer" {
             return Some(layout::buffer(self.width));
+        }
+        if self.samples > 1 {
+            return layout::multisampled(self.format, self.width, self.height, self.array, self.samples);
         }
         layout::texture(
             self.format,
@@ -200,6 +203,17 @@ pub struct Entry {
     pub update_count: u64,
 }
 
+impl Entry {
+    /// Subresource `sub` in the canonical layout: a multisampled texture's is its samples' images, stacked.
+    fn sub(&self, sub: u32) -> Option<Sub> {
+        if self.dims.samples > 1 {
+            layout::stacked(&self.subs, sub)
+        } else {
+            self.subs.get(sub as usize).copied()
+        }
+    }
+}
+
 static ENTRIES: Mutex<Option<HashMap<u64, Entry>>> = Mutex::new(None);
 
 fn entries() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Entry>>> {
@@ -216,7 +230,7 @@ pub fn entry(id: u64) -> Option<Entry> {
 pub fn sub_of(id: u64, sub: u32) -> Option<(&'static str, Option<Sub>)> {
     let entries = entries();
     let e = entries.as_ref()?.get(&id)?;
-    Some((e.dims.kind, e.subs.get(sub as usize).copied()))
+    Some((e.dims.kind, e.sub(sub)))
 }
 
 /// Every live resource's number.
@@ -273,7 +287,7 @@ unsafe fn register(
         ..Default::default()
     };
     if let Some(subs) = dims.subs() {
-        entry.sub_hashes = vec![None; subs.len()];
+        entry.sub_hashes = vec![None; layout::subresources(&subs).len()];
         if !initial.is_null() && settings().uploads != Uploads::Off {
             let (bytes, hashes) = unsafe { pack_initial(&dims, &subs, initial) };
             hashed = bytes.len() as u64;
@@ -423,7 +437,7 @@ unsafe fn update_entry(
             }
             return (None, 0);
         }
-        let Some(&whole) = e.subs.get(sub as usize) else {
+        let Some(whole) = e.sub(sub) else {
             return (None, 0);
         };
         (e.dims.kind, e.dims.format, whole, per_frame)

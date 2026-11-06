@@ -11,6 +11,7 @@ use crate::db;
 mod bindings;
 mod graphics;
 pub mod indirect;
+pub mod samples;
 
 pub use bindings::reproject;
 
@@ -682,7 +683,7 @@ impl Prepared {
                     .get(&resource.id)
                     .and_then(|d| layout(d))
                     .unwrap_or_default();
-                for (i, sub) in subs.into_iter().enumerate() {
+                for (i, sub) in crate::layout::subresources(&subs).into_iter().enumerate() {
                     subresources.push(db::Subresource {
                         resource: resource.id,
                         sub,
@@ -1794,13 +1795,17 @@ fn extent(d: &Value) -> (u32, u32) {
 }
 
 /// A resource's subresources in the canonical layout (see [`crate::layout`]), from its description. D3D12's planar
-/// depth-stencil formats are laid out as the Direct3D 11 format of the same name, one texel holding both planes.
+/// depth-stencil formats are laid out as the Direct3D 11 format of the same name, one texel holding both planes; a
+/// multisampled texture's slices as an image a sample ([`crate::layout::multisampled`]).
 pub fn layout(d: &Value) -> Option<Vec<crate::layout::Sub>> {
     let n = |key: &str| d[key].as_u64().unwrap_or(0) as u32;
     if d["dimension"] == 1 {
         return Some(crate::layout::buffer(n("width")));
     }
     let (depth, array) = extent(d);
+    if n("sample_count") > 1 {
+        return crate::layout::multisampled(n("format"), n("width"), n("height"), array, n("sample_count"));
+    }
     crate::layout::texture(n("format"), n("width"), n("height"), depth, n("mips"), array)
 }
 

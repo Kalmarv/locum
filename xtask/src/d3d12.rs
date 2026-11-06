@@ -315,6 +315,65 @@ fn hardware_smoke(stage: &std::path::Path, log: &std::path::Path) {
     println!("ok   D3D12 hardware: ExecuteIndirect with GPU addresses in its records replays as the game's");
     let said = String::from_utf8_lossy(&result.stdout);
     rays_verified(stage, log, &capture("indirect-rays"), &said, "hardware");
+    samples_verified(stage, log, &capture("samples"), "hardware");
+}
+
+/// What verify says of the fixture's `samples` capture: each multisampled texture's contents written into every
+/// sample, the frame replayed, and its 7 pass ends (two slices of a colour, five other textures) read back sample by
+/// sample, each the game's bit for bit.
+fn samples_verified(stage: &std::path::Path, log: &std::path::Path, capture: &str, on: &str) {
+    let mut args = vec!["verify"];
+    if on == "verify" {
+        args.push("--warp");
+    }
+    args.push(capture);
+    let (ok, text) = cli(stage, log, &args);
+    assert!(
+        ok && text.contains("7 of 7 targets identical") && !text.contains("multisampled"),
+        "samples: every multisampled target replays as the game's, every sample"
+    );
+    println!(
+        "ok   D3D12 {on}: multisampled textures' samples written and read back bit for bit, depth and stencil too"
+    );
+    if on != "verify" {
+        return;
+    }
+    let id = |format: u32| -> String {
+        let query = format!("SELECT id FROM resources WHERE samples = 4 AND format = {format}");
+        let (ok, text) = cli(stage, log, &["sql", capture, &query]);
+        assert!(ok, "locum-cli sql {query}");
+        text.lines().nth(1).unwrap_or_default().trim().to_string()
+    };
+    // The D24S8's texel (0, 0) where its pass ended: each sample's depth and stencil, sample 3 as the frame redrew it.
+    let (ok, text) = cli(stage, log, &["pixel", capture, &format!("#{}", id(44)), "0", "0"]);
+    assert!(
+        ok && text.contains("4 samples")
+            && text.contains("sample 0: depth 0 stencil 0")
+            && text.contains("sample 2: depth 1 stencil 255")
+            && text.contains("stencil 60"),
+        "samples: pixel shows each sample of a multisampled depth-stencil"
+    );
+    // The colour's second slice: its 4 samples' 8x4 images of 4 bytes a texel.
+    let out = log.join("samples-colour-slice1.raw");
+    let (ok, text) = cli(
+        stage,
+        log,
+        &[
+            "export",
+            capture,
+            &id(27),
+            "-o",
+            &out.display().to_string(),
+            "--sub",
+            "1",
+        ],
+    );
+    let bytes = std::fs::metadata(&out).map_or(0, |m| m.len());
+    assert!(
+        ok && bytes == 512 && text.contains("its 4 samples stacked"),
+        "samples: export --sub of a multisampled texture gives that subresource's samples ({bytes} bytes)"
+    );
+    println!("ok   D3D12 {on}: pixel and export take a multisampled texture's samples");
 }
 
 /// What verify says of the fixture's `indirect-rays` capture, made where the device has raytracing tier 1.1 (`said`:
@@ -406,6 +465,7 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
         "planes",
         "queries",
         "indirect",
+        "samples",
     ];
     let sql = |name: &str, query: &str| -> String {
         let (ok, text) = run(&["sql", &capture(name), query]);
@@ -502,6 +562,7 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
     );
     let said = std::fs::read_to_string(stage.join("stdout.txt")).expect("the WARP smoke's output");
     rays_verified(stage, &log, &capture("indirect-rays"), &said, "verify");
+    samples_verified(stage, &log, &capture("samples"), "verify");
     // Under the debug layer, with a pass under GPU-based validation of its own: the dispatches write a texture made
     // for simultaneous access as a UAV, which that validation takes for an error the spec does not make it.
     if debug {

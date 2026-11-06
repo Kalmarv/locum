@@ -79,7 +79,9 @@ enum Entry {
 /// A `targets` row: draw, pass, target, width, height, format, blob.
 type Readback = (i64, Option<i64>, String, u32, u32, u32, Option<String>);
 
-fn history(c: &Capture, s: &Subject) -> Result<(String, Vec<Entry>), String> {
+/// A subject's readbacks and missing pass ends, with how many samples a texel has: a multisampled target's
+/// readback is its samples' images stacked top to bottom.
+fn history(c: &Capture, s: &Subject) -> Result<(String, Vec<Entry>, u32), String> {
     let rows: Vec<Readback> = c.rows(
         "SELECT t.draw, d.pass, t.target, t.width, t.height, t.format, t.blob FROM targets t \
          LEFT JOIN draws d ON d.n = t.draw WHERE t.resource = ?1 AND t.sub = ?2 AND t.z = ?3 ORDER BY t.event",
@@ -92,7 +94,18 @@ fn history(c: &Capture, s: &Subject) -> Result<(String, Vec<Entry>), String> {
             s.resource, s.sub
         ));
     };
-    let title = format!("#{} sub {} ({w}x{h} {})", s.resource, s.sub, format::name(f));
+    let samples = crate::describe::shape(c, s.resource).map_or(1, |shape| shape.samples.max(1));
+    let title = if samples > 1 {
+        format!(
+            "#{} sub {} ({w}x{} {}, {samples} samples)",
+            s.resource,
+            s.sub,
+            h / samples,
+            format::name(f)
+        )
+    } else {
+        format!("#{} sub {} ({w}x{h} {})", s.resource, s.sub, format::name(f))
+    };
     let mut entries: Vec<Entry> = rows
         .into_iter()
         .map(|(draw, pass, target, w, h, f, blob)| Entry::Read {
@@ -123,7 +136,16 @@ fn history(c: &Capture, s: &Subject) -> Result<(String, Vec<Entry>), String> {
         };
         entries.sort_by_key(draw);
     }
-    Ok((title, entries))
+    Ok((title, entries, samples))
+}
+
+/// Texel (x, y) of each of `samples` images stacked in `image`: its channels, and its stencil for a depth-stencil
+/// format.
+fn values(image: &Image, x: u32, y: u32, samples: u32) -> Option<Vec<(Vec<f32>, Option<u8>)>> {
+    let height = image.height / samples;
+    (y < height)
+        .then(|| (0..samples).map(|k| value(image, x, y + k * height)).collect())
+        .flatten()
 }
 
 /// Texel (x, y): its channels, and its stencil for a depth-stencil format.
@@ -149,13 +171,13 @@ pub fn pixel(
     changed_only: bool,
 ) -> Result<(), String> {
     let s = subject(c, arg, sub)?;
-    let (title, entries) = history(c, &s)?;
+    let (title, entries, samples) = history(c, &s)?;
     out!(
         "{title}, texel ({x}, {y}): {} readbacks and missing pass ends",
         entries.len()
     );
     out!("{:>5} {:>6} {:<6} value", "pass", "draw", "target");
-    let mut last: Option<Vec<u32>> = None;
+    let mut last: Option<Texel> = None;
     for e in &entries {
         match e {
             Entry::Read {
@@ -167,15 +189,20 @@ pub fn pixel(
             } => {
                 let pass = pass.map_or("-".into(), |p| p.to_string());
                 let v = match image {
-                    Ok(image) => {
-                        value(image, x, y).ok_or_else(|| format!("outside its {}x{}", size.0, size.1))
-                    }
+                    Ok(image) => values(image, x, y, samples)
+                        .ok_or_else(|| format!("outside its {}x{}", size.0, size.1 / samples)),
                     Err(e) => Err(e.clone()),
                 };
                 let (shown, note) = match &v {
-                    Ok((v, stencil)) => {
-                        let mut now = bits(v);
-                        now.extend(stencil.map(u32::from));
+                    Ok(texel) => {
+                        let now: Texel = texel
+                            .iter()
+                            .map(|(v, stencil)| {
+                                let mut w = bits(v);
+                                w.extend(stencil.map(u32::from));
+                                w
+                            })
+                            .collect();
                         let note = match &last {
                             None => "first readback",
                             Some(l) if *l != now => "changed",
@@ -186,14 +213,23 @@ pub fn pixel(
                         if changed_only && !changed {
                             continue;
                         }
-                        let values = v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(" ");
-                        (
+                        let one = |(v, stencil): &(Vec<f32>, Option<u8>)| {
+                            let values = v.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(" ");
                             match stencil {
                                 Some(s) => format!("depth {values} stencil {s}"),
                                 None => values,
-                            },
-                            note,
-                        )
+                            }
+                        };
+                        let shown = match texel.as_slice() {
+                            [only] => one(only),
+                            _ => texel
+                                .iter()
+                                .enumerate()
+                                .map(|(k, t)| format!("sample {k}: {}", one(t)))
+                                .collect::<Vec<_>>()
+                                .join("; "),
+                        };
+                        (shown, note)
                     }
                     Err(why) => (format!("({why})"), ""),
                 };
@@ -210,7 +246,7 @@ pub fn pixel(
 /// For each readback of a target, how many texels (in `rect`, or all) differ from the readback before, and where.
 pub fn changes(c: &Capture, arg: &str, sub: Option<u32>, rect: Option<[u32; 4]>) -> Result<(), String> {
     let s = subject(c, arg, sub)?;
-    let (title, entries) = history(c, &s)?;
+    let (title, entries, samples) = history(c, &s)?;
     let region = rect.map_or("all texels".into(), |[x0, y0, x1, y1]| {
         format!("texels {x0},{y0} to {x1},{y1}")
     });
@@ -240,8 +276,10 @@ pub fn changes(c: &Capture, arg: &str, sub: Option<u32>, rect: Option<[u32; 4]>)
                         continue;
                     }
                 };
-                let [x0, y0, x1, y1] = rect.unwrap_or([0, 0, image.width, image.height]);
-                let (x1, y1) = (x1.min(image.width), y1.min(image.height));
+                // A texel of a multisampled target changed where any of its samples did.
+                let height = image.height / samples;
+                let [x0, y0, x1, y1] = rect.unwrap_or([0, 0, image.width, height]);
+                let (x1, y1) = (x1.min(image.width), y1.min(height));
                 let Some(before) = last
                     .as_ref()
                     .filter(|b| b.width == image.width && b.height == image.height)
@@ -253,12 +291,15 @@ pub fn changes(c: &Capture, arg: &str, sub: Option<u32>, rect: Option<[u32; 4]>)
                 let (mut n, mut bounds) = (0u64, [u32::MAX, u32::MAX, 0, 0]);
                 for y in y0..y1 {
                     for x in x0..x1 {
-                        let i = (y * image.width + x) as usize;
-                        let differs = image.texels[i]
-                            .iter()
-                            .zip(&before.texels[i])
-                            .any(|(a, b)| a.to_bits() != b.to_bits())
-                            || image.stencil.as_ref().map(|s| s[i]) != before.stencil.as_ref().map(|s| s[i]);
+                        let differs = (0..samples).any(|k| {
+                            let i = ((y + k * height) * image.width + x) as usize;
+                            image.texels[i]
+                                .iter()
+                                .zip(&before.texels[i])
+                                .any(|(a, b)| a.to_bits() != b.to_bits())
+                                || image.stencil.as_ref().map(|s| s[i])
+                                    != before.stencil.as_ref().map(|s| s[i])
+                        });
                         if differs {
                             n += 1;
                             bounds = [
@@ -285,6 +326,9 @@ pub fn changes(c: &Capture, arg: &str, sub: Option<u32>, rect: Option<[u32; 4]>)
     }
     Ok(())
 }
+
+/// A texel's channels' bits (and its stencil for a depth-stencil format), one a sample.
+type Texel = Vec<Vec<u32>>;
 
 /// Texel (x, y) of the target a readback holds (`DRAW:TARGET`) after each event of the frame that wrote it up to the
 /// readback, by replaying them: which draws inside a pass wrote it, where the readbacks show only each pass's end.
@@ -334,23 +378,30 @@ pub fn within(c: &Capture, arg: &str, x: u32, y: u32, sub: Option<u32>, warp: bo
             place.width, place.height
         ));
     }
+    // A multisampled texture's samples follow one another in its subresource, each an image `place` is the first of.
+    let samples = shape.samples.max(1);
     let at = (place.offset
         + u64::try_from(s.z).unwrap_or(0) * place.slice_bytes()
         + u64::from(y) * u64::from(place.row_bytes)
         + u64::from(x) * u64::from(block)) as usize;
-    // A texel as its channels' bits, and its stencil for a depth-stencil format.
-    let texel = |bytes: &[u8]| -> Result<Vec<u32>, String> {
-        let one = bytes
-            .get(at..at + block as usize)
-            .ok_or_else(|| format!("{} bytes, the texel at {at}", bytes.len()))?;
-        let image = texels::decode(shape.format, 1, 1, one)?;
-        let (v, stencil) = value(&image, 0, 0).ok_or("no texel")?;
-        let mut words = bits(&v);
-        words.extend(stencil.map(u32::from));
-        Ok(words)
+    // A texel as its channels' bits, and its stencil for a depth-stencil format: one a sample.
+    let texel = |bytes: &[u8]| -> Result<Texel, String> {
+        (0..samples)
+            .map(|k| {
+                let at = at + (u64::from(k) * place.size) as usize;
+                let one = bytes
+                    .get(at..at + block as usize)
+                    .ok_or_else(|| format!("{} bytes, the texel at {at}", bytes.len()))?;
+                let image = texels::decode(shape.format, 1, 1, one)?;
+                let (v, stencil) = value(&image, 0, 0).ok_or("no texel")?;
+                let mut words = bits(&v);
+                words.extend(stencil.map(u32::from));
+                Ok(words)
+            })
+            .collect()
     };
     let stencil = matches!(shape.format, 19 | 20 | 44 | 45);
-    let shown = |words: &[u32]| -> String {
+    let one = |words: &[u32]| -> String {
         let (v, s) = match words.split_last() {
             Some((s, v)) if stencil => (v, Some(s)),
             _ => (words, None),
@@ -365,6 +416,17 @@ pub fn within(c: &Capture, arg: &str, x: u32, y: u32, sub: Option<u32>, warp: bo
             None => values,
         }
     };
+    let shown = |texel: &[Vec<u32>]| -> String {
+        match texel {
+            [words] => one(words),
+            _ => texel
+                .iter()
+                .enumerate()
+                .map(|(k, words)| format!("sample {k}: {}", one(words)))
+                .collect::<Vec<_>>()
+                .join("; "),
+        }
+    };
     let writers: std::collections::HashSet<i64> = c
         .rows(
             "SELECT event FROM event_resources WHERE resource = ?1 AND access = 'write' AND event <= ?2",
@@ -373,7 +435,7 @@ pub fn within(c: &Capture, arg: &str, x: u32, y: u32, sub: Option<u32>, warp: bo
         )
         .into_iter()
         .collect();
-    let first: Option<Vec<u32>> = c
+    let first: Option<Texel> = c
         .row("SELECT content FROM resources WHERE id = ?1", [s.resource], |r| {
             r.get::<_, Option<String>>(0)
         })
@@ -381,7 +443,7 @@ pub fn within(c: &Capture, arg: &str, x: u32, y: u32, sub: Option<u32>, warp: bo
         .and_then(|k| c.blob(&k).ok())
         .and_then(|b| texel(&b).ok());
     let plan = crate::replay::plan_before(c, s.resource, event + 1);
-    let mut after: Vec<(i64, Result<Vec<u32>, String>)> = Vec::new();
+    let mut after: Vec<(i64, Result<Texel, String>)> = Vec::new();
     let warnings = crate::replay::run(
         c,
         &plan,
@@ -433,12 +495,17 @@ pub fn within(c: &Capture, arg: &str, x: u32, y: u32, sub: Option<u32>, warp: bo
         "({changes} of the {} writes changed it; the rest left it as it was)",
         after.len()
     );
+    // A multisampled target is read back as its samples' images stacked top to bottom.
     let recorded = readback.and_then(|k| c.blob(&k).ok()).and_then(|bytes| {
-        let image = texels::decode(shape.format, place.width, place.height, &bytes).ok()?;
-        let (v, st) = value(&image, x, y)?;
-        let mut w = bits(&v);
-        w.extend(st.map(u32::from));
-        Some(w)
+        let image = texels::decode(shape.format, place.width, place.height * samples, &bytes).ok()?;
+        (0..samples)
+            .map(|k| {
+                let (v, st) = value(&image, x, y + k * place.height)?;
+                let mut w = bits(&v);
+                w.extend(st.map(u32::from));
+                Some(w)
+            })
+            .collect::<Option<Vec<_>>>()
     });
     match (recorded, &last) {
         (Some(r), Some(l)) if r == *l => out!("the replayed texel is the readback's"),

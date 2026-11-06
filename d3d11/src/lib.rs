@@ -2,4 +2,5 @@
 
 pub mod predication;
 pub mod readback;
+pub mod samples;
 pub mod tiles;
