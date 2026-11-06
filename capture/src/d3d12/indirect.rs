@@ -48,7 +48,9 @@ fn argument(a: &Value) -> Result<(usize, Option<Address>), String> {
         8 => (8, at(Kind::UnorderedAccess)),
         10 => (12, None), // DISPATCH_MESH
         9 => return Err("a DispatchRays argument, whose records locum does not read".into()),
-        11 => return Err("an incrementing constant, whose place in a record locum does not know".into()),
+        // INCREMENTING_CONSTANT: the runtime sets the root constant to each command's index; it has no bytes in a
+        // record.
+        11 => (0, None),
         t => return Err(format!("argument type {t}, which locum does not know")),
     })
 }
@@ -167,11 +169,17 @@ mod tests {
         assert_eq!(layout(&draws).unwrap().addresses, Vec::new());
         assert_eq!(root_parameters(&draws), Vec::<u32>::new());
         assert!(layout(&json!({"stride": 8, "arguments": [{"type": 6}, {"type": 0}]})).is_err());
-        // An incrementing constant's records are not read, but the parameter it sets is known.
-        let incrementing =
-            json!({"stride": 64, "arguments": [{"type": 11, "root_parameter": 4}, {"type": 0}]});
-        assert!(layout(&incrementing).is_err());
-        assert_eq!(root_parameters(&incrementing), vec![4]);
+        // An incrementing constant takes no bytes of a record, and sets its root parameter.
+        let incrementing = json!({"stride": 24, "arguments": [{"type": 11, "root_parameter": 4, "offset": 1},
+            {"type": 6, "root_parameter": 0}, {"type": 0}]});
+        assert_eq!(
+            layout(&incrementing).unwrap(),
+            Layout {
+                stride: 24,
+                addresses: vec![at(0, Kind::ConstantBuffer)]
+            }
+        );
+        assert_eq!(root_parameters(&incrementing), vec![0, 4]);
     }
 
     #[test]

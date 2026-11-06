@@ -1030,13 +1030,18 @@ impl D3d12 {
                                             },
                                         }
                                     }
-                                    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT
-                                    | D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT => {
+                                    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT => D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                                        Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                                            RootParameterIndex: root,
+                                            DestOffsetIn32BitValues: n("offset"),
+                                            Num32BitValuesToSet: n("count"),
+                                        },
+                                    },
+                                    D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT => {
                                         D3D12_INDIRECT_ARGUMENT_DESC_0 {
-                                            Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                                            IncrementingConstant: D3D12_INDIRECT_ARGUMENT_DESC_0_5 {
                                                 RootParameterIndex: root,
                                                 DestOffsetIn32BitValues: n("offset"),
-                                                Num32BitValuesToSet: n("count"),
                                             },
                                         }
                                     }
@@ -1082,7 +1087,33 @@ impl D3d12 {
                         match unsafe { self.device.CreateCommandSignature(&desc, root.as_ref(), &mut s) } {
                             Ok(()) => s,
                             Err(e) => {
-                                self.warn(format!("command signature #{id} could not be made: {e}"));
+                                let tier = if args
+                                    .iter()
+                                    .any(|a| a.Type == D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT)
+                                {
+                                    let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS21::default();
+                                    let known = unsafe {
+                                        self.device.CheckFeatureSupport(
+                                            D3D12_FEATURE_D3D12_OPTIONS21,
+                                            (&mut o as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS21).cast(),
+                                            size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS21>() as u32,
+                                        )
+                                    }
+                                    .is_ok();
+                                    match known {
+                                        true if o.ExecuteIndirectTier.0 < D3D12_EXECUTE_INDIRECT_TIER_1_1.0 => format!(
+                                            " (it has an incrementing constant, which needs ExecuteIndirect tier 1.1;                                              the replay device's is {}.{})",
+                                            o.ExecuteIndirectTier.0 / 10,
+                                            o.ExecuteIndirectTier.0 % 10
+                                        ),
+                                        true => String::new(),
+                                        false => " (it has an incrementing constant, which needs ExecuteIndirect tier                                                    1.1; the replay device's runtime knows no tiers)"
+                                            .into(),
+                                    }
+                                } else {
+                                    String::new()
+                                };
+                                self.warn(format!("command signature #{id} could not be made: {e}{tier}"));
                                 None
                             }
                         }

@@ -345,8 +345,8 @@ fn targets(stage: &std::path::Path, log: &std::path::Path, capture: &str) -> usi
         .unwrap_or_else(|| panic!("{capture}: a count of targets: {text}"))
 }
 
-/// What verify must say of the fixture's `indirect` capture (`targets` of them, 4 or, with mesh dispatches, 5): each
-/// target the game's, the copier's two outputs and what the root UAVs in records wrote the game's, nothing missing.
+/// What verify must say of the fixture's `indirect` capture (`targets` of them: 4, and one each for the incrementing
+/// constant and the mesh dispatches where the device has them): each target the game's, the copier's two outputs and what the root UAVs in records wrote the game's, nothing missing.
 fn indirect_verified(ok: bool, text: &str, targets: usize) {
     assert!(targets >= 4, "indirect: {targets} targets read back");
     assert!(
@@ -373,13 +373,7 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
             .to_string()
     };
     let run = |args: &[&str]| cli(stage, &log, args);
-    let sql = |name: &str, query: &str| -> String {
-        let (ok, text) = run(&["sql", &capture(name), query]);
-        assert!(ok, "locum-cli sql {query}");
-        text.lines().nth(1).unwrap_or_default().trim().to_string()
-    };
-    // Every capture replays without an event, argument or descriptor kind it skips.
-    for name in [
+    let replayed = [
         "journal",
         "graphics",
         "modern",
@@ -392,7 +386,14 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
         "planes",
         "queries",
         "indirect",
-    ] {
+    ];
+    let sql = |name: &str, query: &str| -> String {
+        let (ok, text) = run(&["sql", &capture(name), query]);
+        assert!(ok, "locum-cli sql {query}");
+        text.lines().nth(1).unwrap_or_default().trim().to_string()
+    };
+    // Every capture replays without an event, argument or descriptor kind it skips.
+    for name in replayed {
         let (_, text) = run(&["verify", "--warp", &capture(name)]);
         assert!(
             !text.contains(" are not replayed"),
@@ -494,6 +495,32 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
         println!(
             "ok   D3D12 verify --debug: ExecuteIndirect with addresses in its records, no validation errors"
         );
+        // Every other capture too: its frame replays under both without an error, and compares as without them.
+        for name in replayed.iter().chain(&["indirect-gaps"]) {
+            let (plain_ok, plain) = run(&["verify", "--warp", &capture(name)]);
+            let (ok, text) = run(&["verify", "--warp", "--debug", &capture(name)]);
+            assert!(
+                text.lines()
+                    .any(|l| l.starts_with("validated in ") && l.ends_with(": 0 errors")),
+                "{name}: GPU-based validation found errors"
+            );
+            assert!(
+                !text.contains("D3D12 validation"),
+                "{name}: the debug layer found errors"
+            );
+            let last = |t: &str| {
+                t.lines()
+                    .rfind(|l| !l.trim().is_empty())
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            assert_eq!(
+                (ok, last(&text)),
+                (plain_ok, last(&plain)),
+                "{name}: verify --debug compares as verify does"
+            );
+        }
+        println!("ok   D3D12 verify --debug: every capture, no validation errors, compared as without it");
     }
     // Passes' targets, drawn from root constants across lists, are the fixture's bit for bit.
     let (_, text) = run(&["verify", "--warp", &capture("passes")]);

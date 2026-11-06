@@ -49,12 +49,17 @@ pub unsafe fn created_command_signature(
                     D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW => {
                         v["slot"] = json!(a.Anonymous.VertexBuffer.Slot);
                     }
-                    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT
-                    | D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT => {
+                    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT => {
                         let c = a.Anonymous.Constant;
                         v["root_parameter"] = json!(c.RootParameterIndex);
                         v["offset"] = json!(c.DestOffsetIn32BitValues);
                         v["count"] = json!(c.Num32BitValuesToSet);
+                    }
+                    // One constant, the command's index: its description has no count.
+                    D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT => {
+                        let c = a.Anonymous.IncrementingConstant;
+                        v["root_parameter"] = json!(c.RootParameterIndex);
+                        v["offset"] = json!(c.DestOffsetIn32BitValues);
                     }
                     D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW => {
                         v["root_parameter"] = json!(a.Anonymous.ConstantBufferView.RootParameterIndex);

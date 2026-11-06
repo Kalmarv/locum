@@ -729,8 +729,10 @@ after-frame copy, where that ExecuteIndirect is the last of the frame to write t
 queue; otherwise (written again later, on another queue, not a buffer) a `d3d12-results` gap says which and why. A
 root parameter the records set is neither a binding of the event nor an output place copied after it: what the list
 set there before is stale, and what the records name is in `event_resources`. A list executed again in the frame
-copies its records again; the last execution's are read. Records locum cannot read (a DispatchRays or
-incrementing-constant argument, a signature it did not see made, more than 64 MiB), addresses in no live buffer, an
+copies its records again; the last execution's are read. An incrementing constant has no bytes in a record: the
+runtime sets its root constant to each command's index (from 0), and replay's runtime does the same, so it replays
+where the replay device has ExecuteIndirect tier 1.1 (verify says so where it has not). Records locum cannot read (a
+DispatchRays argument, a signature it did not see made, more than 64 MiB), addresses in no live buffer, an
 ExecuteIndirect of an uninstrumented list whose records hold addresses, and a buffer the after-frame copy cannot be
 made of (no description, a destroyed queue) are `d3d12-indirect-arguments`, `contents` or `d3d12-results` gaps. A
 bundle may run only a signature of one draw or dispatch with no count buffer (the debug layer refuses any other,
@@ -792,17 +794,18 @@ An unrecognized PSO stream type logs its first occurrence once per type per proc
 
 `cargo xtask smoke --api d3d12` runs a program through it on WARP with the debug layer on (copies, dispatches, fences,
 pipeline states and libraries, placed resources, barriers, swap chain present and resize). Its `indirect` capture
-runs every argument type locum patches: vertex and index buffer views, root CBVs, SRVs and UAVs, root constants and
+runs every argument type locum patches: vertex and index buffer views, root CBVs, SRVs and UAVs, root constants, an
+incrementing constant over a stale value the list set (where the device has ExecuteIndirect tier 1.1) and
 DispatchMesh (where the adapter has mesh shaders and a Windows SDK's dxcompiler is found, or `LOCUM_DXCOMPILER`;
-the run says if it skipped them), with records the CPU wrote, records a dispatch wrote at a non-zero offset with a
+the run says if it skipped either), with records the CPU wrote, records a dispatch wrote at a non-zero offset with a
 count it wrote, lower than the most records (the record past it names no buffer), and a bundle's. What a root UAV in
 records wrote is verified as an output. Its `indirect-gaps` capture holds what cannot be proven: an uninstrumented
 list's records, and a buffer only a root UAV names. verify must call it incomplete and still compare that output.
 Both smokes check `info`, the verify line and the `verifications` row of a capture (every part of the machine
 described, no `environment` gap, both ends named). `cargo xtask smoke --api d3d12 --hardware` runs what WARP cannot
 show on the default adapter, at the game's size (a copy's order against the list's next draw), and the `indirect`
-capture, and verifies both there; `--debug` also verifies the UAV and `indirect` fixtures with `verify --debug` (no
-validation errors, outputs compared as without it); `cargo xtask smoke` stays the Direct3D 11 suite.
+capture, and verifies both there; `--debug` also verifies every capture of the WARP run with `verify --debug` (no
+validation errors, each verify's result and last line as without it); `cargo xtask smoke` stays the Direct3D 11 suite.
 
 ### Known problems: Motor Town
 

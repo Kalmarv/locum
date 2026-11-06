@@ -12,6 +12,9 @@
 //! - an index buffer view, root constants and a root SRV the vertex shader reads its positions through, then an
 //!   indexed draw;
 //! - a root UAV and a root constant, then a dispatch: what it writes is the dispatch's output;
+//! - an incrementing constant, then a draw: the runtime gives each command its index as a root constant, which the
+//!   shaders place and colour its half by (over a stale value the list set before), where the device has
+//!   ExecuteIndirect tier 1.1;
 //! - a root CBV, then a mesh dispatch, where the adapter has mesh shaders and a DXIL compiler is found.
 //!
 //! The vertex, index, position and mesh constant buffers are in default heaps and nothing but the records names them,
@@ -32,9 +35,11 @@ const STRIDE_C: usize = 24;
 const STRIDE_D: usize = 20;
 /// Signature E, a bundle's: DRAW (16).
 const STRIDE_E: usize = 16;
-/// Each target's left and right halves, in order: CPU records, GPU records, the indexed draws, the bundle's, the mesh
-/// dispatches'.
-const COLOURS: [[f32; 4]; 10] = [
+/// Signature F: INCREMENTING_CONSTANT (no bytes), DRAW (16).
+const STRIDE_F: usize = 16;
+/// Each target's left and right halves, in order: CPU records, GPU records, the indexed draws, the bundle's, the
+/// incrementing constant's, the mesh dispatches'.
+const COLOURS: [[f32; 4]; 12] = [
     [1., 0., 0., 1.],
     [0., 0., 1., 1.],
     [0., 1., 0., 1.],
@@ -45,6 +50,8 @@ const COLOURS: [[f32; 4]; 10] = [
     [0., 1., 0., 1.],
     [0., 0., 1., 1.],
     [1., 1., 0., 1.],
+    [1., 0., 0., 1.],
+    [0., 1., 1., 1.],
 ];
 /// An address in no buffer: the record past the count holds it, so a record run or patched past the count fails.
 const NOWHERE: u64 = 0xdead_0000_0000;
@@ -447,6 +454,63 @@ unsafe fn mesh_pso(
     unsafe { device.CreatePipelineState(&desc) }.map_err(|e| format!("mesh pipeline: {e}"))
 }
 
+/// Signature F's root signature, pipeline and signature, where the device has ExecuteIndirect tier 1.1; or why not.
+/// Root constant word 1 is the command's index: command i draws the half from x = i - 1 to i, in `COLOURS[8 + i]`.
+unsafe fn incrementing_f(device: &ID3D12Device) -> std::result::Result<DrawA, String> {
+    unsafe {
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS21::default();
+        device
+            .CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS21,
+                (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS21).cast(),
+                size_of::<D3D12_FEATURE_DATA_D3D12_OPTIONS21>() as u32,
+            )
+            .map_err(|e| format!("CheckFeatureSupport(OPTIONS21): {e}"))?;
+        if options.ExecuteIndirectTier.0 < D3D12_EXECUTE_INDIRECT_TIER_1_1.0 {
+            return Err(format!(
+                "the device's ExecuteIndirect tier is {}, not 1.1",
+                options.ExecuteIndirectTier.0
+            ));
+        }
+        let [l, r] = [COLOURS[8], COLOURS[9]].map(|c| format!("float4({},{},{},{})", c[0], c[1], c[2], c[3]));
+        let constants = "cbuffer K:register(b0) { uint unused; uint index; };";
+        let vs = graphics::compile(
+            format!(
+                "{constants} float4 main(uint v:SV_VertexID):SV_Position {{ \
+                 float x0 = float(index) - 1, x1 = float(index); \
+                 float2 q[6] = {{ float2(x0,-1), float2(x0,1), float2(x1,-1), float2(x1,-1), float2(x0,1), \
+                 float2(x1,1) }}; return float4(q[v],0,1); }}"
+            )
+            .as_bytes(),
+            s!("vs_5_0"),
+        );
+        let ps = graphics::compile(
+            format!("{constants} float4 main():SV_Target {{ return index == 0 ? {l} : {r}; }}").as_bytes(),
+            s!("ps_5_0"),
+        );
+        let root = root_signature(device, &[root_constants(0, 2)], D3D12_ROOT_SIGNATURE_FLAG_NONE);
+        let pso = graphics_pso(device, &root, &vs, &ps, &[]);
+        let signature = signature(
+            device,
+            &[
+                D3D12_INDIRECT_ARGUMENT_DESC {
+                    Type: D3D12_INDIRECT_ARGUMENT_TYPE_INCREMENTING_CONSTANT,
+                    Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                        IncrementingConstant: D3D12_INDIRECT_ARGUMENT_DESC_0_5 {
+                            RootParameterIndex: 0,
+                            DestOffsetIn32BitValues: 1,
+                        },
+                    },
+                },
+                argument(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW, 0, 0),
+            ],
+            STRIDE_F,
+            Some(&root),
+        );
+        Ok(DrawA { root, pso, signature })
+    }
+}
+
 /// `n` 8x8 targets in RENDER_TARGET, their RTV heap and each one's handle.
 unsafe fn targets(
     device: &ID3D12Device,
@@ -829,6 +893,12 @@ pub(super) unsafe fn capture(
             Ok(_) => println!("indirect: mesh dispatch included"),
             Err(why) => println!("indirect: mesh dispatch SKIPPED: {why}"),
         }
+        // F: an incrementing constant.
+        let f = incrementing_f(device);
+        match &f {
+            Ok(_) => println!("indirect: incrementing constant included"),
+            Err(why) => println!("indirect: incrementing constant SKIPPED: {why}"),
+        }
 
         // The buffers only records name, filled before the frame: quads, indices, positions, mesh constants.
         let vertices = default_buffer(device, 512, false);
@@ -842,7 +912,10 @@ pub(super) unsafe fn capture(
         index_bytes.resize(64, 0);
         index_bytes.extend_from_within(..64);
         let mut mesh_bytes = Vec::new();
-        for (colour, rect) in [(COLOURS[8], [-1f32, 0., 0., 0.]), (COLOURS[9], [0., 1., 0., 0.])] {
+        for (colour, rect) in [
+            (COLOURS[10], [-1f32, 0., 0., 0.]),
+            (COLOURS[11], [0., 1., 0., 0.]),
+        ] {
             let mut b: Vec<u8> = colour.iter().chain(&rect).flat_map(|f| f.to_le_bytes()).collect();
             b.resize(256, 0);
             mesh_bytes.extend(b);
@@ -907,8 +980,20 @@ pub(super) unsafe fn capture(
             words(&mut d_records, &[1, 1, 1]);
         }
         let d_args = upload(device, &d_records, 256);
+        let mut f_records = Vec::new();
+        words(&mut f_records, &[6, 1, 0, 0, 6, 1, 0, 0]);
+        assert_eq!(f_records.len(), 2 * STRIDE_F);
+        let f_args = upload(device, &f_records, 256);
 
-        let n = if mesh.is_ok() { 5 } else { 4 };
+        // Each target's halves' colours: A's two, B's, the bundle's, then F's and D's where they run.
+        let mut halves: Vec<(usize, usize)> = vec![(0, 1), (2, 3), (4, 5), (6, 7)];
+        if f.is_ok() {
+            halves.push((8, 9));
+        }
+        if mesh.is_ok() {
+            halves.push((10, 11));
+        }
+        let n = halves.len();
         let (targets, _rtvs, rtv) = targets(device, n);
         // A bundle recorded before the frame, as engines record them once: an ExecuteIndirect of draws alone for each
         // half, its vertex buffer and colour set before it.
@@ -1012,10 +1097,20 @@ pub(super) unsafe fn capture(
         list.SetGraphicsRootSignature(&a.root);
         target(3);
         list.ExecuteBundle(&bundle);
+        let mut next = 4;
+        if let Ok(f) = &f {
+            list.SetPipelineState(&f.pso);
+            list.SetGraphicsRootSignature(&f.root);
+            // A stale index: if the commands ran without the runtime's, both would draw off the target.
+            list.SetGraphicsRoot32BitConstants(0, 2, [0u32, 7].as_ptr().cast(), 0);
+            target(next);
+            list.ExecuteIndirect(&f.signature, 2, &f_args, 0, None, 0);
+            next += 1;
+        }
         if let (Ok(pso), Some(signature)) = (&mesh, &signature_d) {
             list.SetPipelineState(pso);
             list.SetGraphicsRootSignature(&root_d);
-            target(4);
+            target(next);
             list.ExecuteIndirect(signature, 2, &d_args, 0, None, 0);
         }
         // Root UAVs in records: what the dispatch writes is known only through them.
@@ -1034,7 +1129,6 @@ pub(super) unsafe fn capture(
         chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
 
         // The game's own pictures and output: what verify's replay must make again.
-        let halves: Vec<(usize, usize)> = (0..n).map(|i| (i * 2, i * 2 + 1)).collect();
         check_targets(device, queue, fence, first + 2, &targets, &halves);
         let written_out = read_buffer(device, queue, fence, first + 3, &out, 512);
         for i in 0..128usize {
@@ -1049,12 +1143,22 @@ pub(super) unsafe fn capture(
 
         let db = written(&label);
         let n = n as i64;
+        let (with_f, with_mesh) = (i64::from(f.is_ok()), i64::from(mesh.is_ok()));
         let ei = "d.call = 'ExecuteIndirect'";
         check(
             &db,
             &[
-                // A1, A2, B, the bundle's two, C, and D where it ran.
+                // A1, A2, B, the bundle's two, C, and F and D where they ran.
                 (&format!("SELECT count(*) FROM draws d WHERE {ei}"), n + 2),
+                // F's signature: the incrementing constant described without a count, and a record of 16 bytes.
+                (
+                    "SELECT count(*) FROM d12_objects WHERE kind = 'ID3D12CommandSignature' AND \
+                     json_extract(description, '$.arguments[0].type') = 11 AND \
+                     json_extract(description, '$.arguments[0].offset') = 1 AND \
+                     json_extract(description, '$.arguments[0].count') IS NULL AND \
+                     json_extract(description, '$.stride') = 16",
+                    with_f,
+                ),
                 ("SELECT count(*) FROM draws WHERE call = 'Dispatch'", 1),
                 ("SELECT count(*) FROM targets", n),
                 (
@@ -1065,14 +1169,14 @@ pub(super) unsafe fn capture(
                 // and their contents were copied after the frame.
                 (
                     "SELECT count(*) FROM resources WHERE content_source = 'after-frame' AND used = 1",
-                    3 + i64::from(n == 5),
+                    3 + with_mesh,
                 ),
                 (
                     &format!(
                         "SELECT count(DISTINCT e.event) FROM event_resources e JOIN draws d ON d.event = e.event \
                          JOIN resources r ON r.id = e.resource WHERE {ei} AND r.content_source = 'after-frame'"
                     ),
-                    n - 1,
+                    3 + with_mesh,
                 ),
                 (
                     "SELECT count(*) FROM gaps WHERE what = 'd3d12-indirect-arguments'",
@@ -1103,8 +1207,17 @@ pub(super) unsafe fn capture(
         debug_errors(device);
         println!(
             "D3D12 ExecuteIndirect: vertex and index buffer views, root CBVs, SRVs, UAVs and constants, a GPU count and \
-             offsets, a bundle{}: every half drawn and every word written: {label}",
-            if n == 5 { " and mesh dispatches" } else { "" }
+             offsets, a bundle{}{}: every half drawn and every word written: {label}",
+            if with_f == 1 {
+                ", an incrementing constant"
+            } else {
+                ""
+            },
+            if with_mesh == 1 {
+                " and mesh dispatches"
+            } else {
+                ""
+            }
         );
     }
 }
