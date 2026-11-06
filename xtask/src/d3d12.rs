@@ -725,6 +725,89 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
     println!(
         "ok   D3D12 heaps a capture does not describe: made from their placed resources, their memory shared"
     );
+    // The same capture as one from a GPU that took less of its heaps than this device takes: the placed buffers
+    // took half a tile there, at a 4 KiB alignment this device does not take for a buffer, and a texture the frame
+    // does not use took 4 KiB at the start of each heap the reserved texture's tiles are in. Replay lays those heaps out again, the tiles after that texture at other offsets, and
+    // the buffers still share their memory, the texture its tiles, before and after the frame's remaps.
+    let moved = log.join("captures").join(format!("relocated-{pid}"));
+    std::fs::create_dir_all(&moved).unwrap();
+    let db = moved.join("capture.db");
+    std::fs::copy(
+        log.join("captures")
+            .join(format!("reserved-{pid}"))
+            .join("capture.db"),
+        &db,
+    )
+    .expect("copy the reserved capture");
+    let (buffers, tile_heaps) = rusqlite::Connection::open(&db)
+        .and_then(|db| {
+            let buffers = db.execute(
+                "UPDATE d12_objects SET description = json_set(description, '$.bytes', 32768, '$.alignment', 4096) \
+                 WHERE kind LIKE 'ID3D12Resource%' AND json_extract(description, '$.heap') = \
+                 (SELECT id FROM d12_objects WHERE kind LIKE 'ID3D12Heap%' \
+                  AND json_extract(description, '$.bytes') = 327680)",
+                [],
+            )?;
+            // D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES; a 128x128 R8G8B8A8_UNORM texture takes 64 KiB.
+            let tile_heaps = db.execute(
+                "INSERT INTO d12_objects(id, kind, device, desc_version, description) \
+                 SELECT (SELECT max(id) FROM d12_objects) + row_number() OVER (ORDER BY id), 'ID3D12Resource', \
+                 device, desc_version, json_object('dimension', 3, 'alignment', 0, 'width', 128, 'height', 128, \
+                 'depth_or_array_size', 1, 'mips', 1, 'format', 28, 'sample_count', 1, 'sample_quality', 0, \
+                 'layout', 0, 'flags', 0, 'heap', id, 'heap_offset', 0, 'bytes', 4096) \
+                 FROM d12_objects WHERE kind LIKE 'ID3D12Heap%' AND json_extract(description, '$.flags') = 68",
+                [],
+            )?;
+            Ok((buffers, tile_heaps))
+        })
+        .expect("shrink what the copy's placed resources took");
+    assert!(
+        buffers == 2 && tile_heaps > 0,
+        "the reserved capture has two placed buffers ({buffers}) and heaps of tiles ({tile_heaps})"
+    );
+    let from_moved = |id: &str, at: i64, name: &str| -> Vec<u8> {
+        let raw = log.join(name);
+        let (ok, text) = run(&[
+            "export",
+            &moved.display().to_string(),
+            id,
+            "--at",
+            &at.to_string(),
+            "--warp",
+            "-o",
+            &raw.display().to_string(),
+        ]);
+        assert!(ok, "export #{id} at event {at} from the relocated copy");
+        assert!(
+            text.contains("heaps were laid out again for this device")
+                && !text.contains("made committed")
+                && !text.contains("are not run")
+                && !text.contains("do not here"),
+            "replay lays the copy's heaps out again and shares all their memory: {text}"
+        );
+        std::fs::read(&raw).unwrap()
+    };
+    let bytes = from_moved(&texture, first, "relocated.raw");
+    assert!(
+        (0..128).all(|y| (0..256).all(|x| mip0(&bytes, x, y) == filled(x, y)))
+            && (128..256).all(|y| (0..128).all(|x| mip0(&bytes, x, y) == 0)),
+        "export: in heaps laid out again, the reserved texture as its first use read it"
+    );
+    let bytes = from_moved(&texture, last, "relocated-remapped.raw");
+    assert!(
+        (128..256).all(|y| (0..128).all(|x| mip0(&bytes, x, y) == filled(x, y - 128)))
+            && (128..256).all(|y| (128..256).all(|x| mip0(&bytes, x, y) == filled(x, y))),
+        "export: in heaps laid out again, after the frame's remaps, tile 2 holds what tile 0 does"
+    );
+    let bytes = from_moved(&aliased, events(&aliased).1, "relocated-aliased.raw");
+    assert!(
+        bytes.len() == 65536 && bytes.iter().enumerate().all(|(i, &b)| b == (i * 7 + 3) as u8),
+        "export: in a heap laid out again, a placed buffer reads what the frame wrote through another"
+    );
+    println!(
+        "ok   D3D12 heaps this device takes more of than the game's GPU did: laid out again, every tile and buffer \
+         sharing what it shared"
+    );
     // Queries: what replay resolves is what the GPU gave the fixture (queries.rs), but for the timestamps, which are
     // the replay's clock. Through `export --at`, so the plan must take the draws the queries counted.
     let expected = std::fs::read(log.join("queries-expected.bin")).expect("queries-expected.bin");

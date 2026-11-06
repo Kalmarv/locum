@@ -10,10 +10,12 @@
 //! in it record: the heap properties and flags GetHeapProperties gave the game for each, and a size that holds each at
 //! its offset as this device lays it out, and each reserved tile mapped into it; replay says so.
 //!
-//! Where that cannot be done as the game did, the resource is made committed instead, and replay says why: a heap the
-//! capture does not describe and no resource in it describes either, a resource that takes more of its heap on this
-//! device than in the game or is not aligned for it there, a reserved resource this device tiles otherwise, or one the
-//! capture holds no page table of.
+//! A heap is laid out for this device (see [`Relocation`]): where it takes more of the heap for a placed resource than
+//! the game's GPU did, or another alignment, the heap is stretched to hold it, and every offset after moves with it.
+//!
+//! Where sharing cannot be done at all, the resource is made committed instead, and replay says why: a heap the
+//! capture does not describe and no resource in it describes either, a resource this device refuses, a reserved
+//! resource this device tiles otherwise, or one the capture holds no page table of.
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use locum_capture::tiles::{Layout, Pages};
@@ -28,11 +30,10 @@ use crate::open::Capture;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Placement {
     Committed,
-    /// In heap `heap` at `offset`, taking `bytes` of it there where the capture says.
+    /// In heap `heap` at `offset`.
     Placed {
         heap: i64,
         offset: u64,
-        bytes: Option<u64>,
     },
     Reserved,
 }
@@ -43,7 +44,6 @@ impl Placement {
             Some(heap) => Placement::Placed {
                 heap,
                 offset: d["heap_offset"].as_u64().unwrap_or(0),
-                bytes: d["bytes"].as_u64(),
             },
             // A reserved resource has no heap properties of its own.
             None if !d["heap_properties"].is_object() => Placement::Reserved,
@@ -61,10 +61,141 @@ struct Mapping {
     args: Value,
 }
 
+/// A range of a game's heap that something takes: placed at `start`, ending at `end` in the game (where the capture
+/// says), taking `bytes` from its start on this device, which must start it at a multiple of `alignment`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Span {
+    pub(super) start: u64,
+    pub(super) end: Option<u64>,
+    pub(super) bytes: u64,
+    pub(super) alignment: u64,
+}
+
+impl Span {
+    /// Where it ends in the game: where the capture says, else where it ends on this device.
+    fn game_end(&self) -> u64 {
+        self.end.unwrap_or(self.start + self.bytes)
+    }
+}
+
+/// Where the offsets of a game's heap are in the heap made again on this device. Each offset a span starts or ends
+/// at keeps its order and its distance from the one before, except where a span takes more on this device than in
+/// the game (the heap is stretched at its end to hold it) or must start at another alignment (stretched to that).
+/// Nothing overlaps here that did not in the game, and on a device that lays everything out as the game's did every
+/// offset is the game's. Two spans that overlapped in the game can stop overlapping where one is stretched past the
+/// other's start; [`Relocation::lost`] counts them.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct Relocation {
+    /// (game offset, offset here), by game offset.
+    points: Vec<(u64, u64)>,
+    /// The heap's size here.
+    pub(super) size: u64,
+}
+
+impl Relocation {
+    /// Lays out `spans` of a heap of `size` bytes in the game, here, in a heap of `alignment`.
+    pub(super) fn new(spans: &[Span], size: u64, alignment: u64) -> Relocation {
+        // By offset: the alignment the spans starting there need, and (start, bytes here) of those ending there.
+        let mut starts: HashMap<u64, u64> = HashMap::new();
+        let mut ends: HashMap<u64, Vec<(u64, u64)>> = HashMap::new();
+        let mut points = BTreeSet::from([0, size]);
+        for s in spans.iter().filter(|s| s.game_end() > s.start) {
+            let a = starts.entry(s.start).or_insert(1);
+            *a = (*a).max(s.alignment);
+            ends.entry(s.game_end()).or_default().push((s.start, s.bytes));
+            points.insert(s.start);
+            points.insert(s.game_end());
+        }
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(points.len());
+        let mut here: HashMap<u64, u64> = HashMap::new();
+        for p in points {
+            let mut at = out.last().map_or(p, |&(q, r)| r + (p - q));
+            for &(start, bytes) in ends.get(&p).into_iter().flatten() {
+                at = at.max(here[&start] + bytes);
+            }
+            let at = at.next_multiple_of(starts.get(&p).copied().unwrap_or(1).max(1));
+            here.insert(p, at);
+            out.push((p, at));
+        }
+        let end = out.last().map_or(0, |&(_, r)| r);
+        Relocation {
+            points: out,
+            size: end.next_multiple_of(alignment.max(1)),
+        }
+    }
+
+    /// The offset here of the game's offset `game`.
+    pub(super) fn at(&self, game: u64) -> u64 {
+        match self.points.partition_point(|&(p, _)| p <= game) {
+            0 => game,
+            i => {
+                let (p, r) = self.points[i - 1];
+                r + (game - p)
+            }
+        }
+    }
+
+    /// The tile here of the game's tile `tile` (in 64 KiB units).
+    pub(super) fn tile(&self, tile: u32) -> u32 {
+        let tile_bytes = locum_capture::tiles::TILE_BYTES;
+        (self.at(u64::from(tile) * tile_bytes) / tile_bytes) as u32
+    }
+
+    /// Whether any offset is not the game's.
+    pub(super) fn moved(&self) -> bool {
+        self.points.iter().any(|(p, r)| p != r)
+    }
+
+    /// How many pairs of `spans` overlap in the game and do not here.
+    pub(super) fn lost(&self, spans: &[Span]) -> usize {
+        let mut sorted: Vec<&Span> = spans.iter().filter(|s| s.game_end() > s.start).collect();
+        sorted.sort_by_key(|s| s.start);
+        let mut lost = 0;
+        for (i, a) in sorted.iter().enumerate() {
+            let at = self.at(a.start);
+            for b in &sorted[i + 1..] {
+                if b.start >= a.game_end() {
+                    break;
+                }
+                let bt = self.at(b.start);
+                if bt >= at + a.bytes || at >= bt + b.bytes {
+                    lost += 1;
+                }
+            }
+        }
+        lost
+    }
+}
+
+/// The description of a resource placed as `desc` says, as this device takes it, and what it takes: at the alignment
+/// the game placed it with, or where this device refuses that (a small alignment), at the default. None if this
+/// device refuses it.
+fn allocation(
+    device: &ID3D12Device,
+    desc: &D3D12_RESOURCE_DESC,
+) -> Option<(D3D12_RESOURCE_DESC, D3D12_RESOURCE_ALLOCATION_INFO)> {
+    let info = unsafe { device.GetResourceAllocationInfo(0, &[*desc]) };
+    if info.SizeInBytes != u64::MAX {
+        return Some((*desc, info));
+    }
+    let default = D3D12_RESOURCE_DESC {
+        Alignment: 0,
+        ..*desc
+    };
+    let info = unsafe { device.GetResourceAllocationInfo(0, &[default]) };
+    (desc.Alignment != 0 && info.SizeInBytes != u64::MAX).then_some((default, info))
+}
+
 #[derive(Default)]
 pub(super) struct Memory {
-    /// The game's heaps, made when a resource first needs one, with their size; or why one could not be.
-    heaps: HashMap<i64, Result<(ID3D12Heap, u64), String>>,
+    /// The game's heaps, made when a resource first needs one, with where its offsets are here; or why one could not
+    /// be.
+    heaps: HashMap<i64, Result<(ID3D12Heap, std::rc::Rc<Relocation>), String>>,
+    /// Heaps laid out otherwise than the game's, the placed resources and mapped tiles not at the game's offsets in
+    /// them, and the pairs of those that shared memory in the game and do not here.
+    relocated: usize,
+    moved: usize,
+    lost: usize,
     /// Resources made in a heap (placed, or reserved with their tiles mapped).
     pub(super) shared: HashSet<i64>,
     /// First-use contents waiting for the submission they were copied at: by submission, (resource, blob key).
@@ -111,7 +242,33 @@ impl Memory {
                 self.not_remapped
             ));
         }
+        if self.lost > 0 {
+            out.push(format!(
+                "{} pairs of resources that shared memory in the game do not here: this device takes more of their \
+                 heaps for one of them than the game's did, past where the other starts",
+                self.lost
+            ));
+        }
         out
+    }
+
+    /// Says what replay did otherwise than the game and the same in effect.
+    pub(super) fn notes(&self) -> Vec<String> {
+        if self.relocated == 0 {
+            return Vec::new();
+        }
+        vec![format!(
+            "{} heaps were laid out again for this device, which takes more of them or another alignment for some of \
+             what is placed in them than the game's did: {} placed resources and mapped tiles are at other offsets, \
+             each sharing memory with what it shared in the game{}",
+            self.relocated,
+            self.moved,
+            if self.lost > 0 {
+                " but for the pairs above"
+            } else {
+                ""
+            }
+        )]
     }
 
     pub(super) fn fell_back(&mut self, why: String) {
@@ -161,6 +318,37 @@ fn page_tables(c: &Capture) -> Vec<(i64, Pages)> {
         .collect()
 }
 
+/// An UpdateTileMappings' heap ranges (`flags`, starting tiles `at`, tile `counts`) as they are here: each range's
+/// start where `relocation` keeps its tiles consecutive, else the range one tile at a time. Ranges with no heap tiles
+/// of their own (NULL, SKIP) are as they were; a REUSE_SINGLE_TILE range's one tile is where it is here.
+fn ranges_here(
+    relocation: &Relocation,
+    flags: Option<&[D3D12_TILE_RANGE_FLAGS]>,
+    at: &[u32],
+    counts: &[u32],
+) -> (Vec<D3D12_TILE_RANGE_FLAGS>, Vec<u32>, Vec<u32>) {
+    // (flag, first tile, tiles) a range.
+    let mut out: Vec<(D3D12_TILE_RANGE_FLAGS, u32, u32)> = Vec::new();
+    for (i, (&start, &count)) in at.iter().zip(counts).enumerate() {
+        let flag = flags
+            .and_then(|f| f.get(i).copied())
+            .unwrap_or(D3D12_TILE_RANGE_FLAG_NONE);
+        if flag.0 & (D3D12_TILE_RANGE_FLAG_NULL.0 | D3D12_TILE_RANGE_FLAG_SKIP.0) != 0 {
+            out.push((flag, start, count));
+        } else if flag.0 & D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE.0 != 0
+            || (0..count).all(|k| relocation.tile(start + k) == relocation.tile(start) + k)
+        {
+            out.push((flag, relocation.tile(start), count));
+        } else {
+            out.extend((0..count).map(|k| (flag, relocation.tile(start + k), 1)));
+        }
+    }
+    let f = out.iter().map(|r| r.0).collect();
+    let o = out.iter().map(|r| r.1).collect();
+    let t = out.iter().map(|r| r.2).collect();
+    (f, o, t)
+}
+
 /// A recorded tile coordinate, `[x, y, z, subresource]`.
 fn coordinate(v: &Value) -> D3D12_TILED_RESOURCE_COORDINATE {
     let n = |i: usize| v[i].as_u64().unwrap_or(0) as u32;
@@ -189,25 +377,78 @@ fn array<T>(v: &Value, f: impl Fn(&Value) -> T) -> Option<Vec<T>> {
 }
 
 impl D3d12 {
-    /// The game's heap `id`, made from its description on first use, with its size.
-    fn game_heap(&mut self, c: &Capture, id: i64) -> Result<(ID3D12Heap, u64), String> {
+    /// The game's heap `id`, made from its description on first use, laid out for this device: with where the game's
+    /// offsets in it are here.
+    fn game_heap(&mut self, c: &Capture, id: i64) -> Result<(ID3D12Heap, std::rc::Rc<Relocation>), String> {
         if !self.memory.heaps.contains_key(&id) {
-            let made = self.heap_desc(c, id).and_then(|(desc, inferred)| {
+            let made = self.heap_desc(c, id).and_then(|(mut desc, inferred)| {
+                let spans = self.spans(c, id);
+                // A resource this device aligns at 4 MiB (a multisampled one) needs a heap aligned so.
+                let widest = spans.iter().map(|s| s.alignment).max().unwrap_or(0);
+                desc.Alignment = desc.Alignment.max(widest).max(64 << 10);
+                let relocation = Relocation::new(&spans, desc.SizeInBytes, desc.Alignment);
+                let moved = spans.iter().filter(|s| relocation.at(s.start) != s.start).count();
+                let lost = relocation.lost(&spans);
+                desc.SizeInBytes = relocation.size;
                 let mut heap: Option<ID3D12Heap> = None;
                 unsafe { self.device.CreateHeap(&desc, &mut heap) }
                     .map_err(|e| format!("their heap could not be made on this device: {e}"))?;
                 let heap = heap.ok_or("CreateHeap gave no heap")?;
                 super::name(&heap, format!("#{id}"));
-                Ok((heap, desc.SizeInBytes, inferred))
+                Ok((heap, relocation, inferred, moved, lost))
             });
-            if matches!(made, Ok((_, _, true))) {
-                self.memory.inferred += 1;
-            }
-            self.memory
-                .heaps
-                .insert(id, made.map(|(heap, size, _)| (heap, size)));
+            let made = made.map(|(heap, relocation, inferred, moved, lost)| {
+                self.memory.inferred += usize::from(inferred);
+                if relocation.moved() {
+                    self.memory.relocated += 1;
+                    self.memory.moved += moved;
+                    self.memory.lost += lost;
+                }
+                (heap, std::rc::Rc::new(relocation))
+            });
+            self.memory.heaps.insert(id, made);
         }
         self.memory.heaps[&id].clone()
+    }
+
+    /// What is placed in, or mapped into, the game's heap `id`: each placed resource this device takes (at the
+    /// alignment [`allocation`] gives), and each tile a reserved resource maps there as the frame found it or after
+    /// any of its changes.
+    fn spans(&self, c: &Capture, id: i64) -> Vec<Span> {
+        let mut spans: Vec<Span> = c
+            .rows(
+                "SELECT description FROM d12_objects WHERE kind LIKE 'ID3D12Resource%' \
+                 AND json_extract(description, '$.heap') = ?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .iter()
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .filter_map(|d| {
+                let (_, info) = allocation(&self.device, &super::resource_desc(&d))?;
+                let start = d["heap_offset"].as_u64().unwrap_or(0);
+                Some(Span {
+                    start,
+                    end: d["bytes"].as_u64().map(|b| start + b),
+                    bytes: info.SizeInBytes,
+                    alignment: info.Alignment,
+                })
+            })
+            .collect();
+        let tile = locum_capture::tiles::TILE_BYTES;
+        let tiles: BTreeSet<u32> = page_tables(c)
+            .iter()
+            .flat_map(|(_, pages)| pages.tiles.values())
+            .filter(|&&(heap, _)| heap as i64 == id)
+            .map(|&(_, at)| at)
+            .collect();
+        spans.extend(tiles.into_iter().map(|at| Span {
+            start: u64::from(at) * tile,
+            end: Some((u64::from(at) + 1) * tile),
+            bytes: tile,
+            alignment: tile,
+        }));
+        spans
     }
 
     /// The description of the game's heap `id`, and whether it was inferred: the capture's, or where it has none
@@ -271,11 +512,10 @@ impl D3d12 {
         for d in &placed {
             let desc = super::resource_desc(d);
             multisampled |= desc.SampleDesc.Count > 1;
-            let info = unsafe { self.device.GetResourceAllocationInfo(0, &[desc]) };
             // One this device refuses is made committed when it is reached; it holds nothing of the heap here.
-            if info.SizeInBytes == u64::MAX {
+            let Some((_, info)) = allocation(&self.device, &desc) else {
                 continue;
-            }
+            };
             let bytes = info.SizeInBytes.max(d["bytes"].as_u64().unwrap_or(0));
             end = end.max(d["heap_offset"].as_u64().unwrap_or(0) + bytes);
         }
@@ -307,21 +547,19 @@ impl D3d12 {
         let mut r: Option<ID3D12Resource> = None;
         match placement {
             Placement::Committed => return Err("committed".into()),
-            Placement::Placed { heap, offset, bytes } => {
-                let (h, size) = self.game_heap(c, heap)?;
-                let info = unsafe { self.device.GetResourceAllocationInfo(0, &[*desc]) };
-                if info.SizeInBytes == u64::MAX {
-                    return Err("this device refuses their descriptions".into());
-                }
-                if bytes.is_some_and(|b| info.SizeInBytes > b) {
-                    return Err("they take more of their heap on this device than in the game".into());
-                }
-                if info.Alignment == 0 || offset % info.Alignment != 0 || offset + info.SizeInBytes > size {
+            Placement::Placed { heap, offset } => {
+                let (h, relocation) = self.game_heap(c, heap)?;
+                let (desc, info) =
+                    allocation(&self.device, desc).ok_or("this device refuses their descriptions")?;
+                // The heap was laid out for what this device takes of each: the resource fits where it is here.
+                let at = relocation.at(offset);
+                if info.Alignment == 0 || at % info.Alignment != 0 || at + info.SizeInBytes > relocation.size
+                {
                     return Err("their offsets do not fit their heaps on this device".into());
                 }
                 unsafe {
                     self.device
-                        .CreatePlacedResource(&h, offset, desc, state, None, &mut r)
+                        .CreatePlacedResource(&h, at, &desc, state, None, &mut r)
                 }
                 .map_err(|e| format!("CreatePlacedResource refused them: {e}"))?;
                 self.memory.placed += 1;
@@ -370,7 +608,8 @@ impl D3d12 {
                     e.1.push(at);
                 }
                 for (heap, (starts, offsets)) in by_heap {
-                    let (h, _) = self.game_heap(c, heap)?;
+                    let (h, relocation) = self.game_heap(c, heap)?;
+                    let offsets: Vec<u32> = offsets.iter().map(|&at| relocation.tile(at)).collect();
                     let counts = vec![1u32; starts.len()];
                     unsafe {
                         self.queue.UpdateTileMappings(
@@ -504,17 +743,33 @@ impl D3d12 {
         match call {
             "UpdateTileMappings" => {
                 let heap = match a["heap"].as_i64().filter(|h| *h != 0) {
-                    Some(h) => Some(self.game_heap(c, h)?.0),
+                    Some(h) => Some(self.game_heap(c, h)?),
                     None => None,
                 };
                 let starts = array(&a["starts"], coordinate);
                 let sizes = array(&a["sizes"], size);
-                let flags = array(&a["range_flags"], |v| D3D12_TILE_RANGE_FLAGS(n(v) as i32));
-                let offsets = array(&a["offsets"], n);
+                let mut flags = array(&a["range_flags"], |v| D3D12_TILE_RANGE_FLAGS(n(v) as i32));
+                let mut offsets = array(&a["offsets"], n);
                 // Null counts mean one tile a range when there are several: spelled out, as WARP needs them.
-                let ranges = n(&a["ranges"]);
-                let counts =
+                let mut ranges = n(&a["ranges"]);
+                let mut counts =
                     array(&a["counts"], n).or_else(|| (ranges > 1).then(|| vec![1; ranges as usize]));
+                // The heap's tiles where they are here.
+                if let (Some((_, relocation)), Some(at)) = (&heap, &offsets) {
+                    let regions = n(&a["regions"]);
+                    let tiles = counts.clone().unwrap_or_else(|| {
+                        // One range and no counts: every tile the regions name.
+                        vec![
+                            sizes
+                                .as_ref()
+                                .map_or(regions, |s| s.iter().map(|s| s.NumTiles).sum()),
+                        ]
+                    });
+                    let (f, o, t) = ranges_here(relocation, flags.as_deref(), at, &tiles);
+                    ranges = o.len() as u32;
+                    (flags, offsets, counts) = (Some(f), Some(o), Some(t));
+                }
+                let heap = heap.map(|(h, _)| h);
                 unsafe {
                     self.queue.UpdateTileMappings(
                         &r,
@@ -695,4 +950,85 @@ pub(super) fn aliases(c: &Capture) -> HashMap<i64, BTreeSet<i64>> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const K: u64 = 64 << 10;
+
+    fn span(start: u64, end: u64, bytes: u64, alignment: u64) -> Span {
+        Span {
+            start: start * K,
+            end: Some(end * K),
+            bytes: bytes * K,
+            alignment,
+        }
+    }
+
+    #[test]
+    fn a_heap_that_fits_is_the_games() {
+        let spans = [span(0, 2, 2, K), span(1, 3, 2, K), span(3, 4, 1, 4096)];
+        let r = Relocation::new(&spans, 4 * K, K);
+        assert!(!r.moved());
+        assert_eq!((r.at(K), r.at(3 * K), r.size), (K, 3 * K, 4 * K));
+        assert_eq!(r.lost(&spans), 0);
+    }
+
+    #[test]
+    fn what_takes_more_here_stretches_the_heap_and_keeps_what_shared_memory() {
+        // A takes two units here and one in the game, B shares A's unit, C follows it.
+        let (a, b, c) = (span(0, 1, 2, K), span(0, 1, 1, K), span(1, 2, 1, K));
+        let r = Relocation::new(&[a, b, c], 2 * K, K);
+        assert!(r.moved());
+        assert_eq!((r.at(0), r.at(K), r.size), (0, 2 * K, 3 * K));
+        // A and B still overlap; C, which overlapped neither, starts past A's end here.
+        assert_eq!(r.lost(&[a, b, c]), 0);
+        // A tile mapped at C's unit is where C is.
+        assert_eq!(r.tile(1), 2);
+    }
+
+    #[test]
+    fn an_offset_this_device_cannot_align_to_moves_to_one_it_can() {
+        // A small resource the game placed at 4 KiB, which this device aligns at 64 KiB.
+        let d = Span {
+            start: 4096,
+            end: Some(8192),
+            bytes: 4096,
+            alignment: K,
+        };
+        let r = Relocation::new(&[d], K, K);
+        assert_eq!((r.at(4096), r.size), (K, 2 * K));
+    }
+
+    #[test]
+    fn sharing_that_cannot_be_kept_is_counted() {
+        // C takes three units here; A overlaps C and B in the game, and B, past C's end, cannot start inside A here.
+        let (c, a, b) = (span(0, 1, 3, K), span(0, 2, 2, K), span(1, 3, 2, K));
+        let r = Relocation::new(&[c, a, b], 3 * K, K);
+        assert_eq!(r.at(K), 3 * K);
+        assert_eq!(r.lost(&[c, a, b]), 1);
+    }
+
+    #[test]
+    fn tile_ranges_follow_their_tiles() {
+        // The game's first unit takes two here: its tile 0 stays, tiles 1 and 2 are 2 and 3.
+        let r = Relocation::new(&[span(0, 1, 2, K)], 4 * K, K);
+        let none = D3D12_TILE_RANGE_FLAG_NONE;
+        let (null, reuse) = (
+            D3D12_TILE_RANGE_FLAG_NULL,
+            D3D12_TILE_RANGE_FLAG_REUSE_SINGLE_TILE,
+        );
+        // Tiles 0..3 are no longer consecutive: one range a tile. Tiles 1..3 still are.
+        assert_eq!(
+            ranges_here(&r, None, &[0, 1], &[3, 2]),
+            (vec![none; 4], vec![0, 2, 3, 2], vec![1, 1, 1, 2])
+        );
+        // A NULL range has no tiles of the heap; a reused tile is where it is here.
+        assert_eq!(
+            ranges_here(&r, Some(&[null, reuse]), &[1, 1], &[4, 4]),
+            (vec![null, reuse], vec![1, 2], vec![4, 4])
+        );
+    }
 }

@@ -2429,7 +2429,9 @@ impl Backend for D3d12 {
     }
 
     fn notes(&self) -> Vec<String> {
-        self.queries.notes()
+        let mut notes = self.memory.notes();
+        notes.extend(self.queries.notes());
+        notes
     }
 }
 

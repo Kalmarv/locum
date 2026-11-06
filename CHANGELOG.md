@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Direct3D 12 replay on a device that takes more of a heap for a placed resource than the game's GPU did, or another
+  alignment, lays the heap out again instead of making the resource committed: what shared memory in the game still
+  does, reserved tiles and the frame's tile remaps included. vkd3d-proton on an RTX 5070 Ti sizes 94 of an Elden Ring
+  frame's placed resources so; before, they no longer shared memory and verify called the frame incomplete.
+- A placed resource this device will not take at the small alignment the game placed it with is placed at the default.
+
 ## 0.1.3
 
 - `locum-cli conform CAPTURE --layer DIR` holds a translation layer (DXVK, vkd3d-proton) to a captured frame: it

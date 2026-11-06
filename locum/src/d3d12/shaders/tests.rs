@@ -8,15 +8,43 @@ use windows::Win32::Foundation::{E_NOINTERFACE, S_FALSE, S_OK};
 use windows::Win32::Graphics::Direct3D::ID3DBlob_Vtbl;
 use windows::core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, PCWSTR};
 
-fn temporary(label: &str) -> PathBuf {
+/// A folder of a test's own under the workspace's target folder, removed when the test ends, whether it passed.
+struct Temporary(PathBuf);
+
+impl std::ops::Deref for Temporary {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for Temporary {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::ffi::OsStr> for Temporary {
+    fn as_ref(&self) -> &std::ffi::OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for Temporary {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn temporary(label: &str) -> Temporary {
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
+    Temporary(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
         "../target/shader-archive-{label}-{}-{stamp}",
         std::process::id()
-    ))
+    )))
 }
 fn saved(dir: &Path, suffix: &str, bytes: &[u8]) {
     assert_eq!(

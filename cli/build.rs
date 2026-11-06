@@ -10,6 +10,8 @@ fn main() {
             println!("cargo:rustc-link-arg=/DELAYLOAD:{dll}");
         }
         println!("cargo:rustc-link-arg=delayimp.lib");
+        // A target that calls none of one (the unit tests, whose replays the linker drops) has nothing to delay.
+        println!("cargo:rustc-link-arg=/IGNORE:4199");
     }
     // the workspace's lock in the repository, the package's own once published (a package with binaries carries one)
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));

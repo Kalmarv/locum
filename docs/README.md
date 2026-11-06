@@ -472,10 +472,17 @@ the frame saw there at each point; the game's aliasing barriers and discards of 
 from before heaps were described still records, for each placed resource, the heap properties and flags its heap was
 made with; its heaps are made from those, sized to hold each resource at its offset as the replay's device lays it
 out and each reserved tile mapped into them (in units of 64 KiB, 4 MiB with a multisampled resource), and verify says
-the heaps were inferred. Where sharing cannot be done as the game did (a heap neither the capture nor any resource in
-it describes, or whose resources say different properties; a resource that takes more of its heap on the replay's
-device or is aligned otherwise there; a reserved one tiled otherwise or with no page table), the resource is made
-committed and verify says why. Upload buffers hold, at each submission, the bytes that submission saw. The
+the heaps were inferred. A device that takes more of a heap for a placed resource than the game's GPU did (on an RTX
+5070 Ti, vkd3d-proton sizes some of Elden Ring's textures larger than NVIDIA's driver does), or needs another
+alignment for it (a small resource placed at 4 KiB that it aligns at 64 KiB), gets the heap laid out again. Each offset something starts
+or ends at keeps its order and its distance from the one before, except that the heap is stretched past such a
+resource's end to hold it, or to the alignment it needs. The reserved tiles mapped there, and the frame's changes to
+them, follow (a range of tiles split where it no longer is consecutive). So nothing shares memory that did not in the
+game, and what shared memory still does unless a stretched resource now ends before another starts; verify notes the
+heaps laid out again and says, as incomplete, how many pairs stopped sharing. Where sharing cannot be done at all (a
+heap neither the capture nor any resource in it describes, or whose resources say different properties; a resource
+the device refuses; a reserved one tiled otherwise or with no page table), the resource is made committed and verify
+says why. Upload buffers hold, at each submission, the bytes that submission saw. The
 game's shader-visible descriptor heaps are mirrored and their slots rewritten with each submission's changes, so a
 root table points where it pointed in the game. Each event runs in a command list of its own: buffers and most
 textures go back to the common state between them, and depth and multisampled textures get the transitions each
@@ -717,9 +724,11 @@ What conform found on this machine (RTX 5070 Ti, driver 32.0.16.1074, 2026-11-06
 - vkd3d-proton 3.1 on an Elden Ring frame (6092, 14,475 events, 338 comparisons): the system's replay is the game's
   in every one; through vkd3d-proton 133 of 161 targets and 16 of 170 outputs differ. The first is a shadow map's
   depth at draw 423 (1,127 of 33,554,432 texels, by up to 0.0027); from the G-buffer at draw 882 on, most targets
-  differ. vkd3d-proton also sizes 94 of the frame's placed resources larger than the game's GPU did, so the layer's
-  replay made them committed (a `LAYER COULD NOT`). Making the same 94 committed on the system's runtime leaves every
-  target and output the game's, so that is not why the others differ.
+  differ: 149 findings. vkd3d-proton also sizes 94 of the frame's placed resources larger than the game's GPU did, so
+  the layer's replay lays 4 heaps out again (1,614 placed resources and tiles at other offsets, every pair that shared
+  memory still sharing it). Before it did, it made those 94 committed (a 150th finding, `LAYER COULD NOT`), and making
+  the same 94 committed on the system's runtime left every target and output the game's. So the memory layout is not
+  why the others differ.
 
 Both smokes run conform with locum's own stand-ins as the layer: through them the frame is the game's, the layer is
 named and the system's replay is not; with a `solid` rule in their `overrides.txt` each draw it changes is a
