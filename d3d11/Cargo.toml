@@ -11,7 +11,7 @@ keywords = ["direct3d", "d3d11", "capture", "graphics", "debugging"]
 categories = ["development-tools::debugging", "graphics"]
 
 [dependencies]
-locum-capture = { version = "0.1.1", path = "../capture" }
+locum-capture = { version = "0.1.2", path = "../capture" }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
