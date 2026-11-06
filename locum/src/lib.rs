@@ -19,6 +19,8 @@ mod log;
 mod passthrough;
 mod settings;
 mod system;
+#[cfg(test)]
+mod tests;
 mod values;
 mod vtables;
 
@@ -122,6 +124,16 @@ unsafe fn give_device(device: *mut c_void, device_out: *mut *mut c_void, context
     }
 }
 
+/// Clears each out pointer given, as the runtime does before it checks anything: a call that fails leaves nulls there
+/// and not what the game's variables held before.
+unsafe fn clear(outs: &[*mut *mut c_void]) {
+    for &out in outs {
+        if !out.is_null() {
+            unsafe { *out = core::ptr::null_mut() };
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn D3D11CreateDevice(
     adapter: *mut c_void,
@@ -164,6 +176,7 @@ pub unsafe extern "system" fn D3D11CreateDevice(
         );
         return hr;
     }
+    unsafe { clear(&[device_out, context_out]) };
     let mut device = core::ptr::null_mut();
     let wants = !device_out.is_null() || !context_out.is_null();
     let hr = unsafe {
@@ -214,6 +227,12 @@ pub unsafe extern "system" fn D3D11CreateDeviceAndSwapChain(
         return E_NOTIMPL;
     };
     let adapter = Adapter::unwrap_raw(adapter);
+    unsafe { clear(&[swapchain_out, device_out, context_out]) };
+    // Asked for nothing it can make (a swap chain needs a description), the runtime makes nothing and says S_FALSE;
+    // locum needs the device only to hand it out.
+    let wants = (!swapchain_out.is_null() && !swapchain_desc.is_null())
+        || !device_out.is_null()
+        || !context_out.is_null();
     let mut device = core::ptr::null_mut();
     let mut swapchain = core::ptr::null_mut();
     let hr = unsafe {
@@ -231,7 +250,7 @@ pub unsafe extern "system" fn D3D11CreateDeviceAndSwapChain(
             } else {
                 &mut swapchain
             },
-            &mut device,
+            if wants { &mut device } else { core::ptr::null_mut() },
             level_out,
             core::ptr::null_mut(),
         )
