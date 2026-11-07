@@ -23,6 +23,6 @@ input is not configured the test skips with a line naming its key; with `[run] r
 
 | key | status | gate | about | source |
 | --- | --- | --- | --- | --- |
-| `oracles.corpus.general/slim` | live | yes | the slim shader set: 8,287 programs (`programs/<fam>/<sha256>.<fam>`; 3,671 DXBC, 4,059 DXIL, 557 Direct3D 9), each beside Microsoft's listing, chosen to reach every llvm-cov region and branch side of dx and iridia that the full 108,394-program pool reaches; tests/slim.rs | primase-oracles `producers/slim-set` over the oracle home's game corpora and disassembler sets and outside projects' test corpora (recorded since primase-testdata 0.1.17, its slim.tsv as of 0.2.2); programs stay outside the repository |
+| `oracles.corpus.general/slim` | live | yes | the slim shader set: 8,287 programs (`programs/<fam>/<sha256>.<fam>`; 3,671 DXBC, 4,059 DXIL, 557 Direct3D 9), each beside Microsoft's listing, chosen to reach every llvm-cov region and branch side of dx and iridia that the full 108,394-program pool reaches; tests/slim.rs | primase-oracles `producers/slim-set` over the oracle home's game corpora and disassembler sets and outside projects' test corpora (recorded since primase-testdata 0.1.17, its slim.tsv as of 0.2.2, held as slim.zip from 0.2.6); programs stay outside the repository |
 
 <!-- end of real-data inputs -->

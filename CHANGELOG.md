@@ -9,8 +9,8 @@
   the last register of its range overflowed (a panic in a debug build), and the output tracking reports it as a gap.
   iridia 0.5.0 still links dx 0.5.0, so the build holds both: `shader-file --evidence` names the dx the CLI's own reader
   is (0.9.1), where it took the first `dxil-reader` in Cargo.lock.
-- Tests: `locum-capture`'s `slim` test reads primase-testdata's slim shader set (`oracles.corpus.general/slim`, 0.2.2)
-  as locum does: each DXBC and DXIL program's container, its reflection (`RDEF`, its declarations, or the `STAT` or
+- Tests: `locum-capture`'s `slim` test reads primase-testdata's slim shader set (`oracles.corpus.general/slim`, 0.2.6,
+  from its archive `slim.zip` on the threads `[run] threads` allows) as locum does: each DXBC and DXIL program's container, its reflection (`RDEF`, its declarations, or the `STAT` or
   `DXIL` module), a library's declared exports and a root signature. Of 7,730 programs, 7,728 read; the 2 refused are
   2 of the 10 Microsoft's own tools refuse. The 557 Direct3D 9 programs are not read: locum wraps Direct3D 11 and 12.
   It skips without `GAME_DATA`; CONTRIBUTING says how to run it before pushing.

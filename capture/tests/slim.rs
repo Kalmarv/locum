@@ -101,9 +101,10 @@ fn slim_programs_parse_and_reflect() {
     let counts = Mutex::new(BTreeMap::<(&str, &str), usize>::new());
     let failed = Mutex::new(Vec::new());
     let next = AtomicUsize::new(0);
-    // Reading the set's files over a network share is most of the time: a few threads hide the latency.
+    // On the threads the configuration allows (`[run] threads`): reading the set's archive is a positional read of
+    // one file, which threads can share.
     std::thread::scope(|s| {
-        for _ in 0..16 {
+        for _ in 0..primase_testdata::threads().get() {
             s.spawn(|| {
                 while let Some(&(family, name)) = programs.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let outcome = if family == "d3d9" {
