@@ -37,6 +37,7 @@ mod indirect;
 mod memory;
 mod pipelines;
 mod queries;
+mod rays;
 mod views;
 
 use views::Extent;
@@ -211,6 +212,13 @@ struct Root {
     decoded: Value,
 }
 
+/// What a draw or dispatch runs with.
+enum Pipeline {
+    State(ID3D12PipelineState),
+    /// A raytracing state object (SetPipelineState1).
+    Rays(ID3D12StateObject),
+}
+
 /// A transition of a tracked texture around one event: its subresources and the state they take.
 struct Need {
     resource: i64,
@@ -245,8 +253,10 @@ pub struct D3d12 {
     roots: HashMap<i64, Option<Root>>,
     psos: HashMap<(i64, Vec<String>), Option<ID3D12PipelineState>>,
     signatures: HashMap<i64, Option<ID3D12CommandSignature>>,
-    /// The game's buffers by GPU address, for the addresses in ExecuteIndirect's argument records.
-    addresses: Option<indirect::Addresses>,
+    /// The game's buffers by GPU address, for the addresses in ExecuteIndirect's argument records and shader tables.
+    addresses: Option<std::rc::Rc<indirect::Addresses>>,
+    /// Acceleration structures and raytracing state objects.
+    rays: rays::Rays,
     /// By command list execution, its depth bounds and shading rate calls, which `d12_draw_state` does not hold.
     list_state: Option<HashMap<i64, Vec<ListCall>>>,
     replaced: HashMap<String, Option<Vec<u8>>>,
@@ -262,6 +272,30 @@ pub struct D3d12 {
 /// The resources each resource of a Direct3D 12 capture shares memory with (see [`memory`]).
 pub fn aliases(c: &Capture) -> HashMap<i64, BTreeSet<i64>> {
     memory::aliases(c)
+}
+
+/// The resources of a Direct3D 12 capture that hold acceleration structures.
+pub fn acceleration_structures(c: &Capture) -> BTreeSet<i64> {
+    let mut out: BTreeSet<i64> = c
+        .rows(
+            "SELECT id, description FROM d12_objects WHERE kind LIKE 'ID3D12Resource%'",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .into_iter()
+        .filter(|(_, d)| {
+            serde_json::from_str::<Value>(d).is_ok_and(|d| locum_capture::d3d12::acceleration_structures(&d))
+        })
+        .map(|(id, _)| id)
+        .collect();
+    if c.has_table("d12_acceleration_structures") {
+        out.extend(
+            c.rows("SELECT resource FROM d12_acceleration_structures", [], |r| {
+                r.get::<_, i64>(0)
+            }),
+        );
+    }
+    out
 }
 
 /// For planning: the events that begin, end, count into or resolve the frame's queries, with the queries (as
@@ -415,6 +449,7 @@ impl D3d12 {
                 psos: HashMap::new(),
                 signatures: HashMap::new(),
                 addresses: None,
+                rays: rays::Rays::default(),
                 list_state: None,
                 replaced: HashMap::new(),
                 memory: memory::Memory::default(),
@@ -832,7 +867,11 @@ impl D3d12 {
             return;
         }
         let handle = m.cpu(v.slot);
-        self.view(&v.kind, v.resource, v.counter, &v.description, handle);
+        if v.kind == "srv" && v.description["dimension"] == 11 {
+            self.structure_view(c, &v.description, handle);
+        } else {
+            self.view(&v.kind, v.resource, v.counter, &v.description, handle);
+        }
         self.versions.insert((v.heap, v.slot), v.id);
     }
 
@@ -850,8 +889,9 @@ impl D3d12 {
         let default = views::is_default(desc);
         unsafe {
             match kind {
+                // Made where they are written (`descriptor`), naming replay's storage.
                 "srv" if desc["dimension"] == 11 => {
-                    self.warn("acceleration structure views are not replayed");
+                    self.warn("acceleration structure views a call names by definition are not replayed");
                 }
                 "srv" if default => {
                     if let Some(r) = &r {
@@ -1255,9 +1295,23 @@ impl D3d12 {
                 replaced.push((pipelines::shader_type(r.stage), code));
             }
         }
-        let Some(pso) = self.pso(c, pso_id, texts, &replaced) else {
-            self.warn(format!("draws of pipeline state #{pso_id} were not run"));
-            return Ok(());
+        // A raytracing state object (SetPipelineState1) runs a DispatchRays.
+        let state_object = state["state_object"].as_i64().unwrap_or(0);
+        let pipeline = if compute && pso_id == 0 && state_object != 0 {
+            if !texts.is_empty() {
+                self.warn("rules that put in shaders do not apply to DispatchRays");
+            }
+            let Some(object) = self.state_object(c, state_object) else {
+                self.warn(format!("dispatches of state object #{state_object} were not run"));
+                return Ok(());
+            };
+            Pipeline::Rays(object)
+        } else {
+            let Some(pso) = self.pso(c, pso_id, texts, &replaced) else {
+                self.warn(format!("draws of pipeline state #{pso_id} were not run"));
+                return Ok(());
+            };
+            Pipeline::State(pso)
         };
         let root_id = if compute { compute_root } else { graphics_root };
         let Some((root, decoded)) = self
@@ -1389,9 +1443,35 @@ impl D3d12 {
             }
         }
 
+        // A root SRV may name an acceleration structure: replay's, built before anything of the event is recorded.
+        let mut root_srvs: HashMap<u32, u64> = HashMap::new();
+        for (i, kind, v) in &root_args {
+            if kind == "ShaderResourceView" {
+                let (resource, offset) = (
+                    v["resource"].as_i64().unwrap_or(0),
+                    v["offset"].as_u64().unwrap_or(0),
+                );
+                let address = self
+                    .view_address(c, resource, offset, true)
+                    .unwrap_or_else(|why| {
+                        self.warn(format!("a root SRV: {why}"));
+                        0
+                    });
+                root_srvs.insert(*i, address);
+            }
+        }
+
         let list = self.list.clone();
+        let list4 = list.cast::<ID3D12GraphicsCommandList4>().ok();
         unsafe {
-            list.SetPipelineState(&pso);
+            match (&pipeline, &list4) {
+                (Pipeline::State(pso), _) => list.SetPipelineState(pso),
+                (Pipeline::Rays(object), Some(list4)) => list4.SetPipelineState1(object),
+                (Pipeline::Rays(_), None) => {
+                    self.warn("this device's command lists do no raytracing (ID3D12GraphicsCommandList4)");
+                    return Ok(());
+                }
+            }
             let mut heaps = Vec::new();
             for id in state["descriptor_heaps"]
                 .as_array()
@@ -1439,6 +1519,7 @@ impl D3d12 {
                         }
                     }
                     "ShaderResourceView" => {
+                        let address = root_srvs.get(i).copied().unwrap_or(address);
                         if compute {
                             list.SetComputeRootShaderResourceView(*i, address);
                         } else {
@@ -1530,6 +1611,12 @@ impl D3d12 {
                     a(4) as u32,
                 ),
                 "Dispatch" => self.list.Dispatch(a(0) as u32, a(1) as u32, a(2) as u32),
+                // One not replayed has a warning saying why.
+                "DispatchRays" => {
+                    if let (indirect::Arguments::Rays(desc), Some(list4)) = (&arguments, &list4) {
+                        list4.DispatchRays(desc)
+                    }
+                }
                 "ExecuteIndirect" => {
                     let signature = self.signature(c, a(0) as i64);
                     let (Some(signature), false) =
@@ -2263,16 +2350,19 @@ impl Backend for D3d12 {
         match kind.as_str() {
             "draw" | "dispatch" => {
                 // Before the event records anything: reading its argument records runs the open list.
-                let arguments = if call == "ExecuteIndirect" {
-                    self.indirect_arguments(c, seq, &a)?
-                } else {
-                    indirect::Arguments::AsRecorded
+                let arguments = match call.as_str() {
+                    "ExecuteIndirect" => self.indirect_arguments(c, seq, &a)?,
+                    "DispatchRays" => self.dispatch_rays(c, seq, &a)?,
+                    _ => indirect::Arguments::AsRecorded,
                 };
                 self.count_begin(list)?;
                 self.draw(c, seq, &kind, &call, &a, rules, arguments)?;
                 self.count_end()?;
             }
             "copy" if call == "ResolveQueryData" => self.resolve_queries(&a)?,
+            "copy" if call == "BuildRaytracingAccelerationStructure" => self.build(c, &a)?,
+            "copy" if call == "CopyRaytracingAccelerationStructure" => self.copy_structure(c, &a)?,
+            "copy" if call == "EmitRaytracingAccelerationStructurePostbuildInfo" => self.postbuild(c, &a)?,
             "copy" => self.copy(&call, &a)?,
             "clear" => self.clear(c, &call, &a)?,
             "update" if call == "WriteBufferImmediate" => {

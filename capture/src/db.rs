@@ -45,7 +45,9 @@ CREATE TABLE resources(
                                    -- tile-events (D3D11: the frame's tile operations give it its contents) |
                                    -- upload-at-first-submission (D3D12 upload heap, as the GPU reached the frame's
                                    -- first captured submission) |
-                                   -- after-frame (named only by ExecuteIndirect argument records)
+                                   -- after-frame (named only by ExecuteIndirect argument records or shader
+                                   -- tables) |
+                                   -- acceleration-structure-builds (D3D12: no bytes; replay builds its structures)
   content_note TEXT                -- why content is missing, or how it may differ
 );
 CREATE TABLE subresources(

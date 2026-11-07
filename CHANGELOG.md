@@ -28,10 +28,30 @@
   locum's stand-ins forward to `locum.dll`, which was otherwise the first of that name beside locum-cli or on PATH
   (cargo's target folders under `cargo xtask smoke`), or none, and the layer replay failed to load the system's
   `d3d11.dll`. The machine line names those modules too.
+- A copy of locum's from a buffer the game's list had not moved by a barrier (a build's inputs, armed or not;
+  ExecuteIndirect's records and DispatchRays' tables while a capture is armed) no longer leaves the buffer in a state
+  the game does not know. The copy promoted it to COPY_SOURCE as well, so the game's next barrier from the state it
+  expected was an error the debug layer reports, and the runtime's tracking of the buffer went wrong. Locum now moves
+  it back right before that barrier, or between the lists of one ExecuteCommandLists, and joins COPY_SOURCE first
+  where an earlier list of the call left the buffer in a state of its own.
+- A top-level build in the frame whose instances are an array of pointers reads the buffers its pointers point into,
+  so a plan makes them and they get first-use copies. Before, replay left out every instance only a pointer named.
+  Such a build before the frame is still not captured (see the docs for why): replay builds it empty, and verify says
+  so.
 - An ExecuteIndirect whose command signature runs DispatchRays has its records read, as other records with addresses
   are: the shader tables they name are among its reads, so a plan makes them, and a table nothing else in the frame
-  names is copied after it. Before, its records were a `d3d12-indirect-arguments` gap. Replay does not run
-  DispatchRays yet, and verify says so.
+  names is copied after it. Before, its records were a `d3d12-indirect-arguments` gap.
+- Raytracing replays. A DispatchRays, direct or through ExecuteIndirect, runs with its state object made again
+  (collections and AddToStateObject included) on copies of its shader tables in which each record's identifier and
+  local root arguments are replay's; acceleration structures the frame began with are built again from the inputs the
+  capture copied at their builds, and the frame's builds, updates, copies and inline traces (RayQuery) run as it ran
+  them. Capture reads what each record's local root arguments name (the buffers and descriptors a dispatch reads and
+  writes through its tables alone), at the Present and, for a direct DispatchRays, as its submission is made, so what
+  they name gets a first-use copy; copies what a DispatchRays writes through UAVs, as a dispatch's outputs; keeps each
+  state object's subobjects and the identifiers the game asked for; and names each acceleration structure view's
+  buffer. Before, replay ran no DispatchRays and verify said so. Verified on WARP and NVIDIA hardware, a capture made
+  on one replayed on the other, through callable shaders, compacted, updated and cloned structures, and instances by
+  pointer.
 - Multisampled textures are captured sample by sample, bit for bit, depth and stencil included: their contents and
   their pass-end targets on both APIs. Before, Direct3D 11 captured their resolve, and Direct3D 12 none of them (a
   gap). Draws read the samples, since no copy can: a twin of the texture's typeless family, and a pixel shader per

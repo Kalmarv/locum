@@ -289,14 +289,26 @@ pub fn after(c: &Class, e: &Entry) -> String {
         ("d12_device", "CreatePipelineLibrary") => {
             "if result.is_ok() { crate::d3d12::shaders::bytes(\"pipeline-library.bin\",a0,a1); crate::d3d12::pipelines::created(self.data.id,a3,||serde_json::json!({\"kind\":\"pipeline_library\",\"initial\":crate::d3d12::pipelines::bytes(a0,a1)})); }"
         }
-        ("d12_device", "CreateStateObject" | "AddToStateObject") => {
-            "if result.is_ok() { crate::d3d12::shaders::state_object(a0); }"
+        ("d12_device", "CreateStateObject") => {
+            "if result.is_ok() { crate::d3d12::shaders::state_object(a0); crate::d3d12::pipelines::created(self.data.id,a2,||crate::d3d12::pipelines::state_object(a0,0)); }"
+        }
+        ("d12_device", "AddToStateObject") => {
+            "if result.is_ok() { crate::d3d12::shaders::state_object(a0); crate::d3d12::pipelines::created(self.data.id,a3,||crate::d3d12::pipelines::state_object(a0,crate::d3d12::id(a1))); }"
+        }
+        ("d12_properties", "GetShaderIdentifier") => {
+            "crate::d3d12::pipelines::identifier(self.data.id,a0,result);"
         }
         ("d12_pso", "GetCachedBlob") => "if result.is_ok() { crate::d3d12::shaders::cached_blob(a0); }",
         ("d12_library", "Serialize") => {
             "crate::log::log!(\"D3D12 Serialize: library={} capacity={}\",self.data.id,a1);"
         }
         ("d12_list", "Close") => "self.data.close(result);",
+        ("d12_list", "BuildRaytracingAccelerationStructure") => {
+            "crate::d3d12::rays::built(&self.data,self.real(),a0);"
+        }
+        ("d12_list", "CopyRaytracingAccelerationStructure") => {
+            "crate::d3d12::rays::copied(self.data.id,a0,a1,a2);"
+        }
         ("d12_list", "Reset") => "self.data.reset(self.real(),result,a0,a1);",
         ("d12_queue", "ExecuteCommandLists") => {
             "crate::d3d12::journal::submitted(&self.data,self.real(),submission);"

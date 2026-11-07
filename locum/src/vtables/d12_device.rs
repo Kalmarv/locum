@@ -4201,6 +4201,9 @@ unsafe impl Device12Methods for crate::d3d12::Object {
             crate::d3d12::wrap_output(result, a1, a2);
             if result.is_ok() {
                 crate::d3d12::shaders::state_object(a0);
+                crate::d3d12::pipelines::created(self.data.id, a2, || {
+                    crate::d3d12::pipelines::state_object(a0, 0)
+                });
             }
             result
         }
@@ -4250,6 +4253,9 @@ unsafe impl Device12Methods for crate::d3d12::Object {
             crate::d3d12::wrap_output(result, a2, a3);
             if result.is_ok() {
                 crate::d3d12::shaders::state_object(a0);
+                crate::d3d12::pipelines::created(self.data.id, a3, || {
+                    crate::d3d12::pipelines::state_object(a0, crate::d3d12::id(a1))
+                });
             }
             result
         }

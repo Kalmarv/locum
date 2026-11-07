@@ -3782,6 +3782,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
                     serde_json::json!([acceleration_structure_build(a0), postbuild_info(a2, a1)])
                 });
             real::BuildRaytracingAccelerationStructure(self.real(), a0, a1, a2);
+            crate::d3d12::rays::built(&self.data, self.real(), a0);
         }
     }
     unsafe fn EmitRaytracingAccelerationStructurePostbuildInfo(
@@ -3817,6 +3818,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
                     serde_json::json!([address(a0), address(a1), a2.0])
                 });
             real::CopyRaytracingAccelerationStructure(self.real(), a0, a1, a2);
+            crate::d3d12::rays::copied(self.data.id, a0, a1, a2);
         }
     }
     unsafe fn SetPipelineState1(&self, a0: *mut core::ffi::c_void) {

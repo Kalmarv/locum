@@ -46,16 +46,20 @@ pub unsafe fn srv(
     if !journal::enabled() {
         return;
     }
+    let mut resource = id(resource);
     let desc = if let Some(d) = unsafe { p.as_ref() } {
         if d.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE {
-            Description::Json(srv_json(d))
+            // Made without a resource: it names the buffer its acceleration structure is in by address.
+            let json = srv_json(d);
+            resource = json["payload"]["address"]["resource"].as_u64().unwrap_or(0);
+            Description::Json(json)
         } else {
             Description::Srv(*d)
         }
     } else {
         Description::DefaultView
     };
-    journal::set_descriptor(handle.ptr as u64, "srv", id(resource), 0, desc);
+    journal::set_descriptor(handle.ptr as u64, "srv", resource, 0, desc);
 }
 pub unsafe fn uav(
     resource: *mut c_void,

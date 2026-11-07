@@ -531,7 +531,7 @@ used. A signature that sets root arguments is made against its root signature. A
 describes, or in one replay did not make, skips the ExecuteIndirect and says why; a capture from before buffers'
 addresses were recorded (2026-11-05) skips them all. Mesh and amplification pipelines (their stream's `AS` and `MS`
 subobjects) are rebuilt as any other, so DispatchMesh, direct or indirect, replays. DispatchRays, direct or
-indirect, does not yet (replay makes no state objects), and verify says so.
+indirect, replays as raytracing below says.
 
 Queries are replayed. An occlusion or pipeline-statistics query must begin and end in one command list, and each
 event replays in a list of its own, so while a game's query is open, each draw and dispatch of the game's list it was
@@ -839,7 +839,8 @@ or index buffer view or a root CBV, SRV or UAV per record, each a GPU address in
 DispatchRays argument names its four shader tables by address; a buffer the frame reads only through those is named by no command it records, so no submission is seen to use it first. In an
 instrumented list, the records such an ExecuteIndirect may run (its most records from the argument offset, as many
 as the buffer holds) and its count are copied right before it, from the states the buffers are in (what the list's
-own barriers left them in; otherwise COMMON or promoted to read states, which a copy reads with no barrier). At the
+own barriers left them in; otherwise COMMON or promoted to read states, which a copy reads with no barrier: see
+below). At the
 Present that closes the capture, locum waits for those copies (up to 10 s), reads the records the count lets run, and
 finds every address in the live buffers: the event reads each buffer a view, a root CBV or SRV or a shader
 table in its records names, and writes each a root UAV in them names (`event_resources` `read` and `write`, so a plan makes them and
@@ -864,6 +865,63 @@ ExecuteIndirect of an uninstrumented list whose records hold addresses, and a bu
 made of (no description, a destroyed queue) are `d3d12-indirect-arguments`, `contents` or `d3d12-results` gaps. A
 bundle may run only a signature of one draw or dispatch with no count buffer (the debug layer refuses any other,
 message 744), so a bundle's records never hold addresses and are read as any buffer is.
+
+Raytracing. A state object's description (`d12_objects`, `kind` `state_object`) holds its type, every subobject in
+order (an association names the subobject it associates by index; a DXIL library its blob and exports; a collection
+the state object it is) and, for AddToStateObject, the state object it grew from (`parent`); each identifier the game
+asks for (GetShaderIdentifier) is added to it under the export's name (`identifiers`). A DispatchRays' shader tables
+are copied right before it in an instrumented list (an ExecuteIndirect's, where its records name them, after the
+frame: a gap where the frame writes such a table); at the Present that closes the capture each record is read by the
+export its identifier is, the local root signature that export runs with (by the DXR spec's association rules,
+through the state object's collections, parents and its libraries' own subobjects; a signature a library declares is
+read from its RTS0 bytes), and the arguments that signature lays out: the buffers its root CBVs, SRVs and UAVs name
+and the descriptors its tables name are the dispatch's reads, the UAVs its writes. A record whose identifier is none
+the game asked for, or that is shorter than its arguments, names nothing and is counted (`d3d12-shader-tables`): a
+table may hold records no ray reaches. An acceleration structure view names the buffer its structure is in. A direct
+DispatchRays' tables are also read as its submission is made, before its lists run (the queue first runs what was
+submitted before), so what their records name gets a first-use copy as what commands name does; a table something in
+the frame writes is not read then, and what only it names has no contents from before the frame (`contents`, which
+says so). What a DispatchRays writes through a UAV the global root signature places is copied right after it, as a
+dispatch's outputs are (its programs are the state object's DXIL libraries, their UAVs read from `dx.resources`); what
+it writes through a local root argument is copied after the frame, where nothing after it writes the buffer.
+
+A copy of locum's inside a game's list (argument records, shader tables, instance pointers, a build's inputs) reads a
+buffer the list's own barriers have not moved with no barrier: a buffer begins each ExecuteCommandLists in COMMON, the
+list's uses promote it to read states, and the copy's COPY_SOURCE joins them. The game does not know of that
+COPY_SOURCE, so its next transition of the buffer names a before-state without it, which the runtime rejects. Locum
+moves it back first: right before that transition, from its before-state with COPY_SOURCE to that state; where the
+list leaves it so, in a list of locum's submitted before the next list of the same ExecuteCommandLists that moves it
+(buffers do not decay between the lists of one call). A buffer an earlier list of the call left in a state of its own
+is not promoted: a list of locum's before the copying one joins COPY_SOURCE to that state. A build's inputs are copied
+armed or not, so this holds in every list.
+
+An acceleration structure's bytes are the driver's own, so a capture keeps how each was last built before the frame
+(`d12_acceleration_structures`: the build's description, and its inputs, copied in the game's list right after the
+build: vertices, indices, transforms, AABBs or instances), a clone or compaction the build of its source. A buffer
+acceleration structures live in has no contents (`content_source` `acceleration-structure-builds`); one the frame
+uses that holds a structure whose inputs are not known is a `d3d12-acceleration-structures` gap. A top-level build in
+the frame whose instances are an array of pointers has the pointers copied right before it in an instrumented list,
+and read at the Present: the build reads each buffer they point into, which a plan then makes. They are read once more
+as its submission is made, for those buffers' first-use copies; a pointer into no live buffer is a
+`d3d12-acceleration-structures` gap. Replay gives
+each of the game's acceleration structures (a buffer and an offset) storage of its own, sized for the largest build
+the capture makes into it on the replay device, and builds it there when it first names it, from those inputs (an
+update built whole), its instances' bottom-level addresses replaced with replay's; the frame's own builds, updates,
+clones, compactions and postbuild information run as the frame ran them, a top-level build's instances read as
+replay's GPU holds them (an array of pointers to them followed) and their addresses replaced the same way. A
+serialized structure is deserialized where the replay device's driver reads the game's (CheckDriverMatchingIdentifier),
+its bottom-level addresses replaced; serialized, visualized and postbuild bytes are the replay device's own, and
+verify says so. Every acceleration structure view, root SRV and shader record argument that names one names replay's
+storage. Each state object is made again (its collections and the state object it grew from first), and each
+DispatchRays runs on copies of its tables read as replay's GPU holds them right before it, in which each record's
+identifier is replay's for the same export and each local argument replay's: a descriptor handle the slot of replay's
+mirror of its heap, a root CBV, SRV or UAV the address of replay's buffer or acceleration structure. What cannot be
+placed is left null and verify says so. Rules that put in shaders do not apply to DispatchRays. Not captured:
+instance descriptions given as an array of pointers to a build before the frame. The pointers are GPU memory, so when
+the build is recorded, where the instances are is not known and nothing can be copied after it; and reading them
+later is no copy of what the build read, since the game may reuse that memory once the build has run.
+`d12_acceleration_structures` says so, the frame's use of such a structure is a `d3d12-acceleration-structures` gap,
+and replay builds it empty. Nor are work graphs and generic programs (SetProgram), which replay refuses by name.
 Each buffer's description keeps its GPU address (`gpu_address`). Each submission records the descriptor definitions
 that changed
 since the previous one (all of them at the first; `empty` marks a slot emptied), so `d12_submission_descriptors`

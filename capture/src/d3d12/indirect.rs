@@ -136,6 +136,29 @@ pub fn addresses(bytes: &[u8], layout: &Layout, records: usize, mut f: impl FnMu
     }
 }
 
+/// The shader tables the DispatchRays argument of each of the first `records` records of `bytes` names (see
+/// [`super::tables::Table::of_desc`]), where the signature's records hold one; records past the end of `bytes` name
+/// none.
+pub fn shader_tables(bytes: &[u8], layout: &Layout, records: usize) -> Vec<Vec<super::tables::Table>> {
+    // The ray generation record's range starts the argument.
+    let Some(start) = layout
+        .addresses
+        .iter()
+        .find(|a| a.kind == Kind::ShaderTable)
+        .map(|a| a.at)
+    else {
+        return Vec::new();
+    };
+    (0..records)
+        .map(|record| {
+            let at = record * layout.stride + start;
+            bytes
+                .get(at..at + DISPATCH_RAYS)
+                .map_or_else(Vec::new, super::tables::Table::of_desc)
+        })
+        .collect()
+}
+
 /// Rewrites the addresses of the first `records` records of `bytes` by `map` (an address of 0 stays 0). Fails at the
 /// first address `map` cannot place, naming the record.
 pub fn patch(
@@ -220,6 +243,35 @@ mod tests {
         assert!(
             layout(&json!({"stride": 104, "arguments": [{"type": 5, "count": 1}, {"type": 9}]})).is_err()
         );
+        // Each record's argument gives its tables: here one record's ray generation record and hit group table.
+        let mut record = vec![0u8; 108 * 2];
+        for (at, v) in [(4, 0x100u64), (12, 64), (44, 0x200), (52, 96), (60, 32)] {
+            record[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        let found = shader_tables(&record, &layout(&rays).unwrap(), 3);
+        use super::super::tables::{Table, Which};
+        assert_eq!(
+            found,
+            [
+                vec![
+                    Table {
+                        which: Which::RayGeneration,
+                        address: 0x100,
+                        bytes: 64,
+                        stride: 64
+                    },
+                    Table {
+                        which: Which::HitGroups,
+                        address: 0x200,
+                        bytes: 96,
+                        stride: 32
+                    }
+                ],
+                Vec::new(),
+                Vec::new()
+            ]
+        );
+        assert!(shader_tables(&record, &layout(&draws).unwrap(), 1).is_empty());
     }
 
     #[test]

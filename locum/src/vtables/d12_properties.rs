@@ -167,6 +167,7 @@ unsafe impl Properties12Methods for crate::d3d12::Object {
     unsafe fn GetShaderIdentifier(&self, a0: windows::core::PCWSTR) -> *mut core::ffi::c_void {
         unsafe {
             let result = real::GetShaderIdentifier(self.real(), a0);
+            crate::d3d12::pipelines::identifier(self.data.id, a0, result);
             result
         }
     }

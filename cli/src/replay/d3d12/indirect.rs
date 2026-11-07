@@ -4,11 +4,13 @@
 //! gfxreconstruct patches at ExecuteCommandLists), maps every address to the game's buffer and offset by the
 //! addresses the capture recorded at each buffer's creation (`gpu_address` in its description), and runs the
 //! signature on a copy holding replay's addresses. The buffers the records name are among the event's reads (the
-//! capture read the records after the frame), so the plan makes them, with their contents.
+//! capture read the records after the frame), so the plan makes them, with their contents. A DispatchRays argument's
+//! tables are replay's copies of the game's, rewritten as a direct DispatchRays' are (see [`super::rays`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
 
-use locum_capture::d3d12::indirect::{Layout, addresses, layout, patch};
+use locum_capture::d3d12::indirect::{Kind, Layout, addresses, layout, patch, shader_tables};
 use serde_json::Value;
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -76,9 +78,18 @@ pub(super) enum Arguments {
     Patched(ID3D12Resource),
     /// Nothing: replay could not place an address (the warning says why).
     Skip,
+    /// A direct DispatchRays' description, its tables replay's copies.
+    Rays(D3D12_DISPATCH_RAYS_DESC),
 }
 
 impl D3d12 {
+    /// The game's buffers by address.
+    pub(super) fn addresses_of(&mut self, c: &Capture) -> Rc<Addresses> {
+        self.addresses
+            .get_or_insert_with(|| Rc::new(Addresses::of(c)))
+            .clone()
+    }
+
     /// The arguments ExecuteIndirect event `seq` (`a`: signature, max count, argument buffer and offset, count buffer
     /// and offset) runs on. Reading the records runs what the open list holds, so it is called before the event
     /// records anything of its own.
@@ -102,16 +113,6 @@ impl D3d12 {
             // signature() says so.
             return Ok(Arguments::AsRecorded);
         };
-        let rays = desc["arguments"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|a| a["type"].as_i64() == Some(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS.0 as i64));
-        if rays {
-            // As a DispatchRays call is (see `draw`).
-            self.warn("DispatchRays is not replayed");
-            return Ok(Arguments::Skip);
-        }
         let layout = match layout(&desc) {
             Ok(l) => l,
             Err(e) => {
@@ -124,24 +125,17 @@ impl D3d12 {
         if layout.addresses.is_empty() {
             return Ok(Arguments::AsRecorded);
         }
-        let addresses = self.addresses.take().unwrap_or_else(|| Addresses::of(c));
-        let result = self.patched(
-            seq,
-            &layout,
-            &addresses,
-            (max, buffer, offset, count, count_offset),
-        );
-        self.addresses = Some(addresses);
-        result
+        self.patched(c, seq, &layout, (max, buffer, offset, count, count_offset))
     }
 
     fn patched(
         &mut self,
+        c: &Capture,
         seq: i64,
         layout: &Layout,
-        addresses_of: &Addresses,
         (max, buffer, offset, count, count_offset): (u64, i64, u64, i64, u64),
     ) -> Result<Arguments, String> {
+        let addresses_of = self.addresses_of(c);
         if addresses_of.is_empty() {
             self.warn(
                 "ExecuteIndirect with GPU addresses in its argument records is not replayed: the capture records no \
@@ -201,19 +195,50 @@ impl D3d12 {
             self.warn(format!("ExecuteIndirect (event {seq}) is not replayed: {why}"));
             return Ok(Arguments::Skip);
         }
+        // The tables each DispatchRays argument names, as the game's records name them.
+        let rays = shader_tables(&records_bytes, layout, records as usize);
         patch(&mut records_bytes, layout, records as usize, |game| {
             placed
                 .get(&game)
                 .copied()
                 .ok_or_else(|| format!("address {game:#x} was not placed"))
         })?;
+        if let Some(start) = layout
+            .addresses
+            .iter()
+            .find(|a| a.kind == Kind::ShaderTable)
+            .map(|a| a.at)
+        {
+            let state_object = c
+                .row(
+                    "SELECT s.root_args_json FROM d12_draw_state s JOIN draws d ON d.n = s.draw WHERE d.event = ?1",
+                    [seq],
+                    |r| r.get::<_, String>(0),
+                )
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|s| s["state_object"].as_i64())
+                .unwrap_or(0);
+            let staged = match self.indirect_tables(c, seq, state_object, &rays) {
+                Ok(s) => s,
+                Err(why) => {
+                    self.warn(format!("ExecuteIndirect (event {seq}) is not replayed: {why}"));
+                    return Ok(Arguments::Skip);
+                }
+            };
+            for (record, fields) in staged.iter().enumerate() {
+                for &(field, address) in fields {
+                    let at = record * layout.stride + start + field;
+                    records_bytes[at..at + 8].copy_from_slice(&address.to_le_bytes());
+                }
+            }
+        }
         let (copy, p) = self.staging(D3D12_HEAP_TYPE_UPLOAD, bytes)?;
         unsafe { core::ptr::copy_nonoverlapping(records_bytes.as_ptr(), p, records_bytes.len()) };
         Ok(Arguments::Patched(copy))
     }
 
     /// `len` bytes of buffer `id` from `offset`, as replay's GPU holds them now.
-    fn read_range(&mut self, id: i64, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+    pub(super) fn read_range(&mut self, id: i64, offset: u64, len: u64) -> Result<Vec<u8>, String> {
         self.first_use_now(id)?;
         let m = self.made(id)?;
         if !m.buffer() {

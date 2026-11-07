@@ -76,7 +76,7 @@ fn records_a(vertices: u64, constants: u64, colours: (u64, u64)) -> Vec<u8> {
     out
 }
 
-unsafe fn upload(device: &ID3D12Device, bytes: &[u8], size: u64) -> ID3D12Resource {
+pub(super) unsafe fn upload(device: &ID3D12Device, bytes: &[u8], size: u64) -> ID3D12Resource {
     unsafe {
         let r = contents::committed(
             device,
@@ -93,7 +93,7 @@ unsafe fn upload(device: &ID3D12Device, bytes: &[u8], size: u64) -> ID3D12Resour
 }
 
 /// A buffer in a default heap, in COPY_DEST.
-unsafe fn default_buffer(device: &ID3D12Device, size: u64, uav: bool) -> ID3D12Resource {
+pub(super) unsafe fn default_buffer(device: &ID3D12Device, size: u64, uav: bool) -> ID3D12Resource {
     unsafe {
         contents::committed(
             device,
@@ -114,7 +114,7 @@ unsafe fn default_buffer(device: &ID3D12Device, size: u64, uav: bool) -> ID3D12R
     }
 }
 
-unsafe fn root_signature(
+pub(super) unsafe fn root_signature(
     device: &ID3D12Device,
     parameters: &[D3D12_ROOT_PARAMETER],
     flags: D3D12_ROOT_SIGNATURE_FLAGS,
@@ -143,7 +143,7 @@ unsafe fn root_signature(
     }
 }
 
-fn root_view(kind: D3D12_ROOT_PARAMETER_TYPE, register: u32) -> D3D12_ROOT_PARAMETER {
+pub(super) fn root_view(kind: D3D12_ROOT_PARAMETER_TYPE, register: u32) -> D3D12_ROOT_PARAMETER {
     D3D12_ROOT_PARAMETER {
         ParameterType: kind,
         Anonymous: D3D12_ROOT_PARAMETER_0 {
@@ -156,7 +156,7 @@ fn root_view(kind: D3D12_ROOT_PARAMETER_TYPE, register: u32) -> D3D12_ROOT_PARAM
     }
 }
 
-fn root_constants(register: u32, count: u32) -> D3D12_ROOT_PARAMETER {
+pub(super) fn root_constants(register: u32, count: u32) -> D3D12_ROOT_PARAMETER {
     D3D12_ROOT_PARAMETER {
         ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
         Anonymous: D3D12_ROOT_PARAMETER_0 {
@@ -292,7 +292,7 @@ fn rasterizer() -> D3D12_RASTERIZER_DESC {
     }
 }
 
-unsafe fn compute_pso(
+pub(super) unsafe fn compute_pso(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
     cs: &ID3DBlob,
@@ -314,7 +314,7 @@ unsafe fn compute_pso(
 
 /// DXIL for `profile` (`ms_6_5`, or a library's `lib_6_3`), from `LOCUM_DXCOMPILER` or the newest Windows SDK's
 /// `dxcompiler.dll` (which signs it with the `dxil.dll` beside it); or why there is none.
-fn dxil(source: &str, profile: &str) -> std::result::Result<Vec<u8>, String> {
+pub(super) fn dxil(source: &str, profile: &str) -> std::result::Result<Vec<u8>, String> {
     use windows::Win32::Graphics::Direct3D::Dxc::*;
     let path = match std::env::var_os("LOCUM_DXCOMPILER") {
         Some(p) => std::path::PathBuf::from(p),
@@ -568,7 +568,7 @@ unsafe fn targets(
 }
 
 /// Copies `staging` into each buffer of `copies` (default, in COPY_DEST) before the frame.
-unsafe fn fill(
+pub(super) unsafe fn fill(
     device: &ID3D12Device,
     queue: &ID3D12CommandQueue,
     fence: &ID3D12Fence,
@@ -621,7 +621,7 @@ fn colours() -> Vec<u8> {
 }
 
 /// Waits for the capture a fixture asked for; its database.
-fn written(label: &str) -> rusqlite::Connection {
+pub(super) fn written(label: &str) -> rusqlite::Connection {
     let dir = std::path::PathBuf::from(std::env::var_os("LOCUM_DIR").unwrap());
     let path = dir.join("captures").join(label).join("capture.db");
     let until = Instant::now() + Duration::from_secs(15);
@@ -632,12 +632,12 @@ fn written(label: &str) -> rusqlite::Connection {
     rusqlite::Connection::open(&path).unwrap()
 }
 
-fn request(label: &str) {
+pub(super) fn request(label: &str) {
     let dir = std::path::PathBuf::from(std::env::var_os("LOCUM_DIR").unwrap());
     std::fs::write(dir.join("capture"), format!("label {label}\n")).unwrap();
 }
 
-fn check(db: &rusqlite::Connection, checks: &[(&str, i64)]) {
+pub(super) fn check(db: &rusqlite::Connection, checks: &[(&str, i64)]) {
     for (sql, n) in checks {
         assert_eq!(
             db.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap(),
@@ -784,7 +784,7 @@ unsafe fn check_targets(
 }
 
 /// A default buffer's bytes, read back.
-unsafe fn read_buffer(
+pub(super) unsafe fn read_buffer(
     device: &ID3D12Device,
     queue: &ID3D12CommandQueue,
     fence: &ID3D12Fence,
@@ -1323,7 +1323,7 @@ pub(super) unsafe fn gaps(
                 // what the dispatch wrote is its output, copied after the frame.
                 (
                     "SELECT count(*) FROM resources WHERE width = 256 AND used = 1 AND written = 1 AND content IS NULL \
-                     AND content_note LIKE 'only ExecuteIndirect argument records name it, and a root UAV%'",
+                     AND content_note LIKE 'only ExecuteIndirect argument records, shader tables or instance pointers name it, and a UAV%'",
                     1,
                 ),
                 (

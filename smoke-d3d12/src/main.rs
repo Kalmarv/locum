@@ -16,6 +16,7 @@ mod modern;
 mod passes;
 mod planes;
 mod queries;
+mod rays;
 mod reserved;
 mod results;
 mod sample_values;
@@ -192,6 +193,9 @@ unsafe fn hardware() {
         }
         samples::capture(&device, &queue, &fence, &chain, 54);
         samples::conversions(&device, &queue, &fence, 56);
+        if let Err(why) = rays::capture(&device, &queue, &fence, &chain, 57) {
+            println!("rays SKIPPED: {why}");
+        }
         drop(chain);
         DestroyWindow(hwnd).unwrap();
     }
@@ -565,6 +569,9 @@ unsafe fn run() {
         }
         samples::capture(&device, &queue, &fence, &chain, 61);
         samples::conversions(&device, &queue, &fence, 63);
+        if let Err(why) = rays::capture(&device, &queue, &fence, &chain, 64) {
+            println!("rays SKIPPED: {why}");
+        }
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

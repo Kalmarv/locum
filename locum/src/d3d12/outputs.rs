@@ -6,6 +6,9 @@
 //! with a capture armed, its pipeline, root signatures and root arguments are followed, and at each draw or dispatch
 //! every register its programs declare is looked up where the root signature puts it: the root view's buffer, or the
 //! descriptor its table's slot holds then. A buffer is copied whole; a texture, the subresources its view covers.
+//! A DispatchRays' programs are its state object's DXIL libraries: a register the global root signature places is
+//! found so, and one it does not is a local root signature's, which the shader tables set (found after the frame:
+//! see [`super::indirect`]).
 //! An ExecuteIndirect's command signature can set root parameters per record: those come from its records, not
 //! from what the list set, and what a root UAV in them names is found after the frame (see [`super::indirect`]).
 use std::collections::HashMap;
@@ -34,7 +37,7 @@ fn programs() -> MutexGuard<'static, HashMap<String, Option<Registers>>> {
     lock(&PROGRAMS)
 }
 
-/// A pipeline's programs: each one's stage and registers.
+/// A pipeline's programs: each one's stage (`lib` a state object's DXIL library) and registers.
 type Stages = Arc<Vec<(&'static str, Option<Registers>)>>;
 
 /// By pipeline: its programs.
@@ -98,6 +101,41 @@ pub fn pipeline(id: u64, description: &Value) {
             .collect()
     };
     pipelines().insert(id, Arc::new(stages));
+}
+
+/// A state object made, from its description: its DXIL libraries' programs, and those of the collections it takes
+/// and the state object it grew from (AddToStateObject), each made before it.
+pub fn state_object(id: u64, description: &Value) {
+    let subobjects = description["subobjects"]
+        .as_array()
+        .map_or(&[][..], Vec::as_slice);
+    let mut stages: Vec<(&'static str, Option<Registers>)> = {
+        let p = programs();
+        subobjects
+            .iter()
+            .filter(|s| s["type"] == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY.0)
+            .map(|s| {
+                let registers = s["value"]["library"]["blob"]
+                    .as_str()
+                    .and_then(|k| p.get(k).cloned().flatten());
+                ("lib", registers)
+            })
+            .collect()
+    };
+    let mut pipelines = pipelines();
+    let taken = subobjects
+        .iter()
+        .filter(|s| s["type"] == D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION.0)
+        .map(|s| s["value"]["collection"].as_u64().unwrap_or(0))
+        .chain(description["parent"].as_u64().filter(|&p| p != 0));
+    for other in taken {
+        match pipelines.get(&other) {
+            Some(theirs) => stages.extend(theirs.iter().cloned()),
+            // Its programs are not known: what they write cannot be named.
+            None => stages.push(("lib", None)),
+        }
+    }
+    pipelines.insert(id, Arc::new(stages));
 }
 
 /// A root signature made, from its decoded description: where it puts UAV registers.
@@ -172,7 +210,7 @@ pub fn destroyed(id: u64) {
 }
 
 /// One subresource (or a whole buffer, `sub` None) a command wrote.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Written {
     pub resource: u64,
     pub sub: Option<u32>,
@@ -195,7 +233,8 @@ impl Bound {
     pub fn apply(&mut self, call: &str, a: &Value) {
         let id = |v: &Value| v.as_u64().unwrap_or(0);
         match call {
-            "SetPipelineState" => self.pso = id(&a[0]),
+            // A state object (SetPipelineState1) runs DispatchRays.
+            "SetPipelineState" | "SetPipelineState1" => self.pso = id(&a[0]),
             "SetGraphicsRootSignature" | "SetComputeRootSignature" => {
                 let k = usize::from(call == "SetComputeRootSignature");
                 // A root signature set anew drops the arguments, even the same one.
@@ -258,11 +297,16 @@ impl Bound {
                     Err(why) => gaps.push(why),
                 }
             }
-            "Dispatch" | "DispatchMesh" | "DrawInstanced" | "DrawIndexedInstanced" | "ExecuteIndirect" => {
+            "Dispatch"
+            | "DispatchRays"
+            | "DispatchMesh"
+            | "DrawInstanced"
+            | "DrawIndexedInstanced"
+            | "ExecuteIndirect" => {
                 // An indirect command's signature says whether it draws or dispatches; both root signatures are
                 // followed, so either is found.
                 let kinds: &[usize] = match call {
-                    "Dispatch" => &[1],
+                    "Dispatch" | "DispatchRays" => &[1],
                     "ExecuteIndirect" => &[0, 1],
                     _ => &[0],
                 };
@@ -283,7 +327,10 @@ impl Bound {
                     let Some(places) = roots().get(&self.roots[k]).cloned() else {
                         continue;
                     };
-                    for (stage, registers) in stages.iter().filter(|(s, _)| (*s == "cs") == compute) {
+                    for (stage, registers) in stages
+                        .iter()
+                        .filter(|(s, _)| matches!(*s, "cs" | "lib") == compute)
+                    {
                         let Some(registers) = registers else {
                             gaps.push(format!("its {stage} program says nothing of its UAVs"));
                             continue;
@@ -337,14 +384,18 @@ impl Bound {
             "ms" => 7,
             _ => 0,
         };
-        let place = places
-            .iter()
-            .find(|p| {
-                (p.visibility == 0 || p.visibility == visible)
-                    && p.space == space
-                    && (p.first..=p.last).contains(&register)
-            })
-            .ok_or_else(|| format!("u{register} space {space} is in no root parameter"))?;
+        let place = places.iter().find(|p| {
+            (p.visibility == 0 || p.visibility == visible)
+                && p.space == space
+                && (p.first..=p.last).contains(&register)
+        });
+        let place = match place {
+            Some(place) => place,
+            // A library's register the global root signature does not place is a local root signature's: the
+            // shader tables set it.
+            None if stage == "lib" => return Ok(None),
+            None => return Err(format!("u{register} space {space} is in no root parameter")),
+        };
         if from_records.contains(&place.parameter) {
             return Ok(None);
         }
@@ -495,4 +546,83 @@ fn covered(resource: u64, view: Result<Option<Description>, String>) -> Result<V
             sub: Some(mip + slice * mips + plane * mips * slices),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A DispatchRays writes what its state object's libraries' UAV registers name where the global root signature
+    /// places them (here a root UAV); a register it does not place is a local root signature's, named by the tables.
+    #[test]
+    fn a_dispatch_of_rays_writes_through_its_libraries_registers() {
+        // `RWByteAddressBuffer written : register(u0)`.
+        program(
+            "outputs-test-library",
+            include_bytes!("../../../capture/src/testdata/dxil-library.cso"),
+        );
+        let library = |key: &str| json!({"type": 5, "value": {"library": {"blob": key}, "exports": []}});
+        // A collection of the library, a pipeline taking it, and one grown from that with a library of its own
+        // that no program reading has seen.
+        state_object(
+            9001,
+            &json!({"kind": "state_object", "parent": 0, "subobjects": [library("outputs-test-library")]}),
+        );
+        state_object(
+            9002,
+            &json!({"kind": "state_object", "parent": 0,
+                "subobjects": [{"type": 6, "value": {"collection": 9001, "exports": []}}]}),
+        );
+        state_object(
+            9003,
+            &json!({"kind": "state_object", "parent": 9002, "subobjects": [library("outputs-test-unread")]}),
+        );
+        let uav = |register: u32| json!({"type": 4, "visibility": 0, "value": {"ShaderRegister": register, "RegisterSpace": 0}});
+        root(9010, &json!({"parameters": [uav(0)]}));
+        root(9011, &json!({"parameters": [uav(1)]}));
+
+        let mut bound = Bound::default();
+        bound.apply("SetComputeRootSignature", &json!([9010]));
+        bound.apply(
+            "SetComputeRootUnorderedAccessView",
+            &json!([0, {"resource": 7, "offset": 0}]),
+        );
+        bound.apply("SetPipelineState1", &json!([9002]));
+        let (written, gaps) = bound.written("DispatchRays", &json!([]));
+        assert_eq!(
+            written,
+            [Written {
+                resource: 7,
+                sub: None
+            }]
+        );
+        assert!(gaps.is_empty(), "{gaps:?}");
+
+        // u0 placed by no global root parameter: the tables' to name.
+        bound.apply("SetComputeRootSignature", &json!([9011]));
+        bound.apply(
+            "SetComputeRootUnorderedAccessView",
+            &json!([0, {"resource": 8, "offset": 0}]),
+        );
+        let (written, gaps) = bound.written("DispatchRays", &json!([]));
+        assert!(written.is_empty() && gaps.is_empty(), "{gaps:?}");
+
+        // What the grown state object's own library writes is not known, and says so.
+        bound.apply("SetComputeRootSignature", &json!([9010]));
+        bound.apply(
+            "SetComputeRootUnorderedAccessView",
+            &json!([0, {"resource": 7, "offset": 0}]),
+        );
+        bound.apply("SetPipelineState1", &json!([9003]));
+        let (written, gaps) = bound.written("DispatchRays", &json!([]));
+        assert_eq!(
+            written,
+            [Written {
+                resource: 7,
+                sub: None
+            }]
+        );
+        assert_eq!(gaps, ["its lib program says nothing of its UAVs"]);
+    }
 }

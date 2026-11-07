@@ -208,8 +208,9 @@ pub fn bindings(code: &[u8]) -> Option<Vec<Binding>> {
 }
 
 /// The UAV registers a program declares, as (space, first, last) with `u32::MAX` the last of an unbounded array:
-/// a DXIL program's from its `PSV0` part, which a runtime keeps however stripped the program is, and a DXBC
-/// program's from its reflection. Cheap enough to run as programs are made. None where neither says.
+/// a DXIL program's from its `PSV0` part, which a runtime keeps however stripped the program is, a DXIL library's
+/// (which has none) from its module's `dx.resources`, and a DXBC program's from its reflection or declarations.
+/// Cheap enough to run as programs are made. None where nothing says.
 pub fn uav_registers(code: &[u8]) -> Option<Vec<(u32, u32, u32)>> {
     if let Ok(parts) = dxil_reader::parts(code)
         && let Ok(Some(psv)) = dxil_reader::psv::part(&parts)
@@ -223,12 +224,8 @@ pub fn uav_registers(code: &[u8]) -> Option<Vec<(u32, u32, u32)>> {
                 .collect(),
         );
     }
-    let bindings = match rdef(code) {
-        Some(rdef) => rdef.bindings.iter().map(binding).collect(),
-        None => declared(code)?,
-    };
     Some(
-        bindings
+        bindings(code)?
             .into_iter()
             .filter(|b| b.class() == "uav")
             .map(|b| {
@@ -658,6 +655,13 @@ mod tests {
         let mut uavs = uav_registers(code).expect("its UAVs");
         uavs.sort();
         assert_eq!(uavs, [(0, 0, 0), (0, 4, 4)]);
+    }
+
+    /// A DXIL library has no `PSV0` part: its UAVs are its module's (`RWByteAddressBuffer written : register(u0)`).
+    #[test]
+    fn a_librarys_uavs_are_its_modules() {
+        let code = include_bytes!("testdata/dxil-library.cso");
+        assert_eq!(uav_registers(code), Some(vec![(0, 0, 0)]));
     }
 
     #[test]

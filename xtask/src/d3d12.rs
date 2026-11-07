@@ -314,7 +314,7 @@ fn hardware_smoke(stage: &std::path::Path, log: &std::path::Path) {
     indirect_verified(ok, &text, targets(stage, log, &capture("indirect")));
     println!("ok   D3D12 hardware: ExecuteIndirect with GPU addresses in its records replays as the game's");
     let said = String::from_utf8_lossy(&result.stdout);
-    rays_verified(stage, log, &capture("indirect-rays"), &said, "hardware");
+    rays_verified(stage, log, &capture, &said, "hardware");
     samples_verified(stage, log, &capture("samples"), "hardware");
 }
 
@@ -379,29 +379,60 @@ fn samples_verified(stage: &std::path::Path, log: &std::path::Path, capture: &st
     println!("ok   D3D12 {on}: pixel and export take a multisampled texture's samples");
 }
 
-/// What verify says of the fixture's `indirect-rays` capture, made where the device has raytracing tier 1.1 (`said`:
-/// what the smoke printed, which says why where it made none): replay runs no DispatchRays, and says so. Whether the
-/// capture read the shader table the records name, the fixture checked in it.
-fn rays_verified(stage: &std::path::Path, log: &std::path::Path, capture: &str, said: &str, on: &str) {
-    if let Some(why) = said
-        .lines()
-        .find_map(|l| l.strip_prefix("indirect-rays SKIPPED: "))
-    {
-        println!("SKIP D3D12 {on}: ExecuteIndirect of DispatchRays not captured: {why}");
-        return;
+/// The fixture's raytracing captures, made where the device has raytracing tier 1.1, and the outputs their
+/// DispatchRays and inline traces write: `indirect-rays` (an ExecuteIndirect's record runs one) and `rays` (two direct
+/// ones, a collection and a state object grown by AddToStateObject, with local root arguments; a scene built before
+/// the frame and one in it; and two inline traces, the scene a view in a table and a root SRV).
+const RAYS: [(&str, usize); 2] = [("indirect-rays", 1), ("rays", 4)];
+
+/// What verify says of the fixture's raytracing captures (`said`: what the smoke printed, which says why where it made
+/// none), on the adapter they were made on and, where `on` is the WARP stage, on the default one too: every
+/// DispatchRays replays, its tables replay's copies with replay's identifiers and local arguments, its scenes built
+/// again from what capture copied, and each output it wrote is the game's bit for bit.
+fn rays_verified(
+    stage: &std::path::Path,
+    log: &std::path::Path,
+    capture: &dyn Fn(&str) -> String,
+    said: &str,
+    on: &str,
+) {
+    for (name, outputs) in RAYS {
+        if let Some(why) = said
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} SKIPPED: ")))
+        {
+            println!("SKIP D3D12 {on}: {name} not captured: {why}");
+            continue;
+        }
+        let path = capture(name);
+        assert!(
+            std::path::Path::new(&path).is_dir(),
+            "{name}: the smoke neither made the capture nor said why"
+        );
+        let adapters: &[&[&str]] = if on == "verify" {
+            &[&["--warp"], &[]]
+        } else {
+            &[&[]]
+        };
+        for adapter in adapters {
+            let mut args = vec!["verify"];
+            args.extend_from_slice(adapter);
+            args.push(&path);
+            let (ok, text) = cli(stage, log, &args);
+            let compared = format!(
+                "what draws and dispatches wrote through UAVs: {outputs} identical to the game's, 0 different"
+            );
+            assert!(
+                ok && text.contains(&compared) && !text.contains("incomplete"),
+                "{name}: every DispatchRays replays and writes what the game's did ({})",
+                adapter.join(" ")
+            );
+        }
+        println!(
+            "ok   D3D12 {on}: {name}: every DispatchRays replayed through replay's tables and scenes, its {outputs} \
+             outputs the game's"
+        );
     }
-    assert!(
-        std::path::Path::new(capture).is_dir(),
-        "indirect-rays: the smoke neither made the capture nor said why"
-    );
-    let (ok, text) = cli(stage, log, &["verify", capture]);
-    assert!(
-        !ok && text.contains("DispatchRays is not replayed"),
-        "indirect-rays: verify says replay runs no DispatchRays"
-    );
-    println!(
-        "ok   D3D12 {on}: ExecuteIndirect of DispatchRays captured, its shader table read; replay says it runs none"
-    );
 }
 
 /// Runs locum-cli with `args`, printing what it says: whether it succeeded, and what it said.
@@ -564,7 +595,7 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
         "ok   D3D12 verify: ExecuteIndirect records it could not read, and contents it could not know, are gaps"
     );
     let said = std::fs::read_to_string(stage.join("stdout.txt")).expect("the WARP smoke's output");
-    rays_verified(stage, &log, &capture("indirect-rays"), &said, "verify");
+    rays_verified(stage, &log, &capture, &said, "verify");
     samples_verified(stage, &log, &capture("samples"), "verify");
     // Under the debug layer, with a pass under GPU-based validation of its own: the dispatches write a texture made
     // for simultaneous access as a UAV, which that validation takes for an error the spec does not make it.
@@ -601,7 +632,11 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
             "ok   D3D12 verify --debug: ExecuteIndirect with addresses in its records, no validation errors"
         );
         // Every other capture too: its frame replays under both without an error, and compares as without them.
-        for name in replayed.iter().chain(&["indirect-gaps"]) {
+        let rays = RAYS.map(|(name, _)| name);
+        let made = rays
+            .iter()
+            .filter(|name| std::path::Path::new(&capture(name)).is_dir());
+        for name in replayed.iter().chain(&["indirect-gaps"]).chain(made) {
             let (plain_ok, plain) = run(&["verify", "--warp", &capture(name)]);
             let (ok, text) = run(&["verify", "--warp", "--debug", &capture(name)]);
             assert!(

@@ -11,7 +11,9 @@ use crate::db;
 mod bindings;
 mod graphics;
 pub mod indirect;
+pub mod programs;
 pub mod samples;
+pub mod tables;
 
 pub use bindings::reproject;
 
@@ -61,6 +63,18 @@ pub struct List {
     /// that discard or allow unordered-access writes).
     #[serde(skip)]
     pub written: Vec<u64>,
+    /// The buffers copies of locum's inside it read where its own barriers had not moved them, each once.
+    #[serde(skip)]
+    pub promoted: Vec<Promoted>,
+}
+
+/// A buffer a copy of locum's inside a list read by implicit promotion to COPY_SOURCE: the list's own barriers had
+/// not moved it, so the copy joined COPY_SOURCE to the state it was in. `settled`: a later transition of the list's
+/// own moved it, and locum first moved it from that transition's before-state with COPY_SOURCE back to that state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Promoted {
+    pub resource: u64,
+    pub settled: bool,
 }
 
 /// A render or depth target copied inside a list where a pass ended, before the command at `at` (after all the
@@ -104,6 +118,9 @@ pub struct Output {
 /// argument offset, then the count's 4 bytes. They are read after the frame, for the buffers the addresses are in. A
 /// bundle's ExecuteIndirect has none: D3D12 lets a bundle run only a signature of one draw or dispatch, without a
 /// count buffer, so its records name nothing and are read as any buffer is.
+///
+/// Or the shader tables of a DispatchRays (`tables` holds them): each table's `bytes` one after another, copied right
+/// before it, read after the frame for what their records' local root arguments name (see [`tables`]).
 #[derive(Clone, Debug, Default)]
 pub struct Arguments {
     pub id: u64,
@@ -111,6 +128,11 @@ pub struct Arguments {
     pub layout: indirect::Layout,
     pub bytes: u64,
     pub counted: bool,
+    pub tables: Vec<tables::Table>,
+    /// A top-level build's instances given as an array of pointers: how many pointers were copied (see
+    /// [`instance_pointers`]), and the GPU address they are at.
+    pub pointers: u32,
+    pub pointers_at: u64,
     /// Why no copy was made.
     pub gap: Option<String>,
 }
@@ -130,13 +152,32 @@ impl Arguments {
     }
 }
 
-/// An ExecuteIndirect event whose argument records were copied (copy `arguments.id`), executed in `submission` on
-/// `queue`.
+/// How many instances a top-level build (`build`, its recorded description) gives as an array of pointers (each the
+/// GPU address of one `D3D12_RAYTRACING_INSTANCE_DESC`): 0 for any other build.
+pub fn instance_pointers(build: &Value) -> u64 {
+    const ARRAY_OF_POINTERS: i64 = 1;
+    let inputs = &build["inputs"];
+    if inputs["type"] == 0 && inputs["layout"].as_i64() == Some(ARRAY_OF_POINTERS) {
+        inputs["count"].as_u64().unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// The GPU addresses an array of instance pointers holds (`bytes`, as copied).
+pub fn pointers(bytes: &[u8]) -> impl Iterator<Item = u64> + '_ {
+    bytes.as_chunks::<8>().0.iter().map(|p| u64::from_le_bytes(*p))
+}
+
+/// An ExecuteIndirect event whose argument records were copied, a DispatchRays whose shader tables were, or a
+/// top-level build whose instance pointers were (copy `arguments.id`), executed in `submission` on `queue`.
 #[derive(Clone, Debug)]
 pub struct Indirect {
     pub event: u64,
     pub submission: u64,
     pub queue: u64,
+    /// The raytracing state object the call ran with (SetPipelineState1), or 0.
+    pub state_object: u64,
     pub arguments: Arguments,
 }
 
@@ -189,6 +230,39 @@ impl Recording {
 
     pub fn arguments(&mut self, arguments: Arguments) {
         Arc::make_mut(&mut self.current).arguments.push(arguments);
+    }
+
+    /// A copy of locum's read buffer `resource` by implicit promotion (see [`Promoted`]).
+    pub fn promote(&mut self, resource: u64) {
+        let promoted = &mut Arc::make_mut(&mut self.current).promoted;
+        if !promoted.iter().any(|p| p.resource == resource && !p.settled) {
+            promoted.push(Promoted {
+                resource,
+                settled: false,
+            });
+        }
+    }
+
+    /// The buffers copies of locum's read by implicit promotion so far.
+    pub fn promoted(&self) -> &[Promoted] {
+        &self.current.promoted
+    }
+
+    /// Whether buffer `resource` is promoted and not yet settled; it is settled from now.
+    pub fn settle(&mut self, resource: u64) -> bool {
+        if !self
+            .current
+            .promoted
+            .iter()
+            .any(|p| p.resource == resource && !p.settled)
+        {
+            return false;
+        }
+        let promoted = &mut Arc::make_mut(&mut self.current).promoted;
+        for p in promoted.iter_mut().filter(|p| p.resource == resource) {
+            p.settled = true;
+        }
+        true
     }
 
     /// What the generation's pass tracking learned of the targets it continues and the resources it names.
@@ -282,6 +356,17 @@ pub struct TileMapping {
     pub after: Result<Value, String>,
 }
 
+/// An acceleration structure the frame began with (in buffer `resource` at `offset`): its latest build before the
+/// frame, as `BuildRaytracingAccelerationStructure` described it, and the inputs that build read, each
+/// `{part, geometry, resource, offset, bytes, blob}`; or why they are not known.
+#[derive(Clone, Debug)]
+pub struct AccelerationStructure {
+    pub resource: u64,
+    pub offset: u64,
+    pub build: Value,
+    pub inputs: Result<Value, String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     pub objects: Vec<Object>,
@@ -289,7 +374,114 @@ pub struct Frame {
     pub sync: Vec<Sync>,
     pub tile_pages: Vec<TilePages>,
     pub tile_mappings: Vec<TileMapping>,
+    pub acceleration_structures: Vec<AccelerationStructure>,
     pub diagnostics: Vec<String>,
+}
+
+/// What shader tables are read against (see [`named_by_tables`]): objects by id as described (state objects, root
+/// signatures, descriptor heaps), what a DXIL library declares by its blob key, a local root signature's decoded
+/// description, and the live buffers a GPU virtual address is in.
+pub struct Tables<'a> {
+    pub objects: &'a BTreeMap<u64, &'a Value>,
+    pub declared: &'a dyn Fn(&str) -> Result<Arc<programs::Declared>, String>,
+    pub decode: &'a mut dyn FnMut(&programs::Local) -> Result<Value, String>,
+    pub buffers_at: &'a dyn Fn(u64) -> Vec<u64>,
+}
+
+/// What shader tables name: the resources a DispatchRays reads through them, those it may write (a UAV's, and its
+/// counter's), and what named nothing that could be placed, by reason.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct TableNames {
+    pub reads: Vec<u64>,
+    pub writes: Vec<u64>,
+    pub unplaced: BTreeMap<String, u64>,
+}
+
+/// What the shader tables a DispatchRays ran with name (`tables`, their bytes `bytes`, one after another): read by
+/// [`tables::read`] against state object `state_object` and `read`'s objects, each root CBV, SRV or UAV's buffers,
+/// and the resources the descriptors a descriptor table covers view (`descriptors`, the slots as the DispatchRays'
+/// submission found them).
+pub fn named_by_tables<'d>(
+    read: Tables,
+    state_object: u64,
+    tables: &[tables::Table],
+    bytes: &[u8],
+    descriptors: impl FnOnce() -> BTreeMap<(u64, u32), &'d Descriptor>,
+) -> TableNames {
+    struct Objects<'a> {
+        objects: &'a BTreeMap<u64, &'a Value>,
+        declared: &'a dyn Fn(&str) -> Result<Arc<programs::Declared>, String>,
+    }
+    impl programs::Source for Objects<'_> {
+        fn description(&self, id: u64) -> Option<Value> {
+            self.objects.get(&id).map(|&d| d.clone())
+        }
+        fn declared(&self, blob: &str) -> Result<Arc<programs::Declared>, String> {
+            (self.declared)(blob)
+        }
+    }
+    let Tables {
+        objects,
+        declared,
+        decode,
+        buffers_at,
+    } = read;
+    let source = Objects { objects, declared };
+    let mut named = tables::read(&source, state_object, tables, bytes, decode);
+    let (mut reads, mut writes) = (BTreeSet::new(), BTreeSet::new());
+    let mut unplaced = |why: &str| *named.unplaced.entry(why.to_string()).or_default() += 1;
+    for &(address, kind) in &named.addresses {
+        let found = buffers_at(address);
+        if found.is_empty() {
+            unplaced("a root descriptor's address is in no live buffer");
+        }
+        let into = if kind == programs::Kind::UnorderedAccess {
+            &mut writes
+        } else {
+            &mut reads
+        };
+        into.extend(found);
+    }
+    if !named.handles.is_empty() {
+        let heaps: Vec<(u64, &Value)> = objects
+            .iter()
+            .filter(|(_, d)| d["gpu_start"].as_u64().is_some_and(|g| g != 0))
+            .map(|(&id, &d)| (id, d))
+            .collect();
+        let descriptors = descriptors();
+        for (handle, ranges) in &named.handles {
+            let Some((heap, base)) = tables::slot(heaps.iter().copied(), *handle) else {
+                unplaced("a descriptor table's handle is in no shader-visible heap");
+                continue;
+            };
+            let count = objects[&heap]["count"].as_u64().unwrap_or(0) as u32;
+            for (start, end, kind) in tables::ranges(ranges, base, count) {
+                for d in descriptors.range((heap, start)..(heap, end)).map(|(_, d)| d) {
+                    if d.kind != kind {
+                        continue;
+                    }
+                    // An acceleration structure's view names its buffer by address.
+                    let viewed = Some(d.resource).filter(|&r| r != 0).or_else(|| {
+                        d.description["payload"]["address"]["resource"]
+                            .as_u64()
+                            .filter(|&r| r != 0)
+                    });
+                    if kind == "uav" {
+                        writes.extend(viewed);
+                        writes.extend(Some(d.counter).filter(|&c| c != 0));
+                    } else {
+                        reads.extend(viewed);
+                    }
+                }
+            }
+        }
+    }
+    let reads = reads.difference(&writes).copied().collect();
+    TableNames {
+        reads,
+        writes: writes.into_iter().collect(),
+        unplaced: named.unplaced,
+    }
 }
 
 /// The database extension and the common-table projection share this one prepared plan.
@@ -405,6 +597,63 @@ impl Prepared {
         self.named.writes.extend(writes.iter().map(|&w| (event, w)));
     }
 
+    /// Object `id` as the frame last described it.
+    pub fn description(&self, id: u64) -> Option<&Value> {
+        self.frame
+            .objects
+            .iter()
+            .rev()
+            .find(|o| o.id == id)
+            .map(|o| &o.description)
+    }
+
+    /// The descriptor definitions of every slot as of submission `id`: the frame's definitions up to it, the latest
+    /// of each slot.
+    pub fn descriptors_at(&self, id: u64) -> BTreeMap<(u64, u32), &Descriptor> {
+        let mut out = BTreeMap::new();
+        for s in &self.frame.submissions {
+            for d in &s.descriptors {
+                if d.kind == "empty" {
+                    out.remove(&(d.heap, d.slot));
+                } else {
+                    out.insert((d.heap, d.slot), d);
+                }
+            }
+            if s.id == id {
+                break;
+            }
+        }
+        out
+    }
+
+    /// What the shader tables DispatchRays event `rays` ran with name (see [`named_by_tables`]), against the frame's
+    /// objects as last described and its descriptors as of the event's submission.
+    pub fn named_by_tables(
+        &self,
+        rays: &Indirect,
+        tables: &[tables::Table],
+        bytes: &[u8],
+        declared: &dyn Fn(&str) -> Result<Arc<programs::Declared>, String>,
+        decode: &mut dyn FnMut(&programs::Local) -> Result<Value, String>,
+        buffers_at: &dyn Fn(u64) -> Vec<u64>,
+    ) -> TableNames {
+        let objects: BTreeMap<u64, &Value> = self
+            .frame
+            .objects
+            .iter()
+            .map(|o| (o.id, &o.description))
+            .collect();
+        let read = Tables {
+            objects: &objects,
+            declared,
+            decode,
+            buffers_at,
+        };
+        named_by_tables(read, rays.state_object, tables, bytes, || {
+            self.descriptors_at(rays.submission)
+        })
+    }
+
     /// The buffers to copy whole after the frame, once every ExecuteIndirect's records are known
     /// ([`Prepared::named_by_arguments`]); `copied` says whether a resource's contents were copied (or given up)
     /// before the frame first used it.
@@ -453,11 +702,15 @@ impl Prepared {
                 continue;
             }
             let why = if writers.contains_key(&resource) {
-                "only ExecuteIndirect argument records name it, and a root UAV in them lets the frame write it: what it \
-                 held as the frame began was not copied (after the frame it holds what the frame wrote)"
+                "only ExecuteIndirect argument records, shader tables or instance pointers name it, and a UAV they \
+                 name lets the frame write it: what it held as the frame began was not copied (after the frame it \
+                 holds what the frame wrote)"
             } else {
                 match descriptions.get(&resource) {
-                    None => "only ExecuteIndirect argument records name it, and its description is not known",
+                    None => {
+                        "only ExecuteIndirect argument records, shader tables or instance pointers name it, and its \
+                         description is not known"
+                    }
                     // An upload buffer's contents are its copy at the frame's first submission; only the GPU writes a
                     // readback buffer (as `contents` says).
                     Some(d) if matches!(d["heap_properties"]["type"].as_u64(), Some(2 | 3)) => continue,
@@ -536,6 +789,10 @@ impl Prepared {
             }
             None => {}
         }
+    }
+    /// An acceleration structure the frame began with, its build's inputs read back after the frame.
+    pub fn add_acceleration_structure(&mut self, a: AccelerationStructure) {
+        self.frame.acceleration_structures.push(a);
     }
     /// Upload copies a submission made, read back after the frame (in one batch or several).
     pub fn add_uploads(&mut self, submission: u64, uploads: Vec<(u64, Value)>) {
@@ -633,6 +890,7 @@ impl Prepared {
             .map(|o| (o.id, &o.description))
             .collect();
         let mut missing = BTreeMap::<String, u64>::new();
+        let mut unbuilt = BTreeMap::<String, u64>::new();
         let mut subresources = Vec::new();
         for resource in &mut capture.resources {
             let mut hashes = Vec::new();
@@ -650,9 +908,9 @@ impl Prepared {
                         resource.content = Some(key.clone());
                         resource.content_source = Some("after-frame");
                         resource.content_note = Some(
-                            "copied after the frame: only ExecuteIndirect argument records name it, and nothing the \
-                             frame recorded writes it, root UAVs in those records included (a shader indexing the \
-                             descriptor heap itself could)"
+                            "copied after the frame: only ExecuteIndirect argument records, shader tables or instance \
+                             pointers name it, and nothing the frame recorded writes it, UAVs they name included (a \
+                             shader indexing the descriptor heap itself could)"
                                 .into(),
                         );
                         hashes.clone_from(subs);
@@ -666,6 +924,28 @@ impl Prepared {
                     Err(why) => {
                         resource.content_note = Some(why.clone());
                         *missing.entry(why.clone()).or_default() += 1;
+                    }
+                }
+            } else if descriptions
+                .get(&resource.id)
+                .is_some_and(|d| acceleration_structures(d))
+            {
+                // Its bytes are the driver's: replay builds each structure in it again. One the frame began with
+                // whose inputs are not known is built empty.
+                resource.content_source = Some("acceleration-structure-builds");
+                resource.content_note = Some(
+                    "acceleration structures: those the frame began with built again from \
+                     d12_acceleration_structures, the rest as the frame builds them"
+                        .into(),
+                );
+                if resource.used {
+                    let structures = self
+                        .frame
+                        .acceleration_structures
+                        .iter()
+                        .filter(|a| a.resource == resource.id);
+                    for why in structures.filter_map(|a| a.inputs.as_ref().err()) {
+                        *unbuilt.entry(why.clone()).or_default() += 1;
                     }
                 }
             } else if descriptions
@@ -818,6 +1098,13 @@ impl Prepared {
         }
         for (why, count) in missing {
             capture.gap("contents", why, count);
+        }
+        for (why, count) in unbuilt {
+            capture.gap(
+                "d3d12-acceleration-structures",
+                format!("a structure the frame began with, in a buffer it uses, is built empty: {why}"),
+                count,
+            );
         }
         capture.meta("counts", serde_json::json!({
             "events":capture.events.len(), "draws":capture.draws.len(),
@@ -1019,6 +1306,8 @@ struct PassEnds {
 #[derive(Clone, Default, Serialize)]
 struct Pipeline {
     pso: u64,
+    /// The raytracing state object SetPipelineState1 set (each of it and SetPipelineState unsets the other's).
+    state_object: u64,
     graphics_root: u64,
     compute_root: u64,
     graphics_args: BTreeMap<u32, Value>,
@@ -1038,7 +1327,14 @@ impl Pipeline {
                     ..Self::default()
                 };
             }
-            "SetPipelineState" => self.pso = a[0].as_u64().unwrap_or(0),
+            "SetPipelineState" => {
+                self.pso = a[0].as_u64().unwrap_or(0);
+                self.state_object = 0;
+            }
+            "SetPipelineState1" => {
+                self.state_object = a[0].as_u64().unwrap_or(0);
+                self.pso = 0;
+            }
             "SetGraphicsRootSignature" => {
                 let id = a[0].as_u64().unwrap_or(0);
                 if self.graphics_root != id {
@@ -1341,6 +1637,18 @@ impl Frame {
                 ],
             )?;
         }
+        for a in &self.acceleration_structures {
+            tx.execute(
+                "INSERT INTO d12_acceleration_structures VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    integer(a.resource)?,
+                    integer(a.offset)?,
+                    a.build.to_string(),
+                    a.inputs.as_ref().ok().map(Value::to_string),
+                    a.inputs.as_ref().err()
+                ],
+            )?;
+        }
         for m in &self.tile_mappings {
             tx.execute(
                 "INSERT INTO d12_tile_mappings(queue,queue_seq,cpu_seq,call,resource,source,args_json,pages_json,diagnostic) \
@@ -1411,13 +1719,14 @@ impl Projection {
 
     /// The argument records a list copied, each on the event of its ExecuteIndirect (`seqs`, the events of the list's
     /// commands). Every execution of a generation copies them again: read after the frame, they hold its last.
-    fn arguments(&mut self, list: &List, seqs: &[u64], submission: &Submission) {
+    fn arguments(&mut self, list: &List, seqs: &[u64], state_objects: &[u64], submission: &Submission) {
         for a in &list.arguments {
             match (&a.gap, seqs.get(a.command)) {
                 (None, Some(&event)) => self.indirect.push(Indirect {
                     event,
                     submission: submission.id,
                     queue: submission.queue,
+                    state_object: state_objects.get(a.command).copied().unwrap_or(0),
                     arguments: a.clone(),
                 }),
                 (Some(why), _) => *self.unread_arguments.entry(why.clone()).or_default() += 1,
@@ -1429,14 +1738,17 @@ impl Projection {
                 }
             }
         }
-        // Those no copy was made at, whose records hold addresses or cannot be read: the list was not instrumented.
+        // Those no copy was made at, whose records hold addresses or cannot be read, DispatchRays (whose tables
+        // always hold identifiers) and builds of instances by pointer: the list was not instrumented.
         let uncopied = list.commands.iter().enumerate().filter(|(index, c)| {
-            c.call == "ExecuteIndirect"
-                && !list.arguments.iter().any(|a| a.command == *index)
-                && self
-                    .objects
-                    .get(&c.args[0].as_u64().unwrap_or(0))
-                    .is_none_or(|s| indirect::layout(s).map_or(true, |l| !l.addresses.is_empty()))
+            !list.arguments.iter().any(|a| a.command == *index)
+                && (c.call == "DispatchRays"
+                    || c.call == "BuildRaytracingAccelerationStructure" && instance_pointers(&c.args[0]) > 0
+                    || c.call == "ExecuteIndirect"
+                        && self
+                            .objects
+                            .get(&c.args[0].as_u64().unwrap_or(0))
+                            .is_none_or(|s| indirect::layout(s).map_or(true, |l| !l.addresses.is_empty())))
         });
         let uncopied = uncopied.count() as u64;
         if uncopied > 0 {
@@ -1531,6 +1843,40 @@ impl Projection {
         self.objects.insert(id, description.clone());
     }
 
+    /// Object `id` as described so far.
+    pub fn description(&self, id: u64) -> Option<&Value> {
+        self.objects.get(&id)
+    }
+
+    /// The DispatchRays whose shader tables were copied, and the ExecuteIndirects whose argument records were, in the
+    /// submissions projected so far.
+    pub fn indirect(&self) -> &[Indirect] {
+        &self.indirect
+    }
+
+    /// What the shader tables DispatchRays `rays` runs with name (see [`named_by_tables`]), as its submission is
+    /// made: against the objects as described so far and the descriptors as that submission finds them.
+    pub fn named_by_tables(
+        &self,
+        rays: &Indirect,
+        tables: &[tables::Table],
+        bytes: &[u8],
+        declared: &dyn Fn(&str) -> Result<Arc<programs::Declared>, String>,
+        decode: &mut dyn FnMut(&programs::Local) -> Result<Value, String>,
+        buffers_at: &dyn Fn(u64) -> Vec<u64>,
+    ) -> TableNames {
+        let objects: BTreeMap<u64, &Value> = self.objects.iter().map(|(&id, d)| (id, d)).collect();
+        let read = Tables {
+            objects: &objects,
+            declared,
+            decode,
+            buffers_at,
+        };
+        named_by_tables(read, rays.state_object, tables, bytes, || {
+            self.descriptors.iter().map(|(&slot, d)| (slot, d)).collect()
+        })
+    }
+
     /// Projects one submission, after the frame's earlier ones. Returns the resources its events read or write, each
     /// once, in the order they are first touched.
     pub fn submit(&mut self, capture: &mut db::Capture, submission: &Submission) -> Vec<u64> {
@@ -1616,12 +1962,15 @@ impl Projection {
             pipeline.graphics.begin_bundle();
         }
         let mut seqs = Vec::with_capacity(list.commands.len());
+        // The raytracing state object each command ran with: a DispatchRays' tables identify its exports.
+        let mut state_objects = Vec::with_capacity(list.commands.len());
         for (index, command) in list.commands.iter().enumerate() {
             self.checkpoints(capture, list, index, first);
             self.outputs(list, index, &seqs, first);
             pipeline.apply(command);
             let seq = capture.events.len() as u64 + 1;
             seqs.push(seq);
+            state_objects.push(pipeline.state_object);
             // The event kinds D3D11 captures use, so both APIs browse alike.
             let kind = match command.call {
                 "DrawInstanced" | "DrawIndexedInstanced" | "DispatchMesh" => "draw",
@@ -1770,7 +2119,7 @@ impl Projection {
         }
         self.checkpoints(capture, list, list.commands.len(), first);
         self.outputs(list, list.commands.len(), &seqs, first);
-        self.arguments(list, &seqs, submission);
+        self.arguments(list, &seqs, &state_objects, submission);
         if depth == 0 && list.kind == 0 && last_draw.is_some() {
             if list.instrumented {
                 self.pass_ends.lists_instrumented += 1;
@@ -1792,6 +2141,13 @@ impl Projection {
 fn extent(d: &Value) -> (u32, u32) {
     let n = d["depth_or_array_size"].as_u64().unwrap_or(1) as u32;
     if d["dimension"] == 4 { (n, 1) } else { (1, n) }
+}
+
+/// Whether a resource (its description) holds acceleration structures: a buffer made in
+/// RAYTRACING_ACCELERATION_STRUCTURE, or with the flag of that name. It stays so for its life, and no copy may read
+/// or write it: its contents are the builds into it.
+pub fn acceleration_structures(d: &Value) -> bool {
+    d["initial_state"].as_i64() == Some(0x40_0000) || d["flags"].as_i64().is_some_and(|f| f & 0x100 != 0)
 }
 
 /// A resource's subresources in the canonical layout (see [`crate::layout`]), from its description. D3D12's planar
@@ -1985,6 +2341,8 @@ CREATE TABLE d12_sync(id INTEGER PRIMARY KEY,queue INTEGER NOT NULL,queue_seq IN
  kind TEXT NOT NULL,fence INTEGER NOT NULL,value_u64 BLOB NOT NULL CHECK(length(value_u64)=8));
 CREATE TABLE d12_tile_pages(resource INTEGER PRIMARY KEY,cpu_seq INTEGER NOT NULL,layout_json TEXT,pages_json TEXT,
  diagnostic TEXT);
+CREATE TABLE d12_acceleration_structures(resource INTEGER NOT NULL,offset INTEGER NOT NULL,build_json TEXT NOT NULL,
+ inputs_json TEXT,diagnostic TEXT,PRIMARY KEY(resource,offset));
 CREATE TABLE d12_tile_mappings(id INTEGER PRIMARY KEY,queue INTEGER NOT NULL,queue_seq INTEGER NOT NULL,
  cpu_seq INTEGER NOT NULL,call TEXT NOT NULL,resource INTEGER NOT NULL,source INTEGER,args_json TEXT NOT NULL,
  pages_json TEXT,diagnostic TEXT);
@@ -2008,6 +2366,45 @@ fn integer(value: u64) -> rusqlite::Result<i64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_top_level_builds_by_pointer_have_instance_pointers() {
+        let build = |kind, layout| json!({"inputs": {"type": kind, "layout": layout, "count": 3}});
+        assert_eq!(instance_pointers(&build(0, 1)), 3);
+        assert_eq!(
+            instance_pointers(&build(0, 0)),
+            0,
+            "an array of instance descriptions"
+        );
+        assert_eq!(instance_pointers(&build(1, 1)), 0, "a bottom-level build");
+        assert_eq!(instance_pointers(&json!({})), 0);
+        let mut bytes = Vec::new();
+        for p in [0x1234_5678_9abc_u64, 0, u64::MAX] {
+            bytes.extend(p.to_le_bytes());
+        }
+        bytes.push(7);
+        assert_eq!(
+            pointers(&bytes).collect::<Vec<_>>(),
+            [0x1234_5678_9abc, 0, u64::MAX],
+            "a partial pointer is none"
+        );
+    }
+
+    #[test]
+    fn set_pipeline_state_and_set_pipeline_state1_unset_each_other() {
+        let command = |call, id: u64| Command {
+            call,
+            args: json!([id]),
+            bundle: None,
+            diagnostic: None,
+        };
+        let mut p = Pipeline::default();
+        p.apply(&command("SetPipelineState", 5));
+        p.apply(&command("SetPipelineState1", 9));
+        assert_eq!((p.pso, p.state_object), (0, 9));
+        p.apply(&command("SetPipelineState", 6));
+        assert_eq!((p.pso, p.state_object), (6, 0));
+    }
 
     #[test]
     fn old_recordings_repeated_executions_and_bundle_generations_stay_distinct() {
@@ -2098,6 +2495,147 @@ mod tests {
     }
 
     #[test]
+    fn shader_tables_name_what_their_records_local_arguments_do_as_of_their_submission() {
+        let object = |id, kind, description| Object {
+            id,
+            kind,
+            device: 1,
+            description,
+        };
+        let id = "aa".repeat(programs::IDENTIFIER);
+        // State object #20 runs `gen` with local root signature #21 (its default): a root SRV, then a table of two UAVs.
+        let objects = vec![
+            object(
+                20,
+                "ID3D12StateObject",
+                json!({"kind": "state_object", "parent": 0, "identifiers": {"gen": id}, "subobjects": [
+                    {"type": 5, "value": {"library": {"blob": "lib", "size": 1}, "exports": []}},
+                    {"type": 2, "value": 21},
+                ]}),
+            ),
+            object(
+                21,
+                "ID3D12RootSignature",
+                json!({"decoded": {"parameters": [
+                    {"type": 3, "value": {}},
+                    {"type": 0, "value": [{"RangeType": 1, "NumDescriptors": 2, "OffsetInDescriptorsFromTableStart": 0}]},
+                ]}}),
+            ),
+            object(
+                30,
+                "ID3D12DescriptorHeap",
+                json!({"gpu_start": 0x10000, "count": 8, "stride": 32}),
+            ),
+        ];
+        let uav = |id, slot, resource, counter| Descriptor {
+            id,
+            heap: 30,
+            slot,
+            kind: "uav",
+            resource,
+            counter,
+            description: json!({}),
+        };
+        let mut list = Recording::new(1, 0, 10, 0, false);
+        list.instrument();
+        list.record(Command {
+            call: "SetPipelineState1",
+            args: json!([20]),
+            bundle: None,
+            diagnostic: None,
+        });
+        list.record(Command {
+            call: "DispatchRays",
+            args: json!([{}]),
+            bundle: None,
+            diagnostic: None,
+        });
+        let table = tables::Table {
+            which: tables::Which::RayGeneration,
+            address: 0x5000,
+            bytes: 48,
+            stride: 48,
+        };
+        list.arguments(Arguments {
+            id: 40,
+            command: 1,
+            bytes: 48,
+            tables: vec![table],
+            ..Arguments::default()
+        });
+        list.close();
+        let submission = |id, descriptors| Submission {
+            id,
+            queue: 7,
+            queue_seq: id,
+            cpu_seq: id,
+            lists: vec![list.snapshot()],
+            descriptors,
+            uploads: Vec::new(),
+        };
+        // Slot 3 holds #12's view (with counter #13) at the first submission, #11's from the second.
+        let frame = Frame {
+            objects,
+            submissions: vec![
+                submission(1, vec![uav(1, 2, 10, 0), uav(2, 3, 12, 13)]),
+                submission(2, vec![uav(3, 3, 11, 0)]),
+            ],
+            ..Frame::default()
+        };
+        let mut c = db::Capture::default();
+        let prepared = frame.prepare(&mut c);
+        let rays: Vec<_> = prepared.indirect().to_vec();
+        assert_eq!(rays.len(), 2);
+        assert!(
+            rays.iter()
+                .all(|r| r.state_object == 20 && r.arguments.tables == [table])
+        );
+        // The record: identifier, the root SRV's address (in #9), the table's handle (slot 2).
+        let mut record = vec![0xaa; programs::IDENTIFIER];
+        record.extend(0x9000u64.to_le_bytes());
+        record.extend((0x10000u64 + 2 * 32).to_le_bytes());
+        let declared = |_: &str| {
+            Ok(Arc::new(programs::Declared {
+                shaders: vec!["gen".into()],
+                subobjects: Vec::new(),
+            }))
+        };
+        let mut decode = |l: &programs::Local| {
+            assert_eq!(l, &programs::Local::Object(21));
+            Ok(prepared.frame.objects[1].description["decoded"].clone())
+        };
+        let buffers = |a: u64| if a == 0x9000 { vec![9] } else { Vec::new() };
+        let first = prepared.named_by_tables(&rays[0], &[table], &record, &declared, &mut decode, &buffers);
+        let names = |reads: Vec<u64>, writes: Vec<u64>| TableNames {
+            reads,
+            writes,
+            unplaced: BTreeMap::new(),
+        };
+        assert_eq!(first, names(vec![9], vec![10, 12, 13]));
+        let second = prepared.named_by_tables(&rays[1], &[table], &record, &declared, &mut decode, &buffers);
+        assert_eq!(second, names(vec![9], vec![10, 11]));
+        // An address in no buffer, and a handle in no heap, are counted.
+        record[32..40].copy_from_slice(&0x7000u64.to_le_bytes());
+        record[40..48].copy_from_slice(&0x90000u64.to_le_bytes());
+        let TableNames {
+            reads,
+            writes,
+            unplaced,
+        } = prepared.named_by_tables(&rays[0], &[table], &record, &declared, &mut decode, &buffers);
+        assert!(reads.is_empty() && writes.is_empty());
+        assert_eq!(
+            unplaced.into_iter().collect::<Vec<_>>(),
+            [
+                (
+                    "a descriptor table's handle is in no shader-visible heap".to_string(),
+                    1
+                ),
+                ("a root descriptor's address is in no live buffer".to_string(), 1)
+            ]
+        );
+    }
+
+    #[test]
     fn indirect_records_are_found_on_their_events_or_are_gaps() {
         let object = |id, kind, description| Object {
             id,
@@ -2148,7 +2686,7 @@ mod tests {
             layout: indirect::layout(&objects[signature].description).unwrap(),
             bytes: 48,
             counted: false,
-            gap: None,
+            ..Default::default()
         };
         // A bundle may run only a signature of draws or dispatches alone: its records name nothing, so it copies none.
         let mut bundle = Recording::new(3, 1, 12, 0, false);
@@ -2239,7 +2777,7 @@ mod tests {
                 first
                     .content
                     .as_ref()
-                    .is_err_and(|why| why.contains("a root UAV in them lets the frame write it")),
+                    .is_err_and(|why| why.contains("a UAV they name lets the frame write it")),
                 "#{id}"
             );
         }
@@ -2270,7 +2808,7 @@ mod tests {
         );
         for id in [10, 11] {
             assert_eq!(r(id).content, None);
-            assert!(r(id).content_note.as_ref().unwrap().contains("root UAV"));
+            assert!(r(id).content_note.as_ref().unwrap().contains("a UAV they name"));
         }
         assert_eq!(r(12).content.as_deref(), Some("k12-before"));
         // Outputs: the last ExecuteIndirect's, of #11 and #12. The first writing #11 wrote it again later, and #10's

@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 use locum_capture::d3d12 as model;
 use serde_json::{Value, json};
+use windows::Win32::Graphics::Direct3D12::{D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_UPLOAD, ID3D12Resource};
 
 /// A subresource's state: a legacy resource state, or an enhanced-barrier layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,6 +28,39 @@ impl Access {
         match self {
             Access::State(s) => json!({"state":s}),
             Access::Layout(l) => json!({"layout":l}),
+        }
+    }
+}
+
+/// How a copy of locum's inside a list reads a buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Read {
+    /// Moved from the state or layout it is in to COPY_SOURCE, and back after.
+    Moved(Access),
+    /// As it is: an upload buffer, always in GENERIC_READ, or one in COMMON a list of locum's own copies from.
+    AsIs,
+    /// As it is, which promotes it to COPY_SOURCE: the list's own barriers have not moved it (see
+    /// [`super::promoted`]).
+    Promoted,
+}
+
+impl Read {
+    /// How buffer `real` is read where the list's own barriers last left it `known` (None: they have not moved
+    /// it); `enhanced`: the list has recorded enhanced barriers, by which locum moves its buffers too.
+    pub fn of(known: Option<Access>, enhanced: bool, real: &ID3D12Resource) -> Read {
+        if let Some(k) = known {
+            return Read::Moved(k);
+        }
+        let mut heap = D3D12_HEAP_PROPERTIES::default();
+        let upload = unsafe { real.GetHeapProperties(Some(&mut heap), None) }.is_ok()
+            && heap.Type == D3D12_HEAP_TYPE_UPLOAD;
+        if upload {
+            Read::AsIs
+        } else if enhanced {
+            // A buffer has no layout: the enhanced barrier names its accesses.
+            Read::Moved(Access::Layout(COMMON))
+        } else {
+            Read::Promoted
         }
     }
 }

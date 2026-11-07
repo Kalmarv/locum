@@ -117,6 +117,16 @@ fn touches(c: &Capture) -> BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)> {
             e.0.extend(reads);
             e.1.extend(writes);
         }
+        // An acceleration structure names those it is built of by address (a top-level one its instances' bottom
+        // levels), which the plan cannot see: what uses one uses them all.
+        let structures = d3d12::acceleration_structures(c);
+        if !structures.is_empty() {
+            for (read, written) in out.values_mut() {
+                if read.iter().chain(written.iter()).any(|r| structures.contains(r)) {
+                    read.extend(structures.iter().filter(|r| !written.contains(r)));
+                }
+            }
+        }
         let aliases = d3d12::aliases(c);
         if !aliases.is_empty() {
             for (_, written) in out.values_mut() {
@@ -584,8 +594,8 @@ fn lacking(c: &Capture) -> HashSet<i64> {
     };
     c.rows(
         &format!(
-            "SELECT id FROM resources WHERE content IS NULL AND coalesce(content_source, '') != 'tile-events' \
-             {readback}"
+            "SELECT id FROM resources WHERE content IS NULL AND coalesce(content_source, '') NOT IN ('tile-events', \
+             'acceleration-structure-builds') {readback}"
         ),
         [],
         |r| r.get(0),

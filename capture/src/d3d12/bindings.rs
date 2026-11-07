@@ -276,6 +276,7 @@ pub fn reproject(conn: &rusqlite::Connection) -> rusqlite::Result<db::Capture> {
         let state: Value = serde_json::from_str(&state).unwrap_or(Value::Null);
         let pipeline = Pipeline {
             pso: state["pso"].as_u64().unwrap_or(0),
+            state_object: state["state_object"].as_u64().unwrap_or(0),
             graphics_root: state["graphics_root"].as_u64().unwrap_or(0),
             compute_root: state["compute_root"].as_u64().unwrap_or(0),
             graphics_args: args(&state["graphics_args"]),

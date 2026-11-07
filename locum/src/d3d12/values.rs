@@ -189,7 +189,9 @@ pub unsafe fn created_descriptor_heap(device: u64, out: *mut *mut c_void) {
     super::journal::describe(
         id,
         device,
-        json!({"type":d.Type.0,"count":d.NumDescriptors,"flags":d.Flags.0,"node_mask":d.NodeMask}),
+        // Where its descriptors were: shader tables' local root arguments hold GPU handles into it.
+        json!({"type":d.Type.0,"count":d.NumDescriptors,"flags":d.Flags.0,"node_mask":d.NodeMask,
+            "cpu_start":cpu,"gpu_start":gpu,"stride":stride}),
     );
 }
 

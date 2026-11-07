@@ -4,7 +4,7 @@ use super::{id, journal, portable::Portable, values::slice};
 use core::ffi::c_void;
 use serde_json::{Value, json};
 use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
-use windows::core::{GUID, HRESULT, Interface, PCSTR};
+use windows::core::{GUID, HRESULT, Interface, PCSTR, PCWSTR};
 
 /// Bytes into the blob store by content hash. A full writer queue is waited for, never dropped: the capture's
 /// shader and upload records point at these blobs.
@@ -30,6 +30,15 @@ unsafe fn shader(stage: &str, code: &D3D12_SHADER_BYTECODE) -> Value {
     }
     if let Some(o) = value.as_object_mut() {
         o.insert("stage".into(), json!(stage));
+    }
+    value
+}
+/// A state object's DXIL library, its UAV registers read as a program's are.
+unsafe fn library(code: &D3D12_SHADER_BYTECODE) -> Value {
+    let value = unsafe { bytes(code.pShaderBytecode, code.BytecodeLength) };
+    if let Some(key) = value["blob"].as_str() {
+        let data = unsafe { slice(code.pShaderBytecode.cast::<u8>(), code.BytecodeLength) };
+        super::outputs::program(key, data);
     }
     value
 }
@@ -197,6 +206,136 @@ pub unsafe fn stream(p: *const D3D12_PIPELINE_STATE_STREAM_DESC) -> Value {
     Value::Object(common)
 }
 
+/// A wide string's text, or null.
+unsafe fn wide(s: PCWSTR) -> Value {
+    if s.is_null() {
+        Value::Null
+    } else {
+        unsafe { s.to_string() }.map_or(Value::Null, Value::String)
+    }
+}
+unsafe fn names(p: *const PCWSTR, n: u32) -> Value {
+    json!(
+        unsafe { slice(p, n as usize) }
+            .iter()
+            .map(|s| unsafe { wide(*s) })
+            .collect::<Vec<_>>()
+    )
+}
+unsafe fn exports(p: *const D3D12_EXPORT_DESC, n: u32) -> Value {
+    json!(
+        unsafe { slice(p, n as usize) }
+            .iter()
+            .map(|e| json!({"name":unsafe { wide(e.Name) },
+        "rename":unsafe { wide(e.ExportToRename) },"flags":e.Flags.0}))
+            .collect::<Vec<_>>()
+    )
+}
+/// A state object (CreateStateObject, or AddToStateObject onto `parent`): its type and every subobject in order, as
+/// replay makes it again. An association names the subobject it associates by its index in this description; one
+/// pointing outside it (which the runtime rejects) keeps its index null. The identifiers the application asks for
+/// are added as it asks ([`identifier`]).
+pub unsafe fn state_object(p: *const D3D12_STATE_OBJECT_DESC, parent: u64) -> Value {
+    let Some(d) = (unsafe { p.as_ref() }) else {
+        return Value::Null;
+    };
+    let subobjects = unsafe { slice(d.pSubobjects, d.NumSubobjects as usize) };
+    let index = |target: *const D3D12_STATE_SUBOBJECT| {
+        subobjects
+            .iter()
+            .position(|s| core::ptr::eq(s, target))
+            .map_or(Value::Null, |i| json!(i))
+    };
+    let encoded: Vec<Value> = subobjects
+        .iter()
+        .map(|s| {
+            let pointer = s.pDesc;
+            macro_rules! read {
+                ($ty:ty) => {
+                    unsafe { pointer.cast::<$ty>().read_unaligned() }
+                };
+            }
+            let value = if pointer.is_null() {
+                Value::Null
+            } else {
+                match s.Type {
+                    D3D12_STATE_SUBOBJECT_TYPE_STATE_OBJECT_CONFIG => json!(read!(u32)),
+                    D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE
+                    | D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE => json!(id(read!(*mut c_void))),
+                    D3D12_STATE_SUBOBJECT_TYPE_NODE_MASK => json!(read!(u32)),
+                    D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY => {
+                        let l = unsafe { &*pointer.cast::<D3D12_DXIL_LIBRARY_DESC>() };
+                        json!({"library":unsafe { library(&l.DXILLibrary) },
+                            "exports":unsafe { exports(l.pExports, l.NumExports) }})
+                    }
+                    D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION => {
+                        let c = unsafe { &*pointer.cast::<D3D12_EXISTING_COLLECTION_DESC>() };
+                        json!({"collection":c.pExistingCollection.as_ref().map_or(0, |o| id(o.as_raw())),
+                            "exports":unsafe { exports(c.pExports, c.NumExports) }})
+                    }
+                    D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION => {
+                        let a = unsafe { &*pointer.cast::<D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION>() };
+                        json!({"subobject":index(a.pSubobjectToAssociate),
+                            "exports":unsafe { names(a.pExports, a.NumExports) }})
+                    }
+                    D3D12_STATE_SUBOBJECT_TYPE_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION => {
+                        let a = unsafe { &*pointer.cast::<D3D12_DXIL_SUBOBJECT_TO_EXPORTS_ASSOCIATION>() };
+                        json!({"subobject":unsafe { wide(a.SubobjectToAssociate) },
+                            "exports":unsafe { names(a.pExports, a.NumExports) }})
+                    }
+                    D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG => {
+                        let c = read!(D3D12_RAYTRACING_SHADER_CONFIG);
+                        json!({"payload":c.MaxPayloadSizeInBytes,"attributes":c.MaxAttributeSizeInBytes})
+                    }
+                    D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG => {
+                        json!({"depth":read!(D3D12_RAYTRACING_PIPELINE_CONFIG).MaxTraceRecursionDepth})
+                    }
+                    D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1 => {
+                        let c = read!(D3D12_RAYTRACING_PIPELINE_CONFIG1);
+                        json!({"depth":c.MaxTraceRecursionDepth,"flags":c.Flags.0})
+                    }
+                    D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP => {
+                        let h = read!(D3D12_HIT_GROUP_DESC);
+                        json!({"name":unsafe { wide(h.HitGroupExport) },"type":h.Type.0,
+                            "any_hit":unsafe { wide(h.AnyHitShaderImport) },
+                            "closest_hit":unsafe { wide(h.ClosestHitShaderImport) },
+                            "intersection":unsafe { wide(h.IntersectionShaderImport) }})
+                    }
+                    // Work graphs and generic programs (SetProgram) are not raytracing; replay refuses them by name.
+                    _ => json!({"diagnostic":"state subobject type not represented"}),
+                }
+            };
+            json!({"type":s.Type.0,"value":value})
+        })
+        .collect();
+    json!({"kind":"state_object","type":d.Type.0,"parent":parent,"subobjects":encoded,"identifiers":{}})
+}
+
+/// The application asked state object `id` for `export`'s shader identifier and got `identifier`: kept in its
+/// description, by which replay maps the identifiers in shader tables to its own.
+pub unsafe fn identifier(id: u64, export: PCWSTR, identifier: *const c_void) {
+    if !journal::enabled() || identifier.is_null() || export.is_null() {
+        return;
+    }
+    let Ok(name) = (unsafe { export.to_string() }) else {
+        return;
+    };
+    let bytes = unsafe {
+        slice(
+            identifier.cast::<u8>(),
+            D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as usize,
+        )
+    };
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    journal::amend(id, |d| {
+        if d["identifiers"][&name] == json!(hex) {
+            return false;
+        }
+        d["identifiers"][&name] = json!(hex);
+        true
+    });
+}
+
 pub unsafe fn created(device: u64, out: *mut *mut c_void, description: impl FnOnce() -> Value) {
     if !journal::enabled() || out.is_null() || unsafe { (*out).is_null() } {
         return;
@@ -204,6 +343,8 @@ pub unsafe fn created(device: u64, out: *mut *mut c_void, description: impl FnOn
     let (id, description) = (id(unsafe { *out }), description());
     if description.get("shaders").is_some() {
         super::outputs::pipeline(id, &description);
+    } else if description["kind"] == "state_object" {
+        super::outputs::state_object(id, &description);
     }
     journal::describe(id, device, description);
 }

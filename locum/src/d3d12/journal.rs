@@ -9,7 +9,9 @@ use std::time::Instant;
 use super::cost::Counter;
 use locum_capture::{d3d12 as model, db, environment, writer};
 use serde_json::{Value, json};
-use windows::Win32::Graphics::Direct3D12::ID3D12GraphicsCommandList;
+use windows::Win32::Graphics::Direct3D12::{
+    D3D12_COMMAND_LIST_TYPE, ID3D12CommandQueue, ID3D12Device, ID3D12GraphicsCommandList,
+};
 use windows::core::{HRESULT, Interface};
 
 use crate::log::{folder, log};
@@ -55,6 +57,9 @@ impl Data {
         let args = build();
         let mut recording = self.recording.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(recording) = recording.as_mut() {
+            if call == "ResourceBarrier" {
+                unsafe { super::promoted::settle(recording, real, &args) };
+            }
             self.checkpoints(recording, |pass, at| unsafe {
                 pass.before(real, call, &args, at)
             });
@@ -106,16 +111,19 @@ impl Data {
             return;
         };
         let checkpoints = make(pass, recording.len());
-        self.keep(recording, checkpoints, pass.outputs(), pass.arguments());
+        self.keep(recording, checkpoints, pass);
     }
-    /// Assigns copies made in the list to its generation.
+    /// Assigns copies made in the list (`checkpoints`, and what `pass` copied since last asked) to its generation.
     fn keep(
         &self,
         recording: &mut model::Recording,
         checkpoints: Vec<model::Checkpoint>,
-        outputs: Vec<model::Output>,
-        arguments: Vec<model::Arguments>,
+        pass: &mut super::passes::Pass,
     ) {
+        let (outputs, arguments) = (pass.outputs(), pass.arguments());
+        for resource in pass.promoted() {
+            recording.promote(resource);
+        }
         super::passes::belong(
             self.id,
             checkpoints
@@ -145,7 +153,7 @@ impl Data {
         let pass = self.pass.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let (Some(recording), Some(mut pass)) = (recording.as_mut(), pass) {
             let checkpoints = unsafe { pass.closing(real, recording.len()) };
-            self.keep(recording, checkpoints, pass.outputs(), pass.arguments());
+            self.keep(recording, checkpoints, &mut pass);
             let (continues, written) = pass.touches();
             recording.touches(continues, written);
         }
@@ -163,6 +171,7 @@ impl Data {
         let start = Instant::now();
         let (allocator, pso) = (super::id(allocator), super::id(pso));
         super::passes::retire(self.id);
+        super::rays::retire(self.id);
         if hr.is_ok()
             && let Some(r) = self.recording.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
         {
@@ -237,6 +246,8 @@ struct Live {
     executed: HashSet<(u64, u64)>,
     /// The reserved resources whose page tables as the frame found them are recorded (see [`super::tiles`]).
     paged: HashSet<u64>,
+    /// Every acceleration structure's latest build as the frame began (see [`super::rays`]).
+    rays: Vec<(super::rays::Key, Arc<super::rays::Build>)>,
 }
 #[derive(Default)]
 struct Upload {
@@ -276,6 +287,23 @@ pub fn describe(id: u64, device: u64, description: Value) {
         }
     }
 }
+/// Changes object `id`'s description in place with `change`, which says whether it changed anything: what the
+/// object reports after its creation (a state object's shader identifiers).
+pub fn amend(id: u64, change: impl FnOnce(&mut Value) -> bool) {
+    let mut s = state();
+    let Some(object) = s.objects.get_mut(&id) else {
+        return;
+    };
+    if !change(&mut object.description) {
+        return;
+    }
+    let object = object.clone();
+    if let Some(live) = s.capture.as_mut() {
+        live.projection.describe(id, &object.description);
+        live.frame.objects.retain(|o| o.id != id);
+        live.frame.objects.push(object);
+    }
+}
 /// A resource's states from its creation in `initial` (see [`super::states`]).
 pub fn track(id: u64, description: &Value, initial: super::states::Access) {
     if !enabled() {
@@ -296,6 +324,8 @@ pub fn destroy(id: u64) {
     let start = Instant::now();
     super::passes::destroyed(id);
     super::outputs::destroyed(id);
+    super::rays::retire(id);
+    super::rays::destroyed(id);
     {
         let mut s = state();
         s.objects.remove(&id);
@@ -561,8 +591,22 @@ pub unsafe fn submit(
             uploads: Vec::new(),
         });
         let submission = live.frame.submissions.last().expect("pushed");
-        let touched = live.projection.submit(&mut live.capture, submission);
+        let from = live.projection.indirect().len();
+        let mut touched = live.projection.submit(&mut live.capture, submission);
         let unknown = unsafe { unknown_wait(waits.entry(queue.id).or_default(), signals) };
+        // What its DispatchRays' shader tables name, read now: the queue runs everything submitted before first.
+        if unknown.is_none()
+            && let Some(real) = unsafe { ID3D12CommandQueue::from_raw_borrowed(&real) }
+        {
+            let named = unsafe {
+                super::indirect::named_at_submission(&live.projection, &live.capture.events, from, real)
+            };
+            for r in named {
+                if !touched.contains(&r) {
+                    touched.push(r);
+                }
+            }
+        }
         let snapshots = first_uses(live, objects, states, touched, unknown.as_deref(), cpu_seq);
         let copies = upload_copies(uploads, first, &lists, constant_buffers.values());
         if !copies.is_empty() || !snapshots.is_empty() {
@@ -572,8 +616,10 @@ pub unsafe fn submit(
     }
     // The copies run before these lists, which change states for the next submission.
     states.execute(&lists, queue_type);
-    let mut submitted = super::passes::Submitted::new(id);
+    let mut submitted = super::passes::Submitted::new(id, D3D12_COMMAND_LIST_TYPE(queue_type));
+    submitted.rays = super::rays::executing(&lists.iter().map(|l| l.id).collect::<Vec<_>>());
     let mut executed = Vec::new();
+    let ordinals_of = ordinals.clone();
     for (at, list) in ordinals.into_iter().zip(&lists).filter(|(_, l)| l.instrumented) {
         let copied = list.checkpoints.iter().filter(|c| c.gap.is_none()).map(|c| c.id);
         let copied = copied.chain(list.outputs.iter().filter(|o| o.gap.is_none()).map(|o| o.id));
@@ -592,6 +638,31 @@ pub unsafe fn submit(
         executed.push(super::passes::Executed { at, list, first });
     }
     let continued = unsafe { super::passes::ends(&mut submitted, &executed) };
+    // Buffers locum's copies promoted, moved between the lists (see [`super::promoted`]).
+    let placed: Vec<(usize, &model::List)> = ordinals_of
+        .iter()
+        .copied()
+        .zip(lists.iter().map(|l| &**l))
+        .collect();
+    let moves = super::promoted::between(&placed);
+    if !moves.is_empty() {
+        let mut device: Option<ID3D12Device> = None;
+        let made = unsafe { ID3D12CommandQueue::from_raw_borrowed(&real) }
+            .ok_or_else(|| "no queue".to_string())
+            .and_then(|q| unsafe { q.GetDevice(&mut device) }.map_err(|e| e.to_string()))
+            .and_then(|()| device.ok_or_else(|| "no device".to_string()));
+        for (at, m) in moves {
+            if let Err(why) = made
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|d| unsafe { submitted.moves_before(d, at, &m) })
+            {
+                crate::log::log!(
+                    "D3D12: submission {id}: the buffers locum's copies promoted are not moved back before list {at}: {why}"
+                );
+            }
+        }
+    }
     if let Some(live) = capture.as_ref() {
         if submitted.reads() {
             submitted.results = Some(live.results.clone());
@@ -612,8 +683,10 @@ pub unsafe fn submit(
 }
 
 /// Called while the queue lock is held, immediately after forwarding ExecuteCommandLists to `real`, the real queue.
-pub unsafe fn submitted(queue: &Data, real: *mut c_void, submission: super::passes::Submitted) {
+pub unsafe fn submitted(queue: &Data, real: *mut c_void, mut submission: super::passes::Submitted) {
+    let builds = std::mem::take(&mut submission.rays);
     unsafe { super::passes::submitted(queue.id, real, submission) };
+    unsafe { super::rays::submitted(queue.id, real, builds) };
 }
 
 /// The first wait this queue has been told of that no submitted Signal and no completed fence value is known to
@@ -680,8 +753,9 @@ fn first_uses(
             }
         };
         let n = |key: &str| d[key].as_u64().unwrap_or(0) as u32;
-        // Upload and readback heaps.
-        if matches!(d["heap_properties"]["type"].as_u64(), Some(2 | 3)) {
+        // Upload and readback heaps; and acceleration structures, which a frame begins with as they were built
+        // (see `rays`).
+        if matches!(d["heap_properties"]["type"].as_u64(), Some(2 | 3)) || model::acceleration_structures(d) {
             continue;
         }
         let texture = n("dimension") > 1;
@@ -1064,6 +1138,7 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         results,
         series: of,
         used,
+        rays,
         ..
     }) = finished
     {
@@ -1128,6 +1203,9 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                     for (resource, copy) in batch.contents {
                         prepared.set_after_frame(resource, copy);
                     }
+                }
+                for (key, b) in &rays {
+                    prepared.add_acceleration_structure(super::rays::record(*key, b));
                 }
                 prepared.contents(&mut capture, &crate::settings::settings().blobs);
                 capture.d3d12 = Some(prepared);
@@ -1224,6 +1302,7 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         used: HashSet::new(),
         executed: HashSet::new(),
         paged: HashSet::new(),
+        rays: super::rays::latest(),
     });
     s.series = Some(series.clone());
     super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
