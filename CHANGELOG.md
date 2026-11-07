@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Docs: GPU-based validation, which `verify --debug` and `replay --debug` run under, checks textures' layouts but not
+  buffers' states: a shader writing a buffer in COPY_SOURCE is reported neither by it nor by the debug layer. The docs
+  said it checks resource states.
+
 ## 0.1.6 (2026-11-06)
 
 - A top-level build before the frame whose instances are an array of pointers is captured: its pointers are copied

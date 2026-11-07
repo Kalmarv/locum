@@ -58,10 +58,10 @@ pub enum Validation {
     Off,
     /// The debug layer: each call checked as it is made.
     Layer,
-    /// The debug layer and, in Direct3D 12, GPU-based validation: descriptors, resource states and bounds checked as
-    /// the shaders use them, by shaders it patches. Patched shaders round some results otherwise than the game's (in
-    /// Elden Ring, an SSAO pixel shader with no UAVs left 7 of 921600 texels one step off), so what a replay under it
-    /// writes is not the game's to the bit.
+    /// The debug layer and, in Direct3D 12, GPU-based validation: descriptors, textures' layouts and bounds checked as
+    /// the shaders use them, by shaders it patches; buffers' states are not checked. Patched shaders round some results
+    /// otherwise than the game's (in Elden Ring, an SSAO pixel shader with no UAVs left 7 of 921600 texels one step
+    /// off), so what a replay under it writes is not the game's to the bit.
     Gpu,
 }
 

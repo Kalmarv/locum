@@ -545,12 +545,15 @@ it runs reads, neither can change an output, and verify notes them; resolved any
 incomplete. Other query types (stream output, video) are not replayed, and verify lists them.
 
 `verify --debug` replays a Direct3D 12 frame twice. The first time is under GPU-based validation, which checks
-descriptors, resource states and bounds as the shaders use them; only its errors count. It patches the shaders to do
-that, and patched shaders round some results otherwise than the game's. In Elden Ring an SSAO pixel shader with no
-UAVs left 7 of 921600 texels one step off, and later passes carried that on, so 44 of 184 targets differed. Patch
-mode NONE gives every target identical; STATE_TRACKING_ONLY gives the same 44. The second time is under the debug
-layer alone, which compares as verify does without it. `replay --debug` runs under GPU-based validation, so its
-images can differ from the game's in that way.
+descriptors, textures' layouts and bounds as the shaders use them; only its errors count. Buffers' states it does not
+check: a shader that writes a buffer in COPY_SOURCE, through a UAV in a table or a root UAV, is reported neither by it
+nor by the debug layer, where a texture in that state is ("Incompatible texture barrier layout", message 1358). So with
+the debug layer of Windows 10.0.26200, in the default and the guarded patch modes, on WARP and on an RTX 5070 Ti, with
+locum's DLLs and without. It patches the shaders to do that, and patched shaders round some results otherwise than the
+game's. In Elden Ring an SSAO pixel shader with no UAVs left 7 of 921600 texels one step off, and later passes carried
+that on, so 44 of 184 targets differed. Patch mode NONE gives every target identical; STATE_TRACKING_ONLY gives the same
+44. The second time is under the debug layer alone, which compares as verify does without it. `replay --debug` runs
+under GPU-based validation, so its images can differ from the game's in that way.
 
 GPU-based validation takes a texture made for simultaneous access as in the COMMON layout. It then reports any UAV
 use of it as "Incompatible texture barrier layout" (message 1358), barrier or not. The spec keeps those textures in
