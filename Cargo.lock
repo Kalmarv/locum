@@ -275,18 +275,9 @@ dependencies = [
 
 [[package]]
 name = "d3d9-reader"
-version = "0.5.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07ee33894b73ff54d137c0bff4ee215a84693d6f15709ad85618ba065ac20bd0"
-dependencies = [
- "thiserror",
-]
-
-[[package]]
-name = "d3d9-reader"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc75ddd255896e3e9e19be676ded494d3e842a02aaafe56d5efdf983678089bf"
+checksum = "92d425781216a902c5a8bd7989bb800eb53e583d3407af92fb7477903ae72763"
 dependencies = [
  "thiserror",
 ]
@@ -304,41 +295,20 @@ dependencies = [
 
 [[package]]
 name = "dxbc-reader"
-version = "0.5.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1fadf67c3e0dde6677fabf30d64aa888ed9240584c18c1f07733c8c85b5d5e3"
+checksum = "96d26dabbab1eed38a948279b3322c30677ee4849ea3704374e530549d2d5ad1"
 dependencies = [
- "d3d9-reader 0.5.0",
- "dxcontainer 0.5.0",
- "thiserror",
-]
-
-[[package]]
-name = "dxbc-reader"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd4c76d3cd16ce42fc9dd8fa9ceb91016c8502c50d5710379512cc07f1b2085a"
-dependencies = [
- "d3d9-reader 0.9.1",
- "dxcontainer 0.9.1",
+ "d3d9-reader",
+ "dxcontainer",
  "thiserror",
 ]
 
 [[package]]
 name = "dxcontainer"
-version = "0.5.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af62c58aff5d90b000bdf31f191f1d6dc2243edaa8fa0dae25bafaf5bc6ba977"
-dependencies = [
- "primase-foundations",
- "thiserror",
-]
-
-[[package]]
-name = "dxcontainer"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57160070a9e6ce5142258f4999f877e1e763d109b36124738b223683a1959bf9"
+checksum = "434e78a929a111671777fe4ca0a81aaabb51a51483b0acc0cf0653f6234b2136"
 dependencies = [
  "primase-foundations",
  "thiserror",
@@ -346,22 +316,11 @@ dependencies = [
 
 [[package]]
 name = "dxil-reader"
-version = "0.5.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e0c2157e9e3b67371f7fbd16749b1fd15aa0436d66109108518364796beeae38"
+checksum = "663bdc332f401344e64903868769f593f33df7597336fac80de204679eaa17ac"
 dependencies = [
- "dxcontainer 0.5.0",
- "primase-foundations",
- "thiserror",
-]
-
-[[package]]
-name = "dxil-reader"
-version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b159184c124febfbebe2ee710dbd7124594903c2fff664f37dcab1b14397a6cc"
-dependencies = [
- "dxcontainer 0.9.1",
+ "dxcontainer",
  "primase-foundations",
  "thiserror",
 ]
@@ -605,9 +564,8 @@ dependencies = [
 
 [[package]]
 name = "iridia"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57705f4c0ace24dd5236014c8506f368e9784275cad83596368a40138bed28f8"
+version = "0.6.0"
+source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
 dependencies = [
  "iridia-interface",
  "iridia-ir",
@@ -619,34 +577,33 @@ dependencies = [
 
 [[package]]
 name = "iridia-dxbc"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43f5fdb162bf0867c740575ba085deed773bb54f2484fabeac64d97e971235b2"
+version = "0.6.0"
+source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
 dependencies = [
- "dxbc-reader 0.5.0",
- "dxcontainer 0.5.0",
+ "dxbc-reader",
+ "dxcontainer",
  "iridia",
+ "iridia-ir",
  "primase-naga",
 ]
 
 [[package]]
 name = "iridia-dxil"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e99b14cf1f2117332ebf8a22a4b5ad984d911887fd04cadc9270bcda9e74b84c"
+version = "0.6.0"
+source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
 dependencies = [
- "dxcontainer 0.5.0",
- "dxil-reader 0.5.0",
+ "dxcontainer",
+ "dxil-reader",
  "half",
  "iridia",
+ "iridia-ir",
  "primase-naga",
 ]
 
 [[package]]
 name = "iridia-interface"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891da8ab0869ffaabbac7985bc90098170f533cee2a8593a300de197af13cb1d"
+version = "0.6.0"
+source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
 dependencies = [
  "iridia-ir",
  "serde",
@@ -654,9 +611,8 @@ dependencies = [
 
 [[package]]
 name = "iridia-ir"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "637a77a4aa95fd797f6e80ca015e973feec7a7f0d2d6a97d0e10117f170dab14"
+version = "0.6.0"
+source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
 dependencies = [
  "serde",
  "serde_json",
@@ -665,9 +621,8 @@ dependencies = [
 
 [[package]]
 name = "iridia-passes"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b40406ab40a267c0034a9f7da795df1dff8627fcc45aa8ed6cace4bfb6965765"
+version = "0.6.0"
+source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
 dependencies = [
  "iridia-ir",
 ]
@@ -739,8 +694,8 @@ dependencies = [
 name = "locum-capture"
 version = "0.1.6"
 dependencies = [
- "dxbc-reader 0.9.1",
- "dxil-reader 0.9.1",
+ "dxbc-reader",
+ "dxil-reader",
  "primase-foundations",
  "primase-testdata",
  "rusqlite",
@@ -757,8 +712,8 @@ name = "locum-cli"
 version = "0.1.6"
 dependencies = [
  "clap",
- "dxcontainer 0.9.1",
- "dxil-reader 0.9.1",
+ "dxcontainer",
+ "dxil-reader",
  "iridia",
  "iridia-dxbc",
  "iridia-dxil",

@@ -255,30 +255,26 @@ pub fn declared(code: &[u8]) -> Option<Vec<Binding>> {
         .declarations
         .iter()
         .filter_map(|d| {
-            // D3D_SHADER_INPUT_TYPE, the register's letter, the Shader Model 5.0 register, the 5.1 range.
-            let (kind, letter, slot, range) = match &d.kind {
-                D::ConstantBuffer { slot, range, .. } => (0, "cb", *slot, range),
-                D::Sampler { slot, range, .. } => (3, "s", *slot, range),
-                D::Resource { slot, range, .. } => (2, "t", *slot, range),
-                D::ResourceRaw { slot, range } => (7, "t", *slot, range),
-                D::ResourceStructured { slot, range, .. } => (5, "t", *slot, range),
-                D::UavTyped { slot, range, .. } => (4, "u", *slot, range),
-                D::UavRaw { slot, range, .. } => (8, "u", *slot, range),
-                D::UavStructured { slot, range, .. } => (6, "u", *slot, range),
+            // D3D_SHADER_INPUT_TYPE and the register's letter.
+            let (kind, letter) = match &d.kind {
+                D::ConstantBuffer { .. } => (0, "cb"),
+                D::Sampler { .. } => (3, "s"),
+                D::Resource { .. } => (2, "t"),
+                D::ResourceRaw { .. } => (7, "t"),
+                D::ResourceStructured { .. } => (5, "t"),
+                D::UavTyped { .. } => (4, "u"),
+                D::UavRaw { .. } => (8, "u"),
+                D::UavStructured { .. } => (6, "u"),
                 _ => return None,
             };
-            let (slot, count, space) = match range {
-                Some(r) => (
-                    r.lower,
-                    if r.upper == u32::MAX {
-                        0
-                    } else {
-                        r.upper.saturating_sub(r.lower) + 1
-                    },
-                    r.space,
-                ),
-                None => (slot, 1, 0),
+            // the Shader Model 5.1 range, or the one register in space 0 before it
+            let r = d.kind.registers()?;
+            let count = if r.upper == u32::MAX {
+                0
+            } else {
+                r.upper.saturating_sub(r.lower) + 1
             };
+            let (slot, space) = (r.lower, r.space);
             let name = match space {
                 0 => format!("{letter}{slot}"),
                 s => format!("{letter}{slot} space {s}"),

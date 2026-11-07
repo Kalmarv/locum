@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- dx 0.11.0 (`dxbc-reader`, `dxil-reader`, `dxcontainer`; were 0.9.1) and iridia's main at 064e0b9 (`iridia`,
+  `iridia-dxbc`, `iridia-dxil`; were 0.5.0 from crates.io), which links the same dx, so the build holds one version of
+  each dx reader again. iridia is taken from its repository until its next release, the one without the naga path. The slim
+  shader set reads as it did on 0.9.1 (DXBC: 2,169 by `RDEF`, 1,501 by declarations, 1 refused; DXIL: 1,249 by the
+  module, 2,806 by `STAT`, 3 root signatures alone, 1 refused). A DXBC program stripped of its reflection takes its
+  registers from `dxbc-reader`'s `Declared::registers`.
 - dx 0.9.1 (`dxbc-reader`, `dxil-reader`, `dxcontainer`; were 0.5.0) reads 66 programs of the slim shader set that 0.5.0
   refused: 64 whose DXIL resources include one bound to no register (register and space -1), one with a reorder-coherent
   resource tag and one with `sample_d_clamp_feedback`'s feedback operand. Their reflection now names their resources for
