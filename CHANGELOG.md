@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.6 (2026-11-06)
 
 - A top-level build before the frame whose instances are an array of pointers is captured: its pointers are copied
   in the game's list right after it, and a list of locum's right after that list gathers each instance on the GPU
