@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.5 (2026-11-06)
 
 - A wrapper is another face of the real object: its `AddRef` and `Release` are the object's, one wrapper is made per
   object, and it is freed when the object is destroyed. A game sees the counts it would see without locum: a child
