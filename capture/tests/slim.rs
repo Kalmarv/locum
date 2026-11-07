@@ -13,8 +13,8 @@ use inputs::{Game, OracleSet};
 use locum_capture::d3d12::programs::{Declared, root_layout};
 use locum_capture::{dxbc, rdef};
 
-/// The set's programs by family, as primase-testdata records it (0.1.17 on).
-const PROGRAMS: [(&str, usize); 3] = [("d3d9", 557), ("dxbc", 3_670), ("dxil", 4_059)];
+/// The set's programs by family, as primase-testdata records it (0.2.2 on).
+const PROGRAMS: [(&str, usize); 3] = [("d3d9", 557), ("dxbc", 3_671), ("dxil", 4_059)];
 
 /// What locum read of a program: where its reflection came from (`RDEF`, its declarations when it has none, the
 /// `STAT` or `DXIL` module), or `root signature alone` for a container holding nothing else; an error names the

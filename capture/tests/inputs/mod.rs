@@ -19,8 +19,8 @@ primase_testdata::inputs! {
         Query::Oracle(OracleSet::Corpus, Game::General, "slim") => {
             status: Live,
             gate: true,
-            about: r#"the slim shader set: 8,286 programs (`programs/<fam>/<sha256>.<fam>`; 3,670 DXBC, 4,059 DXIL, 557 Direct3D 9), each beside Microsoft's listing, chosen to reach every llvm-cov region and branch side of dx and iridia that the full 108,394-program pool reaches; tests/slim.rs"#,
-            source: r#"primase-oracles `producers/slim-set` over the oracle home's game corpora and disassembler sets and outside projects' test corpora (recorded since primase-testdata 0.1.17, its slim.tsv as of 0.2.1); programs stay outside the repository"#,
+            about: r#"the slim shader set: 8,287 programs (`programs/<fam>/<sha256>.<fam>`; 3,671 DXBC, 4,059 DXIL, 557 Direct3D 9), each beside Microsoft's listing, chosen to reach every llvm-cov region and branch side of dx and iridia that the full 108,394-program pool reaches; tests/slim.rs"#,
+            source: r#"primase-oracles `producers/slim-set` over the oracle home's game corpora and disassembler sets and outside projects' test corpora (recorded since primase-testdata 0.1.17, its slim.tsv as of 0.2.2); programs stay outside the repository"#,
         },
     }
     debug {}
