@@ -21,17 +21,40 @@ fn main() {
         .expect("a Cargo.lock beside the package or the workspace");
     println!("cargo:rerun-if-changed={}", lock.display());
     let text = std::fs::read_to_string(&lock).expect("read Cargo.lock");
+    let entries: Vec<&str> = text.split("[[package]]").collect();
+    let field = |entry: &str, name: &str| {
+        entry
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name} = \"")))
+            .map(|value| value.trim_end_matches('"').to_owned())
+    };
+    let named =
+        |entry: &&str, package: &str| entry.lines().any(|line| line == format!("name = \"{package}\""));
+    let cli = entries
+        .iter()
+        .find(|entry| named(entry, env!("CARGO_PKG_NAME")))
+        .expect("Cargo.lock has this package");
     for (package, variable) in [("dxil-reader", "LOCUM_DX"), ("iridia-dxil", "LOCUM_IRIDIA")] {
-        let entry = text
-            .split("[[package]]")
-            .find(|entry| entry.lines().any(|line| line == format!("name = \"{package}\"")))
-            .unwrap_or_else(|| panic!("Cargo.lock has no {package}"));
-        let field = |name: &str| {
-            entry
-                .lines()
-                .find_map(|line| line.strip_prefix(&format!("{name} = \"")))
-                .map(|value| value.trim_end_matches('"').to_owned())
-        };
+        // This package's own dependency: where the lock holds more than one version (iridia's dx beside ours), it
+        // names it `"dxil-reader 0.9.1"`, else `"dxil-reader"`.
+        let wanted = cli
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix('"')?.split('"').next())
+            .find_map(|dependency| {
+                let mut words = dependency.split(' ');
+                (words.next() == Some(package)).then(|| words.next().map(str::to_owned))
+            })
+            .unwrap_or_else(|| panic!("{} does not depend on {package}", env!("CARGO_PKG_NAME")));
+        let entry = entries
+            .iter()
+            .find(|entry| {
+                named(entry, package)
+                    && wanted
+                        .as_ref()
+                        .is_none_or(|v| field(entry, "version").as_ref() == Some(v))
+            })
+            .unwrap_or_else(|| panic!("Cargo.lock has no {package} {wanted:?}"));
+        let field = |name: &str| field(entry, name);
         let version = field("version").unwrap_or_else(|| panic!("Cargo.lock has no version of {package}"));
         // a crates.io build is named by its version, a git build by its commit
         let build = match field("source") {

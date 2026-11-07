@@ -36,6 +36,9 @@ windows = { workspace = true, features = [
 ] }
 texture2ddecoder = "0.1.2"
 
+[dev-dependencies]
+primase-testdata.workspace = true
+
 [target.'cfg(windows)'.build-dependencies]
 windows = { workspace = true, features = ["Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc"] }
 

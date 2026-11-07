@@ -336,6 +336,10 @@ impl Bound {
                             continue;
                         };
                         for &(space, first, last) in registers.iter() {
+                            if first == u32::MAX {
+                                gaps.push("a UAV bound to no register: what it writes is not named".into());
+                                continue;
+                            }
                             if last == u32::MAX || last - first >= MOST_REGISTERS {
                                 gaps.push(
                                     "a UAV array of unbounded or large size: what it writes is not named"
@@ -624,5 +628,40 @@ mod tests {
             }]
         );
         assert_eq!(gaps, ["its lib program says nothing of its UAVs"]);
+    }
+
+    /// A library's UAV bound to no register (dxc's register -1) is a gap; its bound UAV is written.
+    #[test]
+    fn a_librarys_uav_bound_to_no_register_is_a_gap() {
+        // `RWBuffer<uint> unbound_uav;` beside `RWBuffer<float> bound : register(u1);`.
+        program(
+            "outputs-test-unbound",
+            include_bytes!("../../../capture/src/testdata/dxil-lib-unbound.cso"),
+        );
+        state_object(
+            9020,
+            &json!({"kind": "state_object", "parent": 0,
+                "subobjects": [{"type": 5, "value": {"library": {"blob": "outputs-test-unbound"}, "exports": []}}]}),
+        );
+        root(
+            9021,
+            &json!({"parameters": [{"type": 4, "visibility": 0, "value": {"ShaderRegister": 1, "RegisterSpace": 0}}]}),
+        );
+        let mut bound = Bound::default();
+        bound.apply("SetComputeRootSignature", &json!([9021]));
+        bound.apply(
+            "SetComputeRootUnorderedAccessView",
+            &json!([0, {"resource": 9, "offset": 0}]),
+        );
+        bound.apply("SetPipelineState1", &json!([9020]));
+        let (written, gaps) = bound.written("DispatchRays", &json!([]));
+        assert_eq!(
+            written,
+            [Written {
+                resource: 9,
+                sub: None
+            }]
+        );
+        assert_eq!(gaps, ["a UAV bound to no register: what it writes is not named"]);
     }
 }

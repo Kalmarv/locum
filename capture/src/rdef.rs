@@ -210,6 +210,7 @@ pub fn bindings(code: &[u8]) -> Option<Vec<Binding>> {
 /// The UAV registers a program declares, as (space, first, last) with `u32::MAX` the last of an unbounded array:
 /// a DXIL program's from its `PSV0` part, which a runtime keeps however stripped the program is, a DXIL library's
 /// (which has none) from its module's `dx.resources`, and a DXBC program's from its reflection or declarations.
+/// A library's UAV bound to no register, which dxc gives register and space -1, is `(u32::MAX, u32::MAX, u32::MAX)`.
 /// Cheap enough to run as programs are made. None where nothing says.
 pub fn uav_registers(code: &[u8]) -> Option<Vec<(u32, u32, u32)>> {
     if let Ok(parts) = dxil_reader::parts(code)
@@ -235,7 +236,7 @@ pub fn uav_registers(code: &[u8]) -> Option<Vec<(u32, u32, u32)>> {
                     if b.count == 0 {
                         u32::MAX
                     } else {
-                        b.slot + b.count - 1
+                        b.slot.saturating_add(b.count - 1)
                     },
                 )
             })
@@ -662,6 +663,31 @@ mod tests {
     fn a_librarys_uavs_are_its_modules() {
         let code = include_bytes!("testdata/dxil-library.cso");
         assert_eq!(uav_registers(code), Some(vec![(0, 0, 0)]));
+    }
+
+    /// `testdata/dxil-lib-unbound.cso`: dx's `lib_unbound` fixture (dxil-reader tests/fixtures, dxc `-T lib_6_6`),
+    /// `RWBuffer<uint> unbound_uav;` and `Texture2D<float4> unbound_srv;` bound to no register beside
+    /// `RWBuffer<float> bound : register(u1);`. dxc gives the unbound ones register and space -1.
+    #[test]
+    fn a_librarys_uav_bound_to_no_register_takes_the_last_register() {
+        let code = include_bytes!("testdata/dxil-lib-unbound.cso");
+        let mut found: Vec<(String, &str, u32, u32, u32)> = bindings(code)
+            .expect("its module")
+            .into_iter()
+            .map(|b| (b.name.clone(), b.class(), b.space, b.slot, b.count))
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ("bound".to_string(), "uav", 0, 1, 1),
+                ("unbound_srv".to_string(), "srv", u32::MAX, u32::MAX, 1),
+                ("unbound_uav".to_string(), "uav", u32::MAX, u32::MAX, 1),
+            ]
+        );
+        let mut uavs = uav_registers(code).expect("its UAVs");
+        uavs.sort();
+        assert_eq!(uavs, [(0, 1, 1), (u32::MAX, u32::MAX, u32::MAX)]);
     }
 
     #[test]
