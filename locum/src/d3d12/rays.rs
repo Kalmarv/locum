@@ -7,7 +7,8 @@
 //! locum's: the application cannot change them before its next barrier, so the copy reads what the build read. Each
 //! buffer is copied from the state or layout this list's barriers left it in (see [`super::passes::record_ranges`]).
 //! The copies belong to the list until it is reset or destroyed; then those that are still some acceleration
-//! structure's latest build are kept, the rest freed once the GPU is done with them.
+//! structure's latest build are kept, the rest freed once the GPU is done with them. A top-level build's instances
+//! given as an array of pointers are gathered on the GPU instead, after the list (see [`super::gather`]).
 //!
 //! Lists execute in the order they are submitted, so that is the order builds take effect: an acceleration
 //! structure's latest build is the last one submitted into it. `CopyRaytracingAccelerationStructure` makes the
@@ -54,6 +55,8 @@ pub struct Build {
     /// Why its inputs were not copied.
     pub error: Option<String>,
     copy: Option<Copy>,
+    /// Its instances' gather, where they are given as an array of pointers (`copy` is its readback).
+    gather: Option<super::gather::Gather>,
     /// The fence value locum signalled after the latest execution of the list it is in.
     last: Mutex<Option<(ID3D12Fence, u64)>>,
 }
@@ -84,6 +87,16 @@ impl Build {
             return Err(why.clone());
         }
         let copy = self.copy.as_ref().ok_or("its inputs were not copied")?;
+        let analysis = match &self.gather {
+            Some(g) => {
+                let analysis = g.analysis.get().ok_or("its list was never submitted")?.as_ref()?;
+                if let Some(why) = g.failed.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                    return Err(format!("its instances' gather was not made: {why}"));
+                }
+                Some((g.count, analysis))
+            }
+            None => None,
+        };
         let last = self.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let Some((fence, value)) = last else {
             return Err("its list was never submitted".into());
@@ -92,13 +105,16 @@ impl Build {
         let mut mapped = core::ptr::null_mut();
         unsafe { copy.buffer.Map(0, None, Some(&mut mapped)) }.map_err(|e| format!("Map: {e}"))?;
         let all = unsafe { core::slice::from_raw_parts(mapped.cast::<u8>(), copy.bytes as usize) };
-        let parts = self
-            .inputs
-            .iter()
-            .map(|i| all[i.at as usize..(i.at + i.bytes) as usize].to_vec())
-            .collect();
+        let parts = analysis
+            .map_or(Ok(()), |(count, a)| super::gather::verdict(all, count, a))
+            .map(|()| {
+                self.inputs
+                    .iter()
+                    .map(|i| all[i.at as usize..(i.at + i.bytes) as usize].to_vec())
+                    .collect()
+            });
         unsafe { copy.buffer.Unmap(0, None) };
-        Ok(parts)
+        parts
     }
 }
 
@@ -160,15 +176,10 @@ fn extent(count: u64, stride: u64, last: u64) -> u64 {
 /// A range a build reads: its part, the geometry it is of, its address and its bytes.
 type Range = (&'static str, Option<usize>, u64, u64);
 
-/// The ranges a build reads.
+/// The ranges a build reads (a top-level build's instances in an array: an array of pointers is gathered).
 unsafe fn ranges(i: &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS) -> Result<Vec<Range>, String> {
     let n = i.NumDescs as usize;
     if i.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL {
-        if i.DescsLayout != D3D12_ELEMENTS_LAYOUT_ARRAY {
-            return Err(
-                "its instance descriptions are an array of pointers, which locum does not follow".into(),
-            );
-        }
         let bytes = n as u64 * size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() as u64;
         return Ok(vec![(
             "instances",
@@ -282,9 +293,9 @@ pub unsafe fn built(
         return;
     };
     let description = unsafe { super::values::acceleration_structure_build(p) };
-    let (inputs, copy, error) = match unsafe { copy_inputs(data, real, &d.Inputs) } {
-        Ok((inputs, copy)) => (inputs, copy, None),
-        Err(why) => (Vec::new(), None, Some(why)),
+    let (inputs, copy, gather, error) = match unsafe { copy_inputs(data, real, &d.Inputs) } {
+        Ok((inputs, copy, gather)) => (inputs, copy, gather, None),
+        Err(why) => (Vec::new(), None, None, Some(why)),
     };
     let build = Arc::new(Build {
         dest,
@@ -292,17 +303,44 @@ pub unsafe fn built(
         inputs,
         error,
         copy,
+        gather,
         last: Mutex::new(None),
     });
     state().lists.entry(data.id).or_default().push(Step::Build(build));
+}
+
+/// A build's inputs, the copy holding them, and its instances' gather where they are given as an array of pointers.
+type Copied = (Vec<Input>, Option<Copy>, Option<super::gather::Gather>);
+
+/// Readback memory of `bytes` for a build's inputs, on the real device of the real list `list`, counted against
+/// [`BUDGET`].
+unsafe fn readback(list: &ID3D12GraphicsCommandList, bytes: u64) -> Result<(ID3D12Device, Copy), String> {
+    if BYTES.fetch_add(bytes, Ordering::AcqRel) + bytes > BUDGET {
+        BYTES.fetch_sub(bytes, Ordering::AcqRel);
+        return Err(format!(
+            "the {} GiB kept of builds' inputs are spent",
+            BUDGET >> 30
+        ));
+    }
+    let mut device: Option<ID3D12Device> = None;
+    let made = unsafe { list.GetDevice(&mut device) }
+        .map_err(|e| e.to_string())
+        .and_then(|()| device.ok_or_else(|| "no device".to_string()))
+        .and_then(|d| unsafe { super::passes::readback_resource(&d, bytes) }.map(|b| (d, b)));
+    match made {
+        Ok((device, buffer)) => Ok((device, Copy { buffer, bytes })),
+        Err(why) => {
+            BYTES.fetch_sub(bytes, Ordering::AcqRel);
+            Err(why)
+        }
+    }
 }
 
 unsafe fn copy_inputs(
     data: &super::journal::Data,
     real: *mut c_void,
     i: &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS,
-) -> Result<(Vec<Input>, Option<Copy>), String> {
-    let ranges = unsafe { ranges(i) }?;
+) -> Result<Copied, String> {
     let list = unsafe { ID3D12GraphicsCommandList::from_raw_borrowed(&real) }.ok_or("no list")?;
     let commands = data
         .recording
@@ -312,6 +350,12 @@ unsafe fn copy_inputs(
         .map(|r| r.snapshot())
         .ok_or("its list is not recorded")?;
     let commands = &commands.commands;
+    if i.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL
+        && i.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS
+    {
+        return unsafe { gathered(data, list, commands, i) };
+    }
+    let ranges = unsafe { ranges(i) }?;
     let mut inputs = Vec::new();
     let mut copies = Vec::new();
     let mut at = 0;
@@ -337,27 +381,9 @@ unsafe fn copy_inputs(
         at += bytes;
     }
     if at == 0 {
-        return Ok((inputs, None));
+        return Ok((inputs, None, None));
     }
-    if BYTES.fetch_add(at, Ordering::AcqRel) + at > BUDGET {
-        BYTES.fetch_sub(at, Ordering::AcqRel);
-        return Err(format!(
-            "the {} GiB kept of builds' inputs are spent",
-            BUDGET >> 30
-        ));
-    }
-    let mut device: Option<ID3D12Device> = None;
-    let made = unsafe { list.GetDevice(&mut device) }
-        .map_err(|e| e.to_string())
-        .and_then(|()| unsafe { super::passes::readback_resource(device.as_ref().ok_or("no device")?, at) });
-    let buffer = match made {
-        Ok(b) => b,
-        Err(why) => {
-            BYTES.fetch_sub(at, Ordering::AcqRel);
-            return Err(why);
-        }
-    };
-    let copy = Copy { buffer, bytes: at };
+    let (_, copy) = unsafe { readback(list, at) }?;
     let predicate = predication(commands)
         .and_then(|(r, offset, op)| super::real::<ID3D12Resource>(r).map(|r| (r, offset, op)));
     let promoted = unsafe {
@@ -369,12 +395,81 @@ unsafe fn copy_inputs(
             &copy.buffer,
         )
     }?;
+    promote(data, promoted);
+    Ok((inputs, Some(copy), None))
+}
+
+/// The buffers a copy of locum's in the list of `data` read by promotion (see [`super::promoted`]).
+fn promote(data: &super::journal::Data, promoted: Vec<u64>) {
     if let Some(r) = data.recording.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         for resource in promoted {
             r.promote(resource);
         }
     }
-    Ok((inputs, Some(copy)))
+}
+
+/// A top-level build whose instances are an array of pointers, just recorded into the real list `list` (whose
+/// commands so far are `commands`): its pointers copied and its gather made (see [`super::gather`]). Its inputs are
+/// the instances, gathered into an array, and the pointers.
+unsafe fn gathered(
+    data: &super::journal::Data,
+    list: &ID3D12GraphicsCommandList,
+    commands: &[locum_capture::d3d12::Command],
+    i: &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS,
+) -> Result<Copied, String> {
+    let count = u64::from(i.NumDescs);
+    if count == 0 {
+        return Ok((Vec::new(), None, None));
+    }
+    if predication(commands).is_some() {
+        return Err(
+            "its build is predicated (SetPredication), so locum does not know whether it ran, nor gathers its \
+             instances, which are given as an array of pointers"
+                .into(),
+        );
+    }
+    let address = unsafe { i.Anonymous.InstanceDescs };
+    let (resource, offset) = key(address).ok_or("its instance pointers are in no live buffer locum knows")?;
+    let real =
+        super::real::<ID3D12Resource>(resource).ok_or("its instance pointers' buffer was destroyed")?;
+    let source = super::passes::Source {
+        resource,
+        read: access(commands, resource, &real),
+        real,
+        offset,
+        bytes: count * 8,
+    };
+    let (device, copy) = unsafe { readback(list, super::gather::bytes(count)) }?;
+    let instances = count * size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() as u64;
+    let inputs = vec![
+        Input {
+            part: "instances",
+            geometry: None,
+            resource,
+            offset,
+            bytes: instances,
+            at: 0,
+        },
+        Input {
+            part: "pointers",
+            geometry: None,
+            resource,
+            offset,
+            bytes: count * 8,
+            at: instances,
+        },
+    ];
+    let (gather, promoted) = unsafe {
+        super::gather::prepare(
+            &device,
+            list,
+            source,
+            i.NumDescs,
+            commands.len().saturating_sub(1),
+        )
+    }?;
+    promote(data, promoted);
+    Ok((inputs, Some(copy), Some(gather)))
 }
 
 /// After `CopyRaytracingAccelerationStructure(dest, source, mode)` was recorded into list `list`.
@@ -454,6 +549,62 @@ pub fn executing(lists: &[u64]) -> Vec<Arc<Build>> {
     }
     sweep(&mut guard);
     builds
+}
+
+/// The gathers the application lists `lists` (each with its place in the application's array) make once
+/// submitted, by that place: their builds whose instances are an array of pointers, each with what its list does
+/// after it (see [`super::gather::analyse`]), decided at its first submission. Builds no gather can read for are left
+/// out: their reads say why.
+pub fn gathers(lists: &[(usize, &locum_capture::d3d12::List)]) -> Vec<(usize, Vec<Arc<Build>>)> {
+    let s = state();
+    let mut out = Vec::new();
+    for &(at, list) in lists {
+        let builds: Vec<Arc<Build>> = s
+            .lists
+            .get(&list.id)
+            .into_iter()
+            .flatten()
+            .filter_map(|step| match step {
+                Step::Build(b) => b.gather.as_ref().map(|g| (b, g)),
+                Step::Copy(..) => None,
+            })
+            .filter(|(_, g)| {
+                g.analysis
+                    .get_or_init(|| super::gather::analyse(&list.commands, g.at, &super::slots::buffer_range))
+                    .is_ok()
+            })
+            .map(|(b, _)| b.clone())
+            .collect();
+        if !builds.is_empty() {
+            out.push((at, builds));
+        }
+    }
+    out
+}
+
+/// Records into locum's list `list` the gathers of `builds` (of one application list, from [`gathers`]).
+///
+/// # Safety
+/// `list` is a real list of locum's open for recording, on the builds' device, submitted right after their list.
+pub unsafe fn record_gathers(list: &ID3D12GraphicsCommandList, builds: &[Arc<Build>]) {
+    let gathers: Vec<_> = builds
+        .iter()
+        .filter_map(|b| {
+            let g = b.gather.as_ref()?;
+            let analysis = g.analysis.get()?.as_ref().ok()?;
+            Some((g, analysis, &b.copy.as_ref()?.buffer))
+        })
+        .collect();
+    unsafe { super::gather::record(list, &gathers) };
+}
+
+/// The latest submission of `builds` made their gathers, or did not, for `why`.
+pub fn gathered_at_submission(builds: &[Arc<Build>], why: Option<&str>) {
+    for b in builds {
+        if let Some(g) = &b.gather {
+            *g.failed.lock().unwrap_or_else(|e| e.into_inner()) = why.map(str::to_string);
+        }
+    }
 }
 
 /// After the lists holding `builds` were submitted to the real queue `queue` (number `queue_id`): locum's fence

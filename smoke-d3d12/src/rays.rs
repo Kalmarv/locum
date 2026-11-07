@@ -4,8 +4,12 @@
 //! and a top-level one of two instances of them, and then the buffers they were built from are overwritten: replay
 //! has only what capture copied at the builds. The triangle's is compacted into another buffer, which the scene's
 //! instance names, and the triangle's own then built again of another triangle; the box's is built from another
-//! box and updated to its own. Those are three lists of one ExecuteCommandLists, which read inputs their own barriers
-//! have not moved: where the list before left them, and where nothing has. The pipeline is a collection (the miss shader) and a library (a ray
+//! box and updated to its own. Those are four lists of one ExecuteCommandLists, which read inputs their own barriers
+//! have not moved: where the list before left them, and where nothing has. Three more top-level structures are
+//! built in them of instances given by arrays of pointers, which locum gathers after their lists: one of pointers and
+//! instances in upload heaps; one of pointers and instances its list writes (by copies) before the build and then
+//! moves to COPY_SOURCE, which the gather moves back to read; and one whose instances its list overwrites after the
+//! build, which the capture says it does not hold (its list wrote them after the build read them). The pipeline is a collection (the miss shader) and a library (a ray
 //! generation shader, the hit groups' shaders), and AddToStateObject adds the ray generation shader again under
 //! another name. Local root signatures give the ray generation records a constant, the scene as a root SRV and the
 //! output UAV through a descriptor table; the hit group records a constant each, and the callable shader's record one
@@ -14,8 +18,9 @@
 //! The frame: a DispatchRays into one output; a bottom-level build of a triangle no ray reaches from a buffer the
 //! frame writes, updated in place to another, and a top-level build of it (its instance given by an array of
 //! pointers), then cloned; a DispatchRays of the added shader, through the new scene, into a second output; a compute
-//! dispatch tracing inline (RayQuery) through the first scene, its view in a descriptor table, into a third; and
-//! another through the clone, a root SRV, into a fourth. Nothing but the shader tables names the first two outputs.
+//! dispatch tracing inline (RayQuery) through the first scene, its view in a descriptor table, into a third;
+//! another through the clone, a root SRV, into a fourth; and two more through the gathered scenes, into a fifth and a
+//! sixth. Nothing but the shader tables names the first two outputs.
 use super::indirect::{
     check, default_buffer, dxil, fill, read_buffer, request, root_constants, root_signature, root_view,
     upload, written,
@@ -31,6 +36,9 @@ const GROUPS: [u32; 2] = [0x21, 0x22];
 const CALL: u32 = 0x30;
 /// The instances' IDs: the triangle and the box in the first scene, the frame's triangle in the second.
 const INSTANCES: [u32; 3] = [5, 7, 9];
+/// The gathered scenes' instances' IDs, each the triangle's and the box's: in upload heaps, written by the list, and
+/// overwritten after the build.
+const POINTED: [[u32; 2]; 3] = [[11, 13], [15, 17], [19, 21]];
 
 const LIBRARY: &str = r#"
 struct Payload { uint v; };
@@ -147,11 +155,15 @@ fn traced(n: usize, x: u32, y: u32) -> u32 {
     hit | ((K[n] + CALL) << 24)
 }
 
-/// What inline trace `n` (0: the first scene, 1: the frame's) writes at `(x, y)`: the scene's triangle (the box is
-/// a candidate it does not commit).
+/// What inline trace `n` (0: the first scene, 1: the frame's, 2 and 3: the gathered ones in upload heaps and written
+/// by their list) writes at `(x, y)`: the scene's triangle (the box is a candidate it does not commit).
 fn queried(n: usize, x: u32, y: u32) -> u32 {
+    let id = match n {
+        0 | 1 => INSTANCES[n * 2],
+        _ => POINTED[n - 2][0],
+    };
     if in_triangle(origin(x, y), n == 1) {
-        2 | (INSTANCES[n * 2] << 4)
+        2 | (id << 4)
     } else {
         1
     }
@@ -661,7 +673,7 @@ unsafe fn raw_uav(
     }
 }
 
-/// The `rays` capture (see the module's documentation), where the device can. Fence values `first` to `first + 12`.
+/// The `rays` capture (see the module's documentation), where the device can. Fence values `first` to `first + 14`.
 pub(super) unsafe fn capture(
     device: &ID3D12Device,
     queue: &ID3D12CommandQueue,
@@ -806,11 +818,13 @@ pub(super) unsafe fn capture(
             D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
         );
 
-        // Then, in one ExecuteCommandLists of three lists, the triangle's compacted, the box's updated to its own box,
+        // Then, in one ExecuteCommandLists of four lists, the triangle's compacted, the box's updated to its own box,
         // the scene of the two built, and the triangle's own structure built again, of a triangle no ray reaches.
         // Locum's copies of the inputs read buffers these lists' own barriers have not moved (see `promoted` in
         // locum): the first list moves the box's after its update reads it; the second reads the far triangle where
-        // the first left it, and the instances where nothing has moved them; the third moves both.
+        // the first left it, and the instances where nothing has moved them; the third moves both. The gathered
+        // scenes: the second list builds the one in upload heaps, the fourth the other two (see the module's
+        // documentation). Each array of pointers names the box first, and the triangle further on.
         let instances = [
             instance(INSTANCES[0], 0, va(&compacted)),
             instance(INSTANCES[1], 1, va(&box_structure.0)),
@@ -827,7 +841,41 @@ pub(super) unsafe fn capture(
         );
         let scene_inputs = top(va(&instance_buffer), 2, D3D12_ELEMENTS_LAYOUT_ARRAY);
         let scene = structure(&device5, &[&scene_inputs]);
-        let lists = [direct_list(device), direct_list(device), direct_list(device)];
+        // Each gathered scene's instances (the box at 64, the triangle at 256) and its pointers to them.
+        let pointed_instances = |ids: [u32; 2]| {
+            let mut bytes = vec![0u8; 512];
+            bytes[64..128].copy_from_slice(&instance(ids[1], 1, va(&box_structure.0)));
+            bytes[256..320].copy_from_slice(&instance(ids[0], 0, va(&compacted)));
+            bytes
+        };
+        let pointers_to = |r: &ID3D12Resource| [va(r) + 64, va(r) + 256].map(u64::to_le_bytes).concat();
+        let uploaded_instances = upload(device, &pointed_instances(POINTED[0]), 512);
+        let uploaded_pointers = upload(device, &pointers_to(&uploaded_instances), 256);
+        let written_instances = default_buffer(device, 512, false);
+        let written_pointers = default_buffer(device, 256, false);
+        let written_staged = [
+            upload(device, &pointed_instances(POINTED[1]), 512),
+            upload(device, &pointers_to(&written_instances), 256),
+        ];
+        let overwritten_instances = default_buffer(device, 512, false);
+        let overwritten_staged = upload(device, &pointed_instances(POINTED[2]), 512);
+        let overwritten_pointers = upload(device, &pointers_to(&overwritten_instances), 256);
+        let pointed =
+            |pointers: &ID3D12Resource| top(va(pointers), 2, D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS);
+        let (uploaded_inputs, written_inputs, overwritten_inputs) = (
+            pointed(&uploaded_pointers),
+            pointed(&written_pointers),
+            pointed(&overwritten_pointers),
+        );
+        let uploaded_scene = structure(&device5, &[&uploaded_inputs]);
+        let written_scene = structure(&device5, &[&written_inputs]);
+        let overwritten_scene = structure(&device5, &[&overwritten_inputs]);
+        let lists = [
+            direct_list(device),
+            direct_list(device),
+            direct_list(device),
+            direct_list(device),
+        ];
         copy_structure(
             &lists[0],
             &compacted,
@@ -849,12 +897,38 @@ pub(super) unsafe fn capture(
         );
         build(&lists[1], &scene_inputs, &scene);
         build(&lists[1], &far_inputs, &triangle_structure);
+        build(&lists[1], &uploaded_inputs, &uploaded_scene);
         transitions(
             &lists[2],
             &[&far, &instance_buffer],
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
             D3D12_RESOURCE_STATE_COPY_DEST,
         );
+        lists[3].CopyBufferRegion(&written_instances, 0, &written_staged[0], 0, 512);
+        lists[3].CopyBufferRegion(&written_pointers, 0, &written_staged[1], 0, 256);
+        lists[3].CopyBufferRegion(&overwritten_instances, 0, &overwritten_staged, 0, 512);
+        transitions(
+            &lists[3],
+            &[&written_instances, &written_pointers, &overwritten_instances],
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        );
+        build(&lists[3], &written_inputs, &written_scene);
+        build(&lists[3], &overwritten_inputs, &overwritten_scene);
+        transitions(
+            &lists[3],
+            &[&written_instances],
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        transitions(
+            &lists[3],
+            &[&overwritten_instances],
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+        let scrawl = upload(device, &[0x5a; 512], 512);
+        lists[3].CopyBufferRegion(&overwritten_instances, 0, &scrawl, 0, 512);
         for l in &lists {
             l.Close().unwrap();
         }
@@ -872,8 +946,16 @@ pub(super) unsafe fn capture(
                 (inputs[2], &garbage, 256),
                 (inputs[3], &garbage, 256),
                 (&instance_buffer, &garbage, 256),
+                (&written_instances, &scrawl, 512),
+                (&written_pointers, &garbage, 256),
             ],
         );
+        for (r, bytes) in [(&uploaded_instances, 512), (&uploaded_pointers, 256)] {
+            let mut p = core::ptr::null_mut();
+            r.Map(0, None, Some(&mut p)).unwrap();
+            core::ptr::write_bytes(p.cast::<u8>(), 0x7f, bytes);
+            r.Unmap(0, None);
+        }
 
         // The frame's scene: its instance given by an array of one pointer to it, and its clone.
         let frame_instances = upload(device, &instance(INSTANCES[2], 0, va(&frame_structure.0)), 256);
@@ -891,11 +973,13 @@ pub(super) unsafe fn capture(
             default_buffer(device, bytes, true),
             default_buffer(device, bytes, true),
             default_buffer(device, bytes, true),
+            default_buffer(device, bytes, true),
+            default_buffer(device, bytes, true),
         ];
         let heap: ID3D12DescriptorHeap = device
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: 5,
+                NumDescriptors: 7,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -923,6 +1007,8 @@ pub(super) unsafe fn capture(
         );
         raw_uav(device, &outputs[2], bytes, cpu(3));
         raw_uav(device, &outputs[3], bytes, cpu(4));
+        raw_uav(device, &outputs[4], bytes, cpu(5));
+        raw_uav(device, &outputs[5], bytes, cpu(6));
 
         // The shader tables: the ray generation records in a default heap, the rest in upload heaps. The added
         // pipeline's tables take the miss and hit group identifiers its parent gave.
@@ -1114,6 +1200,12 @@ pub(super) unsafe fn capture(
         list.SetComputeRootShaderResourceView(0, va(&frame_clone));
         list.SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu(4) });
         list.Dispatch(1, 1, 1);
+        // The gathered scenes, root SRVs too.
+        for (scene, slot) in [(&uploaded_scene.0, 5), (&written_scene.0, 6)] {
+            list.SetComputeRootShaderResourceView(0, va(scene));
+            list.SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu(slot) });
+            list.Dispatch(1, 1, 1);
+        }
         for o in &outputs {
             transition(
                 &plain,
@@ -1193,20 +1285,32 @@ pub(super) unsafe fn capture(
                     ),
                     2,
                 ),
-                // The four structures built before the frame, each with its inputs: the triangle's (built again), its
-                // compaction, the box's (updated) and the scene.
+                // The six structures built before the frame, each with its inputs: the triangle's (built again), its
+                // compaction, the box's (updated), the scene, and the two gathered scenes whose lists did not write
+                // their instances after the build; the third's list did, and the capture says so.
                 (
                     "SELECT count(*) FROM d12_acceleration_structures WHERE inputs_json IS NOT NULL",
-                    4,
+                    6,
+                ),
+                (
+                    "SELECT count(*) FROM d12_acceleration_structures WHERE inputs_json IS NULL AND diagnostic LIKE \
+                     'instance 0 of 2: its list moves buffer #% to state 0x400 after the build, so it may have \
+                     changed after the build read it'",
+                    1,
+                ),
+                (
+                    "SELECT count(*) FROM d12_acceleration_structures WHERE inputs_json IS NULL",
+                    1,
                 ),
             ],
         );
-        finish(queue, fence, first + 12);
+        finish(queue, fence, first + 14);
         debug_errors(device);
         println!(
             "D3D12 raytracing: two DispatchRays (a collection, AddToStateObject, local root arguments, a callable \
-             shader) and two inline traces, through structures compacted, updated, cloned and of instances by \
-             pointer, every ray as expected; their tables' outputs and scenes found: {label}"
+             shader) and four inline traces, through structures compacted, updated, cloned and of instances by \
+             pointer, in the frame and gathered before it, every ray as expected; their tables' outputs and scenes \
+             found: {label}"
         );
         Ok(())
     }

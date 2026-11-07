@@ -38,6 +38,9 @@ windows = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(windows)'.build-dependencies]
+windows = { workspace = true, features = ["Win32_Graphics_Direct3D", "Win32_Graphics_Direct3D_Fxc"] }
+
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
 # docs.rs has no MSVC tools to build the bundled SQLite; documentation needs no linking, so take the linked path there

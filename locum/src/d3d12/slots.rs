@@ -280,6 +280,10 @@ pub fn buffers_at(value: u64) -> Vec<(u64, u64)> {
             .collect()
     })
 }
+/// The GPU addresses live buffer `id` takes: its first, and how many bytes from it. None for a texture.
+pub fn buffer_range(id: u64) -> Option<(u64, u64)> {
+    read(|index| index.addresses.get(&id).copied())
+}
 pub fn unique_address(value: u64) -> Option<(u64, u64)> {
     read(|index| {
         let mut matches = index.va.get(value);

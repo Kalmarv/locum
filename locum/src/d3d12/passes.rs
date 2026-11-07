@@ -400,6 +400,25 @@ impl Submitted {
         Ok(())
     }
 
+    /// Records a list of locum's that gathers the instances of `builds` (see [`super::gather`]), submitted right after
+    /// the application's list at `at`, which holds them.
+    ///
+    /// # Safety
+    /// Called from ExecuteCommandLists, before the lists are submitted; `device` is the queue's real device.
+    pub unsafe fn gather_after(
+        &mut self,
+        device: &ID3D12Device,
+        at: usize,
+        builds: &[Arc<super::rays::Build>],
+    ) -> Result<(), String> {
+        let mut list = None;
+        let l = unsafe { self.recorder(device, &mut list) }?;
+        unsafe { super::rays::record_gathers(l, builds) };
+        unsafe { l.Close() }.map_err(|e| format!("Close: {e}"))?;
+        self.inserted.push((at, list.expect("made above")));
+        Ok(())
+    }
+
     /// The lists to submit for the application's `count` lists at `lists`: its own, with locum's copy lists after
     /// the lists they follow. The array lives as long as this submission.
     ///

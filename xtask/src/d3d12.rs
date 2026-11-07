@@ -382,8 +382,9 @@ fn samples_verified(stage: &std::path::Path, log: &std::path::Path, capture: &st
 /// The fixture's raytracing captures, made where the device has raytracing tier 1.1, and the outputs their
 /// DispatchRays and inline traces write: `indirect-rays` (an ExecuteIndirect's record runs one) and `rays` (two direct
 /// ones, a collection and a state object grown by AddToStateObject, with local root arguments; a scene built before
-/// the frame and one in it; and two inline traces, the scene a view in a table and a root SRV).
-const RAYS: [(&str, usize); 2] = [("indirect-rays", 1), ("rays", 4)];
+/// the frame and one in it; and four inline traces, the scene a view in a table and a root SRV, two through scenes
+/// built before the frame of instances given by arrays of pointers).
+const RAYS: [(&str, usize); 2] = [("indirect-rays", 1), ("rays", 6)];
 
 /// What verify says of the fixture's raytracing captures (`said`: what the smoke printed, which says why where it made
 /// none), on the adapter they were made on and, where `on` is the WARP stage, on the default one too: every

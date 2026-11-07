@@ -644,13 +644,28 @@ pub unsafe fn submit(
         .copied()
         .zip(lists.iter().map(|l| &**l))
         .collect();
+    // Instances given as arrays of pointers, gathered right after their lists (see [`super::gather`]), before
+    // anything locum moves before the next list.
+    let gathers = super::rays::gathers(&placed);
     let moves = super::promoted::between(&placed);
-    if !moves.is_empty() {
+    if !gathers.is_empty() || !moves.is_empty() {
         let mut device: Option<ID3D12Device> = None;
         let made = unsafe { ID3D12CommandQueue::from_raw_borrowed(&real) }
             .ok_or_else(|| "no queue".to_string())
             .and_then(|q| unsafe { q.GetDevice(&mut device) }.map_err(|e| e.to_string()))
             .and_then(|()| device.ok_or_else(|| "no device".to_string()));
+        for (at, builds) in gathers {
+            let gathered = made
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|d| unsafe { submitted.gather_after(d, at, &builds) });
+            if let Err(why) = &gathered {
+                crate::log::log!(
+                    "D3D12 acceleration structures: gather after list {at} of submission {id}: {why}"
+                );
+            }
+            super::rays::gathered_at_submission(&builds, gathered.err().as_deref());
+        }
         for (at, m) in moves {
             if let Err(why) = made
                 .as_ref()

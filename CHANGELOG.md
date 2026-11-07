@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- A top-level build before the frame whose instances are an array of pointers is captured: its pointers are copied
+  in the game's list right after it, and a list of locum's right after that list gathers each instance on the GPU
+  (ExecuteIndirect, the pointer as a root SRV), armed or not. The game's list's commands after the build decide
+  whether the gather holds what the build read; where that list may have written the instances after the build, the
+  capture says so and replay builds the structure empty, as before. Before, every such structure was replayed empty.
+
 ## 0.1.5 (2026-11-06)
 
 - A wrapper is another face of the real object: its `AddRef` and `Release` are the object's, one wrapper is made per

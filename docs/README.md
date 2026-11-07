@@ -899,7 +899,24 @@ An acceleration structure's bytes are the driver's own, so a capture keeps how e
 (`d12_acceleration_structures`: the build's description, and its inputs, copied in the game's list right after the
 build: vertices, indices, transforms, AABBs or instances), a clone or compaction the build of its source. A buffer
 acceleration structures live in has no contents (`content_source` `acceleration-structure-builds`); one the frame
-uses that holds a structure whose inputs are not known is a `d3d12-acceleration-structures` gap. A top-level build in
+uses that holds a structure whose inputs are not known is a `d3d12-acceleration-structures` gap. A top-level build
+before the frame whose instances are an array of pointers is gathered on the GPU, armed or not: the pointers are GPU
+memory, so where the instances are is not known when the build is recorded. The pointers are copied in the game's
+list right after the build, into a buffer of locum's; a list of locum's submitted right after the game's, in the same
+ExecuteCommandLists, turns each into an ExecuteIndirect record (the pointer as a root SRV) that copies the instance it
+points at into place and stamps it, and the instances, the pointers and the stamps are copied into readback memory
+(`d12_acceleration_structures` keeps the instances as an array, and the pointers). That list reads the instances'
+buffers in NON_PIXEL_SHADER_RESOURCE, moving one the game's list left (after the build) in another state there and
+back. The gather reads the instances after the whole of the game's list, so it holds what the build read unless that
+list wrote them after the build, which is decided once the pointers are known, from the list's recorded commands
+after the build. Without enhanced barriers, the build reads its instances in NON_PIXEL_SHADER_RESOURCE, a read state,
+so the list writes them only after a transition of their buffer to a state that can write (COMMON, which a write
+promotes, included); with enhanced barriers, only after a barrier whose sync waits for the build, after which a write
+locum does not name (a draw's, a dispatch's, a texture's) makes the instances unknown. Placed buffers that share
+memory share GPU addresses, so writes are compared by address. An instance written after the build, a null pointer, a
+record with no stamp, an aliasing barrier after the build, a split barrier left open, and a predicated build are each
+`d12_acceleration_structures`' reason it holds no inputs, and the frame's use of that structure a
+`d3d12-acceleration-structures` gap. A top-level build in
 the frame whose instances are an array of pointers has the pointers copied right before it in an instrumented list,
 and read at the Present: the build reads each buffer they point into, which a plan then makes. They are read once more
 as its submission is made, for those buffers' first-use copies; a pointer into no live buffer is a
@@ -916,12 +933,8 @@ storage. Each state object is made again (its collections and the state object i
 DispatchRays runs on copies of its tables read as replay's GPU holds them right before it, in which each record's
 identifier is replay's for the same export and each local argument replay's: a descriptor handle the slot of replay's
 mirror of its heap, a root CBV, SRV or UAV the address of replay's buffer or acceleration structure. What cannot be
-placed is left null and verify says so. Rules that put in shaders do not apply to DispatchRays. Not captured:
-instance descriptions given as an array of pointers to a build before the frame. The pointers are GPU memory, so when
-the build is recorded, where the instances are is not known and nothing can be copied after it; and reading them
-later is no copy of what the build read, since the game may reuse that memory once the build has run.
-`d12_acceleration_structures` says so, the frame's use of such a structure is a `d3d12-acceleration-structures` gap,
-and replay builds it empty. Nor are work graphs and generic programs (SetProgram), which replay refuses by name.
+placed is left null and verify says so. Rules that put in shaders do not apply to DispatchRays. Not captured: work
+graphs and generic programs (SetProgram), which replay refuses by name.
 Each buffer's description keeps its GPU address (`gpu_address`). Each submission records the descriptor definitions
 that changed
 since the previous one (all of them at the first; `empty` marks a slot emptied), so `d12_submission_descriptors`

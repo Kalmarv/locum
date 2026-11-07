@@ -13,6 +13,7 @@ mod benchmark;
 mod cost;
 pub mod descriptors;
 mod exports;
+mod gather;
 mod indirect;
 pub mod inputs;
 pub mod journal;
