@@ -471,7 +471,8 @@ pub fn verdict(all: &[u8], count: u32, analysis: &Analysis) -> Result<(), String
         if let Some((_, _, why)) = analysis
             .writes
             .iter()
-            .find(|(first, end, _)| p < *end && p + INSTANCE > *first)
+            // In 128 bits: an instance in the last 64 bytes of the address space ends past its last address.
+            .find(|(first, end, _)| p < *end && u128::from(p) + u128::from(INSTANCE) > u128::from(*first))
         {
             return Err(format!(
                 "instance {i} of {n}: {why}, so it may have changed after the build read it"
@@ -807,5 +808,446 @@ mod tests {
                 .unwrap_err()
                 .starts_with("it dispatches")
         );
+    }
+
+    /// Found by `verdict_decides_as_the_reference_at_the_end_of_the_address_space`: the end of an instance at the
+    /// last 64 bytes of the address space overflowed.
+    #[test]
+    fn an_instance_at_the_end_of_the_address_space_is_compared_whole() {
+        let p = u64::MAX - 63;
+        let all = readback(&[p], 1);
+        let writes = |first: u64, end: u64| Analysis {
+            writes: vec![(first, end, "a write".into())],
+            ..Analysis::default()
+        };
+        assert!(
+            verdict(&all, 1, &writes(u64::MAX - 228, u64::MAX - 62))
+                .unwrap_err()
+                .starts_with("instance 0 of 1")
+        );
+        assert_eq!(verdict(&all, 1, &writes(0x1000, p)), Ok(()));
+    }
+
+    /// Found by `analyse_decides_as_the_reference`, against a reference that was wrong: only END_ONLY ends a split
+    /// barrier, so a plain transition after BEGIN_ONLY leaves it open.
+    #[test]
+    fn a_split_barrier_is_ended_only_by_its_end() {
+        let commands = [
+            build(),
+            command(
+                "ResourceBarrier",
+                json!([[transition_of(6, NPSR, 0, BEGIN_ONLY)]]),
+            ),
+            command("ResourceBarrier", json!([[transition_of(6, NPSR, 0, 0)]])),
+        ];
+        assert!(
+            analyse(&commands, 0, &range)
+                .unwrap_err()
+                .contains("split barrier of buffer #6")
+        );
+    }
+
+    /// Properties of the gather's decisions, each over generated inputs and checked against a reference written
+    /// apart from the code.
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+        use std::collections::{BTreeMap, BTreeSet};
+
+        const COMMON: i32 = D3D12_RESOURCE_STATE_COMMON.0;
+        const COPY_DEST: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
+        const COPY_SOURCE: i32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0;
+        /// The legacy states the generated barriers move buffers to: COMMON, read states alone and together, the
+        /// states that write, and the acceleration-structure state.
+        const STATES: &[i32] = &[
+            COMMON,
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER.0,
+            D3D12_RESOURCE_STATE_INDEX_BUFFER.0,
+            D3D12_RESOURCE_STATE_RENDER_TARGET.0,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE.0,
+            D3D12_RESOURCE_STATE_DEPTH_READ.0,
+            NPSR,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0,
+            D3D12_RESOURCE_STATE_STREAM_OUT.0,
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT.0,
+            COPY_DEST,
+            COPY_SOURCE,
+            D3D12_RESOURCE_STATE_RESOLVE_DEST.0,
+            D3D12_RESOURCE_STATE_RESOLVE_SOURCE.0,
+            NPSR | COPY_SOURCE,
+            NPSR | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0,
+            D3D12_RESOURCE_STATE_GENERIC_READ.0,
+            STRUCTURE,
+        ];
+
+        /// Whether a buffer in state `s` may be written, from the states that write named one by one: COMMON, which
+        /// a write promotes, and the structure state, which builds write.
+        fn writes_in(s: i32) -> bool {
+            let write = D3D12_RESOURCE_STATE_RENDER_TARGET.0
+                | D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0
+                | D3D12_RESOURCE_STATE_DEPTH_WRITE.0
+                | D3D12_RESOURCE_STATE_STREAM_OUT.0
+                | COPY_DEST
+                | D3D12_RESOURCE_STATE_RESOLVE_DEST.0
+                | STRUCTURE;
+            s == COMMON || s & write != 0
+        }
+
+        /// A state an analysis can say a buffer was left in: one without NON_PIXEL_SHADER_RESOURCE, not the
+        /// structure state.
+        fn unreadable() -> impl Strategy<Value = i32> {
+            prop::sample::select(STATES)
+                .prop_filter("left unreadable", |s| s & NPSR == 0 && s & STRUCTURE == 0)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// A gather list moves every buffer its analyses name, each once, into a state the gather reads and
+            /// nothing writes, and keeps what a read state allowed.
+            #[test]
+            fn wraps_move_each_named_buffer_once_into_a_state_the_gather_reads(
+                lists in prop::collection::vec(prop::collection::vec((1u64..8, unreadable()), 0..6), 0..4)
+            ) {
+                let analyses: Vec<Analysis> = lists
+                    .iter()
+                    .map(|w| Analysis { wraps: w.clone(), ..Analysis::default() })
+                    .collect();
+                let out = wraps(&analyses.iter().collect::<Vec<_>>());
+                let mut named: Vec<u64> = lists.iter().flatten().map(|w| w.0).collect();
+                named.sort();
+                named.dedup();
+                prop_assert_eq!(out.iter().map(|w| w.0).collect::<Vec<_>>(), named);
+                for &(r, left, read) in &out {
+                    prop_assert!(lists.iter().flatten().any(|&(q, s)| q == r && s == left));
+                    prop_assert!(read & NPSR != 0);
+                    prop_assert!(!writes_in(read), "read in {read:#x}, which writes");
+                    if writes_in(left) {
+                        prop_assert_eq!(read, NPSR);
+                    } else {
+                        prop_assert_eq!(read, left | NPSR);
+                    }
+                }
+            }
+        }
+
+        /// Why a gather does not hold what the build read, by the reference: the first null pointer, else the
+        /// first record not stamped, else unknown writes, else the first instance a write reaches (by its bytes,
+        /// one at a time), with the first write that does.
+        #[derive(Debug, PartialEq)]
+        enum Expected {
+            Holds,
+            Null(usize),
+            Unstamped(usize),
+            Unknown,
+            Written(usize, usize),
+        }
+
+        fn expected(pointers: &[u64], stamps: &[u32], writes: &[(u64, u64)], unknown: bool) -> Expected {
+            if let Some(i) = pointers.iter().position(|&p| p == 0) {
+                return Expected::Null(i);
+            }
+            if let Some(i) = (0..pointers.len()).find(|&i| stamps[i] != i as u32 + 1) {
+                return Expected::Unstamped(i);
+            }
+            if unknown {
+                return Expected::Unknown;
+            }
+            for (i, &p) in pointers.iter().enumerate() {
+                for (w, &(first, end)) in writes.iter().enumerate() {
+                    let reaches = (0..INSTANCE as u128).any(|b| {
+                        let at = p as u128 + b;
+                        at >= first as u128 && at < end as u128
+                    });
+                    if reaches {
+                        return Expected::Written(i, w);
+                    }
+                }
+            }
+            Expected::Holds
+        }
+
+        /// A pointer: mostly in a small range the writes share, now and then null or anywhere.
+        fn pointer() -> impl Strategy<Value = u64> {
+            prop_oneof![1 => Just(0u64), 8 => 1u64..0x3000, 1 => any::<u64>()]
+        }
+
+        /// Records of pointers, each stamped or not (with any other value then).
+        fn records(pointer: impl Strategy<Value = u64>) -> impl Strategy<Value = Vec<(u64, bool, u32)>> {
+            prop::collection::vec((pointer, prop::bool::weighted(0.95), any::<u32>()), 1..8)
+        }
+
+        /// Writes, each from its first address for some bytes, to the end of the address space at most.
+        fn writes(first: impl Strategy<Value = u64>) -> impl Strategy<Value = Vec<(u64, u64)>> {
+            prop::collection::vec(
+                (first, 1u64..0x200).prop_map(|(first, bytes)| (first, first.saturating_add(bytes))),
+                0..6,
+            )
+        }
+
+        /// Checks `verdict` on a readback of `records` against the reference.
+        fn decides_as_the_reference(
+            records: &[(u64, bool, u32)],
+            writes: &[(u64, u64)],
+            unknown: bool,
+        ) -> Result<(), TestCaseError> {
+            let n = records.len() as u64;
+            let pointers: Vec<u64> = records.iter().map(|g| g.0).collect();
+            let stamps: Vec<u32> = records
+                .iter()
+                .enumerate()
+                .map(|(i, &(_, stamped, other))| if stamped { i as u32 + 1 } else { other })
+                .collect();
+            let mut all = vec![0u8; bytes(n) as usize];
+            for i in 0..records.len() {
+                let at = (pointers_at(n) + i as u64 * POINTER) as usize;
+                all[at..at + 8].copy_from_slice(&pointers[i].to_le_bytes());
+                let at = (stamps_at(n) + i as u64 * STAMP) as usize;
+                all[at..at + 4].copy_from_slice(&stamps[i].to_le_bytes());
+            }
+            let analysis = Analysis {
+                wraps: Vec::new(),
+                writes: writes
+                    .iter()
+                    .enumerate()
+                    .map(|(w, &(a, b))| (a, b, format!("write {w}")))
+                    .collect(),
+                unknown: unknown.then(|| "unknown".to_string()),
+            };
+            let got = verdict(&all, n as u32, &analysis);
+            match expected(&pointers, &stamps, writes, unknown) {
+                Expected::Holds => prop_assert_eq!(got, Ok(())),
+                Expected::Null(i) => {
+                    prop_assert_eq!(got, Err(format!("instance pointer {i} of {n} is null")))
+                }
+                Expected::Unstamped(i) => {
+                    let e = got.unwrap_err();
+                    prop_assert!(
+                        e.ends_with(&format!("no instance for pointer {i} of {n}")),
+                        "{}",
+                        e
+                    );
+                }
+                Expected::Unknown => prop_assert!(got.unwrap_err().starts_with("unknown, ")),
+                Expected::Written(i, w) => {
+                    let e = got.unwrap_err();
+                    prop_assert!(
+                        e.starts_with(&format!("instance {i} of {n}: write {w}, ")),
+                        "{}",
+                        e
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// `verdict` decides as the reference does, for any pointers, stamps and writes.
+            #[test]
+            fn verdict_decides_as_the_reference(
+                records in records(pointer()),
+                writes in writes(0u64..0x3000),
+                unknown in prop::bool::weighted(0.1),
+            ) {
+                decides_as_the_reference(&records, &writes, unknown)?;
+            }
+
+            /// So it does for instances and writes at the end of the address space, where an instance's last
+            /// byte is past the last address.
+            #[test]
+            fn verdict_decides_as_the_reference_at_the_end_of_the_address_space(
+                records in records((u64::MAX - 0x100)..=u64::MAX),
+                writes in writes((u64::MAX - 0x200)..u64::MAX),
+            ) {
+                decides_as_the_reference(&records, &writes, false)?;
+            }
+        }
+
+        /// What a list does after (or before) a build, as generated.
+        #[derive(Clone, Debug)]
+        enum Op {
+            /// A transition of resource `r` to `after`; `split` is 0, BEGIN_ONLY or END_ONLY.
+            Move {
+                r: u64,
+                after: i32,
+                split: u64,
+            },
+            Alias,
+            /// An enhanced barrier with this SyncBefore.
+            Sync(i32),
+            Copy(u64),
+            Immediate(Vec<u64>),
+            /// A call whose writes locum does not name.
+            Other(&'static str),
+            /// A call that writes nothing.
+            Harmless(&'static str),
+        }
+
+        /// A resource: buffers 1 to 9 (see `range`) and, now and then, the texture 50.
+        fn resource() -> impl Strategy<Value = u64> {
+            prop_oneof![8 => 1u64..10, 1 => Just(50u64)]
+        }
+
+        fn op() -> impl Strategy<Value = Op> {
+            let split = prop_oneof![6 => Just(0u64), 1 => Just(BEGIN_ONLY), 1 => Just(END_ONLY)];
+            let sync = prop::sample::select(vec![
+                D3D12_BARRIER_SYNC_ALL.0,
+                D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE.0,
+                D3D12_BARRIER_SYNC_COMPUTE_SHADING.0,
+                D3D12_BARRIER_SYNC_COPY.0,
+                D3D12_BARRIER_SYNC_NONE.0,
+            ]);
+            prop_oneof![
+                12 => (resource(), prop::sample::select(STATES), split)
+                    .prop_map(|(r, after, split)| Op::Move { r, after, split }),
+                1 => Just(Op::Alias),
+                2 => sync.prop_map(Op::Sync),
+                3 => resource().prop_map(Op::Copy),
+                1 => prop::collection::vec(resource(), 1..3).prop_map(Op::Immediate),
+                1 => prop::sample::select(vec!["Dispatch", "DrawInstanced", "ClearUnorderedAccessViewUint",
+                    "ExecuteIndirect", "ResolveSubresource"]).prop_map(Op::Other),
+                3 => prop::sample::select(vec!["SetComputeRootSignature", "SetPipelineState", "BeginEvent",
+                    "EndEvent", "IASetVertexBuffers", "OMSetRenderTargets", "EndQuery"]).prop_map(Op::Harmless),
+            ]
+        }
+
+        /// The capture's commands for `ops`: a barrier of each ResourceBarrier item where `join` says so joined to
+        /// the ResourceBarrier before it.
+        fn render(ops: &[(Op, bool)]) -> Vec<model::Command> {
+            let mut out: Vec<model::Command> = Vec::new();
+            let mut last_was_barrier = false;
+            for (op, join) in ops {
+                let item = match op {
+                    Op::Move { r, after, split } => Some(transition_of(*r, NPSR, *after, *split)),
+                    Op::Alias => Some(json!({"type": 1, "flags": 0, "payload": {"before": 1, "after": 2}})),
+                    _ => None,
+                };
+                if let Some(item) = item {
+                    if *join && last_was_barrier {
+                        out.last_mut().unwrap().args[0].as_array_mut().unwrap().push(item);
+                    } else {
+                        out.push(command("ResourceBarrier", json!([[item]])));
+                    }
+                    last_was_barrier = true;
+                    continue;
+                }
+                last_was_barrier = false;
+                out.push(match op {
+                    Op::Sync(s) => command(
+                        "Barrier",
+                        json!([[{"type": 0, "barriers": [{"sync": [s, 0], "access": [0, 0]}]}]]),
+                    ),
+                    Op::Copy(r) => command("CopyBufferRegion", json!([r, 0, 4, 0, 16])),
+                    Op::Immediate(rs) => command(
+                        "WriteBufferImmediate",
+                        json!([
+                            rs.iter()
+                                .map(|r| json!({"address": {"resource": r, "offset": 0}, "value": 0}))
+                                .collect::<Vec<_>>(),
+                            []
+                        ]),
+                    ),
+                    Op::Other(call) => command(call, json!([1, 1, 1])),
+                    Op::Harmless(call) => command(call, json!([])),
+                    Op::Move { .. } | Op::Alias => unreachable!(),
+                });
+            }
+            out
+        }
+
+        /// What the reference says of the ops after a build: an error's subject, or the buffers left unreadable
+        /// with their states, the writes' ranges, and whether a write is not known.
+        type Model = Result<(Vec<(u64, i32)>, Vec<(u64, u64)>, bool), &'static str>;
+
+        fn model(ops: &[(Op, bool)]) -> Model {
+            let waits = |s: i32| {
+                s == D3D12_BARRIER_SYNC_ALL.0
+                    || s == D3D12_BARRIER_SYNC_BUILD_RAYTRACING_ACCELERATION_STRUCTURE.0
+            };
+            let mut left = BTreeMap::new();
+            let mut open = BTreeSet::new();
+            let (mut ordered, mut unknown) = (false, false);
+            let mut writes = Vec::new();
+            for (op, _) in ops {
+                match op {
+                    Op::Move { r, after, split } => {
+                        // A texture holds no instances.
+                        let Some((first, bytes)) = range(*r) else { continue };
+                        if *split == BEGIN_ONLY {
+                            open.insert(*r);
+                            continue;
+                        }
+                        // Only its END_ONLY half ends a split barrier.
+                        if *split == END_ONLY {
+                            open.remove(r);
+                        }
+                        left.insert(*r, *after);
+                        if writes_in(*after) {
+                            writes.push((first, first + bytes));
+                        }
+                    }
+                    Op::Alias => return Err("aliases"),
+                    Op::Sync(s) => ordered |= waits(*s),
+                    Op::Copy(r) if ordered && !unknown => match range(*r) {
+                        Some((first, bytes)) => writes.push((first, first + bytes)),
+                        None => unknown = true,
+                    },
+                    Op::Immediate(rs) if ordered && !unknown => {
+                        for r in rs {
+                            match range(*r) {
+                                Some((first, bytes)) => writes.push((first, first + bytes)),
+                                None => unknown = true,
+                            }
+                        }
+                    }
+                    Op::Other(_) if ordered => unknown = true,
+                    _ => {}
+                }
+            }
+            if !open.is_empty() {
+                return Err("split barrier");
+            }
+            let wraps = left
+                .into_iter()
+                .filter(|&(_, s)| s & NPSR == 0 && s & STRUCTURE == 0)
+                .collect();
+            Ok((wraps, writes, unknown))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// `analyse` decides as the reference does for any list after the build, whatever comes before the
+            /// build and however its barriers are grouped into calls.
+            #[test]
+            fn analyse_decides_as_the_reference(
+                before in prop::collection::vec((op(), any::<bool>()), 0..4),
+                after in prop::collection::vec((op(), any::<bool>()), 0..12),
+            ) {
+                let mut commands = render(&before);
+                let at = commands.len();
+                commands.push(build());
+                commands.extend(render(&after));
+                let got = analyse(&commands, at, &range);
+                match model(&after) {
+                    Err(subject) => {
+                        let e = got.unwrap_err();
+                        prop_assert!(e.contains(subject), "{}", e);
+                    }
+                    Ok((wraps, writes, unknown)) => {
+                        let a = got.unwrap();
+                        prop_assert_eq!(a.wraps, wraps);
+                        prop_assert_eq!(a.unknown.is_some(), unknown);
+                        if !unknown {
+                            let ranges: Vec<(u64, u64)> = a.writes.iter().map(|w| (w.0, w.1)).collect();
+                            prop_assert_eq!(ranges, writes);
+                        }
+                    }
+                }
+            }
+        }
     }
 }

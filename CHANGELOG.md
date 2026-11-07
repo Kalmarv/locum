@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A gathered instance in the last 64 bytes of the address space is compared with the writes after its build whole;
+  before, its end overflowed. Found by property tests of the gather's decisions, now in the crate's tests.
 - Docs: GPU-based validation, which `verify --debug` and `replay --debug` run under, checks textures' layouts but not
   buffers' states: a shader writing a buffer in COPY_SOURCE is reported neither by it nor by the debug layer. The docs
   said it checks resource states.
