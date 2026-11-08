@@ -4,18 +4,19 @@
 //! are followed into the vertex program by semantic, down to the vertex attributes, and each source is shown with
 //! what the draw had: the bound resource, the constant's value, the input-layout element.
 //!
-//! The walk is a may-reach over-approximation, as iridia's own [`iridia::flow::Flow`] is: a constant that is zero
+//! The walk is a may-reach over-approximation, as iridia's own [`iridia_analysis::flow::Flow`] is: a constant that is zero
 //! at run time still carries what it multiplies. Writes to storage buffers and images are not followed into later
 //! reads of them.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 
-use iridia::flow::{At, Node, NodeId, Op, ScalarKind, Supplied, Values};
-use iridia::{
-    D3dBinding, D3dClass, Interface, Label, Program, ResourceId, ResourceKind, ScalarType, SystemValue,
+use iridia_analysis::flow::{At, Node, NodeId, Op, Supplied, Values};
+use iridia_ir::interface::{
+    D3dBinding, D3dClass, Interface, Label, ResourceId, ResourceKind, ScalarType, StorageTarget, SystemValue,
     Varying,
 };
+use iridia_ir::{Program, Scalar};
 use locum_capture::{format, rdef};
 use serde_json::{Value, json};
 
@@ -76,6 +77,8 @@ enum Source {
         stage: usize,
         resource: Option<ResourceId>,
     },
+    /// The hidden counter of a structured buffer, as an increment or decrement reads it.
+    Counter { stage: usize, resource: ResourceId },
 }
 
 /// One program, lifted, with its reflection's constant-buffer names.
@@ -135,7 +138,10 @@ impl Stage {
     }
 
     /// A resource's D3D address and name.
-    fn resource(&self, id: Option<ResourceId>) -> (Option<D3dBinding>, Option<&iridia::Resource>) {
+    fn resource(
+        &self,
+        id: Option<ResourceId>,
+    ) -> (Option<D3dBinding>, Option<&iridia_ir::interface::Resource>) {
         let r = id.and_then(|id| self.interface().resources.iter().find(|r| r.id == id));
         (r.and_then(|r| r.provenance.d3d), r)
     }
@@ -247,6 +253,21 @@ fn same(a: &Label, b: &Label) -> bool {
     a.index == b.index && a.name.eq_ignore_ascii_case(&b.name)
 }
 
+/// Whether a resource of the stage's program is a buffer, typed, structured or raw.
+fn is_buffer(stage: &Stage, resource: ResourceId) -> bool {
+    stage.interface().resources.iter().any(|r| {
+        r.id == resource
+            && matches!(
+                r.kind,
+                ResourceKind::Buffer(_)
+                    | ResourceKind::Storage {
+                        target: StorageTarget::Buffer(_),
+                        ..
+                    }
+            )
+    })
+}
+
 /// Every source that may reach `roots` of stage `start`, each with the strongest way it does.
 fn reach(stages: &[Stage], start: usize, roots: &[NodeId], how: How) -> BTreeMap<Source, How> {
     let mut out: BTreeMap<Source, How> = BTreeMap::new();
@@ -307,21 +328,31 @@ fn reach(stages: &[Stage], start: usize, roots: &[NodeId], how: How) -> BTreeMap
                     &mut out,
                     Source::Word {
                         stage,
-                        resource: *resource,
+                        resource: Some(*resource),
                         word: *word,
                     },
                     how,
                 ),
-                At::Indexed { lane, index } => {
+                At::Indexed { word, index, .. } => {
                     found(
                         &mut out,
                         Source::Indexed {
                             stage,
-                            resource: *resource,
-                            lane: *lane,
+                            resource: Some(*resource),
+                            lane: word % 4,
                         },
                         how,
                     );
+                    if is_buffer(&stages[s], *resource) {
+                        found(
+                            &mut out,
+                            Source::Query {
+                                stage,
+                                resource: Some(*resource),
+                            },
+                            How::Control,
+                        );
+                    }
                     for &i in index {
                         push(&mut best, &mut work, s, i, how.min(How::Address));
                     }
@@ -334,28 +365,67 @@ fn reach(stages: &[Stage], start: usize, roots: &[NodeId], how: How) -> BTreeMap
                 controls,
                 ..
             } => {
+                // a read of a buffer (a typed one's `Load`) is an element of it, as the earlier graph made it: a lane of an
+                // element chosen at run time; a read of an image is a texel's channel
+                let buffer = is_buffer(&stages[s], *resource);
                 found(
                     &mut out,
-                    Source::Texel {
-                        stage,
-                        resource: *resource,
-                        lane: *lane,
+                    if buffer {
+                        Source::Indexed {
+                            stage,
+                            resource: Some(*resource),
+                            lane: u32::from(*lane),
+                        }
+                    } else {
+                        Source::Texel {
+                            stage,
+                            resource: Some(*resource),
+                            lane: *lane,
+                        }
                     },
                     how,
                 );
+                if buffer {
+                    // a read past the buffer's end gives zero: the lane depends on the buffer's length through that check,
+                    // which the earlier graph spelled out as a select on the length and the IR keeps inside the read
+                    found(
+                        &mut out,
+                        Source::Query {
+                            stage,
+                            resource: Some(*resource),
+                        },
+                        How::Control,
+                    );
+                }
                 for &c in coordinate.iter().chain(controls) {
                     push(&mut best, &mut work, s, c, how.min(How::Address));
                 }
             }
-            Node::Query { resource } => found(
+            Node::Query {
+                resource, operands, ..
+            } => {
+                found(
+                    &mut out,
+                    Source::Query {
+                        stage,
+                        resource: Some(*resource),
+                    },
+                    how,
+                );
+                for &o in operands {
+                    push(&mut best, &mut work, s, o, how.min(How::Address));
+                }
+            }
+            Node::Counter { resource } => found(
                 &mut out,
-                Source::Query {
+                Source::Counter {
                     stage,
                     resource: *resource,
                 },
                 how,
             ),
-            Node::Literal(_) => {}
+            // a value no store gave: no source
+            Node::Literal(_) | Node::Undef => {}
             Node::Op { op, operands } => {
                 for (i, &o) in operands.iter().enumerate() {
                     // A select's first operand is its condition.
@@ -693,6 +763,8 @@ fn show(c: &Capture, stages: &[Stage], draw: &mut Option<Draw>, source: &Source)
                 Supplied::Primitive => "SV_PrimitiveID".to_string(),
                 Supplied::DomainLocation => "SV_DomainLocation".to_string(),
                 Supplied::PatchConstant(i) => format!("patch constant {i}"),
+                Supplied::PhaseInstance => "patch constant phase instance".to_string(),
+                Supplied::Payload(i) => format!("task payload {i}"),
             };
             Shown {
                 prefix: format!("{} {name}", st.name),
@@ -701,6 +773,20 @@ fn show(c: &Capture, stages: &[Stage], draw: &mut Option<Draw>, source: &Source)
                 suffix: String::new(),
                 json: json!({"kind":"supplied","stage":st.name,"name":name,"lane":XYZW[usize::from(lane.min(3))].to_string()}),
             }
+        }
+        Source::Counter { stage, resource } => {
+            let st = &stages[stage];
+            let (b, r) = st.resource(Some(resource));
+            let name = r.map_or("?".to_string(), |r| r.provenance.name.clone());
+            plain(
+                format!(
+                    "{} the counter of {} {name}",
+                    st.name,
+                    b.map_or("?".into(), register)
+                ),
+                None,
+                json!({"kind":"counter","stage":st.name,"register":b.map(register),"name":name}),
+            )
         }
         Source::Query { stage, resource } => {
             let st = &stages[stage];
@@ -771,7 +857,7 @@ fn constant(st: &Stage, output: usize, n: NodeId) -> Option<f64> {
     let Node::Literal(v) = st.values.node(n) else {
         return None;
     };
-    let integer = matches!(st.values.kind(n), Some(ScalarKind::Uint | ScalarKind::Sint));
+    let integer = matches!(st.values.kind(n), Some(Scalar::U32 | Scalar::I32));
     let float = st.interface().outputs[output].value.scalar == ScalarType::Float;
     Some(if integer && float {
         f64::from(f32::from_bits(v.0 as i64 as u32))

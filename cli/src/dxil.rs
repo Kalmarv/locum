@@ -238,7 +238,7 @@ pub fn evidence(code: &[u8], source: &str) -> Value {
     let interface = iridia_dxil::interface(code).map_err(|e| e.to_string());
     let iridia_ranges = interface.as_ref().map(|i| {
         let mut ranges = i.resources.iter().filter_map(|r|r.provenance.d3d.map(|b| {
-            use iridia::D3dClass::*;
+            use iridia_ir::interface::D3dClass::*;
             json!({"class":match b.class {ConstantBuffer=>"cb", ShaderResource=>"srv", Sampler=>"sampler", UnorderedAccess=>"uav"},
                 "register":b.register,"space":b.space,"count":r.count,"name":r.provenance.name})
         })).collect::<Vec<_>>();
@@ -258,17 +258,19 @@ pub fn evidence(code: &[u8], source: &str) -> Value {
         "interface":answer(interface),"rdat_subobjects":rdat})
 }
 
-/// A DXIL or DXBC program lifted through iridia.
-pub fn lift(code: &[u8]) -> Result<iridia::Program, String> {
-    if is_dxil(code) {
-        iridia_dxil::lift(code)
+/// A DXIL or DXBC program on iridia's IR, in the form its writers and analyses take (`iridia_passes::prepare`).
+pub fn lift(code: &[u8]) -> Result<iridia_ir::Program, String> {
+    let mut program = if is_dxil(code) {
+        iridia_dxil::ir::lift(code)
     } else {
-        iridia_dxbc::lift(code)
+        iridia_dxbc::ir::lift(code)
     }
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    iridia_passes::prepare(&mut program)?;
+    Ok(program)
 }
 
-/// Readable WGSL of a DXIL or DXBC program, lifted through iridia.
+/// Readable WGSL of a DXIL or DXBC program from iridia's IR, in naga's dialect: resources keep their D3D registers.
 pub fn wgsl(code: &[u8]) -> Result<String, String> {
-    iridia::emit::wgsl(&lift(code)?).map_err(|e| e.to_string())
+    iridia_naga::wgsl(&lift(code)?, &iridia_naga::Profile::NAGA).map_err(|e| e.to_string())
 }

@@ -17,9 +17,12 @@ path = "src/main.rs"
 [dependencies]
 dxcontainer.workspace = true
 dxil-reader.workspace = true
-iridia.workspace = true
+iridia-analysis.workspace = true
 iridia-dxbc.workspace = true
 iridia-dxil.workspace = true
+iridia-ir.workspace = true
+iridia-naga.workspace = true
+iridia-passes.workspace = true
 clap = { version = "4.6.7", features = ["derive"] }
 locum-capture = { version = "0.1.6", path = "../capture" }
 locum-d3d11 = { version = "0.1.6", path = "../d3d11" }

@@ -283,6 +283,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "d3d9-reader"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5de383ac97fbe3b752fbd135118a23dae0feecbdfd941ac04c49ed8adbc567d"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "digest"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -299,8 +308,19 @@ version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "96d26dabbab1eed38a948279b3322c30677ee4849ea3704374e530549d2d5ad1"
 dependencies = [
- "d3d9-reader",
- "dxcontainer",
+ "d3d9-reader 0.11.0",
+ "dxcontainer 0.11.0",
+ "thiserror",
+]
+
+[[package]]
+name = "dxbc-reader"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba230a28cf320b3f2aeff8be2c71147b486e81139eed3704f52f041c620389da"
+dependencies = [
+ "d3d9-reader 0.12.0",
+ "dxcontainer 0.12.0",
  "thiserror",
 ]
 
@@ -315,12 +335,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "dxcontainer"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e88682dabbb043b2048aa966527791b0a2e89b465ff1898c5d01949108418f04"
+dependencies = [
+ "primase-foundations",
+ "thiserror",
+]
+
+[[package]]
 name = "dxil-reader"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "663bdc332f401344e64903868769f593f33df7597336fac80de204679eaa17ac"
 dependencies = [
- "dxcontainer",
+ "dxcontainer 0.11.0",
+ "primase-foundations",
+ "thiserror",
+]
+
+[[package]]
+name = "dxil-reader"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77291f42aa86aeed7a6f974bec5d3f41cf18d1fade73ee3d25856d164a043f64"
+dependencies = [
+ "dxcontainer 0.12.0",
  "primase-foundations",
  "thiserror",
 ]
@@ -565,7 +606,7 @@ dependencies = [
 [[package]]
 name = "iridia"
 version = "0.6.0"
-source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
+source = "git+https://github.com/Kalmarv/iridia?rev=d0e5aaa99b1d643dc3500f590e98357852531788#d0e5aaa99b1d643dc3500f590e98357852531788"
 dependencies = [
  "iridia-interface",
  "iridia-ir",
@@ -576,12 +617,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "iridia-analysis"
+version = "0.6.0"
+source = "git+https://github.com/Kalmarv/iridia?rev=d0e5aaa99b1d643dc3500f590e98357852531788#d0e5aaa99b1d643dc3500f590e98357852531788"
+dependencies = [
+ "half",
+ "iridia-ir",
+ "iridia-passes",
+]
+
+[[package]]
 name = "iridia-dxbc"
 version = "0.6.0"
-source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
+source = "git+https://github.com/Kalmarv/iridia?rev=d0e5aaa99b1d643dc3500f590e98357852531788#d0e5aaa99b1d643dc3500f590e98357852531788"
 dependencies = [
- "dxbc-reader",
- "dxcontainer",
+ "dxbc-reader 0.12.0",
+ "dxcontainer 0.12.0",
  "iridia",
  "iridia-ir",
  "primase-naga",
@@ -590,10 +641,10 @@ dependencies = [
 [[package]]
 name = "iridia-dxil"
 version = "0.6.0"
-source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
+source = "git+https://github.com/Kalmarv/iridia?rev=d0e5aaa99b1d643dc3500f590e98357852531788#d0e5aaa99b1d643dc3500f590e98357852531788"
 dependencies = [
- "dxcontainer",
- "dxil-reader",
+ "dxcontainer 0.12.0",
+ "dxil-reader 0.12.0",
  "half",
  "iridia",
  "iridia-ir",
@@ -603,7 +654,7 @@ dependencies = [
 [[package]]
 name = "iridia-interface"
 version = "0.6.0"
-source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
+source = "git+https://github.com/Kalmarv/iridia?rev=d0e5aaa99b1d643dc3500f590e98357852531788#d0e5aaa99b1d643dc3500f590e98357852531788"
 dependencies = [
  "iridia-ir",
  "serde",
@@ -612,7 +663,7 @@ dependencies = [
 [[package]]
 name = "iridia-ir"
 version = "0.6.0"
-source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
+source = "git+https://github.com/Kalmarv/iridia?rev=d0e5aaa99b1d643dc3500f590e98357852531788#d0e5aaa99b1d643dc3500f590e98357852531788"
 dependencies = [
  "serde",
  "serde_json",
@@ -620,9 +671,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iridia-naga"
+version = "0.6.0"
+source = "git+https://github.com/Kalmarv/iridia?rev=d0e5aaa99b1d643dc3500f590e98357852531788#d0e5aaa99b1d643dc3500f590e98357852531788"
+dependencies = [
+ "iridia-ir",
+ "naga",
+]
+
+[[package]]
 name = "iridia-passes"
 version = "0.6.0"
-source = "git+https://github.com/Kalmarv/iridia?rev=064e0b9db519b02784dab0ba1e971eb640ab5512#064e0b9db519b02784dab0ba1e971eb640ab5512"
+source = "git+https://github.com/Kalmarv/iridia?rev=d0e5aaa99b1d643dc3500f590e98357852531788#d0e5aaa99b1d643dc3500f590e98357852531788"
 dependencies = [
  "iridia-ir",
 ]
@@ -694,8 +754,8 @@ dependencies = [
 name = "locum-capture"
 version = "0.1.6"
 dependencies = [
- "dxbc-reader",
- "dxil-reader",
+ "dxbc-reader 0.11.0",
+ "dxil-reader 0.11.0",
  "primase-foundations",
  "primase-testdata",
  "rusqlite",
@@ -712,11 +772,14 @@ name = "locum-cli"
 version = "0.1.6"
 dependencies = [
  "clap",
- "dxcontainer",
- "dxil-reader",
- "iridia",
+ "dxcontainer 0.11.0",
+ "dxil-reader 0.11.0",
+ "iridia-analysis",
  "iridia-dxbc",
  "iridia-dxil",
+ "iridia-ir",
+ "iridia-naga",
+ "iridia-passes",
  "locum-capture",
  "locum-d3d11",
  "memchr",
@@ -837,6 +900,30 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "naga"
+version = "30.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a616d2fb8c89516ac2723a581f69d6c18576046bed761bd6b305e5618e6ae130"
+dependencies = [
+ "arrayvec",
+ "bit-set",
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "codespan-reporting",
+ "half",
+ "hashbrown",
+ "indexmap",
+ "libm",
+ "log",
+ "naga-types",
+ "num-traits",
+ "once_cell",
+ "rustc-hash",
+ "thiserror",
 ]
 
 [[package]]

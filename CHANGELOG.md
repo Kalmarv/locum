@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- The shader paths run on iridia's IR (`iridia-ir`, `iridia-passes`, `iridia-analysis`, `iridia-dxbc`, `iridia-dxil`,
+  `iridia-naga`, taken from its repository at one revision until its next release) in place of the `iridia` crate's naga
+  path: the lift, the flow graph behind `trace` and the WGSL of `shader --wgsl` and `shader-file --wgsl` (iridia-naga's NAGA
+  profile). Over the slim shader set (7,730 programs) and the Motor Town and Elden Ring blob stores (9,146 programs),
+  every program's `shader-file` output is as before. WGSL: 1,057 slim programs that had none now have it (among them
+  raw and structured buffer lanes of 8 and 16 bits, 16-bit and 64-bit memory, doubles); 110 that had it are refused with a
+  named reason: 53 whose earlier WGSL did not parse (a multisampled or 1D array texture, a 1D array storage image, a 1D
+  texture sampled at an explicit level), and 57 whose earlier WGSL was valid (35 with descriptor-heap resources that have no
+  register, 17 with ray queries, 3 Mesh programs, 2 with a 1D texture sampled at an explicit level); 4 programs' WGSL nests expressions past a WGSL parser's recursion limit. A trace reports the same sources as
+  before for every lane of the probe app's captures, but one: a vertex program reading the second word of a structured
+  element now names that lane (it named the first).
 - dx 0.11.0 (`dxbc-reader`, `dxil-reader`, `dxcontainer`; were 0.9.1) and iridia's main at 064e0b9 (`iridia`,
   `iridia-dxbc`, `iridia-dxil`; were 0.5.0 from crates.io), which links the same dx, so the build holds one version of
   each dx reader again. iridia is taken from its repository until its next release, the one without the naga path. The slim

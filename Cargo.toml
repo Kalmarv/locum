@@ -14,9 +14,12 @@ windows = { version = "=0.62.2", default-features = false }
 dxbc-reader = "0.11.0"
 dxcontainer = "0.11.0"
 dxil-reader = "0.11.0"
-iridia = { version = "0.6.0", git = "https://github.com/Kalmarv/iridia", rev = "064e0b9db519b02784dab0ba1e971eb640ab5512" }
-iridia-dxbc = { version = "0.6.0", git = "https://github.com/Kalmarv/iridia", rev = "064e0b9db519b02784dab0ba1e971eb640ab5512" }
-iridia-dxil = { version = "0.6.0", git = "https://github.com/Kalmarv/iridia", rev = "064e0b9db519b02784dab0ba1e971eb640ab5512" }
+iridia-analysis = { version = "0.6.0", git = "https://github.com/Kalmarv/iridia", rev = "d0e5aaa99b1d643dc3500f590e98357852531788" }
+iridia-dxbc = { version = "0.6.0", git = "https://github.com/Kalmarv/iridia", rev = "d0e5aaa99b1d643dc3500f590e98357852531788" }
+iridia-dxil = { version = "0.6.0", git = "https://github.com/Kalmarv/iridia", rev = "d0e5aaa99b1d643dc3500f590e98357852531788" }
+iridia-ir = { version = "0.6.0", git = "https://github.com/Kalmarv/iridia", rev = "d0e5aaa99b1d643dc3500f590e98357852531788" }
+iridia-naga = { version = "0.6.0", git = "https://github.com/Kalmarv/iridia", rev = "d0e5aaa99b1d643dc3500f590e98357852531788" }
+iridia-passes = { version = "0.6.0", git = "https://github.com/Kalmarv/iridia", rev = "d0e5aaa99b1d643dc3500f590e98357852531788" }
 primase-foundations = { version = "0.3.3", features = ["compress"] }
 primase-testdata = "0.2.6"
 
