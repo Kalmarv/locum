@@ -12,6 +12,8 @@
   whose earlier WGSL was valid (17 with ray queries, which iridia-naga's WGSL writer does not write, 3 Mesh programs, 2
   with a 1D texture sampled at an explicit level with an offset). Every WGSL text it
   writes (5,743 slim programs, 8,856 of the stores', 179 of the probe captures' shaders) parses and validates under naga.
+  The text is shorter: the `shader-file --wgsl` output over the slim set and both stores is 592 MB (was 1.51 GB), 10.4 million
+  lines (was 32.0 million).
   A trace reports the same sources as
   before for every lane of the probe app's captures, but one: a vertex program reading the second word of a structured
   element now names that lane (it named the first).
