@@ -1080,9 +1080,15 @@ pub fn format_text_with_options(rep: &MemReport, labels: Option<&LabelMap>, opts
         } else {
             String::new()
         };
+        let loss_part = match (e.truncated_by_max_size, e.events_lost > 0) {
+            (true, true) => format!(", TRUNCATED, lost={}", e.events_lost),
+            (true, false) => ", TRUNCATED".into(),
+            (false, true) => format!(", lost={}", e.events_lost),
+            (false, false) => String::new(),
+        };
         let _ = writeln!(
             out,
-            "\n== VidMm / DxgKrnl + Kernel ETW ({} events{rate_part}{split_part}, {:.2} s | {} dxgkrnl, {} sysmem) ==",
+            "\n== VidMm / DxgKrnl + Kernel ETW ({} events{rate_part}{split_part}{loss_part}, {:.2} s | {} dxgkrnl, {} sysmem) ==",
             e.total_events, e.duration_secs, e.dxgkrnl_events, e.system_memory_events
         );
         for w in &e.warnings {

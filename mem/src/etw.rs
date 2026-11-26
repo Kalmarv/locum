@@ -274,6 +274,12 @@ pub struct EtwReport {
     /// Count of DxgKrnl rundown events (`DC_Start`/`DC_Stop` opcode 3/4, `ReportSegment` 78, `ReportCommitted*` 80/227).
     #[serde(default)]
     pub rundown_events: u64,
+    /// Events reported lost by ETW `ControlTraceW(STOP)` during live capture (0 for offline `.etl` unless serialized).
+    #[serde(default)]
+    pub events_lost: u64,
+    /// True if live ETW capture hit `--max-etl-mb` and truncated subsequent events.
+    #[serde(default)]
+    pub truncated_by_max_size: bool,
     pub system_memory_events: u64,
     pub duration_secs: f64,
     #[serde(default)]
@@ -413,9 +419,23 @@ impl EtwReport {
 pub struct TraceSession {
     name: String,
     etl_path: PathBuf,
+    max_file_mb: u32,
     handle: CONTROLTRACE_HANDLE,
     active: bool,
     pub hard_fault_provider_enabled: bool,
+    pub events_lost: u64,
+    pub buffers_lost: u64,
+    pub truncated_by_max_size: bool,
+    pub warnings: Vec<String>,
+}
+
+/// Summary returned by `TraceSession::stop_with_stats`.
+#[derive(Clone, Debug)]
+pub struct TraceStopResult {
+    pub etl_path: PathBuf,
+    pub events_lost: u64,
+    pub buffers_lost: u64,
+    pub truncated_by_max_size: bool,
     pub warnings: Vec<String>,
 }
 
@@ -482,9 +502,13 @@ impl TraceSession {
         let mut sess = Self {
             name,
             etl_path: opts.etl_path,
+            max_file_mb: opts.max_file_mb,
             handle,
             active: true,
             hard_fault_provider_enabled: false,
+            events_lost: 0,
+            buffers_lost: 0,
+            truncated_by_max_size: false,
             warnings: Vec::new(),
         };
 
@@ -628,17 +652,35 @@ impl TraceSession {
             )
         };
         if err != ERROR_SUCCESS {
-            self.warnings.push(format!(
-                "DxgKrnl final CAPTURE_STATE returned Win32 error {}",
-                err.0
-            ));
+            if err.0 == 1502 || err.0 == 4201 {
+                self.warnings.push(format!(
+                    "DxgKrnl final CAPTURE_STATE skipped (Win32 error {}): ETL session already stopped after hitting --max-etl-mb {} MiB cap",
+                    err.0, self.max_file_mb
+                ));
+            } else {
+                self.warnings.push(format!(
+                    "DxgKrnl final CAPTURE_STATE returned Win32 error {}",
+                    err.0
+                ));
+            }
         }
     }
 
     /// Stops and flushes the ETW session, returning the written `.etl` path.
-    pub fn stop(mut self) -> Result<PathBuf, String> {
+    pub fn stop(self) -> Result<PathBuf, String> {
+        Ok(self.stop_with_stats()?.etl_path)
+    }
+
+    /// Stops and flushes the ETW session, returning the written `.etl` path plus drop/truncation stats and warnings.
+    pub fn stop_with_stats(mut self) -> Result<TraceStopResult, String> {
         self.stop_inner()?;
-        Ok(self.etl_path.clone())
+        Ok(TraceStopResult {
+            etl_path: self.etl_path.clone(),
+            events_lost: self.events_lost,
+            buffers_lost: self.buffers_lost,
+            truncated_by_max_size: self.truncated_by_max_size,
+            warnings: std::mem::take(&mut self.warnings),
+        })
     }
 
     fn stop_inner(&mut self) -> Result<(), String> {
@@ -656,10 +698,91 @@ impl TraceSession {
                 EVENT_TRACE_CONTROL_STOP,
             )
         };
-        if err != ERROR_SUCCESS {
-            return Err(format!("ControlTraceW(STOP) failed with Win32 error {}", err.0));
+        if err.0 == 1502 {
+            // Defensive second STOP (normally returns 4201 ERROR_WMI_INSTANCE_NOT_FOUND) to ensure
+            // the logger session and `.etl` file handle are fully closed before parsing.
+            let mut retry_buf = build_trace_properties(&self.name, None, 0);
+            unsafe {
+                let _ = ControlTraceW(
+                    CONTROLTRACE_HANDLE::default(),
+                    &name_w,
+                    retry_buf.as_mut_ptr().cast::<EVENT_TRACE_PROPERTIES>(),
+                    EVENT_TRACE_CONTROL_STOP,
+                );
+            }
         }
+        let props = unsafe { &*(stop_buf.as_ptr().cast::<EVENT_TRACE_PROPERTIES>()) };
+        let events_lost = props.EventsLost as u64;
+        let buffers_lost = props.LogBuffersLost as u64;
+        let file_exists = self.etl_path.is_file()
+            && std::fs::metadata(&self.etl_path)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false);
+        let outcome = classify_stop_result(err.0, events_lost, buffers_lost, self.max_file_mb, file_exists)?;
+        self.events_lost = outcome.events_lost;
+        self.buffers_lost = outcome.buffers_lost;
+        self.truncated_by_max_size = outcome.truncated_by_max_size;
+        self.warnings.extend(outcome.warnings);
         Ok(())
+    }
+}
+
+struct StopOutcome {
+    events_lost: u64,
+    buffers_lost: u64,
+    truncated_by_max_size: bool,
+    warnings: Vec<String>,
+}
+
+/// Classifies the Win32 status from `ControlTraceW(..., EVENT_TRACE_CONTROL_STOP)`.
+///
+/// When a `SEQUENTIAL` ETW session reaches `MaximumFileSize`, Windows stops logging to the file
+/// and `ControlTraceW(STOP)` returns `ERROR_EVENTLOG_FILE_FULL` (1502) or
+/// `ERROR_WMI_INSTANCE_NOT_FOUND` (4201) if the kernel already tore down the session. As long as
+/// the `.etl` file was written, we treat this as a truncated trace with an explicit warning rather
+/// than a hard failure.
+fn classify_stop_result(
+    err_code: u32,
+    events_lost: u64,
+    buffers_lost: u64,
+    max_file_mb: u32,
+    file_exists: bool,
+) -> Result<StopOutcome, String> {
+    const ERROR_EVENTLOG_FILE_FULL: u32 = 1502;
+    const ERROR_WMI_INSTANCE_NOT_FOUND: u32 = 4201;
+
+    let mut warnings = Vec::new();
+    match err_code {
+        0 => {
+            if events_lost > 0 || buffers_lost > 0 {
+                warnings.push(format!(
+                    "ETW session dropped {events_lost} events / {buffers_lost} log buffers (raise --max-etl-mb or use --allocs-only)"
+                ));
+            }
+            Ok(StopOutcome {
+                events_lost,
+                buffers_lost,
+                truncated_by_max_size: false,
+                warnings,
+            })
+        }
+        ERROR_EVENTLOG_FILE_FULL | ERROR_WMI_INSTANCE_NOT_FOUND if file_exists => {
+            let lost_note = if events_lost > 0 || buffers_lost > 0 {
+                format!(" ({events_lost} events / {buffers_lost} buffers reported lost)")
+            } else {
+                String::new()
+            };
+            warnings.push(format!(
+                "ETL reached --max-etl-mb {max_file_mb} MiB cap (Win32 error {err_code}){lost_note}: trace was truncated and later events (possibly including the final rundown) were dropped; raise --max-etl-mb to capture the full window"
+            ));
+            Ok(StopOutcome {
+                events_lost,
+                buffers_lost,
+                truncated_by_max_size: true,
+                warnings,
+            })
+        }
+        other => Err(format!("ControlTraceW(STOP) failed with Win32 error {other}")),
     }
 }
 
@@ -1946,5 +2069,33 @@ mod tests {
         assert_eq!(classify_segment(0x0010_1194, 1), SegmentKind::NonLocalHost);
         // PopulatedFromSystemMemory even if group=0
         assert_eq!(classify_segment(0x0000_0040, 0), SegmentKind::NonLocalHost);
+    }
+
+    #[test]
+    fn stop_result_treats_file_full_as_truncated_warning_when_etl_exists() {
+        // Win32 1502 (ERROR_EVENTLOG_FILE_FULL) with a written ETL -> truncated warning, not error.
+        let full = classify_stop_result(1502, 4200, 3, 256, true).unwrap();
+        assert!(full.truncated_by_max_size);
+        assert_eq!(full.events_lost, 4200);
+        assert_eq!(full.buffers_lost, 3);
+        assert!(
+            full.warnings
+                .iter()
+                .any(|w| w.contains("--max-etl-mb 256") && w.contains("1502") && w.contains("4200 events"))
+        );
+
+        // Win32 4201 (session already auto-stopped on cap) with a written ETL -> truncated warning.
+        let stopped = classify_stop_result(4201, 0, 0, 256, true).unwrap();
+        assert!(stopped.truncated_by_max_size);
+        assert!(stopped.warnings.iter().any(|w| w.contains("4201")));
+
+        // Without an ETL file on disk, 1502/4201 still errors.
+        assert!(classify_stop_result(1502, 0, 0, 256, false).is_err());
+        assert!(classify_stop_result(5, 0, 0, 256, true).is_err());
+
+        // Normal stop with lost events emits a warning without marking truncated.
+        let ok_lost = classify_stop_result(0, 100, 1, 1024, true).unwrap();
+        assert!(!ok_lost.truncated_by_max_size);
+        assert!(ok_lost.warnings.iter().any(|w| w.contains("100 events")));
     }
 }

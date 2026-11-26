@@ -87,7 +87,7 @@ pub enum MemCommand {
         /// Low-overhead mode: drops high-volume `Base` (per-draw/scheduler/VSync) and `GPUVA` steady-state events while still capturing full `CAPTURE_STATE` rundown for segments and live allocations.
         #[arg(long)]
         allocs_only: bool,
-        /// Maximum ETL file size cap in MiB (default 2048).
+        /// Maximum ETL file size cap in MiB (default 2048; if reached, recording truncates with a warning rather than failing). On large D3D12 titles (~60k+ allocs), initial + final rundowns alone can use ~250-350 MiB.
         #[arg(long, default_value_t = 2048)]
         max_etl_mb: u32,
         /// Path for the recorded .etl file (defaults to a temp file deleted after parsing unless --keep-etl).
@@ -200,7 +200,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
             }
             let mut sess = TraceSession::start(trace_opts)?;
             let hf_enabled = sess.hard_fault_provider_enabled;
-            let mut warnings = sess.warnings.clone();
+            let mut extra_warnings = Vec::new();
 
             let dur_ms = (duration.max(0.1) * 1000.0) as u64;
             std::thread::sleep(Duration::from_millis(dur_ms));
@@ -210,7 +210,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
             let win32 = match inspect_process(pid, InspectOptions { sample_step }) {
                 Ok(w) => Some(w),
                 Err(e) => {
-                    warnings.push(format!(
+                    extra_warnings.push(format!(
                         "Win32 process inspection unavailable ({e}); showing ETW adapter-wide / PID data only"
                     ));
                     None
@@ -218,13 +218,17 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
             };
             sess.capture_state(DXGKRNL_KEYWORDS_DEFAULT);
             std::thread::sleep(Duration::from_millis(150));
-            let written = sess.stop()?;
+            let stop_res = sess.stop_with_stats()?;
+            let mut warnings = stop_res.warnings;
+            warnings.extend(extra_warnings);
 
-            let mut etw_rep = parse_etl(&written, Some(pid))?;
+            let mut etw_rep = parse_etl(&stop_res.etl_path, Some(pid))?;
+            etw_rep.events_lost = stop_res.events_lost;
+            etw_rep.truncated_by_max_size = stop_res.truncated_by_max_size;
             etw_rep.apply_live_session_metadata(hf_enabled, warnings);
 
             if is_temp && !keep_etl {
-                let _ = std::fs::remove_file(&written);
+                let _ = std::fs::remove_file(&stop_res.etl_path);
             }
 
             let cap_rep = capture
