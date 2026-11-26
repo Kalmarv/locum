@@ -1,12 +1,22 @@
-//! GPU time of each replayed draw and dispatch, when `LOCUM_REPLAY_TIMES` names a file: a timestamp before and after
+//! GPU time of each replayed draw and dispatch, when `--times` names a file: a timestamp before and after
 //! the call (inside the barriers replay puts around it), resolved when the open list runs, and a tab-separated row per
 //! op appended to the file: event, draw, call, its arguments, its program (the compute shader's, else the pixel or
 //! vertex shader's), and the microseconds between the two timestamps. A pair recorded past the heap's room is not
 //! timed (counted on stderr).
 
 use std::io::Write;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use windows::Win32::Graphics::Direct3D12::*;
+
+/// The file `--times` names, for every replay this process makes.
+static TIMES: OnceLock<PathBuf> = OnceLock::new();
+
+/// Each replay after this appends its ops' times to `path`.
+pub fn time_to(path: PathBuf) {
+    let _ = TIMES.set(path);
+}
 
 /// Timestamp pairs one list holds.
 const PAIRS: u32 = 1 << 16;
@@ -24,16 +34,16 @@ pub(super) struct Timing {
 }
 
 impl Timing {
-    /// None unless `LOCUM_REPLAY_TIMES` is set; an error when it is and the file or queries cannot be made.
+    /// None unless `--times` named a file; an error when it did and the file or queries cannot be made.
     pub(super) fn new(device: &ID3D12Device2, queue: &ID3D12CommandQueue) -> Result<Option<Timing>, String> {
-        let Some(path) = std::env::var_os("LOCUM_REPLAY_TIMES") else {
+        let Some(path) = TIMES.get() else {
             return Ok(None);
         };
         let out = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&path)
-            .map_err(|e| format!("LOCUM_REPLAY_TIMES {}: {e}", path.to_string_lossy()))?;
+            .open(path)
+            .map_err(|e| format!("--times {}: {e}", path.display()))?;
         let mut heap: Option<ID3D12QueryHeap> = None;
         let mut readback: Option<ID3D12Resource> = None;
         let frequency = unsafe {
@@ -161,7 +171,7 @@ impl Timing {
         }
         self.out
             .write_all(rows.as_bytes())
-            .map_err(|e| format!("LOCUM_REPLAY_TIMES: {e}"))
+            .map_err(|e| format!("--times: {e}"))
     }
 }
 
@@ -169,7 +179,7 @@ impl Drop for Timing {
     fn drop(&mut self) {
         if self.dropped > 0 {
             eprintln!(
-                "LOCUM_REPLAY_TIMES: {} op(s) past {PAIRS} in one list were not timed",
+                "--times: {} op(s) past {PAIRS} in one list were not timed",
                 self.dropped
             );
         }

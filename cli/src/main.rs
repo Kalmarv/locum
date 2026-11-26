@@ -572,6 +572,11 @@ enum Command {
         out: PathBuf,
         #[arg(long, default_value = "auto")]
         range: String,
+        /// Direct3D 12: append each replayed draw's and dispatch's GPU time to this file, a tab-separated row each
+        /// (event, draw, call, arguments, program, microseconds). With rules, both replays are timed, the one as
+        /// recorded first.
+        #[arg(long)]
+        times: Option<PathBuf>,
     },
     /// Replays the whole frame and compares every target the capture read back.
     Verify {
@@ -593,6 +598,10 @@ enum Command {
         /// replayed on to this JSON file.
         #[arg(long)]
         report: Option<PathBuf>,
+        /// Direct3D 12: append each replayed draw's and dispatch's GPU time to this file, a tab-separated row each
+        /// (event, draw, call, arguments, program, microseconds).
+        #[arg(long)]
+        times: Option<PathBuf>,
     },
     /// How a translation layer draws the frame: replays it through the system's Direct3D and through the DLLs in
     /// the folder `--layer` names (DXVK's d3d11.dll and dxgi.dll, vkd3d-proton's d3d12.dll and d3d12core.dll),
@@ -1213,7 +1222,11 @@ fn run(cli: Cli) -> Result<(), String> {
             debug,
             out,
             range: r,
+            times,
         } => {
+            if let Some(t) = times {
+                replay::time_to(t);
+            }
             let c = open(&capture)?;
             let n = replay::draw_number(&c, &draw)?;
             let mode =
@@ -1244,14 +1257,20 @@ fn run(cli: Cli) -> Result<(), String> {
             limit,
             out,
             report,
-        } => replay::verify(
-            &open(&capture)?,
-            warp,
-            debug,
-            limit,
-            out.as_deref(),
-            report.as_deref(),
-        ),
+            times,
+        } => {
+            if let Some(t) = times {
+                replay::time_to(t);
+            }
+            replay::verify(
+                &open(&capture)?,
+                warp,
+                debug,
+                limit,
+                out.as_deref(),
+                report.as_deref(),
+            )
+        }
         Command::Conform {
             capture,
             out,

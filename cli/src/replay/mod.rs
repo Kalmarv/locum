@@ -9,6 +9,8 @@
 mod d3d11;
 mod d3d12;
 
+pub use d3d12::time_to;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 

@@ -41,6 +41,7 @@ mod queries;
 mod rays;
 mod staging;
 mod timing;
+pub use timing::time_to;
 mod views;
 
 use views::Extent;
@@ -272,7 +273,7 @@ pub struct D3d12 {
     undescribed: Vec<i64>,
     warnings: BTreeSet<String>,
     debug: Option<ID3D12InfoQueue>,
-    /// Each draw's and dispatch's GPU time, with `LOCUM_REPLAY_TIMES` (see [`timing`]).
+    /// Each draw's and dispatch's GPU time, with `--times` (see [`timing`]).
     timing: Option<timing::Timing>,
 }
 
