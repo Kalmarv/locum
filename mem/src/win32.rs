@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use windows::Wdk::Graphics::Direct3D::{
     D3DKMT_ADAPTERINFO, D3DKMT_CLOSEADAPTER, D3DKMT_ENUMADAPTERS2, D3DKMT_MEMORY_SEGMENT_GROUP_LOCAL,
     D3DKMT_MEMORY_SEGMENT_GROUP_NON_LOCAL, D3DKMT_QUERYVIDEOMEMORYINFO, D3DKMTCloseAdapter,
@@ -31,7 +31,7 @@ use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, 
 use crate::THREAD_SUSPENDS;
 
 /// Process-wide OS counters from `GetProcessMemoryInfo`.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProcessCounters {
     pub private_usage: u64,
     pub working_set_size: u64,
@@ -43,7 +43,7 @@ pub struct ProcessCounters {
 }
 
 /// Out-of-process `D3DKMTQueryVideoMemoryInfo` (identical data source to `IDXGIAdapter3::QueryVideoMemoryInfo`).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AdapterVideoMemoryInfo {
     pub adapter_luid_low: u32,
     pub adapter_luid_high: i32,
@@ -56,7 +56,7 @@ pub struct AdapterVideoMemoryInfo {
     pub non_local_reservation: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryType {
     Private,
@@ -89,7 +89,7 @@ impl MemoryType {
 }
 
 /// One `MEM_COMMIT` or `MEM_RESERVE` virtual-memory region with exact page residency breakdown.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegionInfo {
     pub base: u64,
     pub allocation_base: u64,
@@ -108,8 +108,8 @@ pub struct RegionInfo {
     /// Valid write-combined PCIe BAR / device-IO mapped bytes (`Valid == 1`, `PAGE_WRITECOMBINE`,
     /// zero WS priority bits `0x7F00_0000` — mapped to device VRAM rather than system RAM WS).
     pub bar_mapped_bytes: u64,
-    /// Committed bytes backed and trimmed / paged-out / in standby/modified/compressed store
-    /// (`Valid == 0` with non-zero kernel working-set flags).
+    /// Committed bytes backed and not in working set (`Valid == 0` with non-zero kernel WS flags).
+    /// For `MEM_PRIVATE` this is trimmed/pagefile-backed; for `MEM_MAPPED`/`MEM_IMAGE` it is non-WS section pages.
     pub paged_out_bytes: u64,
     /// Committed bytes never touched (demand-zero PTE, `Valid == 0` with zero kernel flags).
     pub untouched_bytes: u64,
@@ -118,7 +118,7 @@ pub struct RegionInfo {
 }
 
 /// Totals across all virtual-memory regions of a process.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct VaTotals {
     pub commit_bytes: u64,
     pub reserve_bytes: u64,
@@ -130,7 +130,14 @@ pub struct VaTotals {
     pub resident_private_bytes: u64,
     pub resident_shared_bytes: u64,
     pub bar_mapped_bytes: u64,
+    /// Total `Valid == 0, Flags != 0` bytes (`paged_out_private_bytes + non_ws_mapped_bytes`).
     pub paged_out_bytes: u64,
+    /// `MEM_PRIVATE` pages trimmed/paged-out to pagefile/compressed/standby/modified lists.
+    #[serde(default)]
+    pub paged_out_private_bytes: u64,
+    /// `MEM_MAPPED` / `MEM_IMAGE` (and WC section) pages merely not in the working set (not private pagefile paging).
+    #[serde(default)]
+    pub non_ws_mapped_bytes: u64,
     pub untouched_bytes: u64,
     pub locked_bytes: u64,
     pub large_page_bytes: u64,
@@ -140,7 +147,7 @@ pub struct VaTotals {
 }
 
 /// Complete zero-suspend Win32 + D3DKMT snapshot of a process.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProcessMemorySnapshot {
     pub pid: u32,
     pub page_size: u64,
@@ -334,6 +341,11 @@ fn inspect_handle(
             totals.resident_shared_bytes += reg.resident_shared_bytes;
             totals.bar_mapped_bytes += reg.bar_mapped_bytes;
             totals.paged_out_bytes += reg.paged_out_bytes;
+            if mem_type == MemoryType::Private {
+                totals.paged_out_private_bytes += reg.paged_out_bytes;
+            } else {
+                totals.non_ws_mapped_bytes += reg.paged_out_bytes;
+            }
             totals.untouched_bytes += reg.untouched_bytes;
             totals.locked_bytes += reg.locked_bytes;
             totals.large_page_bytes += reg.large_page_bytes;
@@ -860,4 +872,19 @@ fn resolve_target_pid_from_list(
     }
 
     Err("specify one of --pid <PID>, --pid-of-child <PARENT_PID>, or --exe-name <NAME>".into())
+}
+
+/// Returns direct non-console live children of `ppid` (best-effort, zero suspends) so we can warn
+/// when `--pid` points at a launcher process with no D3D device.
+pub fn live_children_of(ppid: u32) -> Vec<ProcessEntry> {
+    let Ok(procs) = list_processes() else {
+        return Vec::new();
+    };
+    let self_pid = std::process::id();
+    procs
+        .into_iter()
+        .filter(|p| {
+            p.parent_pid == ppid && p.pid != 0 && p.pid != self_pid && !is_console_helper(&p.exe_name)
+        })
+        .collect()
 }

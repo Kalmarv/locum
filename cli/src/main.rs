@@ -751,7 +751,7 @@ enum Command {
     /// Out-of-process, zero-suspend CPU and GPU (VidMm/DxgKrnl ETW) memory ground-truth inspection and reconciliation.
     Mem {
         #[command(subcommand)]
-        what: mem::MemCommand,
+        what: Box<mem::MemCommand>,
     },
     /// Brings what an older locum derived in a capture up to this one, from the capture's own records: D3D12
     /// bindings projected again (an older projection bound some registers to two descriptors), structured views'
@@ -1386,7 +1386,7 @@ fn run(cli: Cli) -> Result<(), String> {
             StoreCommand::Merge { folder, into } => store::merge(&folder, &into),
             StoreCommand::Collect { store, count } => store::collect(&store, count),
         },
-        Command::Mem { what } => mem::run(what),
+        Command::Mem { what } => mem::run(*what),
         Command::Upgrade {
             capture,
             check,

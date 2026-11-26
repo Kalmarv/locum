@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, WIN32_ERROR,
 };
@@ -34,6 +34,11 @@ pub const CLASSIC_PAGEFAULT_GUID: GUID = GUID::from_u128(0x3d6fa8d3_fe05_11d0_9d
 /// `Base (0x1) | References (0x4) | Resource (0x40) | Memory (0x80) | GPUVA (0x100000)`.
 pub const DXGKRNL_KEYWORDS_DEFAULT: u64 = 0x0010_00C5;
 
+/// Low-overhead DxgKrnl keyword mask (`References (0x4) | Resource (0x40) | Memory (0x80)`):
+/// drops high-volume `Base (0x1)` per-draw/scheduler/VSync events and `GPUVA (0x100000)` mapping floods
+/// during steady recording while `CAPTURE_STATE` rundown still captures `ReportSegment` and live allocations.
+pub const DXGKRNL_KEYWORDS_ALLOCS_ONLY: u64 = 0x0000_00C4;
+
 /// `SYSTEM_MEMORY_KW_HARD_FAULTS` (`0x2000`) on `SystemMemoryProvider`.
 pub const SYSTEM_MEMORY_KW_HARD_FAULTS: u64 = 0x2000;
 
@@ -55,7 +60,7 @@ const TDH_INTYPE_HEXINT32: u16 = 20;
 const TDH_INTYPE_HEXINT64: u16 = 21;
 
 /// Segment classification from `ReportSegment`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SegmentKind {
     LocalVram,
@@ -84,12 +89,13 @@ impl SegmentKind {
 }
 
 /// Video-memory segment metadata decoded from DxgKrnl `ReportSegment` (id=78).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SegmentInfo {
     pub adapter: u64,
     pub segment_id: u32,
     /// True if `ReportSegment` (id=78) supplied size/flags/group; false if synthesized only from
     /// `TotalBytesResidentInSegment` (id=274).
+    #[serde(default)]
     pub described: bool,
     pub size: u64,
     pub commit_limit: u64,
@@ -107,7 +113,7 @@ pub struct SegmentInfo {
 }
 
 /// One VidMm global allocation tracked across DxgKrnl events.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VidMmAllocation {
     pub global_handle: u64,
     pub adapter: u64,
@@ -137,10 +143,17 @@ pub struct VidMmAllocation {
     pub evict_count: u64,
     pub fault_count: u64,
     pub alive: bool,
+    /// Timestamp (seconds relative to trace start) when this allocation was first observed
+    /// (`AdapterAllocation` Start / DC_Start or `ReportCommitted`).
+    #[serde(default)]
+    pub first_seen_secs: Option<f64>,
+    /// True if created live during the trace (`AdapterAllocation/Start` id=33); false if pre-existing rundown (`DC_Start` id=35).
+    #[serde(default)]
+    pub created_during_trace: bool,
 }
 
 /// Per-process VidMm commitment/usage/demotion reported directly by VidMm ETW events (366/367/370/371).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProcessVidMmCounters {
     pub pid: u32,
     pub local_usage: Option<u64>,
@@ -156,7 +169,7 @@ pub struct ProcessVidMmCounters {
 }
 
 /// GPU virtual-address range mapping (`GpuVirtualAddressRangeMapping` 333/334/435).
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GpuVaMapping {
     pub start: u64,
     pub end: u64,
@@ -167,7 +180,7 @@ pub struct GpuVaMapping {
 }
 
 /// Hard-fault summary from kernel ETW (`SystemMemoryProvider` / classic `PageFault`).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HardFaultSummary {
     pub total_count: u64,
     pub total_bytes: u64,
@@ -177,7 +190,7 @@ pub struct HardFaultSummary {
 }
 
 /// `UpdateTileMappings` (`UpdateGpuVirtualAddress` id=512) summary.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TileMappingSummary {
     pub call_count: u64,
     pub total_operations: u64,
@@ -187,7 +200,7 @@ pub struct TileMappingSummary {
 }
 
 /// VidMm paging / residency activity summary.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PagingActivity {
     pub allocation_faults: u64,
     pub page_in_allocations: u64,
@@ -204,7 +217,7 @@ pub struct PagingActivity {
 
 /// Evidence/provider coverage observed in an ETW trace so reports distinguish true zeroes from
 /// unavailable metrics (missing rundown, keywords, or kernel providers).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TraceCoverage {
     /// Count of `ReportSegment` (id=78) events defining segment size, flags, and Local vs NonLocal kind.
     pub segment_descriptor_events: u64,
@@ -241,7 +254,7 @@ pub struct TraceCoverage {
 }
 
 /// Full parsed ETW report for a trace (optionally filtered to `filter_pid`).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EtwReport {
     pub etl_path: String,
     pub filter_pid: Option<u32>,
@@ -249,11 +262,13 @@ pub struct EtwReport {
     pub dxgkrnl_events: u64,
     pub system_memory_events: u64,
     pub duration_secs: f64,
+    #[serde(default)]
     pub coverage: TraceCoverage,
     pub warnings: Vec<String>,
     /// Adapter-wide segments (residency samples span all processes on the adapter, not just `filter_pid`).
     pub segments: Vec<SegmentInfo>,
     /// Sum of `resident_last` across adapter-wide segments (all processes on the adapter, not PID-filtered).
+    #[serde(default)]
     pub adapter_segment_resident_bytes: u64,
     pub process_counters: BTreeMap<u32, ProcessVidMmCounters>,
     pub allocations: Vec<VidMmAllocation>,
@@ -262,6 +277,7 @@ pub struct EtwReport {
     pub paging: PagingActivity,
     /// When `filter_pid` is set, handle-keyed VidMm paging events whose allocation handle had no rundown entry
     /// (and therefore could not be attributed to any PID).
+    #[serde(default)]
     pub unattributed_paging: Option<PagingActivity>,
     pub hard_faults: HardFaultSummary,
     /// Aggregate bytes of live tracked allocations (for `filter_pid` if set, else all PIDs).
@@ -483,13 +499,30 @@ impl TraceSession {
         }
 
         // Request rundown (DC_Start) of currently live adapters, segments, devices, and allocations.
+        // Always include full default keywords during rundown so ReportSegment / ReportCommitted* fire
+        // even when steady-state capture uses `--allocs-only`.
+        let rundown_kw = opts.dxgkrnl_keywords | DXGKRNL_KEYWORDS_DEFAULT;
+        if rundown_kw != opts.dxgkrnl_keywords {
+            let _ = unsafe {
+                EnableTraceEx2(
+                    sess.handle,
+                    &DXGKRNL_PROVIDER,
+                    EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
+                    TRACE_LEVEL_INFORMATION,
+                    rundown_kw,
+                    0,
+                    0,
+                    Some(&enable_params),
+                )
+            };
+        }
         let e_cap = unsafe {
             EnableTraceEx2(
                 sess.handle,
                 &DXGKRNL_PROVIDER,
                 EVENT_CONTROL_CODE_CAPTURE_STATE.0,
                 TRACE_LEVEL_INFORMATION,
-                opts.dxgkrnl_keywords,
+                rundown_kw,
                 0,
                 0,
                 Some(&enable_params),
@@ -500,6 +533,22 @@ impl TraceSession {
                 "DxgKrnl CAPTURE_STATE rundown returned Win32 error {} (live allocations before trace start may be incomplete)",
                 e_cap.0
             ));
+        }
+        if rundown_kw != opts.dxgkrnl_keywords {
+            // Brief settle for initial rundown, then drop back to low-overhead steady-state keywords.
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            let _ = unsafe {
+                EnableTraceEx2(
+                    sess.handle,
+                    &DXGKRNL_PROVIDER,
+                    EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
+                    TRACE_LEVEL_INFORMATION,
+                    opts.dxgkrnl_keywords,
+                    0,
+                    0,
+                    Some(&enable_params),
+                )
+            };
         }
 
         if opts.enable_hard_faults {
@@ -538,6 +587,18 @@ impl TraceSession {
         let enable_params = ENABLE_TRACE_PARAMETERS {
             Version: 2,
             ..Default::default()
+        };
+        let _ = unsafe {
+            EnableTraceEx2(
+                self.handle,
+                &DXGKRNL_PROVIDER,
+                EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
+                TRACE_LEVEL_INFORMATION,
+                keywords,
+                0,
+                0,
+                Some(&enable_params),
+            )
         };
         let err = unsafe {
             EnableTraceEx2(
@@ -1088,6 +1149,11 @@ impl ParserState {
                 let pinned = schema.get_bool(data, "BackingStoreWasPinned").unwrap_or(false);
                 let page_table = schema.get_bool(data, "PageTableOrDirectory").unwrap_or(false);
 
+                let ts = rec.EventHeader.TimeStamp;
+                let rel_secs = match self.first_ts {
+                    Some(first) if ts >= first => Some((ts - first) as f64 / 1e7),
+                    _ => None,
+                };
                 let entry = self.allocs.entry(gh).or_insert_with(|| VidMmAllocation {
                     global_handle: gh,
                     adapter,
@@ -1111,7 +1177,17 @@ impl ParserState {
                     evict_count: 0,
                     fault_count: 0,
                     alive: true,
+                    first_seen_secs: rel_secs,
+                    created_during_trace: id == 33,
                 });
+                if id == 33 {
+                    entry.created_during_trace = true;
+                    if rel_secs.is_some() {
+                        entry.first_seen_secs = rel_secs;
+                    }
+                } else if entry.first_seen_secs.is_none() {
+                    entry.first_seen_secs = rel_secs;
+                }
                 if pid != 0 {
                     entry.pid = pid;
                 }
@@ -1179,6 +1255,11 @@ impl ParserState {
                 let seg_id = schema.get_u64(data, "ulSegmentId").unwrap_or(0) as u32;
                 let size = schema.get_u64(data, "Size").unwrap_or(0);
                 let pid = schema.get_u64(data, "hProcessId").unwrap_or(0) as u32;
+                let ts = rec.EventHeader.TimeStamp;
+                let rel_secs = match self.first_ts {
+                    Some(first) if ts >= first => Some((ts - first) as f64 / 1e7),
+                    _ => None,
+                };
                 if gh != 0 {
                     let entry = self.allocs.entry(gh).or_insert_with(|| VidMmAllocation {
                         global_handle: gh,
@@ -1203,6 +1284,8 @@ impl ParserState {
                         evict_count: 0,
                         fault_count: 0,
                         alive: true,
+                        first_seen_secs: rel_secs,
+                        created_during_trace: false,
                     });
                     if entry.pid == 0 && pid != 0 {
                         entry.pid = pid;

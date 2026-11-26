@@ -4,13 +4,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use rusqlite::{Connection, OpenFlags};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::etw::EtwReport;
 use crate::labels::LabelMap;
 
 /// Summary of `d12_draw_descriptors` joined against `--labels` and/or ETW GPU VA mappings.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CaptureJoinReport {
     pub capture_path: String,
     pub total_descriptor_rows: u64,
@@ -21,7 +21,7 @@ pub struct CaptureJoinReport {
     pub flag_counts: BTreeMap<String, u64>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaptureOwnerSummary {
     pub owner: String,
     pub descriptor_rows: u64,
@@ -32,7 +32,7 @@ pub struct CaptureOwnerSummary {
     pub flagged_rows: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CapturePlacementSummary {
     pub placement: String,
     pub descriptor_rows: u64,

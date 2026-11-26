@@ -2,16 +2,214 @@
 
 use std::collections::BTreeMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::THREAD_SUSPENDS;
 use crate::capture_join::CaptureJoinReport;
-use crate::etw::{EtwReport, SegmentKind};
+use crate::etw::{EtwReport, SegmentKind, VidMmAllocation};
 use crate::labels::LabelMap;
-use crate::win32::{MemoryType, ProcessMemorySnapshot};
+use crate::win32::{MemoryType, ProcessMemorySnapshot, live_children_of};
+
+/// Standard human-readable size buckets for VidMm and Win32 VA histograms.
+pub const SIZE_BUCKETS: [&str; 7] = [
+    "<64K", "64K..1M", "1..4M", "4..16M", "16..64M", "64..256M", ">=256M",
+];
+
+pub fn size_bucket_index(bytes: u64) -> usize {
+    const K: u64 = 1024;
+    const M: u64 = 1024 * 1024;
+    if bytes < 64 * K {
+        0
+    } else if bytes < M {
+        1
+    } else if bytes < 4 * M {
+        2
+    } else if bytes < 16 * M {
+        3
+    } else if bytes < 64 * M {
+        4
+    } else if bytes < 256 * M {
+        5
+    } else {
+        6
+    }
+}
+
+/// Parses human-friendly byte sizes like `64K`, `64KiB`, `1M`, `64MiB`, `2G`, or raw byte integers.
+pub fn parse_byte_size(raw: &str) -> Result<u64, String> {
+    let s = raw.trim().replace('_', "");
+    if s.is_empty() {
+        return Err("empty size".into());
+    }
+    let lower = s.to_ascii_lowercase();
+    let (num_str, mult): (&str, u64) = if let Some(p) = lower.strip_suffix("gib") {
+        (p, 1024 * 1024 * 1024)
+    } else if let Some(p) = lower.strip_suffix("gb") {
+        (p, 1024 * 1024 * 1024)
+    } else if let Some(p) = lower.strip_suffix('g') {
+        (p, 1024 * 1024 * 1024)
+    } else if let Some(p) = lower.strip_suffix("mib") {
+        (p, 1024 * 1024)
+    } else if let Some(p) = lower.strip_suffix("mb") {
+        (p, 1024 * 1024)
+    } else if let Some(p) = lower.strip_suffix('m') {
+        (p, 1024 * 1024)
+    } else if let Some(p) = lower.strip_suffix("kib") {
+        (p, 1024)
+    } else if let Some(p) = lower.strip_suffix("kb") {
+        (p, 1024)
+    } else if let Some(p) = lower.strip_suffix('k') {
+        (p, 1024)
+    } else if let Some(p) = lower.strip_suffix('b') {
+        (p, 1)
+    } else {
+        (lower.as_str(), 1)
+    };
+    let val: f64 = num_str
+        .trim()
+        .parse()
+        .map_err(|e| format!("invalid size {raw:?}: {e}"))?;
+    if !val.is_finite() || val < 0.0 {
+        return Err(format!("invalid negative/non-finite size {raw:?}"));
+    }
+    Ok((val * mult as f64).round() as u64)
+}
+
+/// Filter for VidMm allocation placement in text tables and `mem diff`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlacementFilter {
+    #[default]
+    All,
+    Local,
+    Vram,
+    Bar,
+    Host,
+    Demoted,
+    Evicted,
+    Unknown,
+}
+
+impl PlacementFilter {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "local" => Ok(Self::Local),
+            "vram" | "local_vram" => Ok(Self::Vram),
+            "bar" | "local_bar" | "local_bar_vram" => Ok(Self::Bar),
+            "host" | "nonlocal" | "non_local" | "non_local_host" | "sysmem" => Ok(Self::Host),
+            "demoted" => Ok(Self::Demoted),
+            "evicted" => Ok(Self::Evicted),
+            "unknown" => Ok(Self::Unknown),
+            other => Err(format!(
+                "invalid --placement {other:?} (expected: all, local, vram, bar, host, demoted, evicted, unknown)"
+            )),
+        }
+    }
+
+    pub fn matches_label(self, label: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Local => matches!(label, "local_vram" | "local_bar_vram"),
+            Self::Vram => label == "local_vram",
+            Self::Bar => label == "local_bar_vram",
+            Self::Host => matches!(label, "non_local_host" | "demoted_host"),
+            Self::Demoted => label == "demoted_host",
+            Self::Evicted => label == "evicted",
+            Self::Unknown => label == "unknown",
+        }
+    }
+}
+
+/// Sort order for Top-N allocation tables.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AllocSort {
+    #[default]
+    Size,
+    Newest,
+    Oldest,
+}
+
+impl AllocSort {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "size" => Ok(Self::Size),
+            "newest" | "new" | "recent" => Ok(Self::Newest),
+            "oldest" | "old" | "time" => Ok(Self::Oldest),
+            other => Err(format!(
+                "invalid --sort {other:?} (expected: size, newest, oldest)"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Size => "size",
+            Self::Newest => "newest",
+            Self::Oldest => "oldest",
+        }
+    }
+}
+
+/// Formatting and filtering options for `format_text_with_options` and `format_diff_text`.
+#[derive(Clone, Debug)]
+pub struct FormatOptions {
+    pub top: usize,
+    pub placement: PlacementFilter,
+    pub min_bytes: Option<u64>,
+    pub max_bytes: Option<u64>,
+    pub sort: AllocSort,
+    pub all_segments: bool,
+}
+
+impl Default for FormatOptions {
+    fn default() -> Self {
+        Self {
+            top: 25,
+            placement: PlacementFilter::All,
+            min_bytes: None,
+            max_bytes: None,
+            sort: AllocSort::Size,
+            all_segments: false,
+        }
+    }
+}
+
+pub fn alloc_placement_label(e: &EtwReport, a: &VidMmAllocation) -> &'static str {
+    if a.demoted {
+        return "demoted_host";
+    }
+    if a.evicted {
+        return "evicted";
+    }
+    a.current_segment_id
+        .map(|s| e.segment_kind(a.adapter, s).as_str())
+        .unwrap_or("unknown")
+}
+
+pub fn alloc_matches_placement(e: &EtwReport, a: &VidMmAllocation, filter: PlacementFilter) -> bool {
+    match filter {
+        PlacementFilter::All => true,
+        PlacementFilter::Demoted => a.demoted,
+        PlacementFilter::Evicted => a.evicted,
+        _ => {
+            let kind = a
+                .current_segment_id
+                .map(|s| e.segment_kind(a.adapter, s))
+                .unwrap_or(SegmentKind::Unknown);
+            match filter {
+                PlacementFilter::Local => kind.is_local(),
+                PlacementFilter::Vram => kind == SegmentKind::LocalVram,
+                PlacementFilter::Bar => kind == SegmentKind::LocalCpuVisibleVram,
+                PlacementFilter::Host => kind.is_non_local() || a.demoted,
+                PlacementFilter::Unknown => kind == SegmentKind::Unknown,
+                PlacementFilter::All | PlacementFilter::Demoted | PlacementFilter::Evicted => unreachable!(),
+            }
+        }
+    }
+}
 
 /// Alert raised when `QueryVideoMemoryInfo` or requested heap placement disagrees with true OS/VidMm placement.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlacementAlert {
     pub kind: String,
     pub owner: Option<String>,
@@ -20,7 +218,7 @@ pub struct PlacementAlert {
 }
 
 /// Per-owner summary built from `--labels <ranges.tsv>` across Win32 VA, HardFaults, VidMm ETW, and Capture.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OwnerBreakdown {
     pub owner: String,
     pub va_commit_bytes: u64,
@@ -29,7 +227,14 @@ pub struct OwnerBreakdown {
     pub resident_private_bytes: u64,
     pub resident_shared_bytes: u64,
     pub bar_mapped_bytes: u64,
+    /// Total `Valid == 0, Flags != 0` bytes (`paged_out_private_bytes + non_ws_mapped_bytes`).
     pub paged_out_bytes: u64,
+    /// `MEM_PRIVATE` pages trimmed/paged-out to pagefile/compressed/standby/modified lists.
+    #[serde(default)]
+    pub paged_out_private_bytes: u64,
+    /// `MEM_MAPPED` / `MEM_IMAGE` section pages merely not in the working set (not private pagefile paging).
+    #[serde(default)]
+    pub non_ws_mapped_bytes: u64,
     pub untouched_bytes: u64,
     pub write_combined_bytes: u64,
     pub region_count: usize,
@@ -43,7 +248,7 @@ pub struct OwnerBreakdown {
 }
 
 /// Conservation check metrics for CPU (`PrivateUsage`, `WorkingSetSize`) and GPU (`VidMm Local + NonLocal`).
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ConservationSummary {
     pub thread_suspends: u64,
     // CPU WorkingSet conservation
@@ -70,23 +275,28 @@ pub struct ConservationSummary {
     pub etw_process_demoted_commitment: Option<u64>,
     /// Adapter-wide sum of `TotalBytesResidentInSegment.resident_last` across all processes on the adapter
     /// (explicitly separate from PID-attributed VidMm conservation).
+    #[serde(default)]
     pub adapter_segment_resident_bytes: u64,
     pub vidmm_accounted_bytes: u64,
     pub vidmm_reference_bytes: u64,
     pub vidmm_accounted_pct: Option<f64>,
     /// Scope of `vidmm_accounted_pct` (e.g. `pid_allocations_vs_qvmi`, `pid_allocations_vs_process_counters`,
     /// or `unavailable` when allocation/process rundown is missing).
+    #[serde(default)]
     pub vidmm_conservation_scope: String,
     /// Explanation when `vidmm_accounted_pct` is `None`.
+    #[serde(default)]
     pub vidmm_conservation_unavailable_reason: Option<String>,
 }
 
 /// Unified ground-truth memory report combining Win32 inspection, ETW VidMm/HardFaults, labels, and capture join.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MemReport {
     pub pid: Option<u32>,
     pub thread_suspends: u64,
     pub conservation: ConservationSummary,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub alerts: Vec<PlacementAlert>,
     pub by_owner: Vec<OwnerBreakdown>,
     pub win32: Option<ProcessMemorySnapshot>,
@@ -159,6 +369,11 @@ pub fn reconcile(
                     entry.resident_bytes += res;
                     entry.bar_mapped_bytes += bar;
                     entry.paged_out_bytes += po;
+                    if reg.mem_type == MemoryType::Private {
+                        entry.paged_out_private_bytes += po;
+                    } else {
+                        entry.non_ws_mapped_bytes += po;
+                    }
                     entry.untouched_bytes += unt;
                 } else {
                     entry.va_reserve_bytes += len;
@@ -491,10 +706,32 @@ pub fn reconcile(
         kb.cmp(&ka).then_with(|| a.owner.cmp(&b.owner))
     });
 
+    let mut warnings = Vec::new();
+    // Warn if the inspected PID has no D3D device usage/allocations and has live child processes
+    // (common when passing a launcher/runner PID instead of the child title PID).
+    if let Some(target_pid) = pid
+        && cons.qvmi_total_bytes == 0
+        && etw.as_ref().is_none_or(|e| e.allocations.is_empty())
+        && win32.is_some()
+    {
+        let kids = live_children_of(target_pid);
+        if !kids.is_empty() {
+            let list = kids
+                .iter()
+                .map(|k| format!("pid={} ({})", k.pid, k.exe_name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            warnings.push(format!(
+                "PID {target_pid} has no D3D video-memory usage or VidMm allocations and has live child process(es): {list}; did you mean `--pid-of-child {target_pid}`?"
+            ));
+        }
+    }
+
     MemReport {
         pid,
         thread_suspends: THREAD_SUSPENDS,
         conservation: cons,
+        warnings,
         alerts,
         by_owner,
         win32,
@@ -517,8 +754,21 @@ fn pct(part: u64, total: u64) -> f64 {
 
 /// Renders a concise, structured text report suitable for terminal and log inspection.
 pub fn format_text(rep: &MemReport, top: usize) -> String {
+    format_text_with_options(
+        rep,
+        None,
+        &FormatOptions {
+            top,
+            ..Default::default()
+        },
+    )
+}
+
+/// Renders a structured text report with explicit filtering, sorting, histograms, and owner labels.
+pub fn format_text_with_options(rep: &MemReport, labels: Option<&LabelMap>, opts: &FormatOptions) -> String {
     let mut out = String::new();
     use std::fmt::Write;
+    let top = opts.top;
 
     let pid_str = rep.pid.map(|p| p.to_string()).unwrap_or_else(|| "all".into());
     let _ = writeln!(
@@ -526,6 +776,9 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
         "locum-mem ground-truth report | pid={pid_str} | thread_suspends={}",
         rep.thread_suspends
     );
+    for w in &rep.warnings {
+        let _ = writeln!(out, "  [warn] {w}");
+    }
 
     if let Some(ref w) = rep.win32 {
         let _ = writeln!(
@@ -563,14 +816,35 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
             mib(w.totals.write_combined_commit_bytes),
             mib(w.totals.reserve_bytes),
         );
+        // Backfill split for legacy JSONs that only serialized `paged_out_bytes`.
+        let (paged_priv, non_ws_mapped) = if w.totals.paged_out_private_bytes == 0
+            && w.totals.non_ws_mapped_bytes == 0
+            && w.totals.paged_out_bytes > 0
+        {
+            let mut pp = 0u64;
+            let mut nm = 0u64;
+            for r in &w.regions {
+                if r.committed {
+                    if r.mem_type == MemoryType::Private {
+                        pp += r.paged_out_bytes;
+                    } else {
+                        nm += r.paged_out_bytes;
+                    }
+                }
+            }
+            (pp, nm)
+        } else {
+            (w.totals.paged_out_private_bytes, w.totals.non_ws_mapped_bytes)
+        };
         let _ = writeln!(
             out,
-            "  VA Split              : RAM resident {:>9.2} MiB (priv {:.2}, shared {:.2}) | BAR/IO {:>8.2} MiB | paged-out {:>8.2} MiB | untouched {:>9.2} MiB",
+            "  VA Split              : RAM resident {:>9.2} MiB (priv {:.2}, shared {:.2}) | BAR/IO {:>8.2} MiB | paged-out priv {:>8.2} MiB | non-WS mapped/img {:>8.2} MiB | untouched {:>9.2} MiB",
             mib(w.totals.resident_bytes),
             mib(w.totals.resident_private_bytes),
             mib(w.totals.resident_shared_bytes),
             mib(w.totals.bar_mapped_bytes),
-            mib(w.totals.paged_out_bytes),
+            mib(paged_priv),
+            mib(non_ws_mapped),
             mib(w.totals.untouched_bytes),
         );
         let _ = writeln!(
@@ -584,6 +858,143 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
             mib(rep.conservation.vidmm_kernel_backing_estimate_bytes),
             mib(rep.conservation.os_private_usage_bytes),
         );
+
+        // Win32 committed allocations grouped by allocation_base: histogram + Top-N (especially valuable for `inspect`).
+        if !w.regions.is_empty() {
+            struct Win32AllocAgg {
+                base: u64,
+                commit: u64,
+                ram: u64,
+                bar: u64,
+                paged_priv: u64,
+                non_ws_mapped: u64,
+                untouched: u64,
+                mem_type: MemoryType,
+                wc: bool,
+                regions: usize,
+            }
+            let mut by_base: BTreeMap<u64, Win32AllocAgg> = BTreeMap::new();
+            for r in &w.regions {
+                if !r.committed {
+                    continue;
+                }
+                let e = by_base.entry(r.allocation_base).or_insert(Win32AllocAgg {
+                    base: r.allocation_base,
+                    commit: 0,
+                    ram: 0,
+                    bar: 0,
+                    paged_priv: 0,
+                    non_ws_mapped: 0,
+                    untouched: 0,
+                    mem_type: r.mem_type,
+                    wc: r.write_combined,
+                    regions: 0,
+                });
+                e.commit += r.size;
+                e.ram += r.resident_bytes;
+                e.bar += r.bar_mapped_bytes;
+                if r.mem_type == MemoryType::Private {
+                    e.paged_priv += r.paged_out_bytes;
+                } else {
+                    e.non_ws_mapped += r.paged_out_bytes;
+                }
+                e.untouched += r.untouched_bytes;
+                e.wc |= r.write_combined;
+                e.regions += 1;
+            }
+            if !by_base.is_empty() {
+                let mut hist: BTreeMap<&str, [(usize, u64); 7]> = BTreeMap::new();
+                for a in by_base.values() {
+                    let key = if a.wc {
+                        match a.mem_type {
+                            MemoryType::Private => "private_wc",
+                            MemoryType::Mapped => "mapped_wc",
+                            MemoryType::Image => "image",
+                            MemoryType::Other(_) => "other",
+                        }
+                    } else {
+                        a.mem_type.as_str()
+                    };
+                    let b = size_bucket_index(a.commit);
+                    let row = hist.entry(key).or_insert([(0, 0); 7]);
+                    row[b].0 += 1;
+                    row[b].1 += a.commit;
+                }
+                let _ = writeln!(out, "\n  Win32 Committed VA Size Histogram (by allocation_base):");
+                let _ = writeln!(
+                    out,
+                    "    {:<12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+                    "type",
+                    SIZE_BUCKETS[0],
+                    SIZE_BUCKETS[1],
+                    SIZE_BUCKETS[2],
+                    SIZE_BUCKETS[3],
+                    SIZE_BUCKETS[4],
+                    SIZE_BUCKETS[5],
+                    SIZE_BUCKETS[6]
+                );
+                for (ty, row) in &hist {
+                    let cells: Vec<String> = row
+                        .iter()
+                        .map(|&(n, b)| {
+                            if n == 0 {
+                                "-".into()
+                            } else {
+                                format!("{n}/{:.0}M", mib(b))
+                            }
+                        })
+                        .collect();
+                    let _ = writeln!(
+                        out,
+                        "    {:<12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+                        ty, cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6]
+                    );
+                }
+
+                if top > 0 && rep.etw.is_none() {
+                    let mut list: Vec<Win32AllocAgg> = by_base
+                        .into_values()
+                        .filter(|a| {
+                            opts.min_bytes.is_none_or(|m| a.commit >= m)
+                                && opts.max_bytes.is_none_or(|m| a.commit <= m)
+                        })
+                        .collect();
+                    list.sort_by_key(|a| std::cmp::Reverse(a.commit));
+                    let _ = writeln!(
+                        out,
+                        "\n  Top {} Win32 Committed Allocations ({} matching filter):",
+                        top.min(list.len()),
+                        list.len(),
+                    );
+                    let _ = writeln!(
+                        out,
+                        "    {:>9} {:>8} {:>8} {:>9} {:>9} {:>8} {:<10} {:>18} owner",
+                        "commit_M", "ram_M", "bar_M", "privpg_M", "mapnws_M", "untch_M", "type", "alloc_base"
+                    );
+                    for a in list.iter().take(top) {
+                        let ty = if a.wc {
+                            format!("{}_wc", a.mem_type.as_str())
+                        } else {
+                            a.mem_type.as_str().into()
+                        };
+                        let owner = labels.and_then(|l| l.owner_of(a.base)).unwrap_or("<unlabeled>");
+                        let _ = writeln!(
+                            out,
+                            "    {:>9.2} {:>8.2} {:>8.2} {:>9.2} {:>9.2} {:>8.2} {:<10} {:>18} {}",
+                            mib(a.commit),
+                            mib(a.ram),
+                            mib(a.bar),
+                            mib(a.paged_priv),
+                            mib(a.non_ws_mapped),
+                            mib(a.untouched),
+                            ty,
+                            format!("{:#x}", a.base),
+                            owner,
+                        );
+                    }
+                }
+            }
+        }
 
         if !w.video_memory.is_empty() {
             let _ = writeln!(out, "\n== Out-of-Process QueryVideoMemoryInfo (D3DKMT) ==");
@@ -622,7 +1033,12 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
             } else {
                 let _ = writeln!(out, "  Adapter-Wide Segments (all processes on adapter):");
             }
+            let mut hidden = 0usize;
             for s in &e.segments {
+                if !opts.all_segments && s.resident_samples == 0 && s.resident_last == 0 {
+                    hidden += 1;
+                    continue;
+                }
                 if s.described {
                     let _ = writeln!(
                         out,
@@ -651,6 +1067,12 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
                         s.resident_samples,
                     );
                 }
+            }
+            if hidden > 0 {
+                let _ = writeln!(
+                    out,
+                    "    ({hidden} inactive segment(s) with 0 samples hidden; pass --all-segments or --json to show)"
+                );
             }
             if e.adapter_segment_resident_bytes > 0 {
                 let _ = writeln!(
@@ -768,41 +1190,143 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
             let _ = writeln!(out, "  Capture Guidance      : {guidance}");
         }
 
+        if !e.allocations.is_empty() {
+            // Size histogram per placement (count/MiB per size class).
+            let mut hist: BTreeMap<&str, [(usize, u64); 7]> = BTreeMap::new();
+            let mut created_in_trace = 0usize;
+            let mut created_in_trace_bytes = 0u64;
+            for a in &e.allocations {
+                if a.page_table_or_dir {
+                    continue;
+                }
+                if a.created_during_trace {
+                    created_in_trace += 1;
+                    created_in_trace_bytes += a.size;
+                }
+                let pl = alloc_placement_label(e, a);
+                let b = size_bucket_index(a.size);
+                let row = hist.entry(pl).or_insert([(0, 0); 7]);
+                row[b].0 += 1;
+                row[b].1 += a.size;
+            }
+            if !hist.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "\n  VidMm Live Allocation Size Histogram (count/MiB; created during trace: {} allocs, {:.2} MiB):",
+                    created_in_trace,
+                    mib(created_in_trace_bytes),
+                );
+                let _ = writeln!(
+                    out,
+                    "    {:<15} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+                    "placement",
+                    SIZE_BUCKETS[0],
+                    SIZE_BUCKETS[1],
+                    SIZE_BUCKETS[2],
+                    SIZE_BUCKETS[3],
+                    SIZE_BUCKETS[4],
+                    SIZE_BUCKETS[5],
+                    SIZE_BUCKETS[6],
+                );
+                for (pl, row) in &hist {
+                    let cells: Vec<String> = row
+                        .iter()
+                        .map(|&(n, b)| {
+                            if n == 0 {
+                                "-".into()
+                            } else {
+                                format!("{n}/{:.0}M", mib(b))
+                            }
+                        })
+                        .collect();
+                    let _ = writeln!(
+                        out,
+                        "    {:<15} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12}",
+                        pl, cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6],
+                    );
+                }
+            }
+        }
+
         if !e.allocations.is_empty() && top > 0 {
+            let mut filtered: Vec<&VidMmAllocation> = e
+                .allocations
+                .iter()
+                .filter(|a| {
+                    !a.page_table_or_dir
+                        && alloc_matches_placement(e, a, opts.placement)
+                        && opts.min_bytes.is_none_or(|m| a.size >= m)
+                        && opts.max_bytes.is_none_or(|m| a.size <= m)
+                })
+                .collect();
+            match opts.sort {
+                AllocSort::Size => filtered.sort_by_key(|a| std::cmp::Reverse(a.size)),
+                AllocSort::Newest => filtered.sort_by(|x, y| {
+                    y.created_during_trace
+                        .cmp(&x.created_during_trace)
+                        .then_with(|| {
+                            y.first_seen_secs
+                                .unwrap_or(-1.0)
+                                .total_cmp(&x.first_seen_secs.unwrap_or(-1.0))
+                        })
+                        .then_with(|| y.size.cmp(&x.size))
+                }),
+                AllocSort::Oldest => filtered.sort_by(|x, y| {
+                    x.first_seen_secs
+                        .unwrap_or(f64::MAX)
+                        .total_cmp(&y.first_seen_secs.unwrap_or(f64::MAX))
+                        .then_with(|| y.size.cmp(&x.size))
+                }),
+            }
             let _ = writeln!(
                 out,
-                "\n  Top {} Live VidMm Allocations:",
-                top.min(e.allocations.len())
+                "\n  Top {} Live VidMm Allocations ({} matching filter, sorted by {}):",
+                top.min(filtered.len()),
+                filtered.len(),
+                opts.sort.as_str(),
             );
             let _ = writeln!(
                 out,
-                "  {:>10} {:>6} {:>6} {:>15} {:>7} {:>18} {:>18}",
-                "size_MiB", "pref", "actual", "placement", "demoted", "cpu_va", "gpu_va"
+                "  {:>10} {:>4} {:>4} {:<15} {:>8} {:>10} {:>18} {:>18} owner",
+                "size_MiB", "pref", "act", "placement", "t_s", "flags", "cpu_va", "gpu_va"
             );
-            for a in e.allocations.iter().take(top) {
+            for a in filtered.iter().take(top) {
                 let actual = a
                     .current_segment_id
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| "-".into());
-                let kind = a
-                    .current_segment_id
-                    .map(|s| e.segment_kind(a.adapter, s).as_str())
-                    .unwrap_or("unknown");
+                let kind = alloc_placement_label(e, a);
+                let ts = if a.created_during_trace {
+                    a.first_seen_secs
+                        .map(|t| format!("+{t:.2}s"))
+                        .unwrap_or_else(|| "new".into())
+                } else {
+                    "rundown".into()
+                };
                 let cpu = a.cpu_va.map(|v| format!("{v:#x}")).unwrap_or_else(|| "-".into());
                 let gpu = a
                     .gpu_va_start
                     .map(|v| format!("{v:#x}"))
                     .unwrap_or_else(|| "-".into());
+                let owner = labels
+                    .and_then(|l| {
+                        a.cpu_va
+                            .and_then(|va| l.owner_of(va))
+                            .or_else(|| a.gpu_va_start.and_then(|va| l.owner_of(va)))
+                    })
+                    .unwrap_or("<unlabeled>");
                 let _ = writeln!(
                     out,
-                    "  {:>10.2} {:>6} {:>6} {:>15} {:>7} {:>18} {:>18}",
+                    "  {:>10.2} {:>4} {:>4} {:<15} {:>8} {:>#10x} {:>18} {:>18} {}",
                     mib(a.size),
                     a.preferred_segment_id,
                     actual,
                     kind,
-                    if a.demoted { "YES" } else { "no" },
+                    ts,
+                    a.flags,
                     cpu,
                     gpu,
+                    owner,
                 );
             }
         }
@@ -816,6 +1340,7 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
     }
 
     if !rep.by_owner.is_empty() {
+        let has_win32 = rep.win32.is_some();
         let has_vidmm_allocs = rep
             .etw
             .as_ref()
@@ -832,14 +1357,17 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
             .clamp(22, 48);
 
         let _ = writeln!(out, "\n== Breakdown by Owner (--labels) ==");
-        if !has_vidmm_allocs || !has_hard_faults {
-            if rep.etw.is_none() {
+        if !has_win32 || !has_vidmm_allocs || !has_hard_faults {
+            if rep.etw.is_none() && has_win32 {
                 let _ = writeln!(
                     out,
                     "  (vram_M/host_M/demot_M/hfault = n/a: needs a live trace or --etl; run `locum-cli mem trace`)"
                 );
             } else {
                 let mut missing = Vec::new();
+                if !has_win32 {
+                    missing.push("commit_M..untch_M (no Win32 process snapshot)");
+                }
                 if !has_vidmm_allocs {
                     missing.push("vram_M/host_M/demot_M (no DxgKrnl allocation rundown)");
                 }
@@ -851,12 +1379,13 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
         }
         let _ = writeln!(
             out,
-            "  {:<owner_w$} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6}",
+            "  {:<owner_w$} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6}",
             "owner",
             "commit_M",
             "ram_M",
             "bar_M",
-            "paged_M",
+            "privpg_M",
+            "mapnws_M",
             "untch_M",
             "vram_M",
             "host_M",
@@ -865,6 +1394,25 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
             owner_w = owner_w,
         );
         for o in rep.by_owner.iter().take(limit) {
+            let (commit_s, ram_s, bar_s, privpg_s, mapnws_s, untch_s) = if has_win32 {
+                (
+                    format!("{:>8.2}", mib(o.va_commit_bytes)),
+                    format!("{:>8.2}", mib(o.resident_bytes)),
+                    format!("{:>8.2}", mib(o.bar_mapped_bytes)),
+                    format!("{:>8.2}", mib(o.paged_out_private_bytes)),
+                    format!("{:>8.2}", mib(o.non_ws_mapped_bytes)),
+                    format!("{:>8.2}", mib(o.untouched_bytes)),
+                )
+            } else {
+                (
+                    "     n/a".into(),
+                    "     n/a".into(),
+                    "     n/a".into(),
+                    "     n/a".into(),
+                    "     n/a".into(),
+                    "     n/a".into(),
+                )
+            };
             let (vram_s, host_s, demot_s) = if has_vidmm_allocs {
                 (
                     format!("{:>8.2}", mib(o.vidmm_local_bytes + o.vidmm_local_bar_bytes)),
@@ -881,13 +1429,14 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
             };
             let _ = writeln!(
                 out,
-                "  {:<owner_w$} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {} {} {} {}",
+                "  {:<owner_w$} {} {} {} {} {} {} {} {} {} {}",
                 o.owner,
-                mib(o.va_commit_bytes),
-                mib(o.resident_bytes),
-                mib(o.bar_mapped_bytes),
-                mib(o.paged_out_bytes),
-                mib(o.untouched_bytes),
+                commit_s,
+                ram_s,
+                bar_s,
+                privpg_s,
+                mapnws_s,
+                untch_s,
                 vram_s,
                 host_s,
                 demot_s,
@@ -1053,11 +1602,27 @@ mod tests {
     #[test]
     fn owner_breakdown_prints_na_without_etw() {
         let labels = LabelMap::parse("[0x1000..0x3000] -> outer_res\n0x2000\t0x2800\tinner_win\n").unwrap();
-        let rep = reconcile(None, None, &labels, None);
+        let snap = ProcessMemorySnapshot {
+            pid: 99,
+            page_size: 4096,
+            sample_step: 1,
+            thread_suspends: 0,
+            elapsed_ms: 1.0,
+            counters: Default::default(),
+            totals: Default::default(),
+            video_memory: Vec::new(),
+            regions: Vec::new(),
+        };
+        let rep = reconcile(Some(snap), None, &labels, None);
         let text = format_text(&rep, 25);
         assert!(text.contains("vram_M/host_M/demot_M/hfault = n/a: needs a live trace or --etl"));
         assert!(text.contains("outer_res"));
         assert!(text.contains("inner_win"));
         assert!(text.contains("     n/a      n/a      n/a    n/a"));
+
+        // Without Win32 snapshot (e.g. offline `mem etl`), CPU columns also print `n/a`.
+        let rep_no_win32 = reconcile(None, None, &labels, None);
+        let text_no_win32 = format_text(&rep_no_win32, 25);
+        assert!(text_no_win32.contains("commit_M..untch_M (no Win32 process snapshot)"));
     }
 }

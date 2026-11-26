@@ -12,6 +12,7 @@
 //!    `capture.db`'s `d12_draw_descriptors` table.
 
 pub mod capture_join;
+pub mod diff;
 pub mod etw;
 pub mod labels;
 pub mod reconcile;
