@@ -115,4 +115,4 @@ are described in [docs/README.md](docs/README.md).
 `cargo xtask smoke` runs the Direct3D 11 test programs through locum and verifies their captures on the GPU and WARP.
 `cargo xtask smoke --api d3d12` does the same for Direct3D 12, and `bun test` runs the viewer's tests.
 [docs/README.md](docs/README.md) is the full reference, and [viewer/README.md](viewer/README.md) covers the viewer.
-locum is licensed under [GPL-3.0-or-later](LICENSE). [CONTRIBUTING.md](CONTRIBUTING.md) describes how releases are made.
+locum is licensed under the [MIT License](LICENSE). [CONTRIBUTING.md](CONTRIBUTING.md) describes how releases are made.

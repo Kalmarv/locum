@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Licence: locum is now under the MIT License (was GPL-3.0-or-later), so other projects of any licence can use and
+  build on it.
 - Direct3D 12 replay: with `--times FILE`, `verify` and `replay` time every draw, dispatch and ExecuteIndirect they
   run on the GPU: a timestamp before and after the call (inside replay's barriers), and a tab-separated row per op
   appended to the file when its list has run: event, draw, call, arguments, program (the compute shader's hash, else
