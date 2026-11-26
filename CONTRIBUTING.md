@@ -2,11 +2,13 @@
 
 ## Before pushing
 
-Besides `cargo fmt`, `cargo clippy --workspace --all-targets` and `cargo test --workspace`, run the slim shader set
-through locum's shader reading, with `GAME_DATA` naming a real-data configuration whose `[run] require = 'gate'`:
-`cargo test --locked -p locum-capture slim -- --nocapture`. It reads primase-testdata's `oracles.corpus.general/slim`
-(8,287 programs; tests/inputs/README.md in `capture`) and prints how many programs read by each path; quote those
-counts in the push report. Without `GAME_DATA` it skips, which is what GitHub's CI runs.
+Run `cargo fmt`, `cargo clippy --workspace --all-targets` and `cargo test --workspace`, which is what GitHub's CI
+runs.
+
+Optional, for a change to shader reading when you have the data: the slim shader set, with `GAME_DATA` naming a
+real-data configuration whose `[run] require = 'gate'`: `cargo test --locked -p locum-capture slim -- --nocapture`. It
+reads primase-testdata's `oracles.corpus.general/slim` (8,287 programs; tests/inputs/README.md in `capture`) and prints
+how many programs read by each path. Without `GAME_DATA` it skips.
 
 ## Releasing
 
