@@ -88,6 +88,9 @@ impl SegmentKind {
 pub struct SegmentInfo {
     pub adapter: u64,
     pub segment_id: u32,
+    /// True if `ReportSegment` (id=78) supplied size/flags/group; false if synthesized only from
+    /// `TotalBytesResidentInSegment` (id=274).
+    pub described: bool,
     pub size: u64,
     pub commit_limit: u64,
     pub flags: u32,
@@ -96,7 +99,7 @@ pub struct SegmentInfo {
     pub cpu_visible: bool,
     pub populated_from_system_memory: bool,
     pub kind: SegmentKind,
-    /// Last/min/max bytes resident reported by `TotalBytesResidentInSegment` (adapter-wide).
+    /// Last/min/max bytes resident reported by `TotalBytesResidentInSegment` (adapter-wide, all processes).
     pub resident_last: u64,
     pub resident_min: u64,
     pub resident_max: u64,
@@ -199,6 +202,44 @@ pub struct PagingActivity {
     pub reserve_resource_by_segment: BTreeMap<u32, u64>,
 }
 
+/// Evidence/provider coverage observed in an ETW trace so reports distinguish true zeroes from
+/// unavailable metrics (missing rundown, keywords, or kernel providers).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TraceCoverage {
+    /// Count of `ReportSegment` (id=78) events defining segment size, flags, and Local vs NonLocal kind.
+    pub segment_descriptor_events: u64,
+    /// Count of adapter-wide `TotalBytesResidentInSegment` (id=274) residency samples.
+    pub segment_residency_events: u64,
+    /// Count of allocation creation/rundown events (`AdapterAllocation`/`DeviceAllocation`/`ReportCommitted*`).
+    pub allocation_rundown_events: u64,
+    /// Count of per-process VidMm counter events (`VidMmProcessBudget/Usage/Demoted/CommitmentChange`).
+    pub process_counter_events: u64,
+    /// Count of GPU VA mapping / `UpdateGpuVirtualAddress` events (`333/334/435/512`).
+    pub gpu_va_events: u64,
+    /// Count of `SystemMemoryProvider` or classic `PageFault` events.
+    pub hard_fault_provider_events: u64,
+    /// Set during live `TraceSession` capture; `None` for offline `.etl` files.
+    pub hard_fault_provider_enabled: Option<bool>,
+    /// True if `ReportSegment` (id=78) defined segment types/sizes.
+    pub has_segment_descriptions: bool,
+    /// True if per-allocation rundown/lifecycle events are present.
+    pub has_allocation_rundown: bool,
+    /// True if per-process VidMm commitment/usage/demotion counters are present.
+    pub has_process_counters: bool,
+    /// True if GPU VA mapping or `UpdateTileMappings` events are present.
+    pub has_gpu_va_events: bool,
+    /// True if hard-fault visibility is available (enabled in live trace or events observed in `.etl`).
+    pub hard_faults_available: bool,
+    /// True if this trace has enough segment + allocation evidence to identify which heap was demoted.
+    pub can_attribute_heap_demotion: bool,
+    /// When `filter_pid` is set and allocation rundown is absent/incomplete, count of handle-keyed VidMm
+    /// paging events (`PageIn`/`Evict`/`AllocFault`/`Migrate`/`ResetBacking`/`ReserveResource`) that
+    /// could not be attributed to any PID.
+    pub unattributed_handle_paging_events: u64,
+    /// Suggested capture flags/command when rundown or providers are missing.
+    pub capture_guidance: Option<String>,
+}
+
 /// Full parsed ETW report for a trace (optionally filtered to `filter_pid`).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct EtwReport {
@@ -208,13 +249,20 @@ pub struct EtwReport {
     pub dxgkrnl_events: u64,
     pub system_memory_events: u64,
     pub duration_secs: f64,
+    pub coverage: TraceCoverage,
     pub warnings: Vec<String>,
+    /// Adapter-wide segments (residency samples span all processes on the adapter, not just `filter_pid`).
     pub segments: Vec<SegmentInfo>,
+    /// Sum of `resident_last` across adapter-wide segments (all processes on the adapter, not PID-filtered).
+    pub adapter_segment_resident_bytes: u64,
     pub process_counters: BTreeMap<u32, ProcessVidMmCounters>,
     pub allocations: Vec<VidMmAllocation>,
     pub gpu_va_mappings: Vec<GpuVaMapping>,
     pub tile_mappings: TileMappingSummary,
     pub paging: PagingActivity,
+    /// When `filter_pid` is set, handle-keyed VidMm paging events whose allocation handle had no rundown entry
+    /// (and therefore could not be attributed to any PID).
+    pub unattributed_paging: Option<PagingActivity>,
     pub hard_faults: HardFaultSummary,
     /// Aggregate bytes of live tracked allocations (for `filter_pid` if set, else all PIDs).
     pub tracked_local_vram_bytes: u64,
@@ -254,6 +302,81 @@ impl EtwReport {
         }
         SegmentKind::Unknown
     }
+
+    /// Recomputes trace coverage flags, diagnostic warnings, and capture guidance.
+    pub fn refresh_coverage_diagnostics(&mut self) {
+        self.coverage.has_segment_descriptions = self.coverage.segment_descriptor_events > 0;
+        self.coverage.has_allocation_rundown = self.coverage.allocation_rundown_events > 0;
+        self.coverage.has_process_counters = self.coverage.process_counter_events > 0;
+        self.coverage.has_gpu_va_events = self.coverage.gpu_va_events > 0;
+        self.coverage.hard_faults_available = self.coverage.hard_fault_provider_events > 0
+            || self.coverage.hard_fault_provider_enabled == Some(true);
+        self.coverage.can_attribute_heap_demotion =
+            self.coverage.has_segment_descriptions && self.coverage.has_allocation_rundown;
+
+        self.warnings.clear();
+
+        let needs_dxg_guidance = !self.coverage.has_segment_descriptions
+            || !self.coverage.has_allocation_rundown
+            || !self.coverage.has_process_counters;
+
+        if !self.coverage.has_segment_descriptions && !self.segments.is_empty() {
+            self.warnings.push(
+                "No DxgKrnl ReportSegment (id=78) rundown events in trace: segment sizes, flags, and Local vs NonLocal types are unknown (segment residency totals are adapter-wide across all processes)."
+                    .into(),
+            );
+        }
+        if self.dxgkrnl_events > 0 && !self.coverage.has_allocation_rundown {
+            self.warnings.push(
+                "No DxgKrnl allocation rundown/lifecycle events (AdapterAllocation/DeviceAllocation/ReportCommitted) in trace: per-allocation tracking, per-heap demotion attribution, and VidMm allocation conservation are unavailable."
+                    .into(),
+            );
+        }
+        if let Some(pid) = self.filter_pid
+            && self.coverage.unattributed_handle_paging_events > 0
+        {
+            self.warnings.push(format!(
+                "PID {pid} filter active without allocation rundown: {} handle-keyed VidMm paging events (PageIn/Evict/AllocFault/Migrate/ResetBacking/ReserveResource) could not be attributed to any PID; PID-filtered paging counts only include thread-context calls (MakeResident/VidMmEvict/PagingQueuePackets).",
+                self.coverage.unattributed_handle_paging_events
+            ));
+        }
+        if self.dxgkrnl_events > 0 && !self.coverage.has_process_counters {
+            self.warnings.push(
+                "No per-process VidMm counter events (VidMmProcessUsageChange/CommitmentChange/DemotedCommitmentChange) in trace: process-level VidMm commitment and demotion totals are unavailable."
+                    .into(),
+            );
+        }
+        if !self.coverage.hard_faults_available {
+            self.warnings.push(
+                "No SystemMemoryProvider ({82958CA9-9C6D-490D-8364-592E28955110}, kw 0x2000) or classic PageFault events in trace: kernel hard-fault counts are unavailable (not proven zero)."
+                    .into(),
+            );
+        }
+
+        self.coverage.capture_guidance = if needs_dxg_guidance || !self.coverage.hard_faults_available {
+            let pid_arg = self
+                .filter_pid
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "<PID>".into());
+            Some(format!(
+                "For per-allocation placement, segment types, heap demotion attribution, and hard faults, capture with `locum-cli mem trace --pid {pid_arg}` (enables Microsoft-Windows-DxgKrnl keywords {DXGKRNL_KEYWORDS_DEFAULT:#010x} [Base 0x1 | References 0x4 | Resource 0x40 | Memory 0x80 | GPUVA 0x100000] + EVENT_CONTROL_CODE_CAPTURE_STATE rundown, and SystemMemoryProvider {{82958CA9-9C6D-490D-8364-592E28955110}} keyword {SYSTEM_MEMORY_KW_HARD_FAULTS:#x})."
+            ))
+        } else {
+            None
+        };
+    }
+
+    /// Applies live `TraceSession` provider status (so a live trace where `SystemMemoryProvider` was
+    /// enabled with 0 faults reports `0 faults` rather than `unavailable`) and appends session warnings.
+    pub fn apply_live_session_metadata(
+        &mut self,
+        hard_fault_provider_enabled: bool,
+        session_warnings: Vec<String>,
+    ) {
+        self.coverage.hard_fault_provider_enabled = Some(hard_fault_provider_enabled);
+        self.refresh_coverage_diagnostics();
+        self.warnings.extend(session_warnings);
+    }
 }
 
 /// Live ETW session guard. Automatically stops the session on `Drop`.
@@ -262,6 +385,7 @@ pub struct TraceSession {
     etl_path: PathBuf,
     handle: CONTROLTRACE_HANDLE,
     active: bool,
+    pub hard_fault_provider_enabled: bool,
     pub warnings: Vec<String>,
 }
 
@@ -330,6 +454,7 @@ impl TraceSession {
             etl_path: opts.etl_path,
             handle,
             active: true,
+            hard_fault_provider_enabled: false,
             warnings: Vec::new(),
         };
 
@@ -395,6 +520,8 @@ impl TraceSession {
                     "SystemMemoryProvider HardFaults enable returned Win32 error {} (falling back to GetProcessMemoryInfo PageFaultCount)",
                     e_hf.0
                 ));
+            } else {
+                sess.hard_fault_provider_enabled = true;
             }
         }
 
@@ -692,7 +819,9 @@ struct ParserState {
     process_counters: BTreeMap<u32, ProcessVidMmCounters>,
     tile_mappings: TileMappingSummary,
     paging: PagingActivity,
+    unattributed_paging: PagingActivity,
     hard_faults: HardFaultSummary,
+    coverage: TraceCoverage,
 }
 
 impl ParserState {
@@ -715,7 +844,9 @@ impl ParserState {
             process_counters: BTreeMap::new(),
             tile_mappings: TileMappingSummary::default(),
             paging: PagingActivity::default(),
+            unattributed_paging: PagingActivity::default(),
             hard_faults: HardFaultSummary::default(),
+            coverage: TraceCoverage::default(),
         }
     }
 
@@ -851,6 +982,7 @@ impl ParserState {
             }
             // ReportSegment (defines segment IDs and Local vs NonLocal / CpuVisible / Aperture)
             78 => {
+                self.coverage.segment_descriptor_events += 1;
                 let seg_id = schema.get_u64(data, "ulSegmentId").unwrap_or(0) as u32;
                 let adapter = schema.get_u64(data, "pDxgAdapter").unwrap_or(0);
                 let size = schema.get_u64(data, "Size").unwrap_or(0);
@@ -864,6 +996,7 @@ impl ParserState {
                     .or_insert_with(|| SegmentInfo {
                         adapter,
                         segment_id: seg_id,
+                        described: true,
                         size,
                         commit_limit,
                         flags,
@@ -877,6 +1010,7 @@ impl ParserState {
                         resident_max: 0,
                         resident_samples: 0,
                     });
+                entry.described = true;
                 entry.size = size;
                 entry.commit_limit = commit_limit;
                 entry.flags = flags;
@@ -888,6 +1022,7 @@ impl ParserState {
             }
             // TotalBytesResidentInSegment
             274 => {
+                self.coverage.segment_residency_events += 1;
                 let adapter = schema.get_u64(data, "DxgAdapter").unwrap_or(0);
                 let seg_id = schema.get_u64(data, "SegmentId").unwrap_or(0) as u32;
                 let bytes = schema.get_u64(data, "TotalBytesResident").unwrap_or(0);
@@ -897,6 +1032,7 @@ impl ParserState {
                     .or_insert_with(|| SegmentInfo {
                         adapter,
                         segment_id: seg_id,
+                        described: false,
                         size: 0,
                         commit_limit: 0,
                         flags: 0,
@@ -921,6 +1057,9 @@ impl ParserState {
             }
             // AdapterAllocation Start (33) / Stop (34) / DC_Start (35)
             33..=35 => {
+                if id != 34 {
+                    self.coverage.allocation_rundown_events += 1;
+                }
                 let gh = schema.get_u64(data, "hVidMmGlobalAlloc").unwrap_or(0);
                 if gh == 0 {
                     return;
@@ -993,6 +1132,9 @@ impl ParserState {
             }
             // DeviceAllocation Start (36) / Stop (37) / DC_Start (38)
             36..=38 => {
+                if id != 37 {
+                    self.coverage.allocation_rundown_events += 1;
+                }
                 let h_alloc = schema.get_u64(data, "hVidMmAlloc").unwrap_or(0);
                 let gh = schema.get_u64(data, "hVidMmGlobalAlloc").unwrap_or(0);
                 if h_alloc != 0 && gh != 0 {
@@ -1029,6 +1171,7 @@ impl ParserState {
             }
             // ReportCommittedAllocation (80) & ReportCommittedGlobalAllocation (227)
             80 | 227 => {
+                self.coverage.allocation_rundown_events += 1;
                 let gh_raw = schema
                     .get_any_u64(data, &["hGlobalAllocationHandle", "hAllocationHandle"])
                     .unwrap_or(0);
@@ -1079,10 +1222,12 @@ impl ParserState {
                     .unwrap_or(0);
                 let gh = self.alloc_to_global.get(&gh_raw).copied().unwrap_or(gh_raw);
                 let mut count_it = self.filter_pid.is_none();
+                let mut known_alloc = false;
                 let filter_pid = self.filter_pid;
                 if gh != 0
                     && let Some(a) = self.allocs.get_mut(&gh)
                 {
+                    known_alloc = true;
                     a.current_segment_id = Some(seg_id);
                     a.evicted = false;
                     if filter_pid.is_none_or(|p| p == a.pid) {
@@ -1092,6 +1237,14 @@ impl ParserState {
                 if count_it {
                     self.paging.reserve_resource_calls += 1;
                     *self.paging.reserve_resource_by_segment.entry(seg_id).or_insert(0) += 1;
+                } else if filter_pid.is_some() && !known_alloc {
+                    self.coverage.unattributed_handle_paging_events += 1;
+                    self.unattributed_paging.reserve_resource_calls += 1;
+                    *self
+                        .unattributed_paging
+                        .reserve_resource_by_segment
+                        .entry(seg_id)
+                        .or_insert(0) += 1;
                 }
             }
             // PageInAllocation (73)
@@ -1100,10 +1253,12 @@ impl ParserState {
                 let gh = self.alloc_to_global.get(&h).copied().unwrap_or(h);
                 let seg_opt = schema.get_u64(data, "uiSegmentId").map(|v| v as u32);
                 let mut matched = self.filter_pid.is_none();
+                let mut known_alloc = false;
                 let filter_pid = self.filter_pid;
                 if gh != 0
                     && let Some(a) = self.allocs.get_mut(&gh)
                 {
+                    known_alloc = true;
                     if let Some(s) = seg_opt {
                         a.current_segment_id = Some(s);
                     }
@@ -1115,6 +1270,9 @@ impl ParserState {
                 }
                 if matched {
                     self.paging.page_in_allocations += 1;
+                } else if filter_pid.is_some() && !known_alloc {
+                    self.coverage.unattributed_handle_paging_events += 1;
+                    self.unattributed_paging.page_in_allocations += 1;
                 }
             }
             // EvictAllocation (74)
@@ -1122,10 +1280,12 @@ impl ParserState {
                 let gh_raw = schema.get_u64(data, "hGlobalAllocationHandle").unwrap_or(0);
                 let gh = self.alloc_to_global.get(&gh_raw).copied().unwrap_or(gh_raw);
                 let mut matched = self.filter_pid.is_none();
+                let mut known_alloc = false;
                 let filter_pid = self.filter_pid;
                 if gh != 0
                     && let Some(a) = self.allocs.get_mut(&gh)
                 {
+                    known_alloc = true;
                     a.evicted = true;
                     a.evict_count += 1;
                     if filter_pid.is_none_or(|p| p == a.pid) {
@@ -1134,6 +1294,9 @@ impl ParserState {
                 }
                 if matched {
                     self.paging.evict_allocations += 1;
+                } else if filter_pid.is_some() && !known_alloc {
+                    self.coverage.unattributed_handle_paging_events += 1;
+                    self.unattributed_paging.evict_allocations += 1;
                 }
             }
             // AllocationFault (71)
@@ -1143,10 +1306,12 @@ impl ParserState {
                     .unwrap_or(0);
                 let gh = self.alloc_to_global.get(&h).copied().unwrap_or(h);
                 let mut matched = self.filter_pid.is_none();
+                let mut known_alloc = false;
                 let filter_pid = self.filter_pid;
                 if gh != 0
                     && let Some(a) = self.allocs.get_mut(&gh)
                 {
+                    known_alloc = true;
                     a.fault_count += 1;
                     if filter_pid.is_none_or(|p| p == a.pid) {
                         matched = true;
@@ -1154,15 +1319,21 @@ impl ParserState {
                 }
                 if matched {
                     self.paging.allocation_faults += 1;
+                } else if filter_pid.is_some() && !known_alloc {
+                    self.coverage.unattributed_handle_paging_events += 1;
+                    self.unattributed_paging.allocation_faults += 1;
                 }
             }
             // MigrateAllocation
             47 => {
                 let h = schema.get_u64(data, "hAllocationGlobalHandle").unwrap_or(0);
-                let matched =
-                    self.filter_pid.is_none() || self.allocs.get(&h).is_some_and(|a| self.matches_pid(a.pid));
+                let alloc = self.allocs.get(&h);
+                let matched = self.filter_pid.is_none() || alloc.is_some_and(|a| self.matches_pid(a.pid));
                 if matched {
                     self.paging.migrate_allocations += 1;
+                } else if self.filter_pid.is_some() && alloc.is_none() {
+                    self.coverage.unattributed_handle_paging_events += 1;
+                    self.unattributed_paging.migrate_allocations += 1;
                 }
             }
             // VidMmMakeResident (320/374) / MakeResident (338)
@@ -1180,11 +1351,16 @@ impl ParserState {
             // ResetBackingStore (242)
             242 => {
                 let h = schema.get_u64(data, "hGlobalAllocationHandle").unwrap_or(0);
-                let matched =
-                    self.filter_pid.is_none() || self.allocs.get(&h).is_some_and(|a| self.matches_pid(a.pid));
+                let pages = schema.get_u64(data, "cPages").unwrap_or(0);
+                let alloc = self.allocs.get(&h);
+                let matched = self.filter_pid.is_none() || alloc.is_some_and(|a| self.matches_pid(a.pid));
                 if matched {
                     self.paging.reset_backing_store_calls += 1;
-                    self.paging.reset_backing_store_pages += schema.get_u64(data, "cPages").unwrap_or(0);
+                    self.paging.reset_backing_store_pages += pages;
+                } else if self.filter_pid.is_some() && alloc.is_none() {
+                    self.coverage.unattributed_handle_paging_events += 1;
+                    self.unattributed_paging.reset_backing_store_calls += 1;
+                    self.unattributed_paging.reset_backing_store_pages += pages;
                 }
             }
             // PagingQueuePacket Start (322/323)
@@ -1195,6 +1371,7 @@ impl ParserState {
             }
             // VidMmProcessBudgetChange (366)
             366 => {
+                self.coverage.process_counter_events += 1;
                 let pid = schema.get_u64(data, "ProcessId").unwrap_or(0) as u32;
                 if pid != 0 && self.matches_pid(pid) {
                     let group = schema.get_u64(data, "MemorySegmentGroup").unwrap_or(0);
@@ -1215,6 +1392,7 @@ impl ParserState {
             }
             // VidMmProcessUsageChange (367)
             367 => {
+                self.coverage.process_counter_events += 1;
                 let pid = schema.get_u64(data, "ProcessId").unwrap_or(0) as u32;
                 if pid != 0 && self.matches_pid(pid) {
                     let group = schema.get_u64(data, "MemorySegmentGroup").unwrap_or(0);
@@ -1237,6 +1415,7 @@ impl ParserState {
             }
             // VidMmProcessDemotedCommitmentChange (370)
             370 => {
+                self.coverage.process_counter_events += 1;
                 let pid = schema.get_u64(data, "ProcessId").unwrap_or(0) as u32;
                 if pid != 0 && self.matches_pid(pid) {
                     let commit = schema.get_u64(data, "Commitment").unwrap_or(0);
@@ -1253,6 +1432,7 @@ impl ParserState {
             }
             // VidMmProcessCommitmentChange (371)
             371 => {
+                self.coverage.process_counter_events += 1;
                 let pid = schema.get_u64(data, "ProcessId").unwrap_or(0) as u32;
                 if pid != 0 && self.matches_pid(pid) {
                     let group = schema.get_u64(data, "MemorySegmentGroup").unwrap_or(0);
@@ -1273,6 +1453,7 @@ impl ParserState {
             }
             // GpuVirtualAddressAllocator DC_Start/Start (335/336)
             335 | 336 => {
+                self.coverage.gpu_va_events += 1;
                 if let Some(va_alloc) = schema.get_any_u64(data, &["pVaAllocator", "pGpuVaAllocator"]) {
                     let pid = schema
                         .get_any_u64(data, &["ProcessId", "hProcessId"])
@@ -1286,6 +1467,7 @@ impl ParserState {
             }
             // GpuVirtualAddressRangeMapping DC_Start (333) / Start (334) / Stop (435)
             333 | 334 | 435 => {
+                self.coverage.gpu_va_events += 1;
                 let start = schema.get_u64(data, "StartAddress").unwrap_or(0);
                 let end = schema.get_u64(data, "EndAddress").unwrap_or(0);
                 let owner = schema.get_u64(data, "pOwner").unwrap_or(0);
@@ -1321,6 +1503,7 @@ impl ParserState {
             }
             // UpdateGpuVirtualAddress (512) — D3D12 UpdateTileMappings
             512 => {
+                self.coverage.gpu_va_events += 1;
                 let num_ops = schema.get_u64(data, "NumOperations").unwrap_or(1);
                 let pid = hdr_pid;
                 if self.matches_pid(pid) {
@@ -1393,7 +1576,24 @@ impl ParserState {
         }
     }
 
-    fn finish(self, etl_path: &Path) -> EtwReport {
+    fn finish(mut self, etl_path: &Path) -> EtwReport {
+        self.coverage.hard_fault_provider_events = self.system_memory_events;
+        let segments: Vec<SegmentInfo> = self
+            .segments
+            .into_values()
+            .map(|mut s| {
+                if s.resident_samples == 0 {
+                    s.resident_min = 0;
+                }
+                s
+            })
+            .collect();
+        let adapter_segment_resident_bytes: u64 = segments.iter().map(|s| s.resident_last).sum();
+        let unattributed_paging = if self.coverage.unattributed_handle_paging_events > 0 {
+            Some(self.unattributed_paging)
+        } else {
+            None
+        };
         let mut rep = EtwReport {
             etl_path: etl_path.display().to_string(),
             filter_pid: self.filter_pid,
@@ -1404,22 +1604,16 @@ impl ParserState {
                 (Some(a), Some(b)) if b > a => (b - a) as f64 / 1e7,
                 _ => 0.0,
             },
+            coverage: self.coverage,
             warnings: Vec::new(),
-            segments: self
-                .segments
-                .into_values()
-                .map(|mut s| {
-                    if s.resident_samples == 0 {
-                        s.resident_min = 0;
-                    }
-                    s
-                })
-                .collect(),
+            segments,
+            adapter_segment_resident_bytes,
             process_counters: self.process_counters,
             allocations: Vec::new(),
             gpu_va_mappings: Vec::new(),
             tile_mappings: self.tile_mappings,
             paging: self.paging,
+            unattributed_paging,
             hard_faults: self.hard_faults,
             ..Default::default()
         };
@@ -1525,6 +1719,7 @@ impl ParserState {
 
         allocs.sort_by_key(|a| std::cmp::Reverse(a.size));
         rep.allocations = allocs;
+        rep.refresh_coverage_diagnostics();
         rep
     }
 }

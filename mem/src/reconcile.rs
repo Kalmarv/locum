@@ -68,9 +68,17 @@ pub struct ConservationSummary {
     pub etw_process_local_commitment: Option<u64>,
     pub etw_process_non_local_commitment: Option<u64>,
     pub etw_process_demoted_commitment: Option<u64>,
+    /// Adapter-wide sum of `TotalBytesResidentInSegment.resident_last` across all processes on the adapter
+    /// (explicitly separate from PID-attributed VidMm conservation).
+    pub adapter_segment_resident_bytes: u64,
     pub vidmm_accounted_bytes: u64,
     pub vidmm_reference_bytes: u64,
     pub vidmm_accounted_pct: Option<f64>,
+    /// Scope of `vidmm_accounted_pct` (e.g. `pid_allocations_vs_qvmi`, `pid_allocations_vs_process_counters`,
+    /// or `unavailable` when allocation/process rundown is missing).
+    pub vidmm_conservation_scope: String,
+    /// Explanation when `vidmm_accounted_pct` is `None`.
+    pub vidmm_conservation_unavailable_reason: Option<String>,
 }
 
 /// Unified ground-truth memory report combining Win32 inspection, ETW VidMm/HardFaults, labels, and capture join.
@@ -396,8 +404,9 @@ pub fn reconcile(
     }
 
     // Compute GPU VidMm conservation:
-    // Compare tracked live allocations (Local + BAR + NonLocal + Unknown) against reference
-    // (`QVMI Local + NonLocal`, or ETW `VidMmProcessCommitmentChange` / `TotalBytesResidentInSegment`).
+    // Compare tracked live allocations (Local + BAR + NonLocal + Unknown) against an independent reference
+    // (`QVMI Local + NonLocal`, or ETW `VidMmProcessCommitmentChange`).
+    // Never divide adapter-wide `TotalBytesResidentInSegment` by itself to fake 100% conservation!
     if let Some(ref e) = etw {
         let etw_tracked = e.tracked_total_bytes;
         let etw_proc_total = match (
@@ -409,32 +418,65 @@ pub fn reconcile(
             (None, Some(n)) => n,
             (None, None) => 0,
         };
-        let seg_resident_total: u64 = e.segments.iter().map(|s| s.resident_last).sum();
+        let seg_resident_total = e.adapter_segment_resident_bytes;
+        cons.adapter_segment_resident_bytes = seg_resident_total;
 
         if cons.qvmi_total_bytes > 0 {
             cons.vidmm_reference_bytes = cons.qvmi_total_bytes;
-            cons.vidmm_accounted_bytes = if etw_tracked > 0 {
-                etw_tracked
+            if etw_tracked > 0 {
+                cons.vidmm_accounted_bytes = etw_tracked;
+                cons.vidmm_accounted_pct = Some(pct(cons.vidmm_accounted_bytes, cons.vidmm_reference_bytes));
+                cons.vidmm_conservation_scope = "pid_allocations_vs_qvmi".into();
             } else if etw_proc_total > 0 {
-                etw_proc_total
+                cons.vidmm_accounted_bytes = etw_proc_total;
+                cons.vidmm_accounted_pct = Some(pct(cons.vidmm_accounted_bytes, cons.vidmm_reference_bytes));
+                cons.vidmm_conservation_scope = "pid_process_counters_vs_qvmi".into();
             } else {
-                0
-            };
-            cons.vidmm_accounted_pct = Some(pct(cons.vidmm_accounted_bytes, cons.vidmm_reference_bytes));
-        } else if etw_proc_total > 0 {
+                cons.vidmm_accounted_bytes = 0;
+                cons.vidmm_accounted_pct = None;
+                cons.vidmm_conservation_scope = "unavailable".into();
+                cons.vidmm_conservation_unavailable_reason = Some(
+                    "no per-allocation or per-process VidMm rundown in trace to reconcile against QueryVideoMemoryInfo"
+                        .into(),
+                );
+            }
+        } else if etw_proc_total > 0 && etw_tracked > 0 {
             cons.vidmm_reference_bytes = etw_proc_total;
-            cons.vidmm_accounted_bytes = if etw_tracked > 0 {
-                etw_tracked
-            } else {
-                etw_proc_total
-            };
+            cons.vidmm_accounted_bytes = etw_tracked;
             cons.vidmm_accounted_pct = Some(pct(cons.vidmm_accounted_bytes, cons.vidmm_reference_bytes));
-        } else if seg_resident_total > 0 {
-            // Existing ETL recorded without Resource/DC_Start (e.g. dxgetl.ps1 with Base|Memory):
-            // TotalBytesResidentInSegment directly accounts for adapter-wide segment residency.
-            cons.vidmm_reference_bytes = seg_resident_total;
-            cons.vidmm_accounted_bytes = seg_resident_total;
-            cons.vidmm_accounted_pct = Some(100.0);
+            cons.vidmm_conservation_scope = if pid.is_some() {
+                "pid_allocations_vs_process_counters".into()
+            } else {
+                "all_pids_allocations_vs_process_counters".into()
+            };
+        } else {
+            cons.vidmm_reference_bytes = 0;
+            cons.vidmm_accounted_bytes = etw_tracked;
+            cons.vidmm_accounted_pct = None;
+            cons.vidmm_conservation_scope = "unavailable".into();
+            let reason = if !e.coverage.has_allocation_rundown && !e.coverage.has_process_counters {
+                if seg_resident_total > 0 {
+                    format!(
+                        "no per-allocation or per-process VidMm rundown in trace (only adapter-wide segment residency total {:.2} MiB across all processes is present)",
+                        mib(seg_resident_total)
+                    )
+                } else {
+                    "no per-allocation or per-process VidMm rundown in trace".into()
+                }
+            } else if !e.coverage.has_allocation_rundown {
+                "no per-allocation VidMm rundown in trace (process counters present, but individual allocations/heaps are untracked)".into()
+            } else {
+                "no QueryVideoMemoryInfo or per-process VidMm commitment reference available for this PID"
+                    .into()
+            };
+            cons.vidmm_conservation_unavailable_reason = Some(reason);
+        }
+    } else {
+        cons.vidmm_conservation_scope = "unavailable".into();
+        if cons.qvmi_total_bytes > 0 {
+            cons.vidmm_reference_bytes = cons.qvmi_total_bytes;
+            cons.vidmm_conservation_unavailable_reason =
+                Some("no DxgKrnl ETW trace supplied to reconcile against QueryVideoMemoryInfo".into());
         }
     }
 
@@ -572,72 +614,159 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
             let _ = writeln!(out, "  [warn] {w}");
         }
         if !e.segments.is_empty() {
-            let _ = writeln!(out, "  Segments:");
-            for s in &e.segments {
+            if let Some(pid) = rep.pid {
                 let _ = writeln!(
                     out,
-                    "    seg {:<2} adapter={:#x} {:<15} size={:>8.1} MiB  flags={:#010x} grp={} resident_last={:>8.1} MiB (min {:.1}, max {:.1}, n={})",
-                    s.segment_id,
-                    s.adapter,
-                    s.kind.as_str(),
-                    mib(s.size),
-                    s.flags,
-                    s.memory_segment_group,
-                    mib(s.resident_last),
-                    mib(s.resident_min),
-                    mib(s.resident_max),
-                    s.resident_samples,
+                    "  Adapter-Wide Segments (all processes on adapter; NOT filtered to pid={pid}):"
+                );
+            } else {
+                let _ = writeln!(out, "  Adapter-Wide Segments (all processes on adapter):");
+            }
+            for s in &e.segments {
+                if s.described {
+                    let _ = writeln!(
+                        out,
+                        "    seg {:<2} adapter={:#x} {:<15} size={:>8.1} MiB  flags={:#010x} grp={} resident_last={:>8.1} MiB (min {:.1}, max {:.1}, n={})",
+                        s.segment_id,
+                        s.adapter,
+                        s.kind.as_str(),
+                        mib(s.size),
+                        s.flags,
+                        s.memory_segment_group,
+                        mib(s.resident_last),
+                        mib(s.resident_min),
+                        mib(s.resident_max),
+                        s.resident_samples,
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "    seg {:<2} adapter={:#x} {:<24} size=     n/a  flags=       n/a grp=n/a resident_last={:>8.1} MiB (min {:.1}, max {:.1}, n={})",
+                        s.segment_id,
+                        s.adapter,
+                        "unknown (no ReportSegment)",
+                        mib(s.resident_last),
+                        mib(s.resident_min),
+                        mib(s.resident_max),
+                        s.resident_samples,
+                    );
+                }
+            }
+            if e.adapter_segment_resident_bytes > 0 {
+                let _ = writeln!(
+                    out,
+                    "    Adapter-Wide Resident Total: {:.2} MiB (all processes on adapter; not PID-attributed)",
+                    mib(e.adapter_segment_resident_bytes),
                 );
             }
         }
-        let _ = writeln!(
-            out,
-            "  Tracked Live Allocs   : {} allocs | Local VRAM {:.2} MiB | Local BAR {:.2} MiB | NonLocal Host {:.2} MiB | Demoted {:.2} MiB | Evicted {:.2} MiB | Unknown {:.2} MiB",
-            e.allocations.len(),
-            mib(e.tracked_local_vram_bytes),
-            mib(e.tracked_local_bar_bytes),
-            mib(e.tracked_non_local_host_bytes),
-            mib(e.tracked_demoted_bytes),
-            mib(e.tracked_evicted_bytes),
-            mib(e.tracked_unknown_segment_bytes),
-        );
+        let alloc_scope = rep
+            .pid
+            .map(|p| format!("pid={p}"))
+            .unwrap_or_else(|| "all pids".into());
+        if e.coverage.has_allocation_rundown {
+            let _ = writeln!(
+                out,
+                "  Tracked Live Allocs ({alloc_scope}) : {} allocs | Local VRAM {:.2} MiB | Local BAR {:.2} MiB | NonLocal Host {:.2} MiB | Demoted {:.2} MiB | Evicted {:.2} MiB | Unknown {:.2} MiB",
+                e.allocations.len(),
+                mib(e.tracked_local_vram_bytes),
+                mib(e.tracked_local_bar_bytes),
+                mib(e.tracked_non_local_host_bytes),
+                mib(e.tracked_demoted_bytes),
+                mib(e.tracked_evicted_bytes),
+                mib(e.tracked_unknown_segment_bytes),
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  Tracked Live Allocs ({alloc_scope}) : unavailable (no allocation rundown/lifecycle events in trace; cannot identify per-allocation placement or which heap was demoted)"
+            );
+        }
         if let Some(pct_v) = rep.conservation.vidmm_accounted_pct {
             let _ = writeln!(
                 out,
-                "  VidMm Conservation    : {:.2}% ({:.2} / {:.2} MiB)",
+                "  VidMm Conservation    : {:.2}% ({:.2} / {:.2} MiB) [{}]",
                 pct_v,
                 mib(rep.conservation.vidmm_accounted_bytes),
                 mib(rep.conservation.vidmm_reference_bytes),
+                rep.conservation.vidmm_conservation_scope,
+            );
+        } else if let Some(ref reason) = rep.conservation.vidmm_conservation_unavailable_reason {
+            let _ = writeln!(out, "  VidMm Conservation    : unavailable ({reason})");
+        }
+        if let Some(pid) = e.filter_pid
+            && !e.coverage.has_allocation_rundown
+        {
+            let _ = writeln!(
+                out,
+                "  Paging / Faults (pid={pid}, thread-context only): MakeResident={} VidMmEvict={} PagingPkts={}",
+                e.paging.make_resident_calls, e.paging.vidmm_evict_calls, e.paging.paging_queue_packets,
+            );
+            if let Some(ref u) = e.unattributed_paging {
+                let _ = writeln!(
+                    out,
+                    "  Paging / Faults (adapter-wide, unattributed to pid={pid} without alloc rundown): PageIn={} Evict={} AllocFault={} Migrate={} ResetBacking={} ({} pages) ReserveRes={}",
+                    u.page_in_allocations,
+                    u.evict_allocations,
+                    u.allocation_faults,
+                    u.migrate_allocations,
+                    u.reset_backing_store_calls,
+                    u.reset_backing_store_pages,
+                    u.reserve_resource_calls,
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  Paging / Faults (handle-keyed, pid={pid}): unavailable without allocation rundown"
+                );
+            }
+        } else {
+            let _ = writeln!(
+                out,
+                "  Paging / Faults       : PageIn={} Evict={} AllocFault={} MakeResident={} Migrate={} ResetBacking={} ({} pages) PagingPkts={} ReserveRes={}",
+                e.paging.page_in_allocations,
+                e.paging.evict_allocations,
+                e.paging.allocation_faults,
+                e.paging.make_resident_calls,
+                e.paging.migrate_allocations,
+                e.paging.reset_backing_store_calls,
+                e.paging.reset_backing_store_pages,
+                e.paging.paging_queue_packets,
+                e.paging.reserve_resource_calls,
             );
         }
-        let _ = writeln!(
-            out,
-            "  Paging / Faults       : PageIn={} Evict={} AllocFault={} MakeResident={} Migrate={} ResetBacking={} ({} pages) PagingPkts={} ReserveRes={}",
-            e.paging.page_in_allocations,
-            e.paging.evict_allocations,
-            e.paging.allocation_faults,
-            e.paging.make_resident_calls,
-            e.paging.migrate_allocations,
-            e.paging.reset_backing_store_calls,
-            e.paging.reset_backing_store_pages,
-            e.paging.paging_queue_packets,
-            e.paging.reserve_resource_calls,
-        );
-        let _ = writeln!(
-            out,
-            "  UpdateTileMappings    : {} calls ({} ops) | GPUVA map={} unmap={} | live_mappings={}",
-            e.tile_mappings.call_count,
-            e.tile_mappings.total_operations,
-            e.tile_mappings.gpuva_map_events,
-            e.tile_mappings.gpuva_unmap_events,
-            e.gpu_va_mappings.len(),
-        );
-        let _ = writeln!(
-            out,
-            "  Kernel HardFaults     : {} faults ({:.2} MiB)",
-            e.hard_faults.total_count,
-            mib(e.hard_faults.total_bytes),
-        );
+        if e.coverage.has_gpu_va_events || e.tile_mappings.call_count > 0 {
+            let _ = writeln!(
+                out,
+                "  UpdateTileMappings    : {} calls ({} ops) | GPUVA map={} unmap={} | live_mappings={}",
+                e.tile_mappings.call_count,
+                e.tile_mappings.total_operations,
+                e.tile_mappings.gpuva_map_events,
+                e.tile_mappings.gpuva_unmap_events,
+                e.gpu_va_mappings.len(),
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  UpdateTileMappings    : unavailable (no GPUVA / UpdateGpuVirtualAddress events in trace)"
+            );
+        }
+        if e.coverage.hard_faults_available {
+            let _ = writeln!(
+                out,
+                "  Kernel HardFaults     : {} faults ({:.2} MiB)",
+                e.hard_faults.total_count,
+                mib(e.hard_faults.total_bytes),
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  Kernel HardFaults     : unavailable (no SystemMemoryProvider / PageFault provider events in trace)"
+            );
+        }
+        if let Some(ref guidance) = e.coverage.capture_guidance {
+            let _ = writeln!(out, "  Capture Guidance      : {guidance}");
+        }
 
         if !e.allocations.is_empty() && top > 0 {
             let _ = writeln!(
@@ -743,4 +872,133 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::etw::{PagingActivity, SegmentInfo, TraceCoverage};
+
+    #[test]
+    fn missing_rundown_and_sysmem_marks_conservation_and_hard_faults_unavailable() {
+        let mut etw = EtwReport {
+            etl_path: "TDp/dxgkrnl.etl".into(),
+            filter_pid: Some(22328),
+            total_events: 4_028_070,
+            dxgkrnl_events: 4_028_068,
+            system_memory_events: 0,
+            duration_secs: 30.05,
+            coverage: TraceCoverage {
+                segment_residency_events: 3852,
+                unattributed_handle_paging_events: 11_711,
+                ..Default::default()
+            },
+            segments: vec![
+                SegmentInfo {
+                    adapter: 0xffff_d58f_9bf6_0000,
+                    segment_id: 2,
+                    described: false,
+                    size: 0,
+                    commit_limit: 0,
+                    flags: 0,
+                    memory_segment_group: 0,
+                    aperture: false,
+                    cpu_visible: false,
+                    populated_from_system_memory: false,
+                    kind: SegmentKind::Unknown,
+                    resident_last: 16_712_294_400,
+                    resident_min: 16_691_892_224,
+                    resident_max: 16_759_136_256,
+                    resident_samples: 3126,
+                },
+                SegmentInfo {
+                    adapter: 0xffff_d58f_9bf6_0000,
+                    segment_id: 3,
+                    described: false,
+                    size: 0,
+                    commit_limit: 0,
+                    flags: 0,
+                    memory_segment_group: 0,
+                    aperture: false,
+                    cpu_visible: false,
+                    populated_from_system_memory: false,
+                    kind: SegmentKind::Unknown,
+                    resident_last: 8_209_506_304,
+                    resident_min: 7_584_358_400,
+                    resident_max: 8_209_506_304,
+                    resident_samples: 726,
+                },
+            ],
+            adapter_segment_resident_bytes: 16_712_294_400 + 8_209_506_304,
+            paging: PagingActivity {
+                make_resident_calls: 864,
+                paging_queue_packets: 4352,
+                ..Default::default()
+            },
+            unattributed_paging: Some(PagingActivity {
+                page_in_allocations: 3642,
+                evict_allocations: 974,
+                allocation_faults: 3614,
+                reset_backing_store_calls: 187,
+                reset_backing_store_pages: 7425,
+                reserve_resource_calls: 3294,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        etw.refresh_coverage_diagnostics();
+
+        assert!(!etw.coverage.has_segment_descriptions);
+        assert!(!etw.coverage.has_allocation_rundown);
+        assert!(!etw.coverage.has_process_counters);
+        assert!(!etw.coverage.hard_faults_available);
+        assert!(!etw.coverage.can_attribute_heap_demotion);
+        assert!(etw.warnings.len() >= 4);
+        assert!(
+            etw.coverage
+                .capture_guidance
+                .as_deref()
+                .is_some_and(|g| g.contains("0x001000c5") && g.contains("locum-cli mem trace --pid 22328"))
+        );
+
+        let rep = reconcile(None, Some(etw), &LabelMap::default(), None);
+        assert_eq!(rep.conservation.vidmm_accounted_pct, None);
+        assert_eq!(rep.conservation.vidmm_conservation_scope, "unavailable");
+        assert_eq!(
+            rep.conservation.adapter_segment_resident_bytes,
+            16_712_294_400 + 8_209_506_304
+        );
+        assert!(rep.conservation.vidmm_conservation_unavailable_reason.is_some());
+
+        let text = format_text(&rep, 10);
+        assert!(text.contains("Adapter-Wide Segments (all processes on adapter; NOT filtered to pid=22328)"));
+        assert!(text.contains("unknown (no ReportSegment)"));
+        assert!(text.contains("Tracked Live Allocs (pid=22328) : unavailable"));
+        assert!(text.contains("VidMm Conservation    : unavailable"));
+        assert!(text.contains("Kernel HardFaults     : unavailable"));
+        assert!(text.contains("Capture Guidance      :"));
+        assert!(text.contains("PageIn=3642"));
+        assert!(!text.contains("100.00%"));
+    }
+
+    #[test]
+    fn live_session_with_hard_fault_provider_enabled_reports_zero_faults_as_available() {
+        let mut etw = EtwReport {
+            dxgkrnl_events: 100,
+            system_memory_events: 0,
+            coverage: TraceCoverage {
+                segment_descriptor_events: 3,
+                allocation_rundown_events: 10,
+                process_counter_events: 4,
+                gpu_va_events: 5,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        etw.apply_live_session_metadata(true, Vec::new());
+        assert!(etw.coverage.hard_faults_available);
+        assert!(etw.coverage.can_attribute_heap_demotion);
+        assert!(etw.warnings.is_empty());
+        assert!(etw.coverage.capture_guidance.is_none());
+    }
 }

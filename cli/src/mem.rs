@@ -128,6 +128,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
                 std::env::temp_dir().join(format!("locum_mem_{}_{}.etl", pid, std::process::id()))
             });
             let mut sess = TraceSession::start(LiveTraceOptions::new(etl_path.clone()))?;
+            let hf_enabled = sess.hard_fault_provider_enabled;
             let warnings = sess.warnings.clone();
 
             let dur_ms = (duration.max(0.1) * 1000.0) as u64;
@@ -140,7 +141,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
             let written = sess.stop()?;
 
             let mut etw_rep = parse_etl(&written, Some(pid))?;
-            etw_rep.warnings.extend(warnings);
+            etw_rep.apply_live_session_metadata(hf_enabled, warnings);
 
             if is_temp && !keep_etl {
                 let _ = std::fs::remove_file(&written);
