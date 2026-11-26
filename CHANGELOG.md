@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- iridia d4a25e2: `locum-cli shader --trace` and `trace` follow a vertex, hull, domain, geometry, mesh or
+  amplification program that reads its lane in the wave (`WaveGetLaneIndex`); iridia refused to lift one ("LaneIndex
+  as a Vertex input has no built-in binding").
 - Direct3D 12: what a draw or dispatch writes into a buffer through a UAV descriptor is copied as far as the view
   covers (`results.offset` and `results.bytes`, schema 7), not the whole buffer: a 512-byte view into a 4 GiB buffer
   was an output over 64 MiB, so not recorded. Replay and `verify` read, compare and put back only those bytes; the
