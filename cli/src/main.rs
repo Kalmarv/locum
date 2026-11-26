@@ -14,6 +14,7 @@ mod dxil;
 mod export;
 mod info;
 mod join;
+mod mem;
 mod memory;
 mod open;
 mod pixels;
@@ -747,6 +748,11 @@ enum Command {
         #[command(subcommand)]
         what: StoreCommand,
     },
+    /// Out-of-process, zero-suspend CPU and GPU (VidMm/DxgKrnl ETW) memory ground-truth inspection and reconciliation.
+    Mem {
+        #[command(subcommand)]
+        what: mem::MemCommand,
+    },
     /// Brings what an older locum derived in a capture up to this one, from the capture's own records: D3D12
     /// bindings projected again (an older projection bound some registers to two descriptors), structured views'
     /// element size, and the programs' debug names in `shaders`. Writes the capture.db in place
@@ -847,7 +853,7 @@ fn sql(c: &open::Capture, query: &str) -> Result<(), String> {
 /// Whether `command` replays in this process, on the Direct3D [`runtime::load`] loads: every command but `conform`,
 /// whose replays are processes of their own.
 fn replays_here(command: &Command) -> bool {
-    !matches!(command, Command::Conform { .. })
+    !matches!(command, Command::Conform { .. } | Command::Mem { .. })
 }
 
 fn run(cli: Cli) -> Result<(), String> {
@@ -1380,6 +1386,7 @@ fn run(cli: Cli) -> Result<(), String> {
             StoreCommand::Merge { folder, into } => store::merge(&folder, &into),
             StoreCommand::Collect { store, count } => store::collect(&store, count),
         },
+        Command::Mem { what } => mem::run(what),
         Command::Upgrade {
             capture,
             check,

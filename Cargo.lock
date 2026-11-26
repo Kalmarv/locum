@@ -783,6 +783,7 @@ dependencies = [
  "iridia-passes",
  "locum-capture",
  "locum-d3d11",
+ "locum-mem",
  "memchr",
  "memmap2",
  "png",
@@ -798,6 +799,16 @@ name = "locum-d3d11"
 version = "0.1.6"
 dependencies = [
  "locum-capture",
+ "windows",
+]
+
+[[package]]
+name = "locum-mem"
+version = "0.1.6"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
  "windows",
 ]
 
