@@ -335,6 +335,10 @@ locum-cli bindings last --name g_SSS       # every register the draws had bound,
                                            # reads of an index or vertex buffer (start=, count=, base=: with an
                                            # index naming face sets, the file is the face set); --draws 100..200,
                                            # --resource N, --kind, --stage, --file; --json for JSON lines
+locum-cli descriptors last --flagged       # D3D12: what each register a draw's root signature reaches pointed at
+                                           # (heap slot, descriptor version, resource, GPU address, bytes, element
+                                           # size, format, whether the program reads it) and its flag; --flag null,
+                                           # --draws, --resource, --kind, --stage, --read, --json
 locum-cli cb last 120 ps 3                 # a constant buffer, every register, named from the shader's reflection
 locum-cli constants m15 m16 --name SC_CameraPos --distinct  # named constants across draws and captures: a row
                                            # per draw (or each value and how many draws read it); parts with `|`
@@ -945,6 +949,21 @@ holds changes, not whole heaps. The CLI and viewer project these into their
 draw, resource, binding and pipeline views. Display order across queues is not a GPU execution order; queue order
 and fence operations are retained separately. CPU-consumed descriptor definitions are frozen when recorded, while
 GPU descriptor tables use the versions present at submission.
+
+`d12_draw_descriptors` says, for each draw and dispatch, what every register its root signature reaches pointed at as
+it was submitted: the root parameter, the heap and slot a table reaches and the descriptor's version there
+(`d12_descriptor_versions.id`; none for a root descriptor), the resource, and for a buffer view, constant buffer view
+or root descriptor the GPU address of its first byte, the bytes it covers and a buffer view's element size, with the
+view's format and dimension. `flag` says what is wrong with it: `null` (a null descriptor, or a root descriptor or
+constant buffer view at address 0), `no-resource` (an address in no live buffer; one several placed buffers share is
+not flagged), `zero-size` (a buffer view of no elements, a constant buffer view of no bytes), `past-end` (the bytes it
+covers run past its buffer's end), `empty` (the table's slot holds no descriptor), `other-type` (it holds one of
+another type than the range's: its version names it) or `no-heap` (the table's handle is in no live heap). A range of
+at most 64 descriptors has a row for every register; a longer one (a bindless table) only for the descriptors of its
+type it reaches. Static samplers, root constants and what a program reads through the heap by index
+(`ResourceDescriptorHeap`) have no rows. `locum-cli descriptors` lists them with the program's name for each register
+and whether it reads it; the viewer shows them on the draw page, flagged ones first. `locum-cli upgrade` makes the
+table for a capture from before it, from the same records.
 
 What each draw, dispatch and UAV clear of an instrumented list writes through UAVs is copied the same way, right
 after it, before the list's next command, into `results` rows as on Direct3D 11. The resources are found as the list

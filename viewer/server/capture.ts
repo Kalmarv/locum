@@ -131,7 +131,7 @@ export class Capture {
   private reflection = new Map<string, ConstantBuffer[] | null>();
   private timelineCache: { rows: TimelineRow[]; groups: Group[] } | null = null;
   private modulesCache: { path: string; base: bigint; size: bigint }[] | null = null;
-  private features: { targetEvent: boolean; results: boolean; resultColumns: Set<string> } | null = null;
+  private features: { targetEvent: boolean; results: boolean; resultColumns: Set<string>; drawDescriptors: boolean } | null = null;
   private blobIndex: Database | null = null;
   private blobTables = new Set<string>();
 
@@ -169,6 +169,7 @@ export class Capture {
       targetEvent: db.query("PRAGMA table_info(targets)").all().some((r: any) => r.name === "event"),
       results: !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'results'").get(),
       resultColumns: new Set(db.query("PRAGMA table_info(results)").all().map((r: any) => r.name as string)),
+      drawDescriptors: !!db.query("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'd12_draw_descriptors'").get(),
     };
     return this.features;
   }
@@ -637,6 +638,7 @@ export class Capture {
 
     const pass = d.pass != null ? this.one("SELECT * FROM passes WHERE n = ?", d.pass) : null;
     const prev = this.one("SELECT n, event FROM draws WHERE n < ? ORDER BY n DESC LIMIT 1", n);
+    const descriptors = this.drawDescriptors(n);
     const next = this.one("SELECT n, event FROM draws WHERE n > ? ORDER BY n LIMIT 1", n);
     return {
       n: d.n, event: d.event, call: d.call, args: json(d.args), pass: d.pass,
@@ -651,11 +653,32 @@ export class Capture {
       viewports: this.all("SELECT * FROM viewports WHERE draw = ? ORDER BY i", n),
       scissors: this.all("SELECT * FROM scissors WHERE draw = ? ORDER BY i", n),
       bindings: out,
+      descriptors,
       results: this.results(d.event),
       passRange: pass ? { n: pass.n, first: pass.first_draw, last: pass.last_draw } : null,
       targets: pass ? this.targetsAfter(pass.last_draw) : this.targetsAfter(n),
       prev, next,
     };
+  }
+
+  /** What each register a D3D12 draw's root signature reaches pointed at (`d12_draw_descriptors`); null for a
+   *  capture without them (D3D11, or D3D12 from before them: `locum-cli upgrade` makes them). */
+  drawDescriptors(n: number) {
+    if (!this.schema().drawDescriptors) return null;
+    const rows = this.all(`
+      SELECT stage, kind, slot, space, parameter, heap, heap_slot, version, resource,
+             CASE WHEN address IS NOT NULL THEN printf('0x%x', address) END AS address, size, stride, format, flag
+      FROM d12_draw_descriptors WHERE draw = ?`, n);
+    rows.sort((a, b) => (STAGE_ORDER[a.stage] ?? 9) - (STAGE_ORDER[b.stage] ?? 9)
+      || (KIND_ORDER[a.kind] ?? 9) - (KIND_ORDER[b.kind] ?? 9) || a.space - b.space || a.slot - b.slot);
+    const shapes = this.shapes(rows.map(r => r.resource).filter(r => r != null));
+    return rows.map(r => ({
+      stage: r.stage, kind: r.kind, slot: r.slot, space: r.space, parameter: r.parameter,
+      heap: r.heap, heapSlot: r.heap_slot, version: r.version,
+      resource: r.resource != null ? this.resourceRef(shapes.get(r.resource), r.resource) : null,
+      address: r.address, size: r.size, stride: r.stride,
+      format: r.format, formatName: r.format != null ? formatName(r.format) : null, flag: r.flag,
+    }));
   }
 
   /** The targets read back after draw `draw` (a pass's last), each with what it looked like before the pass. */

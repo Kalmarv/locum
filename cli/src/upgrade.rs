@@ -3,8 +3,8 @@
 //! its submission (`locum_capture::d3d12::reproject`): an older projection let a table range reach descriptors of
 //! another type and bound root parameters to stages the pipeline has no program for, so its extra rows go and the rest
 //! keep what the capture composed for them (constant-buffer contents). Structured buffer views get their element size,
-//! and `shaders` the programs' debug names, where the capture predates them. What a capture never recorded (the bytes
-//! of a buffer it did not copy) stays missing.
+//! `shaders` the programs' debug names and `d12_draw_descriptors` what each D3D12 draw's registers point at, where the
+//! capture predates them. What a capture never recorded (the bytes of a buffer it did not copy) stays missing.
 //!
 //! The plan is worked out on the read-only capture; only then, and without `--check`, is it written, in one
 //! transaction.
@@ -55,6 +55,8 @@ struct Plan {
     names: Vec<(String, String)>,
     /// Whether `shaders` lacks the `name` column.
     name_column: bool,
+    /// What each D3D12 draw's registers point at, for a capture without `d12_draw_descriptors`.
+    descriptors: Option<Vec<locum_capture::db::DrawDescriptor>>,
 }
 
 pub fn upgrade(c: &Capture, check: bool) -> Result<(), String> {
@@ -67,6 +69,14 @@ pub fn upgrade(c: &Capture, check: bool) -> Result<(), String> {
             plan.remove.len(),
             plan.add.len()
         );
+        match &plan.descriptors {
+            Some(d) => out!(
+                "descriptors: d12_draw_descriptors made, {} rows ({} flagged)",
+                d.len(),
+                d.iter().filter(|d| d.flag.is_some()).count()
+            ),
+            None => out!("descriptors: d12_draw_descriptors is there already"),
+        }
     } else if d3d12 {
         out!("bindings: this capture lacks the D3D12 records to project them again (d12_draw_state)");
     }
@@ -141,6 +151,9 @@ fn write(c: &Capture, plan: &Plan) -> Result<(), String> {
         )
         .map_err(e)?;
     }
+    if let Some(rows) = &plan.descriptors {
+        locum_capture::d3d12::write_draw_descriptors(&tx, rows).map_err(e)?;
+    }
     if plan.name_column {
         tx.execute("ALTER TABLE shaders ADD COLUMN name TEXT", [])
             .map_err(e)?;
@@ -154,6 +167,7 @@ fn write(c: &Capture, plan: &Plan) -> Result<(), String> {
         "bindings_added": plan.add.len(),
         "strides": plan.strides.len(),
         "names": plan.names.len(),
+        "draw_descriptors": plan.descriptors.as_ref().map(Vec::len),
     });
     tx.execute(
         "INSERT OR REPLACE INTO meta VALUES('upgraded', ?1)",
@@ -166,8 +180,11 @@ fn write(c: &Capture, plan: &Plan) -> Result<(), String> {
 /// Which of the capture's shader-stage binding rows the current projection makes (kept, given its stride where they
 /// lack one), which it does not (removed), and which it makes that the capture lacks (added).
 fn bindings(c: &Capture, plan: &mut Plan) -> Result<(), String> {
-    let fresh =
+    let mut fresh =
         locum_capture::d3d12::reproject(&c.db).map_err(|e| format!("projecting the bindings again: {e}"))?;
+    if !c.has_table("d12_draw_descriptors") {
+        plan.descriptors = Some(std::mem::take(&mut fresh.draw_descriptors));
+    }
     let n = |v: Option<u64>| v.map(|v| v as i64);
     let mut wanted: HashMap<Key, &locum_capture::db::Binding> = HashMap::new();
     for b in &fresh.bindings {

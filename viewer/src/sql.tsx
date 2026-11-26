@@ -17,6 +17,7 @@ const EXAMPLES: [string, string][] = [
   ["most used pixel shaders", "SELECT ps, count(*) AS draws FROM draws WHERE ps IS NOT NULL GROUP BY ps ORDER BY draws DESC LIMIT 50"],
   ["largest textures used", "SELECT id, width, height, mips, format, bytes FROM resources WHERE used = 1 AND kind != 'buffer' ORDER BY bytes DESC LIMIT 50"],
   ["what wrote a resource", "SELECT e.seq, e.kind, e.call, e.draw FROM event_resources er JOIN events e ON e.seq = er.event WHERE er.resource = 1 AND er.access = 'write'"],
+  ["D3D12: descriptors flagged null, empty or out of bounds", "SELECT draw, stage, kind, slot, space, heap, heap_slot, resource, printf('0x%x', address) AS address, size, flag FROM d12_draw_descriptors WHERE flag IS NOT NULL LIMIT 200"],
   ["textures each draw reads", "SELECT b.draw, b.stage, b.slot, b.resource, r.width, r.height, r.format FROM bindings b JOIN resources r ON r.id = b.resource WHERE b.kind = 'srv' AND r.kind != 'buffer' LIMIT 200"],
   ["gaps", "SELECT * FROM gaps"],
 ];

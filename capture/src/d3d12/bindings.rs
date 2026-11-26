@@ -61,9 +61,8 @@ pub(super) fn project(
         let d = &parameter["value"];
         if parameter["type"] == 0 {
             let table = &arg["value"];
-            let (Some(heap), Some(base)) = (table["heap"].as_u64(), table["slot"].as_u64()) else {
-                continue;
-            };
+            // A handle in no live heap (or in several) reaches nothing the capture knows.
+            let location = table["heap"].as_u64().zip(table["slot"].as_u64());
             let Some(ranges) = d.as_array() else {
                 continue;
             };
@@ -72,8 +71,7 @@ pub(super) fn project(
                 let offset = range["OffsetInDescriptorsFromTableStart"].as_u64().unwrap_or(0);
                 let offset = if offset == u32::MAX as u64 { append } else { offset };
                 let count = range["NumDescriptors"].as_u64().unwrap_or(0);
-                let start = base.saturating_add(offset);
-                let end = start.saturating_add(count);
+                append = offset.saturating_add(count);
                 let slot = |n: u64| u32::try_from(n).unwrap_or(u32::MAX);
                 // A range reaches only descriptors of its own type: games point tables of different types at
                 // overlapping heap slots (Elden Ring's CBV table b0-b3 starts one slot before its SRV table t0-t3),
@@ -83,30 +81,70 @@ pub(super) fn project(
                     Some(1) => "uav",
                     Some(2) => "cb",
                     Some(3) => "sampler",
-                    _ => "",
+                    _ => continue,
                 };
-                for descriptor in descriptors
-                    .range((heap, slot(start))..(heap, slot(end)))
-                    .map(|(_, d)| d)
-                    .filter(|d| d.kind == kind)
-                {
-                    let register = range["BaseShaderRegister"].as_u64().unwrap_or(0)
-                        + (u64::from(descriptor.slot) - start);
+                let first_register = range["BaseShaderRegister"].as_u64().unwrap_or(0);
+                let space = range["RegisterSpace"].as_u64().unwrap_or(0) as u32;
+                // Register `register`, through heap slot `at` (none where the handle is in no heap) holding `found`.
+                let reach = |c: &mut db::Capture,
+                             register: u64,
+                             at: Option<(u64, u32)>,
+                             found: Option<&Descriptor>| {
                     let Ok(register) = u32::try_from(register) else {
-                        continue;
+                        return;
                     };
                     for stage in &stages {
-                        descriptor_binding(
+                        if let Some(d) = found.filter(|d| d.kind == kind) {
+                            descriptor_binding(c, draw, stage, register, space, d);
+                        }
+                        let mut row = match found {
+                            Some(d) if d.kind == kind => pointee(d, objects),
+                            Some(_) => flagged("other-type"),
+                            None if at.is_some() => flagged("empty"),
+                            None => flagged("no-heap"),
+                        };
+                        row.draw = draw;
+                        row.stage = stage;
+                        row.kind = kind;
+                        row.slot = register;
+                        row.space = space;
+                        row.parameter = index;
+                        row.heap = at.map(|a| a.0);
+                        row.heap_slot = at.map(|a| a.1);
+                        row.version = found.map(|d| d.id);
+                        c.draw_descriptors.push(row);
+                    }
+                };
+                let Some((heap, base)) = location else {
+                    if count <= EVERY_SLOT {
+                        for n in 0..count {
+                            reach(c, first_register + n, None, None);
+                        }
+                    }
+                    continue;
+                };
+                let start = base.saturating_add(offset);
+                let end = start.saturating_add(count);
+                if count <= EVERY_SLOT {
+                    // Every register, those whose slot holds nothing of the range's type too.
+                    for n in start..end {
+                        reach(
                             c,
-                            draw,
-                            stage,
-                            register,
-                            range["RegisterSpace"].as_u64().unwrap_or(0) as u32,
-                            descriptor,
+                            first_register + (n - start),
+                            Some((heap, slot(n))),
+                            descriptors.get(&(heap, slot(n))),
                         );
                     }
+                } else {
+                    for descriptor in descriptors
+                        .range((heap, slot(start))..(heap, slot(end)))
+                        .map(|(_, d)| d)
+                        .filter(|d| d.kind == kind)
+                    {
+                        let register = first_register + (u64::from(descriptor.slot) - start);
+                        reach(c, register, Some((heap, descriptor.slot)), Some(descriptor));
+                    }
                 }
-                append = offset.saturating_add(count);
             }
         } else if parameter["type"] == 1 {
             let Some(words) = arg["words"].as_array() else {
@@ -151,17 +189,35 @@ pub(super) fn project(
                 .and_then(|r| r["width"].as_u64())
                 .and_then(|w| w.checked_sub(offset))
                 .map(|rest| if kind == "cb" { rest.min(65536) } else { rest });
+            let (_, address, flag) = located(value, objects);
+            let (slot, space) = (
+                d["ShaderRegister"].as_u64().unwrap_or(0) as u32,
+                d["RegisterSpace"].as_u64().unwrap_or(0) as u32,
+            );
             for stage in &stages {
                 c.bindings.push(db::Binding {
                     draw,
                     stage,
                     kind,
-                    slot: d["ShaderRegister"].as_u64().unwrap_or(0) as u32,
-                    space: d["RegisterSpace"].as_u64().unwrap_or(0) as u32,
+                    slot,
+                    space,
                     resource,
                     offset: Some(offset),
                     size,
                     ..db::Binding::default()
+                });
+                c.draw_descriptors.push(db::DrawDescriptor {
+                    draw,
+                    stage,
+                    kind,
+                    slot,
+                    space,
+                    parameter: index,
+                    resource,
+                    address,
+                    size,
+                    flag,
+                    ..db::DrawDescriptor::default()
                 });
             }
         }
@@ -302,6 +358,149 @@ pub fn reproject(conn: &rusqlite::Connection) -> rusqlite::Result<db::Capture> {
         );
     }
     Ok(capture)
+}
+
+/// A table range of at most this many descriptors has each of its registers in `d12_draw_descriptors`, those whose
+/// slot holds nothing of its type too; a longer one (a bindless table) only the descriptors of its type it reaches.
+const EVERY_SLOT: u64 = 64;
+
+/// What a `d12_draw_descriptors` row's `flag` says.
+pub const FLAGS: [(&str, &str); 7] = [
+    (
+        "null",
+        "a null descriptor, or a root descriptor or constant buffer view at address 0",
+    ),
+    ("no-resource", "its address is in no live buffer"),
+    (
+        "zero-size",
+        "a buffer view of no elements, or a constant buffer view of no bytes",
+    ),
+    ("past-end", "the bytes it covers run past its buffer's end"),
+    ("empty", "the table's slot holds no descriptor"),
+    (
+        "other-type",
+        "the table's slot holds a descriptor of another type than its range's",
+    ),
+    (
+        "no-heap",
+        "the table's handle is in no live descriptor heap (or in several)",
+    ),
+];
+
+fn flagged(flag: &'static str) -> db::DrawDescriptor {
+    db::DrawDescriptor {
+        flag: Some(flag),
+        ..db::DrawDescriptor::default()
+    }
+}
+
+/// The buffer, GPU address and flag of an address as the capture records it: `{resource, offset}`, null for address
+/// 0, or the candidates (and the address) of one no single live buffer holds. The flag is `null` or `no-resource`;
+/// an address several buffers share (placed buffers) is not flagged.
+fn located(v: &Value, objects: &BTreeMap<u64, Value>) -> (Option<u64>, Option<u64>, Option<&'static str>) {
+    let gpu = |v: &Value| {
+        let base = objects.get(&v["resource"].as_u64()?)?["gpu_address"].as_u64()?;
+        base.checked_add(v["offset"].as_u64().unwrap_or(0))
+    };
+    if v.is_null() {
+        return (None, None, Some("null"));
+    }
+    if let Some(resource) = v["resource"].as_u64() {
+        return (Some(resource), gpu(v), None);
+    }
+    let candidates = v["candidates"].as_array();
+    let address = v["address"]
+        .as_u64()
+        .or_else(|| candidates.and_then(|c| c.first()).and_then(gpu));
+    let flag = candidates.is_none_or(|c| c.is_empty()).then_some("no-resource");
+    (None, address, flag)
+}
+
+/// What descriptor `d`, of its range's type, points at: its resource, the GPU address, bytes and element size of a
+/// buffer view or constant buffer view, its format and dimension, and the flag of a null or out-of-bounds one.
+fn pointee(d: &Descriptor, objects: &BTreeMap<u64, Value>) -> db::DrawDescriptor {
+    let desc = &d.description;
+    let buffer = objects.get(&d.resource);
+    let width = buffer.and_then(|b| b["width"].as_u64());
+    let base = buffer.and_then(|b| b["gpu_address"].as_u64());
+    let mut row = db::DrawDescriptor {
+        resource: (d.resource != 0).then_some(d.resource),
+        ..db::DrawDescriptor::default()
+    };
+    // Bytes `offset..offset + size` of the buffer.
+    let covers = |row: &mut db::DrawDescriptor, offset: u64, size: u64| {
+        row.address = base.and_then(|b| b.checked_add(offset));
+        row.size = Some(size);
+        row.flag = if size == 0 {
+            Some("zero-size")
+        } else if width.is_some_and(|w| offset.saturating_add(size) > w) {
+            Some("past-end")
+        } else {
+            None
+        };
+    };
+    match d.kind {
+        "cb" => {
+            let bytes = desc["bytes"].as_u64().unwrap_or(0);
+            if desc.is_null() {
+                row.flag = Some("null");
+            } else if row.resource.is_some() {
+                covers(&mut row, desc["buffer"]["offset"].as_u64().unwrap_or(0), bytes);
+            } else {
+                let (_, address, flag) = located(&desc["buffer"], objects);
+                row.address = address.or(desc["address"].as_u64().filter(|a| *a != 0));
+                row.size = Some(bytes);
+                row.flag = flag.or((bytes == 0).then_some("zero-size"));
+            }
+        }
+        "srv" | "uav" => {
+            let dimension = desc["dimension"].as_u64().map(|v| v as u32);
+            row.dimension = dimension;
+            row.format = desc["format"].as_u64().map(|v| v as u32);
+            if desc["default"] == true {
+                // The resource's own format, and a buffer whole.
+                row.format = buffer.and_then(|b| b["format"].as_u64()).map(|v| v as u32);
+                if buffer.is_some_and(|b| b["dimension"] == 1) {
+                    covers(&mut row, 0, width.unwrap_or(0));
+                }
+            } else if dimension == Some(11) && d.kind == "srv" {
+                // An acceleration structure view names its buffer by address.
+                let (resource, address, flag) = located(&desc["payload"]["address"], objects);
+                row.resource = resource;
+                row.address = address;
+                row.flag = flag;
+                return row;
+            } else if dimension == Some(1) {
+                let payload = &desc["payload"];
+                let raw = payload["Flags"].as_u64().unwrap_or(0) & 1 != 0;
+                let element = match payload["StructureByteStride"].as_u64().unwrap_or(0) {
+                    0 if raw => Some(4),
+                    0 => row
+                        .format
+                        .and_then(crate::format::layout)
+                        .map(|l| u64::from(l.block_bytes)),
+                    stride => Some(stride),
+                };
+                if let Some(element) = element {
+                    row.stride = u32::try_from(element).ok();
+                    let first = payload["FirstElement"].as_u64().unwrap_or(0);
+                    let count = payload["NumElements"].as_u64().unwrap_or(0);
+                    covers(
+                        &mut row,
+                        first.saturating_mul(element),
+                        count.saturating_mul(element),
+                    );
+                }
+            }
+            // A null descriptor reads zero whatever its description says.
+            if row.resource.is_none() && desc["sampler_feedback"].is_null() {
+                (row.address, row.size, row.stride) = (None, None, None);
+                row.flag = Some("null");
+            }
+        }
+        _ => {}
+    }
+    row
 }
 
 fn stages(visibility: u64, compute: bool) -> Vec<&'static str> {
@@ -488,6 +687,130 @@ mod tests {
                 ("ps", "srv", 0, Some(51)),
                 ("ps", "srv", 1, Some(52))
             ]
+        );
+    }
+
+    #[test]
+    fn draw_descriptors_say_what_each_register_points_at() {
+        // A compute root signature: a table of b0, t0-t3 and u0, a root CBV b1 and a root SRV t4.
+        let range = |kind: u64, register: u64, count: u64, offset: u64| {
+            json!({"RangeType":kind,"BaseShaderRegister":register,"NumDescriptors":count,"RegisterSpace":0,
+                "OffsetInDescriptorsFromTableStart":offset})
+        };
+        let root = json!({"decoded":{"parameters":[
+            {"type":0,"visibility":0,"value":[range(2, 0, 1, 0), range(0, 0, 4, 1), range(1, 0, 1, 5)]},
+            {"type":2,"visibility":0,"value":{"ShaderRegister":1,"RegisterSpace":0}},
+            {"type":3,"visibility":0,"value":{"ShaderRegister":4,"RegisterSpace":0}},
+        ],"samplers":[]}});
+        let buffer = |width: u64, gpu: u64| json!({"dimension":1,"width":width,"gpu_address":gpu,"format":0});
+        let objects = BTreeMap::from([(1, root), (50, buffer(4096, 0x10000)), (51, buffer(256, 0x20000))]);
+        let at = |slot: u32, kind: &'static str, resource: u64, description: Value| {
+            let d = Descriptor {
+                id: u64::from(slot) + 100,
+                heap: 9,
+                slot,
+                kind,
+                resource,
+                counter: 0,
+                description,
+            };
+            ((9, slot), d)
+        };
+        let view = |first: u64, count: u64, stride: u64| {
+            json!({"format":0,"dimension":1,"payload":{"FirstElement":first,"NumElements":count,
+                "StructureByteStride":stride,"Flags":0}})
+        };
+        let descriptors = BTreeMap::from([
+            at(
+                20,
+                "cb",
+                50,
+                json!({"buffer":{"resource":50,"offset":256},"bytes":512}),
+            ),
+            at(21, "srv", 50, view(4, 16, 16)),
+            at(22, "srv", 50, view(0, 0, 16)),
+            at(23, "srv", 0, view(0, 8, 16)),
+            // slot 24 holds nothing; the UAV's slot 25 an SRV
+            at(25, "srv", 51, view(0, 1, 4)),
+        ]);
+        let pipeline = Pipeline {
+            compute_root: 1,
+            compute_args: BTreeMap::from([
+                (0, json!({"kind":"DescriptorTable","value":{"heap":9,"slot":20}})),
+                (1, json!({"kind":"ConstantBufferView","value":null})),
+                (
+                    2,
+                    json!({"kind":"ShaderResourceView","value":{"address":0x90000,"candidates":[]}}),
+                ),
+            ]),
+            ..Pipeline::default()
+        };
+        let mut capture = db::Capture::default();
+        project(&mut capture, 7, true, &pipeline, &objects, &descriptors, &[]);
+        let rows: Vec<_> = capture
+            .draw_descriptors
+            .iter()
+            .map(|d| (d.kind, d.slot, d.heap_slot, d.resource, d.address, d.size, d.flag))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("cb", 0, Some(20), Some(50), Some(0x10100), Some(512), None),
+                ("srv", 0, Some(21), Some(50), Some(0x10040), Some(256), None),
+                (
+                    "srv",
+                    1,
+                    Some(22),
+                    Some(50),
+                    Some(0x10000),
+                    Some(0),
+                    Some("zero-size")
+                ),
+                ("srv", 2, Some(23), None, None, None, Some("null")),
+                ("srv", 3, Some(24), None, None, None, Some("empty")),
+                ("uav", 0, Some(25), None, None, None, Some("other-type")),
+                ("cb", 1, None, None, None, None, Some("null")),
+                ("srv", 4, None, None, Some(0x90000), None, Some("no-resource")),
+            ]
+        );
+        assert!(
+            capture
+                .draw_descriptors
+                .iter()
+                .all(|d| d.draw == 7 && d.stage == "cs")
+        );
+        assert_eq!(capture.draw_descriptors[1].stride, Some(16));
+        assert_eq!(
+            capture.draw_descriptors[5].version,
+            Some(125),
+            "the other type's descriptor is named"
+        );
+        // The bindings stay what they were: the descriptors of each range's type, and the root descriptors.
+        assert_eq!(capture.bindings.len(), 6);
+
+        // A view running past its buffer's end, and a table whose handle is in no heap.
+        let descriptors = BTreeMap::from([at(
+            20,
+            "cb",
+            51,
+            json!({"buffer":{"resource":51,"offset":128},"bytes":256}),
+        )]);
+        let mut capture = db::Capture::default();
+        project(&mut capture, 8, true, &pipeline, &objects, &descriptors, &[]);
+        assert_eq!(capture.draw_descriptors[0].flag, Some("past-end"));
+        let pipeline = Pipeline {
+            compute_root: 1,
+            compute_args: BTreeMap::from([(0, json!({"kind":"DescriptorTable","value":{"candidates":[]}}))]),
+            ..Pipeline::default()
+        };
+        let mut capture = db::Capture::default();
+        project(&mut capture, 9, true, &pipeline, &objects, &descriptors, &[]);
+        assert_eq!(capture.draw_descriptors.len(), 6);
+        assert!(
+            capture
+                .draw_descriptors
+                .iter()
+                .all(|d| d.flag == Some("no-heap") && d.heap.is_none())
         );
     }
 }

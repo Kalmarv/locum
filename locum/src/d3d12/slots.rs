@@ -250,7 +250,7 @@ pub fn address(value: u64) -> Value {
             .chain(matches)
             .map(|(resource, offset)| json!({"resource":resource,"offset":offset}))
             .collect();
-        json!({"candidates":candidates,"diagnostic":"GPU address is not uniquely associated with a live resource"})
+        json!({"address":value,"candidates":candidates,"diagnostic":"GPU address is not uniquely associated with a live resource"})
     })
 }
 /// The UAV slot `slot` of heap `heap` holds now: its resource, its counter's (0 for none) and its view.
@@ -489,6 +489,13 @@ mod tests {
         assert_eq!(address(BASE + 64)["resource"], 1_000_002);
         register_address(1_000_003, BASE + 32, 256);
         assert_eq!(address(BASE + 64)["candidates"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            address(BASE + 64)["address"],
+            BASE + 64,
+            "an ambiguous address keeps its value"
+        );
+        assert_eq!(address(BASE + 4096)["address"], BASE + 4096);
+        assert!(address(BASE + 4096)["candidates"].as_array().unwrap().is_empty());
         destroy(1_000_002);
         assert_eq!(address(BASE + 64)["resource"], 1_000_003);
         assert_eq!(address(BASE + 64)["offset"], 32);

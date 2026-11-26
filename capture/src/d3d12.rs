@@ -15,7 +15,43 @@ pub mod programs;
 pub mod samples;
 pub mod tables;
 
-pub use bindings::reproject;
+pub use bindings::{FLAGS, reproject};
+
+/// Makes `d12_draw_descriptors` and writes `rows` into it: a capture's, or `upgrade`'s for a capture from before it.
+pub fn write_draw_descriptors(tx: &Transaction<'_>, rows: &[db::DrawDescriptor]) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE d12_draw_descriptors(draw INTEGER NOT NULL,stage TEXT NOT NULL,kind TEXT NOT NULL,
+         slot INTEGER NOT NULL,space INTEGER NOT NULL,parameter INTEGER NOT NULL,heap INTEGER,heap_slot INTEGER,
+         version INTEGER,resource INTEGER,address INTEGER,size INTEGER,stride INTEGER,format INTEGER,dimension INTEGER,
+         flag TEXT);
+         CREATE INDEX d12_draw_descriptors_draw ON d12_draw_descriptors(draw);",
+    )?;
+    let mut s = tx.prepare(
+        "INSERT INTO d12_draw_descriptors VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+    )?;
+    let n = |v: Option<u64>| v.map(integer).transpose();
+    for d in rows {
+        s.execute(params![
+            integer(d.draw)?,
+            d.stage,
+            d.kind,
+            d.slot,
+            d.space,
+            d.parameter,
+            n(d.heap)?,
+            d.heap_slot,
+            n(d.version)?,
+            n(d.resource)?,
+            n(d.address)?,
+            n(d.size)?,
+            d.stride,
+            d.format,
+            d.dimension,
+            d.flag
+        ])?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Command {

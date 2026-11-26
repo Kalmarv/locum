@@ -289,6 +289,37 @@ pub struct Binding {
     pub content: Option<String>,
 }
 
+/// What one register of a D3D12 draw's or dispatch's root signature reaches through a descriptor table or a root
+/// descriptor, as of its submission: the descriptor, and the resource, GPU address, bytes and format it points at
+/// (`d12_draw_descriptors`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DrawDescriptor {
+    pub draw: u64,
+    pub stage: &'static str,
+    /// cb, srv, uav or sampler.
+    pub kind: &'static str,
+    pub slot: u32,
+    pub space: u32,
+    /// The root parameter.
+    pub parameter: u32,
+    /// The heap and slot a table reaches, and the descriptor's version there (`d12_descriptor_versions.id`); none
+    /// for a root descriptor, and no version for a slot that holds no descriptor of the range's type.
+    pub heap: Option<u64>,
+    pub heap_slot: Option<u32>,
+    pub version: Option<u64>,
+    pub resource: Option<u64>,
+    /// The GPU address of the first byte a buffer view, constant buffer view or root descriptor covers.
+    pub address: Option<u64>,
+    /// The bytes a buffer view or constant buffer view covers.
+    pub size: Option<u64>,
+    /// A buffer view's element size.
+    pub stride: Option<u32>,
+    pub format: Option<u32>,
+    pub dimension: Option<u32>,
+    /// What is wrong with it, if anything (see [`crate::d3d12::FLAGS`]).
+    pub flag: Option<&'static str>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Viewport {
     pub draw: u64,
@@ -379,6 +410,8 @@ pub struct Capture {
     pub events: Vec<Event>,
     pub draws: Vec<Draw>,
     pub bindings: Vec<Binding>,
+    /// D3D12 only.
+    pub draw_descriptors: Vec<DrawDescriptor>,
     pub cb_data: Vec<(String, Vec<u8>)>,
     pub viewports: Vec<Viewport>,
     pub scissors: Vec<Scissor>,
@@ -668,6 +701,7 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
     }
     if let Some(frame) = &capture.d3d12 {
         frame.write(&tx)?;
+        crate::d3d12::write_draw_descriptors(&tx, &capture.draw_descriptors)?;
     }
     tx.commit()?;
     drop(db);

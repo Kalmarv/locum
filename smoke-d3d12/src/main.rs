@@ -895,6 +895,21 @@ unsafe fn journal_capture(
                 "SELECT count(*) FROM (SELECT heap FROM d12_descriptor_versions WHERE kind='cb' GROUP BY heap HAVING count(DISTINCT resource)=2)",
                 1,
             ),
+            // What each dispatch's registers point at: the table's b3, t0 and t1 and the root b5, none flagged; each
+            // constant buffer view at its buffer's GPU address, each 64-element R32 buffer view 256 bytes.
+            ("SELECT count(*) FROM d12_draw_descriptors", 12),
+            (
+                "SELECT count(*) FROM d12_draw_descriptors WHERE flag IS NOT NULL",
+                0,
+            ),
+            (
+                "SELECT count(*) FROM d12_draw_descriptors d JOIN d12_objects o ON o.id=d.resource WHERE d.kind='cb'                  AND d.address=json_extract(o.description,'$.gpu_address')",
+                6,
+            ),
+            (
+                "SELECT count(*) FROM d12_draw_descriptors WHERE kind='srv' AND space=7 AND size=256 AND stride=4                  AND heap_slot IN (1,2) AND version IS NOT NULL",
+                6,
+            ),
         ] {
             assert_eq!(
                 db.query_row(query, [], |r| r.get::<_, i64>(0)).unwrap(),

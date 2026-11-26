@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Direct3D 12: `d12_draw_descriptors` holds what each register a draw's or dispatch's root signature reaches pointed
+  at as it was submitted: the heap slot and descriptor version, the resource, a buffer or constant buffer view's (or a
+  root descriptor's) GPU address, bytes and element size, the view's format and dimension, and a flag for a null or
+  zero-size view, an address in no live buffer, a view past its buffer's end, and a table slot that holds no
+  descriptor, or one of another type. `locum-cli descriptors` lists them (`--flagged`, `--flag`, `--read`), the
+  viewer's draw page shows them, and `upgrade` makes them for older captures. A constant buffer view or root descriptor
+  whose address is in no single live buffer keeps the address in the capture.
 - Direct3D 12: a buffer bigger than one readback chunk is captured in pieces of a chunk each (it failed before: a
   readback buffer of its size could not be made, `E_OUTOFMEMORY` for a 4 GiB one), and a reserved buffer bigger than
   a chunk only as its mapped tiles, the rest as zeros (for a 4 GiB reserved buffer with 4,502 of its 65,536 tiles

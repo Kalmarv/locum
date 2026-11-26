@@ -1,7 +1,7 @@
 // The pipeline: the timeline of every event in GPU order, grouped by pass, and an inspector for the selected one.
 
 import { useEffect, useMemo, useRef, useState } from "preact/hooks";
-import { cached, get, type Binding, type Draw, type EventDetail, type Group, type ResultOut, type Row } from "./api";
+import { cached, get, type Binding, type Draw, type DrawDescriptor, type EventDetail, type Group, type ResultOut, type Row } from "./api";
 import { Thumb, type Picture } from "./image";
 import { BytesView, ConstantsTable, EventLink, KV, ModeSelect, ResLink, Section, ShaderLink, Stack, useCtx } from "./parts";
 import {
@@ -395,6 +395,8 @@ export function DrawView({ n }: { n: number }) {
             </table>
           </Section>
 
+          {draw.descriptors ? <Descriptors rows={draw.descriptors} /> : null}
+
           <Section title="constants" extra={<ModeSelect />}>
             {draw.bindings.filter(b => b.kind === "cb").map(b => (
               <ConstantsTable title={<span><b>{b.stage} b{b.slot}</b>{b.resource ? <> <ResLink r={b.resource}>#{b.resource.id}</ResLink></> : null}{b.offset ? ` @${b.offset}` : ""}</span>} constants={b.constants!} />
@@ -450,6 +452,37 @@ function BindingRow({ b, first, stage }: { b: Binding; first: boolean; stage: st
         : <span class="muted">{r.contentNote ?? "not captured"}</span>) : null}</td>
       <td>{r?.lastWrite != null ? <EventLink seq={r.lastWrite}>{r.lastWrite}</EventLink> : <span class="muted">{r ? "not this frame" : ""}</span>}</td>
     </tr>
+  );
+}
+
+const REGISTER: Record<string, string> = { cb: "b", srv: "t", uav: "u", sampler: "s" };
+
+/** What each register the root signature reaches pointed at, its flagged rows first. */
+function Descriptors({ rows }: { rows: DrawDescriptor[] }) {
+  const flagged = rows.filter(r => r.flag).length;
+  const sorted = [...rows.filter(r => r.flag), ...rows.filter(r => !r.flag)];
+  return (
+    <Section title={`descriptors (${rows.length}${flagged ? `, ${flagged} flagged` : ""})`} open={flagged > 0}>
+      <table class="bindings">
+        <thead><tr><th>stage</th><th>register</th><th>root parameter</th><th>heap slot</th><th>resource</th><th>address</th><th>size</th><th>stride</th><th>format</th><th>flag</th></tr></thead>
+        <tbody>
+          {sorted.map(r => (
+            <tr>
+              <td class="stage">{r.stage}</td>
+              <td class="slot">{REGISTER[r.kind] ?? r.kind}{r.slot}{r.space ? ` space${r.space}` : ""}</td>
+              <td>{r.parameter}</td>
+              <td>{r.heap != null ? <span title={r.version != null ? `descriptor version ${r.version}` : ""}>#{r.heap}[{r.heapSlot}]</span> : <span class="muted">root</span>}</td>
+              <td>{r.resource ? <ResLink r={r.resource} /> : <span class="muted">-</span>}</td>
+              <td class="slot">{r.address ?? ""}</td>
+              <td>{r.size ?? ""}</td>
+              <td>{r.stride ?? ""}</td>
+              <td>{r.formatName ?? ""}</td>
+              <td>{r.flag ? <span class="warn">{r.flag}</span> : null}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Section>
   );
 }
 

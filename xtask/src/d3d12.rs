@@ -516,6 +516,13 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
         );
         assert!(!text.contains("locum-cli: event "), "{name}: replay failed");
     }
+    // What the journal's dispatches' constant buffer views point at, by GPU address: the table's b3 and the root b5.
+    let (ok, text) = run(&["descriptors", &capture("journal"), "--kind", "cb"]);
+    assert!(
+        ok && text.lines().filter(|l| l.contains("	0x")).count() == 6,
+        "descriptors: the journal's constant buffer views with their GPU addresses"
+    );
+    println!("ok   D3D12 descriptors: what each dispatch's constant buffer views point at, by GPU address");
     // What each dispatch and the clear wrote through UAVs, as replay makes it: the game's bytes, and the tickets the
     // same records whatever order the GPU took them in.
     let (_, text) = run(&["verify", "--warp", &capture("results")]);

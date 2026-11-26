@@ -92,6 +92,27 @@ export interface Binding {
   constants?: Constants;
 }
 
+/** What one register of a D3D12 draw's root signature reached through a table or root descriptor. */
+export interface DrawDescriptor {
+  stage: string;
+  kind: string;
+  slot: number;
+  space: number;
+  parameter: number;
+  heap: number | null;
+  heapSlot: number | null;
+  version: number | null;
+  resource: ResourceRef | null;
+  /** The GPU address of a buffer or constant buffer view, or a root descriptor, as hex. */
+  address: string | null;
+  size: number | null;
+  stride: number | null;
+  format: number | null;
+  formatName: string | null;
+  /** null, no-resource, zero-size, past-end, empty, other-type or no-heap. */
+  flag: string | null;
+}
+
 export interface Target {
   draw: number;
   name: string;
@@ -149,6 +170,8 @@ export interface Draw {
   viewports: any[];
   scissors: any[];
   bindings: Binding[];
+  /** null for a capture without `d12_draw_descriptors`. */
+  descriptors: DrawDescriptor[] | null;
   passRange: { n: number; first: number; last: number } | null;
   targets: Target[];
   results: ResultOut[];

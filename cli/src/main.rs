@@ -6,6 +6,7 @@ mod bindings;
 mod conform;
 mod constants;
 mod describe;
+mod descriptors;
 mod diff;
 mod draw;
 mod draws;
@@ -171,6 +172,38 @@ enum Command {
         /// Only registers it does not read.
         #[arg(long)]
         unread: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What each register a D3D12 draw's or dispatch's root signature reaches pointed at as it was submitted, one
+    /// tab-separated row each (or JSON lines): the heap slot and descriptor version, the resource, a buffer or
+    /// constant buffer view's GPU address, bytes, element size and format, whether the program reads it, and its flag:
+    /// null, no-resource (an address in no live buffer), zero-size, past-end (past its buffer's end), empty (the
+    /// table's slot holds no descriptor), other-type (one of another type) or no-heap (the table's handle is in no
+    /// heap). A table range of more than 64 descriptors lists only those of its type.
+    Descriptors {
+        capture: String,
+        /// One draw, or draws `A..B` (both included).
+        #[arg(long, value_parser = parse_draws)]
+        draws: Option<(i64, i64)>,
+        /// Rows pointing at this resource.
+        #[arg(long)]
+        resource: Option<i64>,
+        /// cb, srv, uav or sampler.
+        #[arg(long)]
+        kind: Option<String>,
+        /// vs, hs, ds, gs, ps, as, ms or cs.
+        #[arg(long)]
+        stage: Option<String>,
+        /// Only rows with this flag.
+        #[arg(long, value_parser = clap::builder::PossibleValuesParser::new(locum_capture::d3d12::FLAGS.map(|f| f.0)))]
+        flag: Option<String>,
+        /// Only rows with a flag.
+        #[arg(long)]
+        flagged: bool,
+        /// Only registers the program reads.
+        #[arg(long)]
+        read: bool,
         #[arg(long)]
         json: bool,
     },
@@ -851,6 +884,29 @@ fn run(cli: Cli) -> Result<(), String> {
                 name,
                 file,
                 read: (read || unread).then_some(read),
+            },
+            json,
+        ),
+        Command::Descriptors {
+            capture,
+            draws,
+            resource,
+            kind,
+            stage,
+            flag,
+            flagged,
+            read,
+            json,
+        } => descriptors::descriptors(
+            &open(&capture)?,
+            &descriptors::Filter {
+                draws,
+                resource,
+                kind,
+                stage,
+                flag,
+                flagged,
+                read,
             },
             json,
         ),

@@ -366,7 +366,7 @@ pub fn constant_buffer(address: u64, bytes: u32) -> super::descriptors::Descript
         } else {
             super::slots::address(address)
         };
-        super::descriptors::Description::Json(json!({"buffer":buffer,"bytes":bytes}))
+        super::descriptors::Description::Json(json!({"buffer":buffer,"address":address,"bytes":bytes}))
     };
     ADDRESS_COST.add(start, 0);
     result
