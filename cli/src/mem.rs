@@ -8,7 +8,7 @@ use locum_mem::capture_join::join_capture;
 use locum_mem::etw::{DXGKRNL_KEYWORDS_DEFAULT, LiveTraceOptions, TraceSession, parse_etl};
 use locum_mem::labels::LabelMap;
 use locum_mem::reconcile::{format_text, reconcile};
-use locum_mem::win32::{InspectOptions, inspect_process};
+use locum_mem::win32::{InspectOptions, inspect_process, resolve_target_pid};
 
 use crate::out;
 
@@ -16,10 +16,16 @@ use crate::out;
 pub enum MemCommand {
     /// Zero-suspend Win32 + D3DKMT snapshot of a running process (optionally enriched with an .etl, --labels, and --capture).
     Inspect {
-        /// Target process ID.
+        /// Target process ID (mutually exclusive with --pid-of-child / --exe-name).
+        #[arg(long, conflicts_with_all = ["pid_of_child", "exe_name"])]
+        pid: Option<u32>,
+        /// Resolve target as the live child/descendant process of this parent PID (e.g. a launcher/runner PID); may be combined with --exe-name.
         #[arg(long)]
-        pid: u32,
-        /// Optional TSV mapping `[start..end] -> owner`.
+        pid_of_child: Option<u32>,
+        /// Resolve target by executable name (case-insensitive, with or without `.exe`); may be combined with --pid-of-child.
+        #[arg(long)]
+        exe_name: Option<String>,
+        /// Optional TSV mapping address ranges to owners: `start<TAB>end<TAB>owner` (or `start..end<TAB>owner`, `[start..end] -> owner`, or header `start<TAB>size<TAB>owner`); nested ranges allowed (innermost wins).
         #[arg(long)]
         labels: Option<PathBuf>,
         /// Optional DxgKrnl/kernel .etl trace to reconcile against Win32 and QueryVideoMemoryInfo.
@@ -40,9 +46,15 @@ pub enum MemCommand {
     },
     /// Live zero-suspend trace: records DxgKrnl + kernel HardFaults ETW (with rundown), snapshots Win32 + D3DKMT, and reconciles.
     Trace {
-        /// Target process ID.
+        /// Target process ID (mutually exclusive with --pid-of-child / --exe-name).
+        #[arg(long, conflicts_with_all = ["pid_of_child", "exe_name"])]
+        pid: Option<u32>,
+        /// Resolve target as the live child/descendant process of this parent PID (e.g. a launcher/runner PID); may be combined with --exe-name.
         #[arg(long)]
-        pid: u32,
+        pid_of_child: Option<u32>,
+        /// Resolve target by executable name (case-insensitive, with or without `.exe`); may be combined with --pid-of-child.
+        #[arg(long)]
+        exe_name: Option<String>,
         /// Recording window in seconds.
         #[arg(long, default_value_t = 5.0)]
         duration: f64,
@@ -52,7 +64,7 @@ pub enum MemCommand {
         /// Keep the recorded .etl file on disk after parsing.
         #[arg(long)]
         keep_etl: bool,
-        /// Optional TSV mapping `[start..end] -> owner`.
+        /// Optional TSV mapping address ranges to owners: `start<TAB>end<TAB>owner` (or `start..end<TAB>owner`, `[start..end] -> owner`, or header `start<TAB>size<TAB>owner`); nested ranges allowed (innermost wins).
         #[arg(long)]
         labels: Option<PathBuf>,
         /// Optional locum capture.db (or capture folder) to join `d12_draw_descriptors`.
@@ -75,7 +87,7 @@ pub enum MemCommand {
         /// Optional target PID filter.
         #[arg(long)]
         pid: Option<u32>,
-        /// Optional TSV mapping `[start..end] -> owner`.
+        /// Optional TSV mapping address ranges to owners: `start<TAB>end<TAB>owner` (or `start..end<TAB>owner`, `[start..end] -> owner`, or header `start<TAB>size<TAB>owner`); nested ranges allowed (innermost wins).
         #[arg(long)]
         labels: Option<PathBuf>,
         /// Optional locum capture.db (or capture folder) to join `d12_draw_descriptors`.
@@ -94,6 +106,8 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
     match cmd {
         MemCommand::Inspect {
             pid,
+            pid_of_child,
+            exe_name,
             labels,
             etl,
             capture,
@@ -101,6 +115,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
             top,
             json,
         } => {
+            let pid = resolve_target_pid(pid, pid_of_child, exe_name.as_deref())?;
             let label_map = load_labels(labels.as_deref())?;
             let win32 = inspect_process(pid, InspectOptions { sample_step })?;
             let etw_rep = etl.as_deref().map(|p| parse_etl(p, Some(pid))).transpose()?;
@@ -113,6 +128,8 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
         }
         MemCommand::Trace {
             pid,
+            pid_of_child,
+            exe_name,
             duration,
             out: etl_out,
             keep_etl,
@@ -122,6 +139,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
             top,
             json,
         } => {
+            let pid = resolve_target_pid(pid, pid_of_child, exe_name.as_deref())?;
             let label_map = load_labels(labels.as_deref())?;
             let is_temp = etl_out.is_none();
             let etl_path = etl_out.unwrap_or_else(|| {

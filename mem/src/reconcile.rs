@@ -816,10 +816,42 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
     }
 
     if !rep.by_owner.is_empty() {
+        let has_vidmm_allocs = rep
+            .etw
+            .as_ref()
+            .is_some_and(|e| e.coverage.has_allocation_rundown);
+        let has_hard_faults = rep.etw.as_ref().is_some_and(|e| e.coverage.hard_faults_available);
+        let limit = top.max(40);
+        let owner_w = rep
+            .by_owner
+            .iter()
+            .take(limit)
+            .map(|o| o.owner.len())
+            .max()
+            .unwrap_or(22)
+            .clamp(22, 48);
+
         let _ = writeln!(out, "\n== Breakdown by Owner (--labels) ==");
+        if !has_vidmm_allocs || !has_hard_faults {
+            if rep.etw.is_none() {
+                let _ = writeln!(
+                    out,
+                    "  (vram_M/host_M/demot_M/hfault = n/a: needs a live trace or --etl; run `locum-cli mem trace`)"
+                );
+            } else {
+                let mut missing = Vec::new();
+                if !has_vidmm_allocs {
+                    missing.push("vram_M/host_M/demot_M (no DxgKrnl allocation rundown)");
+                }
+                if !has_hard_faults {
+                    missing.push("hfault (no SystemMemoryProvider / PageFault events)");
+                }
+                let _ = writeln!(out, "  (n/a columns: {})", missing.join("; "));
+            }
+        }
         let _ = writeln!(
             out,
-            "  {:<22} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6}",
+            "  {:<owner_w$} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>6}",
             "owner",
             "commit_M",
             "ram_M",
@@ -829,22 +861,38 @@ pub fn format_text(rep: &MemReport, top: usize) -> String {
             "vram_M",
             "host_M",
             "demot_M",
-            "hfault"
+            "hfault",
+            owner_w = owner_w,
         );
-        for o in rep.by_owner.iter().take(top.max(40)) {
+        for o in rep.by_owner.iter().take(limit) {
+            let (vram_s, host_s, demot_s) = if has_vidmm_allocs {
+                (
+                    format!("{:>8.2}", mib(o.vidmm_local_bytes + o.vidmm_local_bar_bytes)),
+                    format!("{:>8.2}", mib(o.vidmm_non_local_bytes)),
+                    format!("{:>8.2}", mib(o.vidmm_demoted_bytes)),
+                )
+            } else {
+                ("     n/a".into(), "     n/a".into(), "     n/a".into())
+            };
+            let hfault_s = if has_hard_faults {
+                format!("{:>6}", o.hard_fault_count)
+            } else {
+                "   n/a".into()
+            };
             let _ = writeln!(
                 out,
-                "  {:<22} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>6}",
+                "  {:<owner_w$} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {:>8.2} {} {} {} {}",
                 o.owner,
                 mib(o.va_commit_bytes),
                 mib(o.resident_bytes),
                 mib(o.bar_mapped_bytes),
                 mib(o.paged_out_bytes),
                 mib(o.untouched_bytes),
-                mib(o.vidmm_local_bytes + o.vidmm_local_bar_bytes),
-                mib(o.vidmm_non_local_bytes),
-                mib(o.vidmm_demoted_bytes),
-                o.hard_fault_count,
+                vram_s,
+                host_s,
+                demot_s,
+                hfault_s,
+                owner_w = owner_w,
             );
         }
     }
@@ -1000,5 +1048,16 @@ mod tests {
         assert!(etw.coverage.can_attribute_heap_demotion);
         assert!(etw.warnings.is_empty());
         assert!(etw.coverage.capture_guidance.is_none());
+    }
+
+    #[test]
+    fn owner_breakdown_prints_na_without_etw() {
+        let labels = LabelMap::parse("[0x1000..0x3000] -> outer_res\n0x2000\t0x2800\tinner_win\n").unwrap();
+        let rep = reconcile(None, None, &labels, None);
+        let text = format_text(&rep, 25);
+        assert!(text.contains("vram_M/host_M/demot_M/hfault = n/a: needs a live trace or --etl"));
+        assert!(text.contains("outer_res"));
+        assert!(text.contains("inner_win"));
+        assert!(text.contains("     n/a      n/a      n/a    n/a"));
     }
 }

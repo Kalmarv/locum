@@ -1,9 +1,13 @@
 //! Generic address-range label table (`--labels <ranges.tsv>`).
 //!
 //! Maps half-open address intervals `[start, end)` to human-readable owner names (and optional notes).
-//! Accepted TSV line formats (comments starting with `#` and blank lines are ignored):
+//! Nested and overlapping ranges are supported: the innermost (narrowest) range wins on every
+//! sub-interval (ties broken by later line order).
+//!
+//! Accepted line formats (comments starting with `#` and blank lines are ignored):
 //! - `start\tend\towner[\tnote]` (default; hex `0x...` or decimal)
 //! - `start..end\towner[\tnote]`
+//! - `[start..end] -> owner` (or `start..end -> owner`)
 //! - With a header whose second column is `size`, `bytes`, or `len`: `start\tsize\towner[\tnote]`
 
 use std::collections::BTreeMap;
@@ -21,10 +25,14 @@ pub struct LabelRange {
     pub note: Option<String>,
 }
 
-/// Sorted collection of address-range labels.
+/// Collection of address-range labels with pre-flattened disjoint intervals (innermost range wins).
 #[derive(Clone, Debug, Default)]
 pub struct LabelMap {
+    /// Original declared ranges (preserved so all declared owners can be pre-seeded).
     ranges: Vec<LabelRange>,
+    /// Disjoint, sorted intervals flattened from `ranges` where the narrowest (innermost)
+    /// containing range wins (tie-broken by later line order).
+    resolved: Vec<LabelRange>,
 }
 
 impl LabelMap {
@@ -58,12 +66,7 @@ impl LabelMap {
             let lineno = idx + 1;
 
             let (start, end, owner, note) = if cols.len() >= 2 && cols[0].contains("..") {
-                let (a, b) = cols[0]
-                    .split_once("..")
-                    .ok_or_else(|| format!("line {lineno}: invalid range {:?}", cols[0]))?;
-                let s = parse_u64(a).map_err(|e| format!("line {lineno}: start: {e}"))?;
-                let e =
-                    parse_u64(b.trim_start_matches('=')).map_err(|e| format!("line {lineno}: end: {e}"))?;
+                let (s, e) = parse_range_token(cols[0], lineno)?;
                 let owner = cols[1].to_string();
                 let note = cols.get(2).filter(|s| !s.is_empty()).map(|s| (*s).to_string());
                 (s, e, owner, note)
@@ -79,9 +82,13 @@ impl LabelMap {
                 let owner = cols[2].to_string();
                 let note = cols.get(3).filter(|s| !s.is_empty()).map(|s| (*s).to_string());
                 (s, e, owner, note)
+            } else if let Some((lhs, rhs)) = line.split_once("->") {
+                let (s, e) = parse_range_token(lhs, lineno)?;
+                let owner = rhs.trim().to_string();
+                (s, e, owner, None)
             } else {
                 return Err(format!(
-                    "line {lineno}: expected `start\\tend\\towner` or `start..end\\towner`, got {raw:?}"
+                    "line {lineno}: expected `start\\tend\\towner`, `start..end\\towner`, or `[start..end] -> owner`, got {raw:?}"
                 ));
             };
 
@@ -101,8 +108,9 @@ impl LabelMap {
             });
         }
 
+        let resolved = flatten_innermost(&ranges);
         ranges.sort_by_key(|r| (r.start, r.end));
-        Ok(Self { ranges })
+        Ok(Self { ranges, resolved })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -117,36 +125,36 @@ impl LabelMap {
         &self.ranges
     }
 
-    /// Owner of a single address `addr` (first matching range containing `addr`).
+    /// Owner of a single address `addr` (innermost containing range wins).
     pub fn owner_of(&self, addr: u64) -> Option<&str> {
-        // Binary search for the first range whose start > addr, then scan backwards while possible.
-        let hi = self.ranges.partition_point(|r| r.start <= addr);
-        for r in self.ranges[..hi].iter().rev() {
-            if addr < r.end {
-                return Some(r.owner.as_str());
-            }
+        let hi = self.resolved.partition_point(|r| r.start <= addr);
+        if hi == 0 {
+            return None;
         }
-        None
+        let r = &self.resolved[hi - 1];
+        if addr < r.end {
+            Some(r.owner.as_str())
+        } else {
+            None
+        }
     }
 
-    /// Splits a half-open region `[base, end)` into sub-spans attributed to each overlapping label
-    /// (and `None` for any unlabeled gaps). If multiple labels overlap, the earliest-starting label wins.
+    /// Splits a half-open region `[base, end)` into disjoint sub-spans attributed to each overlapping
+    /// label (and `None` for any unlabeled gaps). For nested/overlapping labels, the innermost
+    /// (narrowest) range wins without double-counting any bytes.
     pub fn split_region(&self, base: u64, end: u64) -> Vec<(u64, u64, Option<&str>)> {
-        if end <= base || self.ranges.is_empty() {
+        if end <= base || self.resolved.is_empty() {
             return if end > base {
                 vec![(base, end, None)]
             } else {
                 Vec::new()
             };
         }
-        // Collect candidate ranges that can intersect [base, end).
-        let hi = self.ranges.partition_point(|r| r.start < end);
+        // First resolved interval whose end > base (disjoint & sorted, so partition_point is exact).
+        let lo = self.resolved.partition_point(|r| r.end <= base);
         let mut cursor = base;
         let mut out = Vec::new();
-        for r in &self.ranges[..hi] {
-            if r.end <= cursor {
-                continue;
-            }
+        for r in &self.resolved[lo..] {
             if r.start >= end {
                 break;
             }
@@ -177,6 +185,61 @@ impl LabelMap {
         }
         map
     }
+}
+
+fn parse_range_token(tok: &str, lineno: usize) -> Result<(u64, u64), String> {
+    let trimmed = tok.trim().trim_start_matches('[').trim_end_matches(']').trim();
+    let (a, b) = trimmed
+        .split_once("..")
+        .ok_or_else(|| format!("line {lineno}: invalid range {tok:?}"))?;
+    let s = parse_u64(a).map_err(|e| format!("line {lineno}: start: {e}"))?;
+    let e = parse_u64(b.trim_start_matches('=')).map_err(|e| format!("line {lineno}: end: {e}"))?;
+    Ok((s, e))
+}
+
+/// Flattens potentially nested/overlapping `ranges` into sorted, disjoint intervals where the
+/// innermost (smallest `end - start`) range wins; equal-size overlaps break ties by later line order.
+fn flatten_innermost(ranges: &[LabelRange]) -> Vec<LabelRange> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+    let mut coords = Vec::with_capacity(ranges.len() * 2);
+    for r in ranges {
+        coords.push(r.start);
+        coords.push(r.end);
+    }
+    coords.sort_unstable();
+    coords.dedup();
+
+    let mut out: Vec<LabelRange> = Vec::new();
+    for win in coords.windows(2) {
+        let (a, b) = (win[0], win[1]);
+        if b <= a {
+            continue;
+        }
+        let best = ranges
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.start <= a && b <= r.end)
+            .min_by_key(|(idx, r)| (r.end - r.start, std::cmp::Reverse(*idx)));
+        if let Some((_, winner)) = best {
+            if let Some(prev) = out.last_mut()
+                && prev.end == a
+                && prev.owner == winner.owner
+                && prev.note == winner.note
+            {
+                prev.end = b;
+            } else {
+                out.push(LabelRange {
+                    start: a,
+                    end: b,
+                    owner: winner.owner.clone(),
+                    note: winner.note.clone(),
+                });
+            }
+        }
+    }
+    out
 }
 
 fn is_header(cols: &[&str]) -> bool {
@@ -211,15 +274,18 @@ mod tests {
 start\tend\towner\tnote
 0x1000\t0x3000\tuma_win0\tsparse
 0x5000..0x6000\tgpu_upload_1g
+[0x7000..0x8000] -> arrow_syntax
 ";
         let m = LabelMap::parse(tsv).unwrap();
-        assert_eq!(m.len(), 2);
+        assert_eq!(m.len(), 3);
         assert_eq!(m.owner_of(0x1000), Some("uma_win0"));
         assert_eq!(m.owner_of(0x2FFF), Some("uma_win0"));
         assert_eq!(m.owner_of(0x3000), None);
         assert_eq!(m.owner_of(0x5500), Some("gpu_upload_1g"));
+        assert_eq!(m.owner_of(0x7000), Some("arrow_syntax"));
+        assert_eq!(m.owner_of(0x8000), None);
 
-        let parts = m.split_region(0x0, 0x7000);
+        let parts = m.split_region(0x0, 0x9000);
         assert_eq!(
             parts,
             vec![
@@ -228,8 +294,40 @@ start\tend\towner\tnote
                 (0x3000, 0x5000, None),
                 (0x5000, 0x6000, Some("gpu_upload_1g")),
                 (0x6000, 0x7000, None),
+                (0x7000, 0x8000, Some("arrow_syntax")),
+                (0x8000, 0x9000, None),
             ]
         );
+    }
+
+    #[test]
+    fn nested_and_overlapping_ranges_innermost_wins_without_double_counting() {
+        let tsv = "\
+0x10000\t0x50000\tarena_outer
+0x20000\t0x40000\theap_mid
+0x28000\t0x30000\twindow3_inner
+";
+        let m = LabelMap::parse(tsv).unwrap();
+        assert_eq!(m.owner_of(0x15000), Some("arena_outer"));
+        assert_eq!(m.owner_of(0x22000), Some("heap_mid"));
+        assert_eq!(m.owner_of(0x2A000), Some("window3_inner"));
+        assert_eq!(m.owner_of(0x35000), Some("heap_mid"));
+        assert_eq!(m.owner_of(0x45000), Some("arena_outer"));
+
+        let parts = m.split_region(0x10000, 0x50000);
+        assert_eq!(
+            parts,
+            vec![
+                (0x10000, 0x20000, Some("arena_outer")),
+                (0x20000, 0x28000, Some("heap_mid")),
+                (0x28000, 0x30000, Some("window3_inner")),
+                (0x30000, 0x40000, Some("heap_mid")),
+                (0x40000, 0x50000, Some("arena_outer")),
+            ]
+        );
+        // Conservation: split spans sum to exact region size.
+        let total: u64 = parts.iter().map(|(s, e, _)| e - s).sum();
+        assert_eq!(total, 0x40000);
     }
 
     #[test]

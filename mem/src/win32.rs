@@ -3,7 +3,7 @@
 //! Opens the target process strictly with `PROCESS_QUERY_INFORMATION | PROCESS_VM_READ` (no suspend
 //! permissions, zero `SuspendThread` / `NtSuspendProcess` / `PssCaptureSnapshot` calls).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 
 use serde::Serialize;
@@ -14,6 +14,9 @@ use windows::Wdk::Graphics::Direct3D::{
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Memory::{
     MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, PAGE_GUARD,
     PAGE_NOACCESS, PAGE_WRITECOMBINE, VirtualQueryEx,
@@ -610,4 +613,251 @@ mod tests {
         // CUSTOM L0 WriteBack in system RAM (Valid=1, non-WC, priority=5)
         assert_eq!(run(0x0500_0041, false), (1, 0, 0, 0, 0));
     }
+
+    #[test]
+    fn resolves_child_and_exe_name_from_process_list() {
+        let procs = vec![
+            ProcessEntry {
+                pid: 100,
+                parent_pid: 1,
+                exe_name: "runner.exe".into(),
+            },
+            ProcessEntry {
+                pid: 101,
+                parent_pid: 100,
+                exe_name: "conhost.exe".into(),
+            },
+            ProcessEntry {
+                pid: 200,
+                parent_pid: 100,
+                exe_name: "GameTitle.exe".into(),
+            },
+            ProcessEntry {
+                pid: 300,
+                parent_pid: 200,
+                exe_name: "CrashHelper.exe".into(),
+            },
+        ];
+        // Direct child skips conhost.exe and picks GameTitle.exe
+        assert_eq!(
+            resolve_target_pid_from_list(&procs, None, Some(100), None, 999).unwrap(),
+            200
+        );
+        // Combined --pid-of-child + --exe-name can match grandchild too
+        assert_eq!(
+            resolve_target_pid_from_list(&procs, None, Some(100), Some("crashhelper"), 999).unwrap(),
+            300
+        );
+        // --exe-name works with or without .exe, case-insensitively
+        assert_eq!(
+            resolve_target_pid_from_list(&procs, None, None, Some("gametitle"), 999).unwrap(),
+            200
+        );
+        assert_eq!(
+            resolve_target_pid_from_list(&procs, None, None, Some("GameTitle.exe"), 999).unwrap(),
+            200
+        );
+        // Explicit --pid passes through
+        assert_eq!(
+            resolve_target_pid_from_list(&procs, Some(200), None, None, 999).unwrap(),
+            200
+        );
+    }
+}
+
+/// Entry from `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcessEntry {
+    pub pid: u32,
+    pub parent_pid: u32,
+    pub exe_name: String,
+}
+
+/// Lists all running processes via `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)` (zero suspends).
+pub fn list_processes() -> Result<Vec<ProcessEntry>, String> {
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|e| format!("CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS) failed: {e}"))?;
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    if unsafe { Process32FirstW(snap, &mut entry) }.is_ok() {
+        loop {
+            let end = entry
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(entry.szExeFile.len());
+            let exe_name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            out.push(ProcessEntry {
+                pid: entry.th32ProcessID,
+                parent_pid: entry.th32ParentProcessID,
+                exe_name,
+            });
+            if unsafe { Process32NextW(snap, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    unsafe {
+        let _ = CloseHandle(snap);
+    }
+    Ok(out)
+}
+
+/// Resolves a single target PID from `--pid`, `--pid-of-child <PARENT_PID>`, and/or `--exe-name <NAME>`.
+///
+/// Uses `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)` only (zero thread suspends).
+pub fn resolve_target_pid(
+    pid: Option<u32>,
+    pid_of_child: Option<u32>,
+    exe_name: Option<&str>,
+) -> Result<u32, String> {
+    if let Some(p) = pid {
+        return Ok(p);
+    }
+    if pid_of_child.is_none() && exe_name.is_none() {
+        return Err("specify one of --pid <PID>, --pid-of-child <PARENT_PID>, or --exe-name <NAME>".into());
+    }
+    let procs = list_processes()?;
+    resolve_target_pid_from_list(&procs, pid, pid_of_child, exe_name, std::process::id())
+}
+
+fn exe_matches(actual: &str, wanted: &str) -> bool {
+    let w = std::path::Path::new(wanted)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(wanted)
+        .trim();
+    if w.is_empty() {
+        return false;
+    }
+    if actual.eq_ignore_ascii_case(w) {
+        return true;
+    }
+    let actual_stem = actual
+        .strip_suffix(".exe")
+        .or_else(|| actual.strip_suffix(".EXE"))
+        .unwrap_or(actual);
+    let wanted_stem = w
+        .strip_suffix(".exe")
+        .or_else(|| w.strip_suffix(".EXE"))
+        .unwrap_or(w);
+    actual_stem.eq_ignore_ascii_case(wanted_stem)
+}
+
+fn is_console_helper(exe: &str) -> bool {
+    exe.eq_ignore_ascii_case("conhost.exe") || exe.eq_ignore_ascii_case("openconsole.exe")
+}
+
+fn resolve_target_pid_from_list(
+    procs: &[ProcessEntry],
+    pid: Option<u32>,
+    pid_of_child: Option<u32>,
+    exe_name: Option<&str>,
+    self_pid: u32,
+) -> Result<u32, String> {
+    if let Some(p) = pid {
+        return Ok(p);
+    }
+
+    if let Some(ppid) = pid_of_child {
+        let mut children_by_parent: HashMap<u32, Vec<&ProcessEntry>> = HashMap::new();
+        for p in procs {
+            if p.pid != 0 && p.pid != self_pid {
+                children_by_parent.entry(p.parent_pid).or_default().push(p);
+            }
+        }
+        let mut descendants: Vec<(&ProcessEntry, usize)> = Vec::new();
+        let mut q = VecDeque::new();
+        q.push_back((ppid, 0usize));
+        while let Some((cur, depth)) = q.pop_front() {
+            if let Some(kids) = children_by_parent.get(&cur) {
+                for &k in kids {
+                    if k.pid == ppid || descendants.iter().any(|(d, _)| d.pid == k.pid) {
+                        continue;
+                    }
+                    descendants.push((k, depth + 1));
+                    q.push_back((k.pid, depth + 1));
+                }
+            }
+        }
+
+        if let Some(want) = exe_name {
+            let matches: Vec<_> = descendants
+                .into_iter()
+                .filter(|(p, _)| exe_matches(&p.exe_name, want))
+                .collect();
+            return match matches.as_slice() {
+                [] => Err(format!(
+                    "no live child/descendant of parent PID {ppid} matching --exe-name {want:?}"
+                )),
+                [(only, _)] => Ok(only.pid),
+                many => {
+                    let list = many
+                        .iter()
+                        .map(|(p, d)| format!("pid={} ({}, depth={d})", p.pid, p.exe_name))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    Err(format!(
+                        "multiple descendants of parent PID {ppid} match --exe-name {want:?}: {list}; pass --pid"
+                    ))
+                }
+            };
+        }
+
+        // No --exe-name filter: prefer direct non-console children, then deeper non-console descendants.
+        let non_console: Vec<_> = descendants
+            .iter()
+            .copied()
+            .filter(|(p, _)| !is_console_helper(&p.exe_name))
+            .collect();
+        let pool = if non_console.is_empty() {
+            descendants
+        } else {
+            non_console
+        };
+        let direct: Vec<_> = pool.iter().copied().filter(|(_, d)| *d == 1).collect();
+        let candidates = if !direct.is_empty() { direct } else { pool };
+
+        return match candidates.as_slice() {
+            [] => Err(format!("no live child process found for parent PID {ppid}")),
+            [(only, _)] => Ok(only.pid),
+            many => {
+                let list = many
+                    .iter()
+                    .map(|(p, d)| format!("pid={} ({}, depth={d})", p.pid, p.exe_name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!(
+                    "multiple child processes found for parent PID {ppid}: {list}; narrow with --exe-name <NAME> or pass --pid"
+                ))
+            }
+        };
+    }
+
+    if let Some(want) = exe_name {
+        let matches: Vec<&ProcessEntry> = procs
+            .iter()
+            .filter(|p| p.pid != 0 && p.pid != self_pid && exe_matches(&p.exe_name, want))
+            .collect();
+        return match matches.as_slice() {
+            [] => Err(format!("no running process matching --exe-name {want:?}")),
+            [only] => Ok(only.pid),
+            many => {
+                let list = many
+                    .iter()
+                    .map(|p| format!("pid={} (parent={}, {})", p.pid, p.parent_pid, p.exe_name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(format!(
+                    "multiple running processes match --exe-name {want:?}: {list}; narrow with --pid-of-child <PPID> or pass --pid"
+                ))
+            }
+        };
+    }
+
+    Err("specify one of --pid <PID>, --pid-of-child <PARENT_PID>, or --exe-name <NAME>".into())
 }
