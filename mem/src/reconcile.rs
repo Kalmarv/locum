@@ -707,12 +707,50 @@ pub fn reconcile(
     });
 
     let mut warnings = Vec::new();
-    // Warn if the inspected PID has no D3D device usage/allocations and has live child processes
-    // (common when passing a launcher/runner PID instead of the child title PID).
+    // Warn if the target process exited or was tearing down during Win32 inspection.
+    if let Some(ref w) = win32 {
+        if w.process_exited {
+            let code = w
+                .exit_code
+                .map(|c| format!("{c:#x}"))
+                .unwrap_or_else(|| "unknown".into());
+            warnings.push(format!(
+                "PID {} exited before/during inspection (exit_code={code}); VA, working set, and D3DKMT counters reflect a partial teardown state",
+                w.pid
+            ));
+        }
+        if w.video_memory.is_empty() {
+            if let Some(ref err) = w.video_memory_error {
+                warnings.push(format!(
+                    "Out-of-process D3DKMT QueryVideoMemoryInfo unavailable ({err}); process may be terminating or have no D3D device"
+                ));
+            } else {
+                warnings.push(
+                    "Out-of-process D3DKMT QueryVideoMemoryInfo returned no adapters; process may be terminating or have no D3D device"
+                        .into(),
+                );
+            }
+        }
+        if !w.process_exited
+            && w.video_memory.is_empty()
+            && w.totals.image_commit_bytes < (2 << 20)
+            && w.totals.commit_bytes > (16 << 20)
+        {
+            warnings.push(format!(
+                "Very low MEM_IMAGE commit ({:.2} MiB of {:.2} MiB committed VA) with missing D3DKMT: process was likely terminating / tearing down its address space during inspection",
+                mib(w.totals.image_commit_bytes),
+                mib(w.totals.commit_bytes),
+            ));
+        }
+    }
+    // Warn if the inspected/traced PID has no D3D device usage or non-page-table VidMm allocations
+    // and has live child processes (common when passing a launcher/runner PID instead of the title PID).
+    let has_non_pt_vidmm = etw
+        .as_ref()
+        .is_some_and(|e| e.tracked_total_bytes > 0 || e.allocations.iter().any(|a| !a.page_table_or_dir));
     if let Some(target_pid) = pid
         && cons.qvmi_total_bytes == 0
-        && etw.as_ref().is_none_or(|e| e.allocations.is_empty())
-        && win32.is_some()
+        && !has_non_pt_vidmm
     {
         let kids = live_children_of(target_pid);
         if !kids.is_empty() {
@@ -996,8 +1034,8 @@ pub fn format_text_with_options(rep: &MemReport, labels: Option<&LabelMap>, opts
             }
         }
 
+        let _ = writeln!(out, "\n== Out-of-Process QueryVideoMemoryInfo (D3DKMT) ==");
         if !w.video_memory.is_empty() {
-            let _ = writeln!(out, "\n== Out-of-Process QueryVideoMemoryInfo (D3DKMT) ==");
             for vm in &w.video_memory {
                 if vm.local_usage == 0 && vm.non_local_usage == 0 && vm.local_budget == 0 {
                     continue;
@@ -1012,14 +1050,40 @@ pub fn format_text_with_options(rep: &MemReport, labels: Option<&LabelMap>, opts
                     mib(vm.non_local_budget),
                 );
             }
+        } else {
+            let reason = w
+                .video_memory_error
+                .as_deref()
+                .unwrap_or("no adapters returned; process may be terminating or have no D3D device");
+            let _ = writeln!(out, "  unavailable ({reason})");
         }
     }
 
     if let Some(ref e) = rep.etw {
+        let rate_part = if e.duration_secs > 0.0 {
+            let ev_k = (e.total_events as f64 / e.duration_secs) / 1e3;
+            if e.etl_size_bytes > 0 {
+                let mb = mib(e.etl_size_bytes);
+                let mb_s = mb / e.duration_secs;
+                format!(", {ev_k:.1}k/s, {mb:.1} MiB ({mb_s:.1} MiB/s)")
+            } else {
+                format!(", {ev_k:.1}k/s")
+            }
+        } else if e.etl_size_bytes > 0 {
+            format!(", {:.1} MiB", mib(e.etl_size_bytes))
+        } else {
+            String::new()
+        };
+        let split_part = if e.rundown_events > 0 {
+            let steady = e.total_events.saturating_sub(e.rundown_events);
+            format!(", rundown={}, steady={steady}", e.rundown_events)
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "\n== VidMm / DxgKrnl + Kernel ETW ({} events, {} dxgkrnl, {} sysmem, {:.2} s) ==",
-            e.total_events, e.dxgkrnl_events, e.system_memory_events, e.duration_secs
+            "\n== VidMm / DxgKrnl + Kernel ETW ({} events{rate_part}{split_part}, {:.2} s | {} dxgkrnl, {} sysmem) ==",
+            e.total_events, e.duration_secs, e.dxgkrnl_events, e.system_memory_events
         );
         for w in &e.warnings {
             let _ = writeln!(out, "  [warn] {w}");
@@ -1087,12 +1151,31 @@ pub fn format_text_with_options(rep: &MemReport, labels: Option<&LabelMap>, opts
             .map(|p| format!("pid={p}"))
             .unwrap_or_else(|| "all pids".into());
         if e.coverage.has_allocation_rundown {
+            let non_pt_count = e.allocations.iter().filter(|a| !a.page_table_or_dir).count();
+            let pt_count = e.allocations.len().saturating_sub(non_pt_count);
+            let alloc_count_str = if pt_count > 0 {
+                format!("{non_pt_count} allocs (+{pt_count} page-table)")
+            } else {
+                format!("{non_pt_count} allocs")
+            };
+            let local_total = e
+                .tracked_local_vram_bytes
+                .saturating_add(e.tracked_local_bar_bytes);
+            let local_str = if e.tracked_local_vram_bytes > 0 && e.tracked_local_bar_bytes > 0 {
+                format!(
+                    "Local VRAM {:.2} MiB (non-vis {:.2}, BAR {:.2})",
+                    mib(local_total),
+                    mib(e.tracked_local_vram_bytes),
+                    mib(e.tracked_local_bar_bytes),
+                )
+            } else if e.tracked_local_bar_bytes > 0 {
+                format!("Local VRAM {:.2} MiB (CPU-vis BAR)", mib(local_total))
+            } else {
+                format!("Local VRAM {:.2} MiB", mib(local_total))
+            };
             let _ = writeln!(
                 out,
-                "  Tracked Live Allocs ({alloc_scope}) : {} allocs | Local VRAM {:.2} MiB | Local BAR {:.2} MiB | NonLocal Host {:.2} MiB | Demoted {:.2} MiB | Evicted {:.2} MiB | Unknown {:.2} MiB",
-                e.allocations.len(),
-                mib(e.tracked_local_vram_bytes),
-                mib(e.tracked_local_bar_bytes),
+                "  Tracked Live Allocs ({alloc_scope}) : {alloc_count_str} | {local_str} | NonLocal Host {:.2} MiB | Demoted {:.2} MiB | Evicted {:.2} MiB | Unknown {:.2} MiB",
                 mib(e.tracked_non_local_host_bytes),
                 mib(e.tracked_demoted_bytes),
                 mib(e.tracked_evicted_bytes),
@@ -1158,13 +1241,27 @@ pub fn format_text_with_options(rep: &MemReport, labels: Option<&LabelMap>, opts
             );
         }
         if e.coverage.has_gpu_va_events || e.tile_mappings.call_count > 0 {
+            let gpuva_part = if e.tile_mappings.gpuva_rundown_map_events > 0
+                || e.tile_mappings.gpuva_live_map_events > 0
+                || e.tile_mappings.gpuva_map_events == 0
+            {
+                format!(
+                    "GPUVA live_map={} unmap={} (rundown_map={})",
+                    e.tile_mappings.gpuva_live_map_events,
+                    e.tile_mappings.gpuva_unmap_events,
+                    e.tile_mappings.gpuva_rundown_map_events,
+                )
+            } else {
+                format!(
+                    "GPUVA map={} unmap={}",
+                    e.tile_mappings.gpuva_map_events, e.tile_mappings.gpuva_unmap_events,
+                )
+            };
             let _ = writeln!(
                 out,
-                "  UpdateTileMappings    : {} calls ({} ops) | GPUVA map={} unmap={} | live_mappings={}",
+                "  UpdateTileMappings    : {} calls ({} ops) | {gpuva_part} | live_mappings={}",
                 e.tile_mappings.call_count,
                 e.tile_mappings.total_operations,
-                e.tile_mappings.gpuva_map_events,
-                e.tile_mappings.gpuva_unmap_events,
                 e.gpu_va_mappings.len(),
             );
         } else {
@@ -1608,6 +1705,9 @@ mod tests {
             sample_step: 1,
             thread_suspends: 0,
             elapsed_ms: 1.0,
+            process_exited: false,
+            exit_code: None,
+            video_memory_error: None,
             counters: Default::default(),
             totals: Default::default(),
             video_memory: Vec::new(),
@@ -1624,5 +1724,137 @@ mod tests {
         let rep_no_win32 = reconcile(None, None, &labels, None);
         let text_no_win32 = format_text(&rep_no_win32, 25);
         assert!(text_no_win32.contains("commit_M..untch_M (no Win32 process snapshot)"));
+    }
+
+    #[test]
+    fn terminating_snapshot_emits_warnings_and_d3dkmt_unavailable() {
+        let snap = ProcessMemorySnapshot {
+            pid: 21960,
+            page_size: 4096,
+            sample_step: 16,
+            thread_suspends: 0,
+            elapsed_ms: 500.0,
+            process_exited: false,
+            exit_code: None,
+            video_memory_error: Some(
+                "D3DKMTQueryVideoMemoryInfo failed: STATUS_PROCESS_IS_TERMINATING (0xc000010a)".into(),
+            ),
+            counters: Default::default(),
+            totals: crate::win32::VaTotals {
+                commit_bytes: 22 << 30,
+                image_commit_bytes: 680 * 1024,
+                ..Default::default()
+            },
+            video_memory: Vec::new(),
+            regions: Vec::new(),
+        };
+        let rep = reconcile(Some(snap), None, &LabelMap::default(), None);
+        assert!(
+            rep.warnings
+                .iter()
+                .any(|w| w.contains("STATUS_PROCESS_IS_TERMINATING"))
+        );
+        assert!(
+            rep.warnings
+                .iter()
+                .any(|w| w.contains("Very low MEM_IMAGE commit"))
+        );
+        let text = format_text(&rep, 10);
+        assert!(text.contains("== Out-of-Process QueryVideoMemoryInfo (D3DKMT) =="));
+        assert!(
+            text.contains("unavailable (D3DKMTQueryVideoMemoryInfo failed: STATUS_PROCESS_IS_TERMINATING")
+        );
+    }
+
+    #[test]
+    fn rebar_local_vram_gpuva_split_and_etl_rate_render_clearly() {
+        let etw = EtwReport {
+            etl_path: "trace2.etl".into(),
+            etl_size_bytes: 160 << 20,
+            filter_pid: Some(23916),
+            total_events: 1_000_000,
+            dxgkrnl_events: 999_998,
+            rundown_events: 600_000,
+            system_memory_events: 0,
+            duration_secs: 5.0,
+            coverage: TraceCoverage {
+                has_segment_descriptions: true,
+                has_allocation_rundown: true,
+                has_gpu_va_events: true,
+                hard_faults_available: true,
+                ..Default::default()
+            },
+            allocations: vec![
+                VidMmAllocation {
+                    global_handle: 1,
+                    adapter: 1,
+                    pid: 23916,
+                    device: 1,
+                    size: 1024 << 20,
+                    flags: 0,
+                    preferred_segment_raw: 2,
+                    preferred_segment_id: 2,
+                    read_segment_set: 0,
+                    write_segment_set: 0,
+                    current_segment_id: Some(2),
+                    demoted: false,
+                    evicted: false,
+                    page_table_or_dir: false,
+                    backing_store_pinned: false,
+                    cpu_va: None,
+                    gpu_va_start: None,
+                    gpu_va_end: None,
+                    page_in_count: 0,
+                    evict_count: 0,
+                    fault_count: 0,
+                    alive: true,
+                    first_seen_secs: Some(0.0),
+                    created_during_trace: false,
+                },
+                VidMmAllocation {
+                    global_handle: 2,
+                    adapter: 1,
+                    pid: 23916,
+                    device: 1,
+                    size: 4096,
+                    flags: 0,
+                    preferred_segment_raw: 2,
+                    preferred_segment_id: 2,
+                    read_segment_set: 0,
+                    write_segment_set: 0,
+                    current_segment_id: Some(2),
+                    demoted: false,
+                    evicted: false,
+                    page_table_or_dir: true,
+                    backing_store_pinned: false,
+                    cpu_va: None,
+                    gpu_va_start: None,
+                    gpu_va_end: None,
+                    page_in_count: 0,
+                    evict_count: 0,
+                    fault_count: 0,
+                    alive: true,
+                    first_seen_secs: Some(0.0),
+                    created_during_trace: false,
+                },
+            ],
+            tracked_local_bar_bytes: 1024 << 20,
+            tracked_total_bytes: 1024 << 20,
+            tile_mappings: crate::etw::TileMappingSummary {
+                call_count: 10,
+                total_operations: 12,
+                by_pid: BTreeMap::new(),
+                gpuva_map_events: 100_050,
+                gpuva_rundown_map_events: 100_000,
+                gpuva_live_map_events: 50,
+                gpuva_unmap_events: 20,
+            },
+            ..Default::default()
+        };
+        let rep = reconcile(None, Some(etw), &LabelMap::default(), None);
+        let text = format_text(&rep, 5);
+        assert!(text.contains("200.0k/s, 160.0 MiB (32.0 MiB/s), rundown=600000, steady=400000"));
+        assert!(text.contains("1 allocs (+1 page-table) | Local VRAM 1024.00 MiB (CPU-vis BAR)"));
+        assert!(text.contains("GPUVA live_map=50 unmap=20 (rundown_map=100000)"));
     }
 }

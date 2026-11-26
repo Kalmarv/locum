@@ -26,7 +26,9 @@ use windows::Win32::System::ProcessStatus::{
     PSAPI_WORKING_SET_EX_INFORMATION, QueryWorkingSetEx,
 };
 use windows::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows::Win32::System::Threading::{
+    GetExitCodeProcess, OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
+};
 
 use crate::THREAD_SUSPENDS;
 
@@ -154,6 +156,15 @@ pub struct ProcessMemorySnapshot {
     pub sample_step: u64,
     pub thread_suspends: u64,
     pub elapsed_ms: f64,
+    /// True if `GetExitCodeProcess` reported the process had already exited before/during inspection.
+    #[serde(default)]
+    pub process_exited: bool,
+    /// Process exit code when `process_exited` is true.
+    #[serde(default)]
+    pub exit_code: Option<u32>,
+    /// Diagnostic reason if `video_memory` could not be queried (e.g. `STATUS_PROCESS_IS_TERMINATING`).
+    #[serde(default)]
+    pub video_memory_error: Option<String>,
     pub counters: ProcessCounters,
     pub totals: VaTotals,
     pub video_memory: Vec<AdapterVideoMemoryInfo>,
@@ -199,8 +210,9 @@ fn inspect_handle(
     let page_size = (sys_info.dwPageSize as u64).max(4096);
     let max_addr = sys_info.lpMaximumApplicationAddress as u64;
 
+    let exit_before = check_process_exited(handle);
     let counters = query_process_counters(handle)?;
-    let video_memory = query_video_memory_info(handle);
+    let (video_memory, video_memory_error) = query_video_memory_info_with_err(handle);
 
     let mut regions = Vec::with_capacity(2048);
     let mut totals = VaTotals::default();
@@ -357,6 +369,8 @@ fn inspect_handle(
         regions.push(reg);
     }
     totals.allocation_count = alloc_bases.len();
+    let exit_after = check_process_exited(handle);
+    let exit_code = exit_before.or(exit_after);
 
     Ok(ProcessMemorySnapshot {
         pid,
@@ -364,11 +378,24 @@ fn inspect_handle(
         sample_step: step,
         thread_suspends: THREAD_SUSPENDS,
         elapsed_ms: t0.elapsed().as_secs_f64() * 1e3,
+        process_exited: exit_code.is_some(),
+        exit_code,
+        video_memory_error,
         counters,
         totals,
         video_memory,
         regions,
     })
+}
+
+fn check_process_exited(handle: HANDLE) -> Option<u32> {
+    const STILL_ACTIVE: u32 = 259;
+    let mut code = 0u32;
+    if unsafe { GetExitCodeProcess(handle, &mut code) }.is_ok() && code != STILL_ACTIVE {
+        Some(code)
+    } else {
+        None
+    }
 }
 
 /// Classifies one `PSAPI_WORKING_SET_EX_BLOCK.Flags` word.
@@ -480,21 +507,52 @@ fn query_process_counters(handle: HANDLE) -> Result<ProcessCounters, String> {
 
 /// Queries per-adapter `QueryVideoMemoryInfo` (`Local` and `NonLocal`) for `handle` out-of-process.
 pub fn query_video_memory_info(handle: HANDLE) -> Vec<AdapterVideoMemoryInfo> {
+    query_video_memory_info_with_err(handle).0
+}
+
+fn format_ntstatus(status: i32) -> String {
+    let u = status as u32;
+    match u {
+        0xC000_010A => "STATUS_PROCESS_IS_TERMINATING (0xc000010a)".into(),
+        0xC000_0022 => "STATUS_ACCESS_DENIED (0xc0000022)".into(),
+        0xC000_0008 => "STATUS_INVALID_HANDLE (0xc0000008)".into(),
+        0xC000_000D => "STATUS_INVALID_PARAMETER (0xc000000d)".into(),
+        _ => format!("NTSTATUS {u:#010x}"),
+    }
+}
+
+fn query_video_memory_info_with_err(handle: HANDLE) -> (Vec<AdapterVideoMemoryInfo>, Option<String>) {
     let mut enum_req = D3DKMT_ENUMADAPTERS2::default();
     let status = unsafe { D3DKMTEnumAdapters2(&mut enum_req) };
-    if status.0 != 0 || enum_req.NumAdapters == 0 {
-        return Vec::new();
+    if status.0 != 0 {
+        return (
+            Vec::new(),
+            Some(format!(
+                "D3DKMTEnumAdapters2 failed: {}",
+                format_ntstatus(status.0)
+            )),
+        );
+    }
+    if enum_req.NumAdapters == 0 {
+        return (Vec::new(), Some("D3DKMTEnumAdapters2 returned 0 adapters".into()));
     }
     let mut adapters = vec![D3DKMT_ADAPTERINFO::default(); enum_req.NumAdapters as usize];
     enum_req.pAdapters = adapters.as_mut_ptr();
     let status = unsafe { D3DKMTEnumAdapters2(&mut enum_req) };
     if status.0 != 0 {
-        return Vec::new();
+        return (
+            Vec::new(),
+            Some(format!(
+                "D3DKMTEnumAdapters2 failed: {}",
+                format_ntstatus(status.0)
+            )),
+        );
     }
     adapters.truncate(enum_req.NumAdapters as usize);
 
     let dxgi_factory: Option<IDXGIFactory4> = unsafe { CreateDXGIFactory1().ok() };
     let mut out = Vec::with_capacity(adapters.len());
+    let mut last_err: Option<i32> = None;
 
     for a in &adapters {
         let mut local = D3DKMT_QUERYVIDEOMEMORYINFO {
@@ -547,6 +605,8 @@ pub fn query_video_memory_info(handle: HANDLE) -> Vec<AdapterVideoMemoryInfo> {
                     0
                 },
             });
+        } else {
+            last_err = Some(s_loc.0);
         }
 
         let close = D3DKMT_CLOSEADAPTER { hAdapter: a.hAdapter };
@@ -555,7 +615,12 @@ pub fn query_video_memory_info(handle: HANDLE) -> Vec<AdapterVideoMemoryInfo> {
         }
     }
 
-    out
+    let err = if out.is_empty() {
+        last_err.map(|s| format!("D3DKMTQueryVideoMemoryInfo failed: {}", format_ntstatus(s)))
+    } else {
+        None
+    };
+    (out, err)
 }
 
 #[cfg(test)]

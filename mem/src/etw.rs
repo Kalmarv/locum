@@ -195,7 +195,15 @@ pub struct TileMappingSummary {
     pub call_count: u64,
     pub total_operations: u64,
     pub by_pid: BTreeMap<u32, u64>,
+    /// Total GPU VA map events (`gpuva_rundown_map_events + gpuva_live_map_events`).
     pub gpuva_map_events: u64,
+    /// `GpuVirtualAddressRangeMapping/DC_Start` (id=333) rundown events emitted on `CAPTURE_STATE`.
+    #[serde(default)]
+    pub gpuva_rundown_map_events: u64,
+    /// `GpuVirtualAddressRangeMapping/Start` (id=334) live steady-state map events during recording.
+    #[serde(default)]
+    pub gpuva_live_map_events: u64,
+    /// `GpuVirtualAddressRangeMapping/Stop` (id=435) live unmap events during recording.
     pub gpuva_unmap_events: u64,
 }
 
@@ -257,9 +265,15 @@ pub struct TraceCoverage {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct EtwReport {
     pub etl_path: String,
+    /// On-disk size of the `.etl` trace file in bytes (0 if unavailable).
+    #[serde(default)]
+    pub etl_size_bytes: u64,
     pub filter_pid: Option<u32>,
     pub total_events: u64,
     pub dxgkrnl_events: u64,
+    /// Count of DxgKrnl rundown events (`DC_Start`/`DC_Stop` opcode 3/4, `ReportSegment` 78, `ReportCommitted*` 80/227).
+    #[serde(default)]
+    pub rundown_events: u64,
     pub system_memory_events: u64,
     pub duration_secs: f64,
     #[serde(default)]
@@ -499,9 +513,10 @@ impl TraceSession {
         }
 
         // Request rundown (DC_Start) of currently live adapters, segments, devices, and allocations.
-        // Always include full default keywords during rundown so ReportSegment / ReportCommitted* fire
-        // even when steady-state capture uses `--allocs-only`.
-        let rundown_kw = opts.dxgkrnl_keywords | DXGKRNL_KEYWORDS_DEFAULT;
+        // Always include `Base (0x1)` so ReportSegment / ReportCommitted* fire even in `--allocs-only`,
+        // but omit `GPUVA (0x100000)` on the initial rundown when steady-state omits it (the final
+        // rundown still captures all live GPU VA mappings once instead of dumping them twice).
+        let rundown_kw = opts.dxgkrnl_keywords | (DXGKRNL_KEYWORDS_DEFAULT & !0x0010_0000);
         if rundown_kw != opts.dxgkrnl_keywords {
             let _ = unsafe {
                 EnableTraceEx2(
@@ -862,6 +877,7 @@ struct ParserState {
     last_ts: Option<i64>,
     total_events: u64,
     dxgkrnl_events: u64,
+    rundown_events: u64,
     system_memory_events: u64,
     /// `(adapter, segment_id)` -> `SegmentInfo`
     segments: BTreeMap<(u64, u32), SegmentInfo>,
@@ -894,6 +910,7 @@ impl ParserState {
             last_ts: None,
             total_events: 0,
             dxgkrnl_events: 0,
+            rundown_events: 0,
             system_memory_events: 0,
             segments: BTreeMap::new(),
             device_pid: HashMap::new(),
@@ -956,6 +973,10 @@ impl ParserState {
 
     fn on_dxgkrnl(&mut self, rec: &EVENT_RECORD) {
         let id = rec.EventHeader.EventDescriptor.Id;
+        let opcode = rec.EventHeader.EventDescriptor.Opcode;
+        if opcode == 3 || opcode == 4 || matches!(id, 78 | 80 | 227) {
+            self.rundown_events += 1;
+        }
         // Fast reject of high-volume scheduler/vsync events we do not need for memory accounting.
         if !matches!(
             id,
@@ -1580,6 +1601,11 @@ impl ParserState {
                         }
                         if self.matches_pid(pid) {
                             self.tile_mappings.gpuva_map_events += 1;
+                            if id == 333 {
+                                self.tile_mappings.gpuva_rundown_map_events += 1;
+                            } else {
+                                self.tile_mappings.gpuva_live_map_events += 1;
+                            }
                         }
                     }
                 }
@@ -1677,11 +1703,14 @@ impl ParserState {
         } else {
             None
         };
+        let etl_size_bytes = std::fs::metadata(etl_path).map(|m| m.len()).unwrap_or(0);
         let mut rep = EtwReport {
             etl_path: etl_path.display().to_string(),
+            etl_size_bytes,
             filter_pid: self.filter_pid,
             total_events: self.total_events,
             dxgkrnl_events: self.dxgkrnl_events,
+            rundown_events: self.rundown_events,
             system_memory_events: self.system_memory_events,
             duration_secs: match (self.first_ts, self.last_ts) {
                 (Some(a), Some(b)) if b > a => (b - a) as f64 / 1e7,
