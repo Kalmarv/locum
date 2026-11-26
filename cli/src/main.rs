@@ -548,6 +548,10 @@ enum Command {
         capture: String,
         /// The draw's number, or `last`.
         draw: String,
+        /// Read a buffer range immediately before and after this draw (RESOURCE:START..END in bytes).
+        /// Rules apply only to this draw. Writes before.bin and after.bin in the output directory.
+        #[arg(long)]
+        buffer_probe: Option<String>,
         /// A rule as in overrides.txt (`constant ps b3 c0 1 0 0 1`, `skip vs=<hash>`, ...); may be given many times.
         #[arg(long)]
         rule: Vec<String>,
@@ -1201,6 +1205,7 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Replay {
             capture,
             draw,
+            buffer_probe,
             rule,
             rules,
             mode,
@@ -1218,6 +1223,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 n,
                 &replay::Options {
                     mode,
+                    buffer_probe,
                     rules: rule,
                     rules_file: rules,
                     warp,

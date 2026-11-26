@@ -451,7 +451,13 @@ locum-cli verify last                      # replay the frame; compare every tar
 locum-cli replay last 812                  # the draw and the earlier events it depends on; writes its targets
 locum-cli replay last last --rule "constant vs b11 c0 8 8 0 0"   # as recorded, with the rule, and a diff picture
 locum-cli replay last 812 --rules mine.txt --mode frame
+locum-cli replay last 812 --mode frame --buffer-probe 4:1024..1280 -o probe
 ```
+
+`--buffer-probe RESOURCE:START..END` reads a buffer immediately before and after the selected draw or dispatch.
+The example writes bytes 1024 through 1279 of buffer #4 to `probe/before.bin` and `probe/after.bin`, and prints
+how many bytes changed. With this option, replay runs earlier events as recorded and applies any rules only to the
+selected event.
 
 `verify` exits with success only when every target and every draw, dispatch or clear output compared is identical and
 nothing the replay needs is missing (contents, command lists, constants; a Direct3D 12 readback buffer's contents are

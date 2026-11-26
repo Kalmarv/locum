@@ -1075,6 +1075,7 @@ pub fn draw_number(c: &Capture, arg: &str) -> Result<i64, String> {
 
 pub struct Options {
     pub mode: Mode,
+    pub buffer_probe: Option<String>,
     pub rules: Vec<String>,
     pub rules_file: Option<PathBuf>,
     pub warp: bool,
@@ -1123,7 +1124,53 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
             shader_named(c, stage, hash)
         })?);
     }
-    let plan = plan(c, target, o.mode);
+    let mut plan = plan(c, target, o.mode);
+    if let Some(spec) = &o.buffer_probe {
+        let err = "expected --buffer-probe RESOURCE:START..END (decimal byte offsets, end excluded)";
+        let (resource, span) = spec.split_once(':').ok_or(err)?;
+        let resource: i64 = resource.parse().map_err(|_| err)?;
+        let (start, end) = span.split_once("..").ok_or(err)?;
+        let start: u64 = start.parse().map_err(|_| err)?;
+        let end: u64 = end.parse().map_err(|_| err)?;
+        let shape = shape(c, resource).ok_or_else(|| format!("no resource #{resource}"))?;
+        if shape.kind != "buffer" || start >= end || end > shape.bytes {
+            return Err(format!(
+                "invalid byte range {start}..{end} for #{resource} ({shape})"
+            ));
+        }
+        if !plan.resources.contains(&resource) || plan.events.pop() != Some(target) {
+            return Err(format!(
+                "draw {draw} does not include #{resource} in its replay plan"
+            ));
+        }
+        plan.until = Some(target);
+        std::fs::create_dir_all(&o.out).map_err(|e| e.to_string())?;
+        let warnings = run(
+            c,
+            &plan,
+            &[],
+            o.warp,
+            o.validation,
+            |_, _| Ok(()),
+            |b| {
+                let before = b.read_bytes(resource, start, end - start)?;
+                std::fs::write(o.out.join("before.bin"), &before).map_err(|e| e.to_string())?;
+                b.run(c, target, &parsed)?;
+                let after = b.read_bytes(resource, start, end - start)?;
+                std::fs::write(o.out.join("after.bin"), &after).map_err(|e| e.to_string())?;
+                let changed = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+                out!(
+                    "draw {draw} event {target}: {changed} of {} bytes changed in #{resource} {start}..{end}",
+                    after.len()
+                );
+                Ok(())
+            },
+        )?;
+        for warning in warnings {
+            out!("warning: {warning}");
+        }
+        return Ok(());
+    }
     let bytes: u64 = plan
         .resources
         .iter()
