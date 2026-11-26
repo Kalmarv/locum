@@ -43,6 +43,8 @@ use windows::core::{GUID, HRESULT, IUnknown, Interface};
 #[repr(C)]
 pub struct Object {
     vtable: *const c_void,
+    /// The table the face was made with.
+    made_with: *const c_void,
     /// The facet's interface of the real object: a reference of the facet's own if the object is counted here, none
     /// if it is watched. Released when the facet is freed ([`free`]).
     real: ManuallyDrop<IUnknown>,
@@ -281,7 +283,24 @@ pub unsafe fn wrap_output(hr: HRESULT, iid: *const GUID, out: *mut *mut c_void) 
         let p = if wanted == IUnknown::IID {
             c.primary
         } else {
-            let p = *c.facets.get(&wanted)?;
+            // One face for every interface the real object answers with the same pointer through the same
+            // table (ID3D12Device..Device14, the list versions), as the runtime gives one pointer: a caller
+            // that changes the object's vtable pointer (a translation layer adopting it) sees it on all of them.
+            let shared = || {
+                let (table, _) = crate::vtables::d12_registry::table(&wanted)?;
+                c.all.iter().copied().find(|&f| unsafe {
+                    let o = &*(f as *const Object);
+                    o.real() == input.as_raw() && o.vtable_matches(table)
+                })
+            };
+            let p = match c.facets.get(&wanted) {
+                Some(&p) => p,
+                None => {
+                    let p = shared()?;
+                    c.facets.insert(wanted, p);
+                    p
+                }
+            };
             // A watched object's facet counts on the pointer it keeps: another pointer gets a facet of its own.
             if c.watched && unsafe { (*(p as *const Object)).real() } != input.as_raw() {
                 return None;
@@ -348,6 +367,7 @@ pub unsafe fn wrap_output(hr: HRESULT, iid: *const GUID, out: *mut *mut c_void) 
         let id = data.id;
         let p = Box::into_raw(Box::new(Object {
             vtable: table,
+            made_with: table,
             real: ManuallyDrop::new(input),
             watched,
             identity: key,
@@ -394,6 +414,10 @@ pub unsafe fn wrap_output(hr: HRESULT, iid: *const GUID, out: *mut *mut c_void) 
 impl Object {
     pub fn real(&self) -> *mut c_void {
         self.real.as_raw()
+    }
+    /// The face was made with `table` (its first pointer may since have been changed by the application).
+    fn vtable_matches(&self, table: *const c_void) -> bool {
+        self.made_with == table
     }
     pub unsafe fn query(&self, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
         if iid.is_null() || out.is_null() {

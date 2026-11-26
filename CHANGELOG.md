@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Direct3D 12: an interface the real object answers with the same pointer through the same table (`ID3D12Device` to
+  `ID3D12Device14`, the command-list versions) gets the same face, as the runtime gives one pointer. Each had a face of
+  its own, so a translation layer that adopts the runtime's objects by changing their table (XCL) never adopted the
+  second face and called its own slots through locum's table: an access violation at start-up.
 - The shader paths run on iridia's IR (`iridia-ir`, `iridia-passes`, `iridia-analysis`, `iridia-dxbc`, `iridia-dxil`,
   `iridia-naga`, taken from its repository at one revision until its next release) in place of the `iridia` crate's naga
   path: the lift, the flow graph behind `trace` and the WGSL of `shader --wgsl` and `shader-file --wgsl` (iridia-naga's NAGA
