@@ -32,6 +32,36 @@ pub trait Backend {
     fn read(&mut self, id: i64) -> Result<Vec<u8>, String>;
     /// Replaces resource `id`'s contents with `contents` (the canonical layout).
     fn write(&mut self, c: &Capture, id: i64, contents: &[u8]) -> Result<(), String>;
+    /// Bytes `offset..offset + len` of buffer `id` now.
+    fn read_bytes(&mut self, id: i64, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+        let whole = self.read(id)?;
+        let at = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        whole
+            .get(at(offset)..at(offset.saturating_add(len)))
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| {
+                format!(
+                    "#{id}: bytes {offset}..{} run past its {} bytes",
+                    offset + len,
+                    whole.len()
+                )
+            })
+    }
+    /// Replaces bytes `offset..` of buffer `id` with `bytes`.
+    fn write_bytes(&mut self, c: &Capture, id: i64, offset: u64, bytes: &[u8]) -> Result<(), String> {
+        let mut whole = self.read(id)?;
+        let len = whole.len();
+        whole
+            .get_mut(offset as usize..offset as usize + bytes.len())
+            .ok_or_else(|| {
+                format!(
+                    "#{id}: {} bytes at {offset} run past its {len} bytes",
+                    bytes.len()
+                )
+            })?
+            .copy_from_slice(bytes);
+        self.write(c, id, &whole)
+    }
     /// What it could not do as recorded, once each.
     fn warnings(&self) -> Vec<String>;
     /// The adapter, driver and runtime it replays on.
@@ -609,6 +639,8 @@ struct Written {
     resource: i64,
     /// The subresource the game's bytes are of; None, the whole resource.
     sub: Option<u32>,
+    /// Of a buffer, the bytes (offset, length) the game's are of; None, all of it.
+    range: Option<(u64, u64)>,
     key: String,
     /// One of its shaders writes what depends on the order the GPU runs its threads.
     ordered: bool,
@@ -632,10 +664,19 @@ fn recorded(c: &Capture) -> HashMap<i64, Vec<Written>> {
     } else {
         "NULL"
     };
+    let range = if columns.iter().any(|n| n == "offset") {
+        "offset, bytes"
+    } else {
+        "NULL, NULL"
+    };
     for (event, w) in c.rows(
-        &format!("SELECT event, resource, content, {ordered}, {sub} FROM results"),
+        &format!("SELECT event, resource, content, {ordered}, {sub}, {range} FROM results"),
         [],
         |r| {
+            let range = match (r.get::<_, Option<i64>>(5)?, r.get::<_, Option<i64>>(6)?) {
+                (Some(offset), Some(bytes)) => Some((offset as u64, bytes as u64)),
+                _ => None,
+            };
             Ok((
                 r.get::<_, i64>(0)?,
                 Written {
@@ -643,6 +684,7 @@ fn recorded(c: &Capture) -> HashMap<i64, Vec<Written>> {
                     key: r.get(2)?,
                     ordered: r.get(3)?,
                     sub: r.get(4)?,
+                    range,
                 },
             ))
         },
@@ -783,14 +825,21 @@ fn settle(
     for w in written {
         let s = shape(c, w.resource).ok_or("resource vanished")?;
         let game = c.blob(&w.key)?;
-        let whole = b.read(w.resource)?;
-        // A subresource's row holds its bytes only.
-        let mine = match w.sub {
-            None => whole.clone(),
-            Some(sub) => sub_of(&s, &whole, Some(sub))
-                .ok_or_else(|| format!("#{} has no subresource {sub}", w.resource))?
-                .0
-                .to_vec(),
+        // A subresource's row holds its bytes only, and a buffer's those its views cover: only those are read.
+        let (whole, mine) = match (w.sub, w.range) {
+            (None, Some((offset, len))) => (Vec::new(), b.read_bytes(w.resource, offset, len)?),
+            (None, None) => {
+                let whole = b.read(w.resource)?;
+                (whole.clone(), whole)
+            }
+            (Some(sub), _) => {
+                let whole = b.read(w.resource)?;
+                let mine = sub_of(&s, &whole, Some(sub))
+                    .ok_or_else(|| format!("#{} has no subresource {sub}", w.resource))?
+                    .0
+                    .to_vec();
+                (whole, mine)
+            }
         };
         // A structured buffer's records are its structures; anything else is taken in 4-byte words, the unit UAV
         // atomics work in.
@@ -852,12 +901,28 @@ fn settle(
     for (w, s, game, whole, mine, _, settled) in each {
         if !matches!(settled, Settled::Identical) {
             if let Some(dir) = keep {
-                let part = w.sub.map_or(String::new(), |sub| format!("-sub{sub}"));
+                let part = match (w.sub, w.range) {
+                    (Some(sub), _) => format!("-sub{sub}"),
+                    (None, Some((offset, _))) => format!("-at{offset}"),
+                    (None, None) => String::new(),
+                };
                 let file = |side: &str| dir.join(format!("event-{seq}-{}{part}.{side}.bin", w.resource));
                 kept(&file("replay"), &mine)?;
                 kept(&file("game"), &game)?;
             }
-            if w.ordered || all {
+            if (w.ordered || all)
+                && let (None, Some((offset, len))) = (w.sub, w.range)
+            {
+                if game.len() as u64 != len {
+                    return Err(format!(
+                        "#{} bytes {offset}..{}: the game's {} bytes",
+                        w.resource,
+                        offset + len,
+                        game.len()
+                    ));
+                }
+                b.write_bytes(c, w.resource, offset, &game)?;
+            } else if w.ordered || all {
                 let contents = match w.sub {
                     None => game.clone(),
                     Some(sub) => {

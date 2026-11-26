@@ -13,11 +13,11 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Bumped when a table changes meaning.
 pub const SCHEMA_VERSION: u32 = 1;
 /// A D3D12 capture's: the same tables, plus the authoritative `d12_*` records. 6 records `results`, a texture's by
-/// subresource (`sub`).
-pub const D3D12_SCHEMA_VERSION: u32 = 6;
+/// subresource (`sub`); 7 a buffer's by the bytes its views cover (`offset`, `bytes`).
+pub const D3D12_SCHEMA_VERSION: u32 = 7;
 /// The oldest D3D12 schema readers accept: 2 to 4 differ from 5 only in `d12_upload_versions`,
 /// `d12_submission_descriptors` and the absence of `d12_first_use`, which the CLI and the viewer do not read; 5
-/// differs from 6 only in having no `results` rows.
+/// differs from 6 only in having no `results` rows, and 6 from 7 in having no `offset` and `bytes` in them.
 pub const D3D12_SCHEMA_OLDEST: u32 = 2;
 
 pub const SCHEMA: &str = r#"
@@ -103,9 +103,11 @@ CREATE TABLE gaps(what TEXT NOT NULL, detail TEXT, count INTEGER NOT NULL);
 -- writes what depends on the order the GPU runs its threads, so the same records in another order are not a
 -- difference. Captures from before every output was recorded have only order-dependent rows, and no such column.
 -- sub: the contents are that subresource's only (a D3D12 texture's, the subresources its view covers, a row each);
--- NULL, the whole resource. Captures from before it have no such column.
+-- NULL, the whole resource. Captures from before it have no such column. offset, bytes: of a D3D12 buffer, the
+-- contents are those bytes of it only, what the views the event wrote it through cover; NULL, all of it. Captures
+-- from before them have no such columns.
 CREATE TABLE results(event INTEGER NOT NULL, resource INTEGER NOT NULL, content TEXT NOT NULL,
-  order_dependent INTEGER NOT NULL, sub INTEGER, PRIMARY KEY(event, resource, sub));
+  order_dependent INTEGER NOT NULL, sub INTEGER, offset INTEGER, bytes INTEGER, PRIMARY KEY(event, resource, sub));
 CREATE INDEX bindings_draw ON bindings(draw);
 CREATE INDEX bindings_resource ON bindings(resource);
 CREATE INDEX bindings_content ON bindings(content);
@@ -382,6 +384,8 @@ pub struct Output {
     pub resource: u64,
     /// The subresource the contents are of; None, the whole resource.
     pub sub: Option<u32>,
+    /// Of a buffer, the bytes (offset, length) the contents are of; None, all of it.
+    pub range: Option<(u64, u64)>,
     pub content: String,
     pub ordered: bool,
 }
@@ -686,14 +690,16 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
         for t in &capture.missing_targets {
             s.execute(params![t.draw as i64, t.target, t.resource as i64, t.why])?;
         }
-        let mut s = tx.prepare("INSERT INTO results VALUES(?1,?2,?3,?4,?5)")?;
+        let mut s = tx.prepare("INSERT INTO results VALUES(?1,?2,?3,?4,?5,?6,?7)")?;
         for o in &capture.results {
             s.execute(params![
                 o.event as i64,
                 o.resource as i64,
                 o.content,
                 o.ordered,
-                o.sub
+                o.sub,
+                o.range.map(|(offset, _)| offset as i64),
+                o.range.map(|(_, bytes)| bytes as i64)
             ])?;
         }
         let mut s = tx.prepare("INSERT INTO gaps VALUES(?1,?2,?3)")?;

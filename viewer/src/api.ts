@@ -146,6 +146,8 @@ export interface ResultOut {
   ordered: boolean;
   /** The subresource the contents are of, or null for the whole resource. */
   sub: number | null;
+  /** Of a buffer, the bytes (offset, length) the contents are of, or null for all of it. */
+  range: [number, number] | null;
 }
 
 export interface Draw {

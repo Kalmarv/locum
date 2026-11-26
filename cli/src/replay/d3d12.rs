@@ -2456,6 +2456,62 @@ impl Backend for D3d12 {
         self.put(id, contents)
     }
 
+    fn read_bytes(&mut self, id: i64, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+        self.first_use_now(id)?;
+        let (r, mapped) = self.bytes_of(id, offset, len)?;
+        let mut data = vec![0u8; len as usize];
+        if mapped {
+            let mut p = core::ptr::null_mut();
+            let range = D3D12_RANGE {
+                Begin: offset as usize,
+                End: (offset + len) as usize,
+            };
+            unsafe {
+                r.Map(0, Some(&range), Some(&mut p))
+                    .map_err(|e| format!("#{id} Map: {e}"))?;
+                core::ptr::copy_nonoverlapping(
+                    p.cast::<u8>().add(offset as usize),
+                    data.as_mut_ptr(),
+                    data.len(),
+                );
+                r.Unmap(0, Some(&D3D12_RANGE::default()));
+            }
+            return Ok(data);
+        }
+        // What a reserved buffer's unmapped tiles hold: zeros.
+        for piece in staging::within(self.pieces(id), offset, offset + len) {
+            let (readback, p) = self.staging(D3D12_HEAP_TYPE_READBACK, piece.len)?;
+            unsafe {
+                self.list
+                    .CopyBufferRegion(&readback, 0, &r, piece.from, piece.len)
+            };
+            self.flush()?;
+            let staged = unsafe { core::slice::from_raw_parts(p.cast_const(), piece.len as usize) };
+            let at = (piece.from - offset) as usize;
+            data[at..at + staged.len()].copy_from_slice(staged);
+            drop(readback);
+        }
+        Ok(data)
+    }
+
+    fn write_bytes(&mut self, _c: &Capture, id: i64, offset: u64, bytes: &[u8]) -> Result<(), String> {
+        // The rest of it as the frame began, first.
+        self.first_use_now(id)?;
+        let (r, mapped) = self.bytes_of(id, offset, bytes.len() as u64)?;
+        if mapped {
+            return self.map_write(id, offset, bytes);
+        }
+        for piece in staging::within(self.pieces(id), offset, offset + bytes.len() as u64) {
+            let (upload, p) = self.staging(D3D12_HEAP_TYPE_UPLOAD, piece.len)?;
+            let at = (piece.from - offset) as usize;
+            unsafe { core::slice::from_raw_parts_mut(p, piece.len as usize) }
+                .copy_from_slice(&bytes[at..at + piece.len as usize]);
+            unsafe { self.list.CopyBufferRegion(&r, piece.from, &upload, 0, piece.len) };
+            self.flush()?;
+        }
+        Ok(())
+    }
+
     fn environment(&self) -> environment::Environment {
         let luid = unsafe { self.device.GetAdapterLuid() };
         let adapter = unsafe { CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0)) }
@@ -2611,6 +2667,22 @@ impl D3d12 {
             },
         );
         Ok(())
+    }
+
+    /// Buffer `id`, and whether the CPU reaches it through a mapping, where bytes `offset..offset + len` are in it.
+    fn bytes_of(&self, id: i64, offset: u64, len: u64) -> Result<(ID3D12Resource, bool), String> {
+        let m = self.made(id)?;
+        if !m.buffer() {
+            return Err(format!("#{id} is not a buffer"));
+        }
+        if offset.checked_add(len).is_none_or(|end| end > m.desc.Width) {
+            return Err(format!(
+                "#{id}: bytes {offset}..{} run past its {} bytes",
+                offset.saturating_add(len),
+                m.desc.Width
+            ));
+        }
+        Ok((m.resource.clone(), m.heap.mapped()))
     }
 
     /// The pieces resource `id`'s contents move in (see [`staging`]): a reserved one's mapped tiles only.

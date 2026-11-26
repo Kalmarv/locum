@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Direct3D 12: what a draw or dispatch writes into a buffer through a UAV descriptor is copied as far as the view
+  covers (`results.offset` and `results.bytes`, schema 7), not the whole buffer: a 512-byte view into a 4 GiB buffer
+  was an output over 64 MiB, so not recorded. Replay and `verify` read, compare and put back only those bytes; the
+  viewer says which. Root UAVs still copy the whole buffer.
 - Direct3D 12: in a series (`frames N`), lists reset while the Present that closes one frame writes it are
   instrumented for the next frame. No capture was armed then, so lists other threads recorded meanwhile (the next
   frame's) copied no pass ends or outputs; with `early N` the second frame could have no instrumented list at all.

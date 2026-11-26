@@ -64,7 +64,8 @@ pub(super) unsafe fn capture(
                 common,
             )
         };
-        let (buf, raw, buf2, raw2) = (buffer(256), buffer(128), buffer(256), buffer(128));
+        // buf2 is written through a view of its elements 64 to 127, bytes 256 to 511.
+        let (buf, raw, buf2, raw2) = (buffer(256), buffer(128), buffer(768), buffer(128));
         // 8x8, two mips, two slices: the view writes mip 1 of slice 1, subresource 3.
         let tex = contents::committed(
             device,
@@ -257,7 +258,9 @@ pub(super) unsafe fn capture(
         };
         device.CreateUnorderedAccessView(&buf, None, Some(&structured), at(0));
         device.CreateUnorderedAccessView(&tex, None, Some(&slice(1, 1)), at(1));
-        device.CreateUnorderedAccessView(&buf2, None, Some(&structured), at(2));
+        let mut part = structured;
+        part.Anonymous.Buffer.FirstElement = 64;
+        device.CreateUnorderedAccessView(&buf2, None, Some(&part), at(2));
         device.CreateUnorderedAccessView(&ltex, None, Some(&slice(0, 0)), at(3));
         let cpu_uav = cpu_heap.GetCPUDescriptorHandleForHeapStart();
         device.CreateUnorderedAccessView(&tex, None, Some(&slice(1, 1)), cpu_uav);
@@ -422,6 +425,22 @@ pub(super) unsafe fn capture(
         let texture = b.iter().find(|r| r.1 == Some(0)).expect("ltex's subresource 0");
         let expect: Vec<u32> = (0..16).map(|i| 3 + i % 4 + i / 4 * 16).collect();
         assert_eq!(words(&texture.3), expect, "list B: ltex");
+        // buf2's bytes its view covers, and only those.
+        let part: Vec<(i64, i64)> = {
+            let mut q = db
+                .prepare(
+                    "SELECT r.offset, r.bytes FROM results r JOIN draws d ON d.event = r.event                      WHERE d.n = 4 AND r.offset IS NOT NULL",
+                )
+                .unwrap();
+            q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(part, [(256, 256)], "list B: buf2's bytes through its view");
+        let buffer = b.iter().find(|r| r.1.is_none() && r.3.len() == 256).unwrap();
+        let expect: Vec<u32> = (0..64).map(|i| if i < 16 { 300 + i } else { 0 }).collect();
+        assert_eq!(words(&buffer.3), expect, "list B: buf2's view as it left it");
         debug_errors(device);
     }
     println!(

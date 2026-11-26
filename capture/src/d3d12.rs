@@ -143,8 +143,10 @@ pub struct Output {
     pub at: usize,
     pub command: usize,
     pub resource: u64,
-    /// The subresource copied (a texture's, one a view covers); None, the whole resource (a buffer).
+    /// The subresource copied (a texture's, one a view covers); None, a buffer.
     pub sub: Option<u32>,
+    /// Of a buffer, the bytes copied (offset, length): what the views it was written through cover; None, all of it.
+    pub range: Option<(u64, u64)>,
     /// Why no copy was made.
     pub gap: Option<String>,
 }
@@ -1079,26 +1081,24 @@ impl Prepared {
         let mut unrecorded = BTreeMap::<String, u64>::new();
         // What draws, dispatches and clears wrote through views the list bound, copied right after each; then what
         // ExecuteIndirects wrote through root UAVs their records set, copied after the frame.
-        let copies = self
-            .projection
-            .outputs
-            .iter()
-            .map(|&(id, event, resource, sub)| {
-                let content = self.checkpoints.get(&id).cloned();
-                (event, resource, sub, content)
-            })
-            .chain(
-                self.named
-                    .outputs
-                    .iter()
-                    .map(|(&(event, resource), content)| (event, resource, None, Some(content.clone()))),
-            );
-        for (event, resource, sub, content) in copies {
+        let copies =
+            self.projection
+                .outputs
+                .iter()
+                .map(|&(id, event, resource, sub, range)| {
+                    let content = self.checkpoints.get(&id).cloned();
+                    (event, resource, sub, range, content)
+                })
+                .chain(self.named.outputs.iter().map(|(&(event, resource), content)| {
+                    (event, resource, None, None, Some(content.clone()))
+                }));
+        for (event, resource, sub, range, content) in copies {
             match content {
                 Some(Ok(key)) => capture.results.push(db::Output {
                     event,
                     resource,
                     sub,
+                    range,
                     content: key,
                     ordered: ordered(event),
                 }),
@@ -1302,6 +1302,10 @@ fn indirect(signature: Option<&Value>) -> &'static str {
     }
 }
 
+/// A copy of what an event wrote through UAVs: the copy, the event, the resource, its subresource (a texture's) and
+/// the bytes (offset, length) of it (a buffer's, None for all of it).
+type Copied = (u64, u64, u64, Option<u32>, Option<(u64, u64)>);
+
 pub struct Projection {
     next_execution: u64,
     executions: Vec<Execution>,
@@ -1321,8 +1325,8 @@ pub struct Projection {
     drawn: BTreeMap<(String, u64), u64>,
     /// How the frame's pass ends went, for the capture's meta: where a frame's targets go missing.
     pass_ends: PassEnds,
-    /// What the frame's outputs copied, by copy: (event, resource, subresource).
-    outputs: Vec<(u64, u64, u64, Option<u32>)>,
+    /// What the frame's outputs copied, by copy.
+    outputs: Vec<Copied>,
     /// Outputs no copy was made for, by reason; draws and dispatches in lists that copied none (not instrumented).
     unrecorded: BTreeMap<String, u64>,
     /// The ExecuteIndirect events whose argument records were copied.
@@ -1818,7 +1822,7 @@ impl Projection {
                 )
             };
             match (why, seqs.get(o.command)) {
-                (None, Some(&event)) => self.outputs.push((o.id, event, o.resource, o.sub)),
+                (None, Some(&event)) => self.outputs.push((o.id, event, o.resource, o.sub, o.range)),
                 (Some(why), _) => *self.unrecorded.entry(why).or_default() += 1,
                 (None, None) => {
                     *self

@@ -988,15 +988,17 @@ What each draw, dispatch and UAV clear of an instrumented list writes through UA
 after it, before the list's next command, into `results` rows as on Direct3D 11. The resources are found as the list
 is recorded: each program's UAV registers (from its `PSV0` part, or a DXBC program's reflection), where the root
 signature puts them (a root UAV or a table's range), and what the root argument or the table's descriptor names at
-that moment; an append or consume buffer's counter is written too. A buffer is copied whole (`sub` empty); a texture
-the subresources its view covers, one row each (`sub` the subresource index). Each copy moves the resource from
+that moment; an append or consume buffer's counter is written too. A buffer is copied as far as the views the command
+wrote it through cover (`offset` and `bytes` say which bytes, from the first view's first to the last one's last; both
+empty where that is all of it, or through a root UAV, whose size the call does not give); a texture the subresources
+its view covers, one row each (`sub` the subresource index). Replay compares and puts back only those bytes. Each copy moves the resource from
 UNORDERED_ACCESS (or what the list's own barriers left it in; in a list that records enhanced barriers, buffers by
 access only; a texture made in a layout from UNORDERED_ACCESS, or COMMON if made for simultaneous access) to
 COPY_SOURCE and back. `order_dependent` marks the rows of a command one of whose programs uses an atomic's result
 (DXBC `imm_atomic_*`, DXIL `atomicBinOp`, `atomicCompareExchange`, `bufferUpdateCounter` or an LLVM atomic whose
 value is used). What could not be copied is a `d3d12-results` gap with its reason: lists recorded before the
 request, compute and copy queues, bundles, a list executed again, arrays of more than 64 registers or unbounded
-ones, multisampled UAVs, an output over 64 MiB, and copies past the 2 GiB of the readback budget outputs may hold
+ones, multisampled UAVs, an output over 64 MiB (of a buffer, what its views cover), and copies past the 2 GiB of the readback budget outputs may hold
 (the rest is kept for pass-end targets).
 
 Upload copies assume the application's host writes obey D3D12 synchronization. Captures retain the original

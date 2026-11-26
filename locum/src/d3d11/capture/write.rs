@@ -255,6 +255,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
                     event: seq,
                     resource,
                     sub: None,
+                    range: None,
                     content: key,
                     ordered,
                 }),

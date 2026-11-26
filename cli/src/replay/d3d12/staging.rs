@@ -82,6 +82,21 @@ pub(super) fn buffer(width: u64, mapped: Option<&Mapped>, limit: u64) -> Vec<Pie
     out
 }
 
+/// The parts of a buffer's `pieces` within its bytes `begin..end`.
+pub(super) fn within(pieces: Vec<Piece>, begin: u64, end: u64) -> Vec<Piece> {
+    pieces
+        .into_iter()
+        .filter_map(|p| {
+            let (from, to) = (p.from.max(begin), (p.from + p.len).min(end));
+            (from < to).then(|| Piece {
+                from,
+                len: to - from,
+                copies: vec![Copy::Buffer { at: from }],
+            })
+        })
+        .collect()
+}
+
 /// One box of a subresource to move: slices `z0..z1` and rows of blocks `r0..r1`.
 struct Band {
     sub: u32,
@@ -273,6 +288,10 @@ mod tests {
         assert_eq!(at(&pieces), [(0, 4), (4, 4), (8, 2)]);
         assert_eq!(pieces[1].copies, [Copy::Buffer { at: 4 }]);
         assert_eq!(at(&buffer(10, None, 64)), [(0, 10)]);
+        // Bytes 3..9 of it: the pieces cut to them.
+        let part = within(buffer(10, None, 4), 3, 9);
+        assert_eq!(at(&part), [(3, 1), (4, 4), (8, 1)]);
+        assert_eq!(part[0].copies, [Copy::Buffer { at: 3 }]);
     }
 
     #[test]

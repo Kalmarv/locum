@@ -1375,12 +1375,12 @@ impl Pass {
     unsafe fn copy_outputs(&mut self, list: &ID3D12GraphicsCommandList, at: usize) {
         for (command, written) in std::mem::take(&mut self.due) {
             let id = NEXT.fetch_add(1, Ordering::Relaxed);
-            let (resource, sub, gap) = match written {
+            let (resource, sub, range, gap) = match written {
                 Ok(w) => {
                     let copied = unsafe { self.copy_output(list, &w) }.map(|readback| keep(id, readback));
-                    (w.resource, w.sub, copied.err())
+                    (w.resource, w.sub, w.range, copied.err())
                 }
-                Err(why) => (0, None, Some(why)),
+                Err(why) => (0, None, None, Some(why)),
             };
             self.outputs.push(model::Output {
                 id,
@@ -1388,6 +1388,7 @@ impl Pass {
                 command,
                 resource,
                 sub,
+                range,
                 gap,
             });
         }
@@ -1428,6 +1429,7 @@ impl Pass {
                 &real,
                 &desc,
                 w.sub,
+                w.range,
                 access,
                 self.predication(),
             )
@@ -1977,27 +1979,31 @@ pub(super) unsafe fn readback_resource(device: &ID3D12Device, bytes: u64) -> Res
 }
 
 /// Records into `list` the copy of what a command wrote through a UAV into `real`: subresource `sub` of a texture,
-/// or the whole of a buffer (`sub` None), from `access`, suspending the list's predication `predicate` around it.
+/// or of a buffer (`sub` None) the bytes `range` (offset, length; None, all of it), from `access`, suspending the
+/// list's predication `predicate` around it.
+#[allow(clippy::too_many_arguments)]
 unsafe fn output_into(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     real: &ID3D12Resource,
     desc: &D3D12_RESOURCE_DESC,
     sub: Option<u32>,
+    range: Option<(u64, u64)>,
     access: Access,
     predicate: Option<(super::Real<ID3D12Resource>, u64, i32)>,
 ) -> Result<Readback, String> {
     let buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    let (offset, _) = range.unwrap_or_default();
     let (layout, footprints, bytes) = if buffer {
-        let bytes = desc.Width;
+        let bytes = range.map_or(desc.Width, |(_, bytes)| bytes);
         if bytes > OUTPUT_BYTES {
             return Err(format!(
-                "a buffer of {} MiB, more than one output's {} MiB",
+                "{} MiB of a buffer through its view, more than one output's {} MiB",
                 bytes >> 20,
                 OUTPUT_BYTES >> 20
             ));
         }
-        (locum_capture::layout::buffer(bytes as u32), Vec::new(), bytes)
+        (locum_capture::layout::buffer_of(bytes), Vec::new(), bytes)
     } else {
         let sub = sub.unwrap_or(0);
         let (mips, _) = shape(real);
@@ -2064,7 +2070,7 @@ unsafe fn output_into(
         }
         to_copy.issue(list);
         if buffer {
-            list.CopyBufferRegion(&readback, 0, real, 0, bytes);
+            list.CopyBufferRegion(&readback, 0, real, offset, bytes);
         } else {
             let dst = D3D12_TEXTURE_COPY_LOCATION {
                 pResource: borrowed(&readback),

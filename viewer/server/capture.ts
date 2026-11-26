@@ -12,7 +12,7 @@ type Row = Record<string, any>;
 
 /** The schema versions this viewer reads, by API: capture/src/db.rs `SCHEMA_VERSION` and `D3D12_SCHEMA_VERSION`. A
  * schema bump that changes no table the viewer queries only raises the upper bound. */
-export const SCHEMAS: Record<string, [number, number]> = { d3d11: [1, 1], d3d12: [2, 6] };
+export const SCHEMAS: Record<string, [number, number]> = { d3d11: [1, 1], d3d12: [2, 7] };
 
 export function schemaReadable(api: string, version: string): boolean {
   const range = SCHEMAS[api];
@@ -482,8 +482,9 @@ export class Capture {
     const columns = this.schema().resultColumns;
     const ordered = columns.has("order_dependent") ? "order_dependent" : "1";
     const sub = columns.has("sub") ? "sub" : "NULL";
+    const range = columns.has("offset") ? "offset, bytes" : "NULL AS offset, NULL AS bytes";
     const rows = this.all(
-      `SELECT resource, content, ${ordered} AS ordered, ${sub} AS sub FROM results WHERE event = ? ORDER BY resource, sub`,
+      `SELECT resource, content, ${ordered} AS ordered, ${sub} AS sub, ${range} FROM results WHERE event = ? ORDER BY resource, sub`,
       seq,
     );
     const shapes = this.shapes(rows.map(r => r.resource));
@@ -493,6 +494,7 @@ export class Capture {
         resource: this.resourceRef(s, r.resource), content: r.content as string,
         size: this.blobSize(r.content), stride: s?.stride ?? 0,
         ordered: !!r.ordered, sub: r.sub as number | null,
+        range: r.offset == null ? null : [r.offset as number, r.bytes as number] as [number, number],
       };
     });
   }

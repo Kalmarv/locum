@@ -327,7 +327,9 @@ function EventView({ e }: { e: EventDetail }) {
 /** What the event wrote through its UAVs (or a clear through its view), as the game's GPU wrote it, right after it. */
 function Results({ results }: { results: ResultOut[] }) {
   if (!results.length) return null;
-  const named = (r: ResultOut) => `#${r.resource.id}${r.sub == null ? "" : ` sub ${r.sub}`}`;
+  const part = (r: ResultOut) =>
+    r.sub != null ? ` sub ${r.sub}` : r.range ? ` bytes ${r.range[0]}..${r.range[0] + r.range[1]}` : "";
+  const named = (r: ResultOut) => `#${r.resource.id}${part(r)}`;
   return (
     <Section title={`output recorded: ${results.map(named).join(", ")}`}>
       <div class="muted small">what the game's GPU wrote; verify compares replay's own output with it. Where a shader's
@@ -335,7 +337,7 @@ function Results({ results }: { results: ResultOut[] }) {
         same records in another order, and puts these bytes in place and goes on from them</div>
       {results.map(r => (
         <div class="result-out">
-          <div><ResLink r={r.resource} />{r.sub == null ? null : <span> sub {r.sub}</span>}{r.ordered ? <span class="muted"> order-dependent</span> : null} <span class="muted">contents right after it, {short(r.content, 16)}{r.size == null ? ", not in the blob store" : `, ${r.size.toLocaleString()} bytes`}</span></div>
+          <div><ResLink r={r.resource} />{part(r) ? <span>{part(r)}</span> : null}{r.ordered ? <span class="muted"> order-dependent</span> : null} <span class="muted">contents right after it, {short(r.content, 16)}{r.size == null ? ", not in the blob store" : `, ${r.size.toLocaleString()} bytes`}</span></div>
           {r.size != null ? <BytesView blob={r.content} total={r.size} stride={r.stride || 16} /> : null}
         </div>
       ))}

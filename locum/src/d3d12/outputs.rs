@@ -209,11 +209,13 @@ pub fn destroyed(id: u64) {
     signatures().remove(&id);
 }
 
-/// One subresource (or a whole buffer, `sub` None) a command wrote.
+/// One subresource (or a buffer, `sub` None) a command wrote.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Written {
     pub resource: u64,
     pub sub: Option<u32>,
+    /// Of a buffer, the bytes (offset, length) the view it was written through covers; None, all of it.
+    pub range: Option<(u64, u64)>,
 }
 
 /// What a list being recorded has bound, as its commands set it: [graphics, compute].
@@ -360,9 +362,7 @@ impl Bound {
             }
             _ => {}
         }
-        let mut seen = std::collections::HashSet::new();
-        out.retain(|w| seen.insert(w.clone()));
-        (out, gaps)
+        (merged(out), gaps)
     }
 
     /// The subresources register `u{register}` of `space` names for `stage`, by root signature `places` and the
@@ -415,7 +415,13 @@ impl Bound {
                     return Err("a root UAV's address names more than one resource".into());
                 }
                 let resource = arg["resource"].as_u64().unwrap_or(0);
-                Ok((resource != 0).then(|| vec![Written { resource, sub: None }]))
+                Ok((resource != 0).then(|| {
+                    vec![Written {
+                        resource,
+                        sub: None,
+                        range: None,
+                    }]
+                }))
             }
             Some(offset) => {
                 let (Some(heap), Some(slot)) = (arg["heap"].as_u64(), arg["slot"].as_u64()) else {
@@ -431,12 +437,55 @@ impl Bound {
                     written.push(Written {
                         resource: counter,
                         sub: None,
+                        range: None,
                     });
                 }
                 Ok(Some(written))
             }
         }
     }
+}
+
+/// Each subresource once, a buffer written through several views with the bytes they cover together (from the
+/// first to the last).
+fn merged(written: Vec<Written>) -> Vec<Written> {
+    let mut out: Vec<Written> = Vec::new();
+    for w in written {
+        match out
+            .iter_mut()
+            .find(|o| o.resource == w.resource && o.sub == w.sub)
+        {
+            Some(o) => {
+                o.range = match (o.range, w.range) {
+                    (Some((a, n)), Some((b, m))) => {
+                        let begin = a.min(b);
+                        Some((begin, (a + n).max(b + m) - begin))
+                    }
+                    _ => None,
+                }
+            }
+            None => out.push(w),
+        }
+    }
+    out
+}
+
+/// The bytes (offset, length) of a buffer `width` bytes long that buffer view `view` of format `format` covers; None
+/// where that is all of it, or the view's elements have no size locum knows.
+pub fn view_bytes(view: &D3D12_BUFFER_UAV, format: u32, width: u64) -> Option<(u64, u64)> {
+    let element = if view.StructureByteStride > 0 {
+        u64::from(view.StructureByteStride)
+    } else if view.Flags.contains(D3D12_BUFFER_UAV_FLAG_RAW) {
+        4
+    } else {
+        u64::from(locum_capture::format::layout(format)?.block_bytes)
+    };
+    let begin = view.FirstElement.checked_mul(element)?.min(width);
+    let end = u64::from(view.NumElements)
+        .checked_mul(element)
+        .and_then(|n| n.checked_add(begin))?
+        .min(width);
+    (begin > 0 || end < width).then_some((begin, end - begin))
 }
 
 /// A UAV definition's view as recorded (the JSON of [`Description::json`]), as far as [`covered`] reads it.
@@ -451,7 +500,15 @@ fn described(v: &Value) -> Result<Option<Description>, String> {
         ..Default::default()
     };
     match d.ViewDimension {
-        D3D12_UAV_DIMENSION_BUFFER => {}
+        D3D12_UAV_DIMENSION_BUFFER => {
+            d.Anonymous.Buffer = D3D12_BUFFER_UAV {
+                FirstElement: v["payload"]["FirstElement"].as_u64().unwrap_or(0),
+                NumElements: n("NumElements"),
+                StructureByteStride: n("StructureByteStride"),
+                CounterOffsetInBytes: v["payload"]["CounterOffsetInBytes"].as_u64().unwrap_or(0),
+                Flags: D3D12_BUFFER_UAV_FLAGS(n("Flags") as i32),
+            }
+        }
         D3D12_UAV_DIMENSION_TEXTURE1D => {
             d.Anonymous.Texture1D = D3D12_TEX1D_UAV {
                 MipSlice: n("MipSlice"),
@@ -490,16 +547,27 @@ fn described(v: &Value) -> Result<Option<Description>, String> {
     Ok(Some(Description::Uav(d)))
 }
 
-/// The subresources of `resource` a UAV view covers: the whole of a buffer; a texture's mip in each array slice of
-/// the view (a volume's whole mip).
+/// The subresources of `resource` a UAV view covers: of a buffer, the bytes its view covers; a texture's mip in each
+/// array slice of the view (a volume's whole mip).
 fn covered(resource: u64, view: Result<Option<Description>, String>) -> Result<Vec<Written>, String> {
     if resource == 0 {
         return Ok(Vec::new());
     }
     let real = super::real::<ID3D12Resource>(resource).ok_or("destroyed before it was written")?;
     let desc = unsafe { real.GetDesc() };
+    let view = view?;
     if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
-        return Ok(vec![Written { resource, sub: None }]);
+        let range = match &view {
+            Some(Description::Uav(d)) if d.ViewDimension == D3D12_UAV_DIMENSION_BUFFER => {
+                view_bytes(unsafe { &d.Anonymous.Buffer }, d.Format.0 as u32, desc.Width)
+            }
+            _ => None,
+        };
+        return Ok(vec![Written {
+            resource,
+            sub: None,
+            range,
+        }]);
     }
     if desc.SampleDesc.Count > 1 {
         return Err("a multisampled UAV is not copied".into());
@@ -516,7 +584,7 @@ fn covered(resource: u64, view: Result<Option<Description>, String>) -> Result<V
                 .saturating_add(if size == u32::MAX { slices } else { size })
                 .min(slices)
     };
-    let (mip, range, plane) = match view? {
+    let (mip, range, plane) = match view {
         None | Some(Description::DefaultView) => (0, 0..slices, 0),
         Some(Description::Uav(d)) => unsafe {
             match d.ViewDimension {
@@ -548,6 +616,7 @@ fn covered(resource: u64, view: Result<Option<Description>, String>) -> Result<V
         .map(|slice| Written {
             resource,
             sub: Some(mip + slice * mips + plane * mips * slices),
+            range: None,
         })
         .collect())
 }
@@ -556,6 +625,52 @@ fn covered(resource: u64, view: Result<Option<Description>, String>) -> Result<V
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A buffer view covers its elements' bytes: structured by their stride, raw in words, typed by the format's
+    /// texel; past the buffer's end cut to it, and all of it said as none.
+    #[test]
+    fn a_buffer_view_covers_its_elements_bytes() {
+        let view = |first: u64, count: u32, stride: u32, flags| D3D12_BUFFER_UAV {
+            FirstElement: first,
+            NumElements: count,
+            StructureByteStride: stride,
+            CounterOffsetInBytes: 0,
+            Flags: flags,
+        };
+        let none = D3D12_BUFFER_UAV_FLAG_NONE;
+        // R32_UINT, R32G32B32A32_FLOAT.
+        assert_eq!(view_bytes(&view(64, 64, 4, none), 0, 768), Some((256, 256)));
+        assert_eq!(
+            view_bytes(&view(2, 8, 0, D3D12_BUFFER_UAV_FLAG_RAW), 0, 4096),
+            Some((8, 32))
+        );
+        assert_eq!(view_bytes(&view(1, 2, 0, none), 2, 4096), Some((16, 32)));
+        assert_eq!(view_bytes(&view(1, 2, 0, none), 42, 4096), Some((4, 8)));
+        assert_eq!(view_bytes(&view(0, 64, 4, none), 0, 256), None, "all of it");
+        assert_eq!(
+            view_bytes(&view(60, 64, 4, none), 0, 256),
+            Some((240, 16)),
+            "cut at its end"
+        );
+        // A typed view of a format without a size locum knows: all of it.
+        assert_eq!(view_bytes(&view(1, 1, 0, none), 0, 256), None);
+    }
+
+    /// One buffer written through several views is one output of the bytes from the first to the last; through a
+    /// view of all of it (or a root UAV), all of it.
+    #[test]
+    fn views_of_one_buffer_are_one_output() {
+        let w = |resource, range| Written {
+            resource,
+            sub: None,
+            range,
+        };
+        assert_eq!(
+            merged(vec![w(4, Some((512, 256))), w(5, None), w(4, Some((64, 64)))]),
+            [w(4, Some((64, 704))), w(5, None)]
+        );
+        assert_eq!(merged(vec![w(4, Some((512, 256))), w(4, None)]), [w(4, None)]);
+    }
 
     /// A DispatchRays writes what its state object's libraries' UAV registers name where the global root signature
     /// places them (here a root UAV); a register it does not place is a local root signature's, named by the tables.
@@ -598,7 +713,8 @@ mod tests {
             written,
             [Written {
                 resource: 7,
-                sub: None
+                sub: None,
+                range: None
             }]
         );
         assert!(gaps.is_empty(), "{gaps:?}");
@@ -624,7 +740,8 @@ mod tests {
             written,
             [Written {
                 resource: 7,
-                sub: None
+                sub: None,
+                range: None
             }]
         );
         assert_eq!(gaps, ["its lib program says nothing of its UAVs"]);
@@ -659,7 +776,8 @@ mod tests {
             written,
             [Written {
                 resource: 9,
-                sub: None
+                sub: None,
+                range: None
             }]
         );
         assert_eq!(gaps, ["a UAV bound to no register: what it writes is not named"]);
