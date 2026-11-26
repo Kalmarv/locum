@@ -13,6 +13,7 @@ mod cb_copied;
 mod compute_first;
 mod contents;
 mod graphics;
+mod heap_indexed;
 mod indirect;
 mod modern;
 mod passes;
@@ -617,6 +618,9 @@ unsafe fn run() {
         big::capture(&device, &queue, &fence, &chain, 200);
         behind_wait::capture(&device, &queue, &fence, &chain, 210);
         sidecar::capture(&device, &queue, &fence, &chain, 220);
+        if let Err(why) = heap_indexed::capture(&device, &queue, &fence, &chain, 230) {
+            println!("heap-indexed SKIPPED: {why}");
+        }
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

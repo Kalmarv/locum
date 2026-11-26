@@ -107,6 +107,15 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
     their passes' targets in the captured frame too. Every pass of every direct list then copies its targets, and
     every draw and dispatch what it wrote through UAVs, in every frame, captured or not: GPU time and readback memory
     (each list's copies are held until it is reset, within the 3 GiB budget pass ends and outputs share).
+  - `heap-indexed on` (default) or `off`, and `heap-indexed-mb N` (32768 by default), Direct3D 12: a submission whose
+    draws or dispatches run with a root signature that indexes the CBV, SRV and UAV heap directly
+    (`CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`, which `ResourceDescriptorHeap` needs) gets a first-use copy of every
+    resource the bound heap's slots name as it finds them, besides what its events name: its programs pick their
+    slots at run time. Those copies stop at N MiB a frame; past it, or with `off`, each such resource is recorded as
+    not copied, with the reason, and the capture has a `d3d12-heap-indexed` gap. A translation layer's frame can name
+    tens of thousands of resources this way (tens of GiB). Every first-use copy also stops 8 GiB short of what the
+    blob store's drive had free when the capture was armed: past that a resource is recorded as `not copied: disk`,
+    a `d3d12-disk` gap. `locum-cli info` says how big a capture is.
 - `overrides.txt` (written by you): rules that change what is drawn, read when a device is made, again when the file
   changes, and dropped when it is removed. What a rule makes the first time it applies (a shader, a constant buffer)
   holds the device until the rules are read again or dropped. One per line:

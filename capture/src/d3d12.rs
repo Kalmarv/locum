@@ -1291,6 +1291,12 @@ impl Composer<'_> {
 
 /// The frame's command history projected into the common tables, one submission at a time.
 /// What an ExecuteIndirect with command signature `signature` is: its last argument draws or dispatches.
+/// Whether a root signature lets its programs index the CBV, SRV and UAV heap directly
+/// (`D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED`, which `ResourceDescriptorHeap` needs).
+fn directly_indexed(root: &Value) -> bool {
+    root["decoded"]["flags"].as_u64().is_some_and(|f| f & 0x400 != 0)
+}
+
 fn indirect(signature: Option<&Value>) -> &'static str {
     let last = signature.and_then(|s| s["arguments"].as_array()?.last()?["type"].as_i64());
     match last {
@@ -1333,6 +1339,11 @@ pub struct Projection {
     indirect: Vec<Indirect>,
     /// ExecuteIndirects with addresses in their records that no copy was made for, by reason.
     unread_arguments: BTreeMap<String, u64>,
+    /// The CBV, SRV and UAV heaps a draw or dispatch of the submission being projected ran with under a root signature
+    /// that indexes them directly (`ResourceDescriptorHeap`): its programs may read any slot.
+    indexed: std::collections::BTreeSet<u64>,
+    /// The resources those heaps' slots named at a submission of the frame, as the submission found them.
+    heap_named: std::collections::BTreeSet<u64>,
 }
 
 /// Counts of the frame's direct-list executions and their checkpoints.
@@ -1496,6 +1507,7 @@ impl Frame {
         let mut projection = Projection::new(&self.objects);
         for submission in &self.submissions {
             projection.submit(capture, submission);
+            projection.heap_indexed();
         }
         self.finish(capture, projection)
     }
@@ -1516,7 +1528,9 @@ impl Frame {
             .collect();
         for resource in &mut capture.resources {
             resource.written = writes.contains(&resource.id);
-            resource.used = resource.written || reads.contains(&resource.id);
+            resource.used = resource.written
+                || reads.contains(&resource.id)
+                || projection.heap_named.contains(&resource.id);
         }
         projection.objects.clear();
         Prepared {
@@ -1759,6 +1773,8 @@ impl Projection {
             indirect: Vec::new(),
             unread_arguments: BTreeMap::new(),
             pass_ends: PassEnds::default(),
+            indexed: std::collections::BTreeSet::new(),
+            heap_named: std::collections::BTreeSet::new(),
         }
     }
 
@@ -1923,8 +1939,10 @@ impl Projection {
     }
 
     /// Projects one submission, after the frame's earlier ones. Returns the resources its events read or write, each
-    /// once, in the order they are first touched.
+    /// once, in the order they are first touched; [`Projection::heap_indexed`] then names those a program indexing a
+    /// descriptor heap directly may read besides.
     pub fn submit(&mut self, capture: &mut db::Capture, submission: &Submission) -> Vec<u64> {
+        self.indexed.clear();
         for d in &submission.descriptors {
             if d.kind == "empty" {
                 self.descriptors.remove(&(d.heap, d.slot));
@@ -1958,6 +1976,27 @@ impl Projection {
             .flat_map(|e| e.reads.iter().chain(&e.writes).copied())
             .filter(|r| seen.insert(*r))
             .collect()
+    }
+
+    /// The resources the last submission projected may read through a descriptor heap its root signatures index
+    /// directly, beyond what its events name: every one a slot of the heap names as the submission found it (and
+    /// each view's counter), in slot order. A program picks its slots at run time, so any of them may be read.
+    pub fn heap_indexed(&mut self) -> Vec<u64> {
+        let mut named = Vec::new();
+        for &heap in &self.indexed {
+            for d in self
+                .descriptors
+                .range((heap, 0)..=(heap, u32::MAX))
+                .map(|(_, d)| d)
+            {
+                for r in [d.resource, d.counter] {
+                    if r != 0 && self.heap_named.insert(r) {
+                        named.push(r);
+                    }
+                }
+            }
+        }
+        named
     }
 
     /// Projects one execution of a list (or a bundle it executes); returns its last graphics draw.
@@ -2078,6 +2117,27 @@ impl Projection {
                         &mut pipeline.graphics,
                         self.objects.get(&pipeline.pso),
                     );
+                }
+                let roots = match kind {
+                    "draw" => [pipeline.graphics_root, 0],
+                    "dispatch" => [pipeline.compute_root, 0],
+                    _ => [pipeline.graphics_root, pipeline.compute_root],
+                };
+                if roots
+                    .iter()
+                    .any(|r| self.objects.get(r).is_some_and(directly_indexed))
+                {
+                    let heaps = pipeline.descriptor_heaps.as_array().into_iter().flatten();
+                    for heap in heaps.filter_map(Value::as_u64) {
+                        // Type 0: CBV, SRV and UAV; a sampler heap names no resource.
+                        if self
+                            .objects
+                            .get(&heap)
+                            .is_some_and(|d| d["type"].as_u64() == Some(0))
+                        {
+                            self.indexed.insert(heap);
+                        }
+                    }
                 }
                 capture.draws.push(draw);
                 if kind == "draw" {
@@ -2682,6 +2742,105 @@ mod tests {
                 ("a root descriptor's address is in no live buffer".to_string(), 1)
             ]
         );
+    }
+
+    #[test]
+    fn a_heap_a_root_signature_indexes_directly_names_every_resource_its_slots_hold() {
+        let object = |id, kind, description| Object {
+            id,
+            kind,
+            device: 1,
+            description,
+        };
+        let buffer = |id| {
+            object(
+                id,
+                "ID3D12Resource",
+                json!({"dimension": 1, "width": 256, "height": 1, "mips": 1, "heap_properties": {"type": 1}}),
+            )
+        };
+        // Root signature #21 indexes the heap directly, #22 does not; #30 is a CBV/SRV/UAV heap, #31 a sampler heap.
+        let mut objects = vec![
+            object(
+                21,
+                "ID3D12RootSignature",
+                json!({"decoded": {"flags": 0x400, "parameters": []}}),
+            ),
+            object(
+                22,
+                "ID3D12RootSignature",
+                json!({"decoded": {"flags": 0, "parameters": []}}),
+            ),
+            object(
+                30,
+                "ID3D12DescriptorHeap",
+                json!({"type": 0, "count": 8, "stride": 32}),
+            ),
+            object(
+                31,
+                "ID3D12DescriptorHeap",
+                json!({"type": 1, "count": 8, "stride": 32}),
+            ),
+        ];
+        objects.extend((10..16).map(buffer));
+        let view = |id, slot, resource, counter| Descriptor {
+            id,
+            heap: 30,
+            slot,
+            kind: "uav",
+            resource,
+            counter,
+            description: json!({}),
+        };
+        let list = |id, root| {
+            let mut list = Recording::new(id, 0, 10 + id, 0, false);
+            for (call, args) in [
+                ("SetDescriptorHeaps", json!([[30, 31]])),
+                ("SetComputeRootSignature", json!([root])),
+                ("Dispatch", json!([1, 1, 1])),
+            ] {
+                list.record(Command {
+                    call,
+                    args,
+                    bundle: None,
+                    diagnostic: None,
+                });
+            }
+            list.close();
+            list.snapshot()
+        };
+        let (plain, indexed) = (list(1, 22), list(2, 21));
+        let submission = |id, list: &Arc<List>, descriptors| Submission {
+            id,
+            queue: 7,
+            queue_seq: id,
+            cpu_seq: id,
+            lists: vec![list.clone()],
+            descriptors,
+            uploads: Vec::new(),
+        };
+        let frame = Frame {
+            objects,
+            ..Frame::default()
+        };
+        let mut c = db::Capture::default();
+        let mut projection = Projection::new(&frame.objects);
+        // A root signature that does not index the heap: its slots are read through tables alone.
+        projection.submit(
+            &mut c,
+            &submission(1, &plain, vec![view(1, 0, 10, 0), view(2, 1, 11, 12)]),
+        );
+        assert!(projection.heap_indexed().is_empty());
+        // One that does: every slot's resource and counter, those of slots written at this submission too.
+        projection.submit(&mut c, &submission(2, &indexed, vec![view(3, 2, 13, 0)]));
+        assert_eq!(projection.heap_indexed(), [10, 11, 12, 13]);
+        // A later submission names only what the frame's earlier ones did not.
+        projection.submit(&mut c, &submission(3, &indexed, vec![view(4, 0, 14, 0)]));
+        assert_eq!(projection.heap_indexed(), [14]);
+        // The frame uses them all, the resource no slot named only not.
+        let _ = frame.finish(&mut c, projection);
+        let used = |id| c.resources.iter().find(|r| r.id == id).unwrap().used;
+        assert!((10..15).all(used) && !used(15));
     }
 
     #[test]

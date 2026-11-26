@@ -261,6 +261,65 @@ struct Live {
     paged: HashSet<u64>,
     /// Every acceleration structure's latest build as the frame began (see [`super::rays`]).
     rays: Vec<(super::rays::Key, Arc<super::rays::Build>)>,
+    /// What the frame's first-use copies take, and those given up for room.
+    room: Room,
+}
+/// What a capture leaves free on the blob store's drive: its first-use copies stop short of it.
+const DISK_KEPT: u64 = 8 << 30;
+/// Room for a frame's first-use copies: a resource only a directly indexed descriptor heap names within
+/// `heap-indexed-mb` (`heap`, None for `heap-indexed off`), and every copy within the bytes free on the blob store's
+/// drive when the capture was armed (`disk`, None if it could not be asked), less [`DISK_KEPT`].
+#[derive(Default)]
+struct Room {
+    heap: Option<u64>,
+    disk: Option<u64>,
+    /// The bytes planned so far, and those of them for resources only such a heap names.
+    planned: u64,
+    heap_bytes: u64,
+    /// The copies given up, by what ran out (`heap-indexed off`, `heap-indexed-mb`, `disk`): how many, and their bytes.
+    uncopied: BTreeMap<&'static str, (u64, u64)>,
+}
+impl Room {
+    /// Takes room for a copy of `bytes` (of a resource only a directly indexed heap names, if `heap_only`), or says
+    /// why there is none.
+    fn take(&mut self, bytes: u64, heap_only: bool) -> Result<(), String> {
+        let why = match (heap_only, self.heap, self.disk) {
+            (true, None, _) => Err(("heap-indexed off", "`heap-indexed off`".to_string())),
+            (true, Some(cap), _) if self.heap_bytes + bytes > cap => Err((
+                "heap-indexed-mb",
+                format!(
+                    "past `heap-indexed-mb` {}: {} MiB of the frame's resources only such a heap names came first",
+                    cap >> 20,
+                    self.heap_bytes >> 20
+                ),
+            )),
+            (_, _, Some(free)) if self.planned + bytes + DISK_KEPT > free => Err((
+                "disk",
+                format!(
+                    "disk: the blob store's drive had {} MiB free when the capture was armed, the frame's copies \
+                     before it take {} MiB, and {} MiB are kept free",
+                    free >> 20,
+                    self.planned >> 20,
+                    DISK_KEPT >> 20
+                ),
+            )),
+            _ => Ok(()),
+        };
+        match why {
+            Ok(()) => {
+                self.planned += bytes;
+                if heap_only {
+                    self.heap_bytes += bytes;
+                }
+                Ok(())
+            }
+            Err((what, why)) => {
+                let lost = self.uncopied.entry(what).or_default();
+                *lost = (lost.0 + 1, lost.1 + bytes);
+                Err(why)
+            }
+        }
+    }
 }
 #[derive(Default)]
 struct Upload {
@@ -609,6 +668,16 @@ pub unsafe fn submit(
         let submission = live.frame.submissions.last().expect("pushed");
         let from = live.projection.indirect().len();
         let mut touched = live.projection.submit(&mut live.capture, submission);
+        // What its programs may read through a heap they index directly, besides what its events name.
+        let mut heap = HashSet::new();
+        let named = live.projection.heap_indexed();
+        if !named.is_empty() {
+            let events: HashSet<u64> = touched.iter().copied().collect();
+            for r in named.into_iter().filter(|r| !events.contains(r)) {
+                heap.insert(r);
+                touched.push(r);
+            }
+        }
         let unknown = unsafe { unknown_wait(waits.entry(queue.id).or_default(), signals) };
         // What its DispatchRays' shader tables name, read now: the queue runs everything submitted before first.
         let real_queue = unsafe { ID3D12CommandQueue::from_raw_borrowed(&real) };
@@ -677,6 +746,7 @@ pub unsafe fn submit(
                 objects,
                 states,
                 touched,
+                &heap,
                 unknown.as_deref(),
                 cpu_seq,
                 &tiles,
@@ -846,6 +916,7 @@ fn first_uses(
     objects: &BTreeMap<u64, model::Object>,
     states: &super::states::Tracker,
     touched: Vec<u64>,
+    heap: &HashSet<u64>,
     unknown: Option<&str>,
     cpu_seq: u64,
     tiles: &HashMap<u64, Tiles>,
@@ -934,6 +1005,24 @@ fn first_uses(
             1
         };
         let layout = layout.expect("checked");
+        let heap_only = heap.contains(&resource);
+        if let Err(why) = live.room.take(locum_capture::layout::total(&layout), heap_only) {
+            let named = if heap_only {
+                ", named only by a descriptor heap its root signature indexes directly"
+            } else {
+                ""
+            };
+            failed.push((
+                resource,
+                model::FirstUse {
+                    submission,
+                    states: json!([]),
+                    content: Err(format!("not copied{named}: {why}")),
+                    note: None,
+                },
+            ));
+            continue;
+        }
         // A multisampled texture's layout has an image a sample; its samples are drawn out joined (see
         // `locum_capture::d3d12::samples`).
         let samples = n("sample_count").max(1);
@@ -948,12 +1037,20 @@ fn first_uses(
                 .then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes)),
             states,
             layout,
-            note: unknown.map(|why| {
-                format!(
-                    "{why}: copied when the queue got past the wait, as this submission found it (work submitted later \
-                     that the GPU ran first may have changed it before)"
-                )
-            }),
+            note: unknown
+                .map(|why| {
+                    format!(
+                        "{why}: copied when the queue got past the wait, as this submission found it (work submitted \
+                         later that the GPU ran first may have changed it before)"
+                    )
+                })
+                .or_else(|| {
+                    heap_only.then(|| {
+                        "named only by a descriptor heap its root signature indexes directly: copied as the slots \
+                         its programs may read hold it"
+                            .to_string()
+                    })
+                }),
         });
     }
     if !failed.is_empty() {
@@ -1311,10 +1408,23 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         series: of,
         used,
         rays,
+        room,
         ..
     }) = finished
     {
         super::log_counts();
+        for (what, (count, bytes)) in room.uncopied {
+            let gap = if what == "disk" {
+                "d3d12-disk"
+            } else {
+                "d3d12-heap-indexed"
+            };
+            capture.gap(
+                gap,
+                format!("{count} first-use copies ({} MiB) not made: {what}", bytes >> 20),
+                count,
+            );
+        }
         capture.meta("api", "d3d12");
         if let Some(of) = &of {
             capture.meta(
@@ -1474,6 +1584,24 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
     }
 }
 
+/// The bytes free to this process on the drive that holds `dir` (or its nearest folder that exists).
+fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let dir = dir.ancestors().find(|d| d.exists())?;
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    unsafe {
+        windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            windows::core::PCWSTR(wide.as_ptr()),
+            Some(&mut free),
+            None,
+            None,
+        )
+    }
+    .ok()
+    .map(|()| free)
+}
+
 /// Arms the capture of the frame after Present `frame_number`, frame `series.index` of its series: written to
 /// `captures/<label>` (one frame), `captures/<label>-<index>` (a series) or `captures/frame-<n>` (no label).
 fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
@@ -1491,6 +1619,9 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         lead_ends();
         return;
     }
+    // Asked before the state is taken: a drive can be slow to answer.
+    let settings = crate::settings::settings();
+    let disk = free_bytes(settings.blobs.root());
     let mut s = state();
     s.descriptors.clear();
     s.constant_buffers.clear();
@@ -1511,6 +1642,11 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         executed: HashSet::new(),
         paged: HashSet::new(),
         rays: super::rays::latest(),
+        room: Room {
+            heap: settings.heap_indexed.then_some(settings.heap_indexed_bytes),
+            disk,
+            ..Room::default()
+        },
     });
     s.series = Some(series.clone());
     super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
@@ -1540,7 +1676,38 @@ pub(super) fn arm_now(root: &std::path::Path, frames: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::runs;
+    use super::{DISK_KEPT, Room, runs};
+
+    #[test]
+    fn first_use_copies_stop_at_the_heap_cap_and_short_of_the_disk() {
+        const MIB: u64 = 1 << 20;
+        // 100 MiB for resources only a heap names; the drive has 150 MiB past what is kept free.
+        let mut room = Room {
+            heap: Some(100 * MIB),
+            disk: Some(DISK_KEPT + 150 * MIB),
+            ..Room::default()
+        };
+        assert!(room.take(60 * MIB, true).is_ok());
+        let past = room.take(50 * MIB, true).unwrap_err();
+        assert!(past.contains("past `heap-indexed-mb` 100: 60 MiB"), "{past}");
+        // A resource an event names is not held to the heap's cap, only to the disk.
+        assert!(room.take(80 * MIB, false).is_ok());
+        let disk = room.take(20 * MIB, false).unwrap_err();
+        assert!(
+            disk.starts_with("disk: ") && disk.contains("take 140 MiB"),
+            "{disk}"
+        );
+        assert!(room.take(10 * MIB, false).is_ok());
+        assert_eq!((room.planned, room.heap_bytes), (150 * MIB, 60 * MIB));
+        assert_eq!(
+            room.uncopied.into_iter().collect::<Vec<_>>(),
+            [("disk", (1, 20 * MIB)), ("heap-indexed-mb", (1, 50 * MIB))]
+        );
+        // `heap-indexed off`, and a drive that could not be asked.
+        let mut off = Room::default();
+        assert_eq!(off.take(1, true).unwrap_err(), "`heap-indexed off`");
+        assert!(off.take(u64::MAX / 2, false).is_ok());
+    }
     #[test]
     fn ranges_merge_across_gaps_smaller_than_the_threshold_and_never_across_resources() {
         let ranges = vec![

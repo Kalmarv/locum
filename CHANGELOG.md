@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Direct3D 12: a program that reads through `ResourceDescriptorHeap` picks its heap slots at run time, so no event
+  named what it read and replay started those resources as zeros. A submission whose draws or dispatches run with a
+  root signature that indexes the CBV, SRV and UAV heap directly now gets a first-use copy of every resource the bound
+  heap's slots name as it finds them (settings.txt `heap-indexed on`, the default, or `off`; at most `heap-indexed-mb`
+  of them a frame, 32768 by default; past it a `d3d12-heap-indexed` gap). Every first-use copy stops 8 GiB short of
+  what the blob store's drive had free when the capture was armed (`not copied: disk`, a `d3d12-disk` gap).
+  `locum-cli info` says how big a capture is: its database and the blobs it names in the store.
 - iridia d4a25e2: `locum-cli shader --trace` and `trace` follow a vertex, hull, domain, geometry, mesh or
   amplification program that reads its lane in the wave (`WaveGetLaneIndex`); iridia refused to lift one ("LaneIndex
   as a Vertex input has no built-in binding").

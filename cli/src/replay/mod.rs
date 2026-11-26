@@ -274,6 +274,10 @@ fn with_bound(c: &Capture, events: Vec<i64>, mut resources: BTreeSet<i64>) -> Pl
             resources.extend(b);
         }
     }
+    // What a program reads through a heap its root signature indexes directly, which no binding names.
+    if c.meta("api").as_deref() == Some("d3d12") {
+        resources.extend(d3d12::heap_named(c, &events.iter().copied().collect()));
+    }
     // Queries are resources only to the planner (negative ids, d3d12::query_touches).
     resources.retain(|&r| r >= 0);
     Plan {

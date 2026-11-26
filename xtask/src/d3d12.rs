@@ -632,6 +632,24 @@ fn replay_checks(stage: &std::path::Path, pid: u32, debug: bool) {
         "ok   D3D12 verify: ExecuteIndirect records it could not read, and contents it could not know, are gaps"
     );
     let said = std::fs::read_to_string(stage.join("stdout.txt")).expect("the WARP smoke's output");
+    // A dispatch reading through ResourceDescriptorHeap: replay finds the contents of what only the heap names.
+    if let Some(why) = said
+        .lines()
+        .find_map(|l| l.strip_prefix("heap-indexed SKIPPED: "))
+    {
+        println!("SKIP D3D12 verify: heap-indexed ({why})");
+    } else {
+        let (ok, text) = run(&["verify", "--warp", &capture("heap-indexed")]);
+        assert!(
+            ok && text.contains(
+                "what draws and dispatches wrote through UAVs: 1 identical to the game's, 0 different"
+            ),
+            "heap-indexed: the dispatch's output identical on replay: {text}"
+        );
+        println!(
+            "ok   D3D12 verify: a dispatch reading only through ResourceDescriptorHeap replays as the game's"
+        );
+    }
     rays_verified(stage, &log, &capture, &said, "verify");
     samples_verified(stage, &log, &capture("samples"), "verify");
     // Under the debug layer, with a pass under GPU-based validation of its own: the dispatches write a texture made

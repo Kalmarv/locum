@@ -165,6 +165,25 @@ fn verifications(c: &Capture) {
     }
 }
 
+/// What a capture takes: its database, and the blobs it names that its store holds (decoded; the store keeps them
+/// compressed, and once for every capture that names the same bytes).
+fn size(c: &Capture) -> Result<String, String> {
+    let db = std::fs::metadata(&c.path)
+        .map_err(|e| format!("{}: {e}", c.path.display()))?
+        .len();
+    let mut keys = std::collections::HashSet::new();
+    locum_capture::db::keys(&c.db, &mut keys).map_err(|e| e.to_string())?;
+    let (blobs, bytes) = keys
+        .iter()
+        .filter_map(|k| c.blobs.size(k))
+        .fold((0u64, 0u64), |(n, total), size| (n + 1, total + size));
+    Ok(format!(
+        "{} database, {blobs} blobs in the store ({} decoded, shared with the store's other captures that name them)",
+        mib(db),
+        mib(bytes)
+    ))
+}
+
 pub fn info(c: &Capture) -> Result<(), String> {
     let counts = c.meta_json("counts");
     let request = c.meta_json("request");
@@ -190,6 +209,7 @@ pub fn info(c: &Capture) -> Result<(), String> {
         out!("  request: {request}");
     }
     out!("  blob store: {}", c.blobs.root().display());
+    out!("  size: {}", size(c)?);
     out!("");
 
     let kinds: Vec<(String, i64)> = c.rows(

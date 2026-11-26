@@ -33,6 +33,7 @@ use crate::open::Capture;
 
 use super::Backend;
 
+mod indexed;
 mod indirect;
 mod memory;
 mod pipelines;
@@ -305,6 +306,11 @@ pub fn acceleration_structures(c: &Capture) -> BTreeSet<i64> {
 /// resources of negative id) each reads and writes.
 pub fn query_touches(c: &Capture) -> Vec<(i64, Vec<i64>, Vec<i64>)> {
     queries::touches(c)
+}
+
+/// For planning: what the heaps `events` index directly name (see [`indexed`]).
+pub fn heap_named(c: &Capture, events: &BTreeSet<i64>) -> BTreeSet<i64> {
+    indexed::named(c, events)
 }
 
 fn u(v: &Value, i: usize) -> u64 {

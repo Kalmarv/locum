@@ -46,6 +46,12 @@ pub struct Settings {
     /// 4096 by default).
     pub sidecar: PathBuf,
     pub sidecar_regions: u64,
+    /// Direct3D 12: a submission whose draws or dispatches run with a root signature that indexes the CBV, SRV and
+    /// UAV heap directly (`ResourceDescriptorHeap`) gets first-use copies of every resource the heap's slots name
+    /// (`heap-indexed on`, the default; `off` records them as not copied), at most `heap-indexed-mb` of them in a
+    /// frame (32768 by default).
+    pub heap_indexed: bool,
+    pub heap_indexed_bytes: u64,
 }
 
 pub fn settings() -> &'static Settings {
@@ -63,6 +69,8 @@ pub fn settings() -> &'static Settings {
             readback_budget: 1 << 30,
             sidecar: dir.join("sidecar.txt"),
             sidecar_regions: 4 << 30,
+            heap_indexed: true,
+            heap_indexed_bytes: 32768 << 20,
         };
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.txt")) {
             for (n, line) in text.lines().enumerate() {
@@ -118,6 +126,21 @@ pub fn settings() -> &'static Settings {
                         Ok(mb) => s.sidecar_regions = mb << 20,
                         _ => log!(
                             "settings.txt line {}: sidecar-region-mb {value:?} is not a number: ignored",
+                            n + 1
+                        ),
+                    },
+                    "heap-indexed" => match value {
+                        "on" => s.heap_indexed = true,
+                        "off" => s.heap_indexed = false,
+                        other => log!(
+                            "settings.txt line {}: heap-indexed {other:?} is not on or off: ignored",
+                            n + 1
+                        ),
+                    },
+                    "heap-indexed-mb" => match value.parse::<u64>() {
+                        Ok(mb) => s.heap_indexed_bytes = mb << 20,
+                        _ => log!(
+                            "settings.txt line {}: heap-indexed-mb {value:?} is not a number: ignored",
                             n + 1
                         ),
                     },
