@@ -2171,7 +2171,11 @@ impl Projection {
         if depth == 0 && list.kind == 0 && !list.instrumented && last_draw.is_some() {
             *self
                 .uncopied
-                .entry("list recorded before the capture was armed: its pass ends were not copied".into())
+                .entry(
+                    "list recorded before the capture was armed: its pass ends were not copied (a request's \
+                     `early N` or `arm-early on` in settings.txt instruments such lists)"
+                        .into(),
+                )
                 .or_default() += 1;
         }
         last_draw

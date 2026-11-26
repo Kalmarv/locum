@@ -29,6 +29,10 @@ pub struct Settings {
     pub blobs: Blobs,
     pub dumper: Option<PathBuf>,
     pub dumps: Option<PathBuf>,
+    /// Direct3D 12 direct lists are instrumented from the process's start, not only from a capture's arming
+    /// (`arm-early on`), so lists recorded before a request copy their passes' targets too. Every pass of every
+    /// direct list then copies its targets in every frame, which costs GPU time and readback memory with no capture.
+    pub arm_early: bool,
     pub crash_av_rvas: Vec<usize>,
     /// Readback memory one chunk of an armed frame's copies may use, and the size of the pieces a bigger buffer is
     /// copied in (`readback-chunk-mb`, 256 by default, 1 to 1024).
@@ -48,6 +52,7 @@ pub fn settings() -> &'static Settings {
             blobs: Blobs::new(dir.join("blobs")),
             dumper: None,
             dumps: None,
+            arm_early: false,
             crash_av_rvas: Vec::new(),
             readback_chunk: 256 << 20,
             readback_budget: 1 << 30,
@@ -72,6 +77,14 @@ pub fn settings() -> &'static Settings {
                     "blobs" => s.blobs = Blobs::new(value),
                     "dumper" => s.dumper = Some(PathBuf::from(value)),
                     "dumps" => s.dumps = Some(PathBuf::from(value)),
+                    "arm-early" => match value {
+                        "on" => s.arm_early = true,
+                        "off" => s.arm_early = false,
+                        other => log!(
+                            "settings.txt line {}: arm-early {other:?} is not on or off: ignored",
+                            n + 1
+                        ),
+                    },
                     "crash-av-rva" => match crash_rvas(value) {
                         Ok(rvas) => s.crash_av_rvas = rvas,
                         Err(_) => log!(
@@ -96,6 +109,9 @@ pub fn settings() -> &'static Settings {
                     other => log!("settings.txt line {}: unknown setting {other:?}: ignored", n + 1),
                 }
             }
+        }
+        if s.arm_early {
+            log!("settings: arm-early on: Direct3D 12 direct lists are instrumented from the start");
         }
         if let Some(dir) = std::env::var_os("LOCUM_BLOBS").filter(|d| !d.is_empty()) {
             s.blobs = Blobs::new(PathBuf::from(dir));

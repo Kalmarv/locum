@@ -99,12 +99,10 @@ unsafe fn draw(list: &ID3D12GraphicsCommandList, (width, height): (u32, u32), co
     }
 }
 
-pub(super) unsafe fn capture(
+/// The passes' root signature (five root constants: colour and depth) and pipelines with and without depth.
+unsafe fn pipelines(
     device: &ID3D12Device,
-    queue: &ID3D12CommandQueue,
-    fence: &ID3D12Fence,
-    chain: &IDXGISwapChain1,
-) {
+) -> (ID3D12RootSignature, ID3D12PipelineState, ID3D12PipelineState) {
     unsafe {
         let constants = b"cbuffer C : register(b0) { float4 colour; float depth; };";
         let vs = compile(
@@ -151,6 +149,18 @@ pub(super) unsafe fn capture(
             .unwrap();
         let with_depth = pipeline(device, &root, &vs, &ps, true);
         let colour_only = pipeline(device, &root, &vs, &ps, false);
+        (root, with_depth, colour_only)
+    }
+}
+
+pub(super) unsafe fn capture(
+    device: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    fence: &ID3D12Fence,
+    chain: &IDXGISwapChain1,
+) {
+    unsafe {
+        let (root, with_depth, colour_only) = pipelines(device);
 
         let tex2d = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
         let rt = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -542,5 +552,140 @@ pub(super) unsafe fn capture(
     }
     println!(
         "D3D12 pass-end targets verified: barrier, rebind, clear, Close, render pass and enhanced-barrier ends; a target moved into RENDER_TARGET after binding; a pass continued in the next list; a re-executed list's pass end named as missing; depth and stencil, array mip, layout target"
+    );
+}
+
+/// Lists recorded before the captured frame: in a request's lead (`early 1`, `before_request` false: reset after the
+/// Present that read the request, before the one that arms the capture), or before the request itself with
+/// `arm-early on` (`before_request`). Executed once before the captured frame as well, the list has its pass ends
+/// copied in it: one inside the list (a rebind ends it), one its Close left open, copied after it there, its end kept
+/// from the earlier execution.
+pub(super) unsafe fn early(
+    device: &ID3D12Device,
+    queue: &ID3D12CommandQueue,
+    chain: &IDXGISwapChain1,
+    before_request: bool,
+) {
+    unsafe {
+        let (root, _, colour_only) = pipelines(device);
+        let target = || {
+            committed(
+                device,
+                D3D12_HEAP_TYPE_DEFAULT,
+                &desc(
+                    D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    RGBA8,
+                    (8, 8),
+                    (1, 1, 1),
+                    D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ),
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+            )
+        };
+        let (t, u) = (target(), target());
+        let heap: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 2,
+                ..Default::default()
+            })
+            .unwrap();
+        let stride = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
+        let start = heap.GetCPUDescriptorHandleForHeapStart();
+        let rtv = |i: usize| D3D12_CPU_DESCRIPTOR_HANDLE {
+            ptr: start.ptr + i * stride,
+        };
+        device.CreateRenderTargetView(&t, None, rtv(0));
+        device.CreateRenderTargetView(&u, None, rtv(1));
+        let allocator: ID3D12CommandAllocator = device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            .unwrap();
+        let list: ID3D12GraphicsCommandList = device
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+            .unwrap();
+        list.Close().unwrap();
+
+        let dir = std::path::PathBuf::from(std::env::var_os("LOCUM_DIR").unwrap());
+        let name = if before_request { "arm-early" } else { "early" };
+        let label = format!("{name}-{}", std::process::id());
+        if !before_request {
+            std::fs::write(dir.join("capture"), format!("label {label}\nearly 1\n")).unwrap();
+            // Reads the request: the lead begins.
+            chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        }
+        allocator.Reset().unwrap();
+        list.Reset(&allocator, &colour_only).unwrap();
+        list.SetGraphicsRootSignature(&root);
+        list.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        list.OMSetRenderTargets(1, Some(&rtv(0)), true, None);
+        draw(&list, (8, 8), [1., 0., 0., 1.], 0.);
+        list.OMSetRenderTargets(1, Some(&rtv(1)), true, None);
+        draw(&list, (8, 8), [0., 1., 0., 1.], 0.);
+        list.Close().unwrap();
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        finish(queue, &fence, 1);
+        if before_request {
+            chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+            std::fs::write(dir.join("capture"), format!("label {label}\n")).unwrap();
+        }
+        // Arms the capture.
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        finish(queue, &fence, 2);
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+
+        let path = dir.join("captures").join(&label).join("capture.db");
+        let until = Instant::now() + Duration::from_secs(15);
+        while !path.is_file() {
+            assert!(
+                Instant::now() < until,
+                "capture writer timeout: {}",
+                path.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let db = rusqlite::Connection::open(&path).unwrap();
+        let blobs = locum_capture::blobs::Blobs::new(dir.join("blobs"));
+        let rows: Vec<(i64, String, Option<String>)> = db
+            .prepare("SELECT draw, target, blob FROM targets ORDER BY draw")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        let shape: Vec<_> = rows.iter().map(|(d, t, _)| (*d, t.as_str())).collect();
+        assert_eq!(shape, [(1, "rt0"), (2, "rt0")], "{rows:?}");
+        for ((_, _, blob), rgba) in rows.iter().zip([[255, 0, 0, 255], [0, 255, 0, 255]]) {
+            let bytes = blobs.get(blob.as_ref().unwrap()).unwrap();
+            assert!(
+                bytes.len() == 8 * 8 * 4 && bytes.chunks(4).all(|t| t == rgba),
+                "early: {rgba:?}: {:?}",
+                &bytes[..8]
+            );
+        }
+        for (sql, n) in [
+            ("SELECT count(*) FROM gaps WHERE what='d3d12-targets'", 0),
+            ("SELECT count(*) FROM missing_targets", 0),
+            (
+                "SELECT json_extract(value, '$.lists_instrumented') FROM meta WHERE key='pass_ends'",
+                1,
+            ),
+            (
+                "SELECT json_extract(value, '$.lists_uninstrumented') FROM meta WHERE key='pass_ends'",
+                0,
+            ),
+        ] {
+            assert_eq!(db.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap(), n, "{sql}");
+        }
+        debug_errors(device);
+    }
+    println!(
+        "D3D12 {}: a list recorded before the captured frame and executed before it too has both its pass ends read back",
+        if before_request {
+            "arm-early on, list recorded before the request"
+        } else {
+            "request lead (early 1)"
+        }
     );
 }

@@ -272,7 +272,36 @@ pub fn smoke(root: &std::path::Path, hardware: bool, debug: bool, dlls: Option<&
         assert!(log.contains(proof), "missing wrapper proof: {proof}");
     }
     println!("D3D12 log proves proxied device, queue, resources, list execution and swapchain");
+    arm_early(&stage);
     replay_checks(&stage, pid, debug);
+}
+
+/// The fixture again with `arm-early on` in a folder of its own: a list recorded before the capture request has its
+/// pass ends read back.
+fn arm_early(stage: &std::path::Path) {
+    let dir = stage.join("arm-early");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("settings.txt"), "arm-early on\n").unwrap();
+    let result = std::process::Command::new(stage.join("locum-smoke-d3d12.exe"))
+        .arg("--arm-early")
+        .current_dir(stage)
+        .env("LOCUM_DIR", &dir)
+        .output()
+        .expect("run D3D12 arm-early smoke");
+    print!("{}", String::from_utf8_lossy(&result.stdout));
+    eprint!("{}", String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "D3D12 arm-early smoke failed: {}",
+        result.status
+    );
+    let log = std::fs::read_to_string(dir.join("locum.log")).unwrap();
+    assert!(
+        log.contains("settings: arm-early on"),
+        "arm-early: the setting is read"
+    );
+    println!("ok   D3D12 arm-early on: a list recorded before the request has its pass ends read back");
 }
 
 /// The fixture's hardware scenarios on the default adapter, then their captures replayed there.

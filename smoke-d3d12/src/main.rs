@@ -92,6 +92,12 @@ fn main() {
         println!("D3D12 hardware smoke: all checks passed");
         return;
     }
+    // Run where settings.txt says `arm-early on`: lists are instrumented from the start.
+    if std::env::args().any(|a| a == "--arm-early") {
+        unsafe { arm_early() };
+        println!("D3D12 arm-early smoke: all checks passed");
+        return;
+    }
     unsafe {
         run();
     }
@@ -151,6 +157,38 @@ unsafe fn swap_chain(factory: &IDXGIFactory4, queue: &ID3D12CommandQueue) -> (HW
 
 /// What only a real GPU shows: the scenarios WARP keeps in order whatever the barriers, on the default adapter
 /// through the shims, with no debug layer (it changes a driver's timing).
+/// A list recorded before the capture request, with `arm-early on`, on WARP.
+unsafe fn arm_early() {
+    unsafe {
+        let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+        let warp: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+        // The debug layer validates the copies' transitions, as in the main run.
+        let mut debug: Option<ID3D12Debug> = None;
+        if D3D12GetDebugInterface(&mut debug).is_ok()
+            && let Some(debug) = debug
+        {
+            debug.EnableDebugLayer();
+        }
+        let mut device: Option<ID3D12Device> = None;
+        D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut device).unwrap();
+        let device = device.unwrap();
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+            .unwrap();
+        let (hwnd, chain) = swap_chain(&factory, &queue);
+        chain.Present(0, DXGI_PRESENT(0)).ok().unwrap();
+        passes::early(&device, &queue, &chain, true);
+        // The closing Present queues back buffer work: it completes before the buffers are released.
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        finish(&queue, &fence, 1);
+        drop(chain);
+        DestroyWindow(hwnd).unwrap();
+    }
+}
+
 unsafe fn hardware() {
     unsafe {
         let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
@@ -552,6 +590,7 @@ unsafe fn run() {
         finish(&queue, &fence, 16);
         passes::capture(&device, &queue, &fence, &chain);
         finish(&queue, &fence, 18);
+        passes::early(&device, &queue, &chain, false);
         compute_first::capture(&device, &queue, &fence, &chain);
         finish(&queue, &fence, 21);
         cb_copied::capture(&device, &queue, &fence, &chain);

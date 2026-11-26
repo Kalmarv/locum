@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Direct3D 12: lists recorded before the captured frame can copy their passes' targets. A request's `early N` (0 to
+  64) instruments the lists reset or made from the Present that reads it and arms the capture N Presents later, for
+  games that record their lists a frame or more ahead; `arm-early on` in settings.txt instruments every direct list
+  from the process's start, for lists recorded long before a request (their copies run in every frame). A pass a
+  list leaves open at Close and executed before the capture was armed is now copied at its first execution in the
+  captured frame (it was dropped at the earlier execution).
 - Direct3D 12: a buffer a submission first uses behind a wait that nothing submitted yet signals (a wait across
   queues, signalled later) is copied anyway, on that queue past the wait, as the submission finds it; its
   `content_note` says so. It had no contents. A texture there is still refused: its state is not known.

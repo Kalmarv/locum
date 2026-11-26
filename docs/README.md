@@ -58,6 +58,11 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
     capture's place (`{"label", "index", "frames"}`); the memory dump is taken at the first frame only. The game
     waits while each capture is read back, so its clock jumps between the frames, though they are still the
     consecutive ones it presented.
+  - `early N` (0 to 64, Direct3D 12): a lead of N frames before the captured one. Direct3D 12 lists reset or made
+    from the Present that reads the request on are instrumented (see below), and the capture is armed N Presents
+    later, so the lists a game records a frame or more ahead of the frame they run in copy their passes' targets
+    too. What the lists copy in the lead is not read; a list executed in the lead and again in the captured frame is
+    read after the latter.
 - `blobs/`: the blob store, shared by every capture: resource contents, targets, the bytes each update and map wrote,
   and shader bytecode, each under the xxh3-128 hash of its bytes (the bytes as decoded). They are appended to
   `packs/*.pack` (one per process writing), and `index.db` (table `packed(key, pack, offset, stored, size, codec)`)
@@ -96,6 +101,11 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
     the dump is written from the snapshot while the game runs on;
   - `dumps DIR`: where the dumps go (default the capture's folder). They hold all of the game's memory: keep them
     private.
+  - `arm-early on` (default `off`, Direct3D 12): every direct list is instrumented from the process's start, not only
+    once a capture is armed, so lists recorded long before a request (recorded once and executed every frame) copy
+    their passes' targets in the captured frame too. Every pass of every direct list then copies its targets, and
+    every draw and dispatch what it wrote through UAVs, in every frame, captured or not: GPU time and readback memory
+    (each list's copies are held until it is reset, within the 3 GiB budget pass ends and outputs share).
 - `overrides.txt` (written by you): rules that change what is drawn, read when a device is made, again when the file
   changes, and dropped when it is removed. What a rule makes the first time it applies (a shader, a constant buffer)
   holds the device until the rules are read again or dropped. One per line:
@@ -824,7 +834,8 @@ first change to it: `pages_json` holds runs `[first tile, tiles, heap, first hea
 call's arguments (resources and heaps by id) and the page table after it. `resource ID` shows how many tiles of
 each mip were mapped, from which heaps, and the frame's changes.
 
-Lists reset or created while a capture is armed are instrumented: where a pass ends, locum records copies of its
+Lists reset or created while a capture is armed (from the request on with `early N`, always with `arm-early on`)
+are instrumented: where a pass ends, locum records copies of its
 render and depth targets into the game's own list, so they run on the GPU right after the pass's last draw. A pass
 ends for a target when a barrier moves it out of its state, its views are rebound or cleared from the state, a clear
 or discard is about to overwrite it, a native render pass ends (after EndRenderPass, its ending accesses done), or the
@@ -835,8 +846,10 @@ state that allows no write is gone back to through COPY_DEST: straight from COPY
 an NVIDIA driver let the list's next barrier into DEPTH_WRITE and the draw after it overlap the copy (Elden Ring's
 split-plane depth-stencil, its stencil copied wrong from row 32 on). Its bytes
 are read after the list's first execution in the frame completes, into `targets` rows on the last draw that had the
-target bound. A multisampled target is read sample by sample, its samples stacked in the row. Lists recorded before
-the request, a list executed again in the frame, attachments a render pass discards or suspends into another list,
+target bound. A pass a list leaves open at Close is decided at its first execution while a capture is armed: one
+executed before (in the lead, or with `arm-early on`) keeps it until then. A multisampled target is read sample by
+sample, its samples stacked in the row. Lists recorded before the request (and before its lead, without `arm-early
+on`), a list executed again in the frame, attachments a render pass discards or suspends into another list,
 and copies past the 3 GiB readback budget are
 `d3d12-targets` gaps. The budget is spent as the copies are recorded, in the order the game records its lists, not
 in pass order, so the passes past it are not only the frame's last; `passes` marks each pass whose targets were not

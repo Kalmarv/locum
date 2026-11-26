@@ -184,7 +184,7 @@ impl Data {
     }
     /// Instruments a generation opened with pipeline `pso` while a capture is armed, if the list is a direct one.
     fn instrument(&self, recording: &mut model::Recording, list: &ID3D12GraphicsCommandList, pso: u64) {
-        let pass = if super::passes::ARMED.load(std::sync::atomic::Ordering::Acquire) {
+        let pass = if super::passes::instrumenting() {
             unsafe { super::passes::Pass::new(list, pso) }
         } else {
             None
@@ -212,6 +212,8 @@ struct State {
     states: super::states::Tracker,
     /// The series the armed frame belongs to (`frames N` in the request): the next frame is armed as it closes.
     series: Option<Series>,
+    /// A request in its lead (`early N`): the Presents left before its first frame is armed, and its series.
+    lead: Option<(u32, Series)>,
     /// Fence values each queue has been told to wait for and no submitted Signal is known to reach, by queue.
     waits: HashMap<u64, Vec<(u64, u64)>>,
     /// The highest value submitted to signal each fence, by fence.
@@ -230,6 +232,8 @@ struct Series {
 
 /// The most frames one request captures.
 const MAX_FRAMES: u32 = 64;
+/// The most Presents a request's lead (`early N`) runs before its first frame is armed.
+const MAX_EARLY: u32 = 64;
 
 /// An armed frame: its history so far, projected as it is submitted, and the copies its submissions made.
 struct Live {
@@ -635,7 +639,12 @@ pub unsafe fn submit(
         if first {
             submitted.read.extend(copied);
         }
-        executed.push(super::passes::Executed { at, list, first });
+        executed.push(super::passes::Executed {
+            at,
+            list,
+            armed: capture.is_some(),
+            first,
+        });
     }
     let continued = unsafe { super::passes::ends(&mut submitted, &executed) };
     // Buffers locum's copies promoted, moved between the lists (see [`super::promoted`]).
@@ -1265,6 +1274,17 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         );
         return;
     }
+    // A request's lead: lists reset since the Present that read it are instrumented, and its first frame is armed
+    // `early` Presents after that one.
+    let lead = state().lead.take();
+    if let Some((left, series)) = lead {
+        if left > 1 {
+            state().lead = Some((left - 1, series));
+        } else {
+            arm(&root, frame_number, series);
+        }
+        return;
+    }
     let request = root.join("capture");
     if let Ok(text) = std::fs::read_to_string(&request) {
         if let Err(e) = std::fs::remove_file(&request) {
@@ -1286,14 +1306,29 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                 }
             },
         };
-        arm(
-            &root,
-            frame_number,
-            Series {
-                label: (!label.is_empty()).then_some(label),
-                index: 1,
-                frames,
+        let series = Series {
+            label: (!label.is_empty()).then_some(label),
+            index: 1,
+            frames,
+        };
+        let early = match text.lines().find_map(|l| l.strip_prefix("early ")) {
+            None => 0,
+            Some(n) => match n.trim().parse::<u32>() {
+                Ok(n @ 0..=MAX_EARLY) => n,
+                _ => {
+                    log!("D3D12 capture request: early {n:?} is not 0 to {MAX_EARLY}; no lead");
+                    0
+                }
             },
+        };
+        if early == 0 {
+            arm(&root, frame_number, series);
+            return;
+        }
+        state().lead = Some((early, series));
+        super::passes::EARLY.store(true, std::sync::atomic::Ordering::Release);
+        log!(
+            "D3D12 capture request read at Present {frame_number}: lists reset from now on are instrumented, the capture armed {early} Presents later"
         );
     }
 }
@@ -1301,6 +1336,8 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
 /// Arms the capture of the frame after Present `frame_number`, frame `series.index` of its series: written to
 /// `captures/<label>` (one frame), `captures/<label>-<index>` (a series) or `captures/frame-<n>` (no label).
 fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
+    // A request's lead ends here: an armed capture instruments lists itself.
+    super::passes::EARLY.store(false, std::sync::atomic::Ordering::Release);
     let name = match &series.label {
         Some(label) if series.frames > 1 => format!("{label}-{}", series.index),
         Some(label) => label.clone(),

@@ -59,8 +59,16 @@ use windows::core::Interface;
 
 use super::states::{Access, COPY_DEST, COPY_SOURCE, Read};
 
-/// Whether lists reset now are instrumented: from the Present that arms a capture to the one that closes it.
+/// Whether a capture is armed: from the Present that arms it to the one that closes it.
 pub static ARMED: AtomicBool = AtomicBool::new(false);
+/// Whether a request's lead is running (`early N`): from the Present that read the request to the one that arms it.
+pub static EARLY: AtomicBool = AtomicBool::new(false);
+
+/// Whether lists reset or created now are instrumented: while a capture is armed, in a request's lead, and from the
+/// process's start with `arm-early on`, so that lists recorded before the captured frame copy their passes too.
+pub fn instrumenting() -> bool {
+    ARMED.load(Ordering::Acquire) || EARLY.load(Ordering::Acquire) || crate::settings::settings().arm_early
+}
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
 /// Checkpoints recorded since the process started: the log compares it at arming and closing.
@@ -449,23 +457,28 @@ impl Submitted {
     }
 }
 
-/// One list of a submission, at `at` in the application's array, and whether this is its generation's first
-/// execution while the capture is armed.
+/// One list of a submission, at `at` in the application's array, whether a capture is armed, and whether this is its
+/// generation's first execution while it is.
 pub struct Executed<'a> {
     pub at: usize,
     pub list: &'a model::List,
+    pub armed: bool,
     pub first: bool,
 }
 
 /// Decides the pending ends of a submission's lists (see the module's documentation), recording locum's copy lists
-/// into `s`. Returns the checkpoints whose pass the next list continues. Ends of lists not executed for the first
-/// time while armed are dropped: their copies would not be read.
+/// into `s`. Returns the checkpoints whose pass the next list continues. Ends of a list executed while no capture is
+/// armed (a list recorded in a request's lead, or with `arm-early on`) are kept for its first execution while one is,
+/// until the list is reset; those of a list executed again while armed are dropped: their copies would not be read.
 ///
 /// # Safety
 /// Called from ExecuteCommandLists on the application's direct queue, before the lists are submitted.
 pub unsafe fn ends(s: &mut Submitted, lists: &[Executed]) -> Vec<u64> {
     let mut continued = Vec::new();
     for (i, e) in lists.iter().enumerate() {
+        if !e.armed {
+            continue;
+        }
         let ends: Vec<(u64, Pending)> = {
             let mut p = pending();
             e.list
