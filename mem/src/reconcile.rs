@@ -1187,6 +1187,11 @@ pub fn format_text_with_options(rep: &MemReport, labels: Option<&LabelMap>, opts
                 mib(e.tracked_evicted_bytes),
                 mib(e.tracked_unknown_segment_bytes),
             );
+        } else if e.truncated_by_max_size {
+            let _ = writeln!(
+                out,
+                "  Tracked Live Allocs ({alloc_scope}) : unavailable (truncated before allocation rundown completed; raise --max-etl-mb)"
+            );
         } else {
             let _ = writeln!(
                 out,
@@ -1269,6 +1274,11 @@ pub fn format_text_with_options(rep: &MemReport, labels: Option<&LabelMap>, opts
                 e.tile_mappings.call_count,
                 e.tile_mappings.total_operations,
                 e.gpu_va_mappings.len(),
+            );
+        } else if e.truncated_by_max_size {
+            let _ = writeln!(
+                out,
+                "  UpdateTileMappings    : unavailable (truncated before final rundown; no GPUVA / UpdateGpuVirtualAddress events captured)"
             );
         } else {
             let _ = writeln!(
@@ -1862,5 +1872,30 @@ mod tests {
         assert!(text.contains("200.0k/s, 160.0 MiB (32.0 MiB/s), rundown=600000, steady=400000"));
         assert!(text.contains("1 allocs (+1 page-table) | Local VRAM 1024.00 MiB (CPU-vis BAR)"));
         assert!(text.contains("GPUVA live_map=50 unmap=20 (rundown_map=100000)"));
+
+        // Truncated trace missing GPUVA rundown says so explicitly.
+        let trunc_etw = EtwReport {
+            etl_path: "cap128.etl".into(),
+            etl_size_bytes: 128 << 20,
+            filter_pid: Some(2820),
+            total_events: 269_630,
+            dxgkrnl_events: 269_628,
+            rundown_events: 144_047,
+            truncated_by_max_size: true,
+            duration_secs: 3.2,
+            coverage: TraceCoverage {
+                has_allocation_rundown: true,
+                has_gpu_va_events: false,
+                hard_faults_available: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let trunc_rep = reconcile(None, Some(trunc_etw), &LabelMap::default(), None);
+        let trunc_text = format_text(&trunc_rep, 5);
+        assert!(trunc_text.contains("TRUNCATED"));
+        assert!(trunc_text.contains(
+            "UpdateTileMappings    : unavailable (truncated before final rundown; no GPUVA / UpdateGpuVirtualAddress events captured)"
+        ));
     }
 }
