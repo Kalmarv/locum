@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Direct3D 12 replay: with `LOCUM_REPLAY_TIMES` naming a file, `verify` and `replay` time every draw, dispatch and
+  ExecuteIndirect they run on the GPU: a timestamp before and after the call (inside replay's barriers), and a
+  tab-separated row per op appended to the file when its list has run: event, draw, call, arguments, program (the
+  compute shader's hash, else the pixel or vertex shader's) and microseconds. Replay runs one queue and waits after
+  each list, so a row is the op's time alone, not its share of the game's frame. Past 65,536 ops in one list the rest
+  are not timed (counted on stderr).
 - Direct3D 12: a program that reads through `ResourceDescriptorHeap` picks its heap slots at run time, so no event
   named what it read and replay started those resources as zeros. A submission whose draws or dispatches run with a
   root signature that indexes the CBV, SRV and UAV heap directly now gets a first-use copy of every resource the bound

@@ -40,6 +40,7 @@ mod pipelines;
 mod queries;
 mod rays;
 mod staging;
+mod timing;
 mod views;
 
 use views::Extent;
@@ -271,6 +272,8 @@ pub struct D3d12 {
     undescribed: Vec<i64>,
     warnings: BTreeSet<String>,
     debug: Option<ID3D12InfoQueue>,
+    /// Each draw's and dispatch's GPU time, with `LOCUM_REPLAY_TIMES` (see [`timing`]).
+    timing: Option<timing::Timing>,
 }
 
 /// The resources each resource of a Direct3D 12 capture shares memory with (see [`memory`]).
@@ -437,6 +440,7 @@ impl D3d12 {
             } else {
                 None
             };
+            let timing = timing::Timing::new(&device, &queue)?;
             Ok(D3d12 {
                 device,
                 queue,
@@ -467,6 +471,7 @@ impl D3d12 {
                 undescribed: Vec::new(),
                 warnings: BTreeSet::new(),
                 debug,
+                timing,
             })
         }
     }
@@ -492,6 +497,9 @@ impl D3d12 {
 
     /// Runs what the open list holds and waits for it; the list is open again, empty, after.
     fn flush(&mut self) -> Result<(), String> {
+        if let Some(t) = &mut self.timing {
+            t.resolve(&self.list);
+        }
         let closed = unsafe { self.list.Close() };
         let ran = closed.and_then(|()| unsafe {
             self.queue
@@ -502,6 +510,9 @@ impl D3d12 {
             self.fence.SetEventOnCompletion(self.fenced, HANDLE::default())
         });
         let removed = unsafe { self.device.GetDeviceRemovedReason() };
+        if let Some(t) = &mut self.timing {
+            t.write(ran.is_ok() && removed.is_ok())?;
+        }
         self.kept.clear();
         unsafe {
             self.allocator
@@ -1607,6 +1618,13 @@ impl D3d12 {
         }
         self.barriers(&needs, false);
         let a = |i: usize| u(args, i);
+        if let Some(t) = &mut self.timing {
+            let program = hashes[5].as_ref().or(hashes[4].as_ref()).or(hashes[0].as_ref());
+            t.begin(
+                &self.list,
+                format!("{seq}	{n}	{call}	{args}	{}", program.map_or("-", |h| h.as_str())),
+            );
+        }
         unsafe {
             match call {
                 "DrawInstanced" => {
@@ -1632,6 +1650,9 @@ impl D3d12 {
                     let (Some(signature), false) =
                         (signature, matches!(arguments, indirect::Arguments::Skip))
                     else {
+                        if let Some(t) = &mut self.timing {
+                            t.end(&self.list);
+                        }
                         self.barriers(&needs, true);
                         return Ok(());
                     };
@@ -1649,6 +1670,9 @@ impl D3d12 {
                 }
                 other => self.warn(format!("{other} is not replayed")),
             }
+        }
+        if let Some(t) = &mut self.timing {
+            t.end(&self.list);
         }
         self.barriers(&needs, true);
         Ok(())

@@ -100,6 +100,8 @@ Other commands:
 - `locum-cli trace last 120 rt1.z`: what one lane of a target is made of
 - `locum-cli export last 812 -o tex.dds`: a resource's contents as the frame began
 - `locum-cli replay last 120 --rule "skip ps=9f2c"`: a draw replayed with a rule, before and after
+- `LOCUM_REPLAY_TIMES=times.tsv locum-cli verify last`: Direct3D 12: the GPU time of every draw and dispatch the
+  replay runs, a tab-separated row each (event, draw, call, arguments, program, microseconds), appended to the file
 - `locum-cli diff before after`: two captures compared draw by draw
 - `locum-cli conform last --layer C:\dxvk\x64`: the frame through a translation layer's DLLs, compared with the
   system's replay and the game's
