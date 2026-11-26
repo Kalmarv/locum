@@ -1291,6 +1291,11 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         (s.capture.take(), s.series.take())
     };
     if finished.is_some() {
+        // The series' next frame is armed at the end of this Present, which writes this one first: the lists other
+        // threads reset meanwhile, the next frame's, are instrumented as in a lead.
+        if series.as_ref().is_some_and(|s| s.index < s.frames) {
+            super::passes::EARLY.store(true, std::sync::atomic::Ordering::Release);
+        }
         super::passes::ARMED.store(false, std::sync::atomic::Ordering::Release);
         log!(
             "D3D12 capture closing: {} copies recorded so far",
@@ -1472,8 +1477,9 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
 /// Arms the capture of the frame after Present `frame_number`, frame `series.index` of its series: written to
 /// `captures/<label>` (one frame), `captures/<label>-<index>` (a series) or `captures/frame-<n>` (no label).
 fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
-    // A request's lead ends here: an armed capture instruments lists itself.
-    super::passes::EARLY.store(false, std::sync::atomic::Ordering::Release);
+    // A request's lead, or the Present between two frames of a series, ends here: an armed capture instruments
+    // lists itself. Lists are instrumented throughout: the lead ends once the capture is armed.
+    let lead_ends = || super::passes::EARLY.store(false, std::sync::atomic::Ordering::Release);
     let name = match &series.label {
         Some(label) if series.frames > 1 => format!("{label}-{}", series.index),
         Some(label) => label.clone(),
@@ -1482,6 +1488,7 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
     let path = root.join("captures").join(name);
     if path.exists() {
         log!("D3D12 capture destination already exists: {}", path.display());
+        lead_ends();
         return;
     }
     let mut s = state();
@@ -1507,6 +1514,7 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
     });
     s.series = Some(series.clone());
     super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
+    lead_ends();
     log!(
         "D3D12 capture armed at Present {frame_number} (frame {} of {}); cached list history retained; {} copies recorded so far",
         series.index,
@@ -1515,16 +1523,17 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
     );
 }
 
-/// Arms the capture of the next frame into `root` at once, as a request read at a Present would.
+/// Arms the capture of the next frame into `root` at once, the first of `frames`, as a request read at a Present
+/// would.
 #[cfg(test)]
-pub(super) fn arm_now(root: &std::path::Path) {
+pub(super) fn arm_now(root: &std::path::Path, frames: u32) {
     arm(
         root,
         0,
         Series {
             label: None,
             index: 1,
-            frames: 1,
+            frames,
         },
     );
 }

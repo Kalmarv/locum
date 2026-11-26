@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Direct3D 12: in a series (`frames N`), lists reset while the Present that closes one frame writes it are
+  instrumented for the next frame. No capture was armed then, so lists other threads recorded meanwhile (the next
+  frame's) copied no pass ends or outputs; with `early N` the second frame could have no instrumented list at all.
 - Direct3D 12 replay: a resource's contents move to and from the GPU in pieces of at most 256 MiB (whole
   subresources, else bands of slices or rows of blocks), not through one staging buffer the resource's size, which a
   4 GiB resource could not have. A reserved resource moves only what its mapped tiles hold (zeros elsewhere), unless

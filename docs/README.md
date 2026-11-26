@@ -57,7 +57,8 @@ locum writes to the folder named by `LOCUM_DIR`, or `%LOCALAPPDATA%\locum`:
     what one frame wrote can be followed into the next (`resource CAPTURE ID` in each, `export`, `diff A B`). `meta.series` says each
     capture's place (`{"label", "index", "frames"}`); the memory dump is taken at the first frame only. The game
     waits while each capture is read back, so its clock jumps between the frames, though they are still the
-    consecutive ones it presented.
+    consecutive ones it presented. Direct3D 12 lists reset while that Present writes one frame, before it arms the
+    next, are instrumented for the next.
   - `early N` (0 to 64, Direct3D 12): a lead of N frames before the captured one. Direct3D 12 lists reset or made
     from the Present that reads the request on are instrumented (see below), and the capture is armed N Presents
     later, so the lists a game records a frame or more ahead of the frame they run in copy their passes' targets

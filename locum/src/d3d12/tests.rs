@@ -396,6 +396,48 @@ fn an_armed_submission_calls_the_real_device_without_the_journal_state() {
     assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
 }
 
+/// A real device's methods taken over: its vtable pointer swapped for a copy of the table with some methods of the
+/// probe's, as a translation layer adopting the device does. Dropped, the device has its own table again.
+struct TakenOver {
+    object: *mut *const usize,
+    original: *const usize,
+    _table: Vec<usize>,
+}
+
+impl Drop for TakenOver {
+    fn drop(&mut self) {
+        unsafe { *self.object = self.original };
+    }
+}
+
+/// Takes over the methods of `device`'s real device at each (offset in its table, replacement), keeping the method
+/// replaced in the static given with it.
+unsafe fn take_over(
+    device: &ID3D12Device,
+    methods: &[(usize, usize, &std::sync::atomic::AtomicUsize)],
+) -> TakenOver {
+    let real = real::<ID3D12Device>(id(device.as_raw())).expect("a real device");
+    let object = real.as_raw() as *mut *const usize;
+    let original = unsafe { *object };
+    let entries = if real.cast::<ID3D12Device10>().is_ok() {
+        size_of::<ID3D12Device10_Vtbl>()
+    } else {
+        size_of::<ID3D12Device_Vtbl>()
+    } / size_of::<usize>();
+    let mut table = unsafe { std::slice::from_raw_parts(original, entries) }.to_vec();
+    for &(offset, method, kept) in methods {
+        let at = offset / size_of::<usize>();
+        kept.store(table[at], Ordering::SeqCst);
+        table[at] = method;
+    }
+    unsafe { *object = table.as_ptr() };
+    TakenOver {
+        object,
+        original,
+        _table: table,
+    }
+}
+
 /// The real device's CreateCommandAllocator and CreateCommandList before the probe took them over.
 static ALLOCATOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static LIST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -523,7 +565,7 @@ fn taken_over_device_probe() {
 
         // A list made while the frame is armed draws to the target (an empty bundle counts as a draw) and leaves its
         // pass open at Close: the submission copies the target's first use, and the pass's end in a list of its own.
-        journal::arm_now(&root);
+        journal::arm_now(&root, 1);
         let list: ID3D12GraphicsCommandList = device
             .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
             .unwrap();
@@ -531,30 +573,25 @@ fn taken_over_device_probe() {
         list.ExecuteBundle(&bundle);
         list.Close().unwrap();
 
-        // The real device's methods taken over, as a translation layer adopting it does: its vtable pointer swapped
-        // for a copy of the table with two methods of its own.
-        let real = real::<ID3D12Device>(id(device.as_raw())).expect("a real device");
-        let object = real.as_raw() as *mut *const usize;
-        let original = *object;
-        let entries = if real.cast::<ID3D12Device10>().is_ok() {
-            size_of::<ID3D12Device10_Vtbl>()
-        } else {
-            size_of::<ID3D12Device_Vtbl>()
-        } / size_of::<usize>();
-        let mut table = std::slice::from_raw_parts(original, entries).to_vec();
-        let at = |offset: usize| offset / size_of::<usize>();
-        let allocator_at = at(std::mem::offset_of!(ID3D12Device_Vtbl, CreateCommandAllocator));
-        let list_at = at(std::mem::offset_of!(ID3D12Device_Vtbl, CreateCommandList));
-        ALLOCATOR.store(table[allocator_at], Ordering::SeqCst);
-        LIST.store(table[list_at], Ordering::SeqCst);
-        table[allocator_at] = taken_allocator as *const () as usize;
-        table[list_at] = taken_list as *const () as usize;
-        *object = table.as_ptr();
-
+        // The real device's methods taken over, as a translation layer adopting it does.
+        let taken_over = take_over(
+            &device,
+            &[
+                (
+                    std::mem::offset_of!(ID3D12Device_Vtbl, CreateCommandAllocator),
+                    taken_allocator as *const () as usize,
+                    &ALLOCATOR,
+                ),
+                (
+                    std::mem::offset_of!(ID3D12Device_Vtbl, CreateCommandList),
+                    taken_list as *const () as usize,
+                    &LIST,
+                ),
+            ],
+        );
         queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
         let taken = TAKEN.load(Ordering::SeqCst);
-        *object = original;
-        drop(table);
+        drop(taken_over);
         assert!(taken > 0, "the submission made its copies on the real device");
 
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
@@ -567,4 +604,95 @@ fn taken_over_device_probe() {
         ));
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Between two frames of a series, lists are instrumented throughout: the Present that closes a frame writes it
+/// before it arms the next, and the lists other threads reset meanwhile are the next frame's. The probe sees it from
+/// the real device's GetAdapterLuid, which that Present asks in between (for the capture's adapter). In a process of
+/// its own: arming changes what every other test's lists do.
+#[test]
+fn lists_reset_between_two_frames_of_a_series_are_instrumented() {
+    let root = std::env::temp_dir().join(format!("locum-series-{}", std::process::id()));
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "d3d12::tests::series_probe",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("LOCUM_DIR", &root)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+/// The real device's GetAdapterLuid before the probe took it over, and what `instrumenting` said in it.
+static LUID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ASKED: AtomicU32 = AtomicU32::new(0);
+static INSTRUMENTING: AtomicBool = AtomicBool::new(false);
+
+unsafe extern "system" fn taken_luid(this: *mut c_void, out: *mut windows::Win32::Foundation::LUID) {
+    ASKED.fetch_add(1, Ordering::SeqCst);
+    INSTRUMENTING.store(passes::instrumenting(), Ordering::SeqCst);
+    let real: unsafe extern "system" fn(*mut c_void, *mut windows::Win32::Foundation::LUID) =
+        unsafe { std::mem::transmute(LUID.load(Ordering::SeqCst)) };
+    unsafe { real(this, out) }
+}
+
+#[test]
+#[ignore = "WARP subprocess fixture that captures a series, run by lists_reset_between_two_frames_of_a_series_are_instrumented"]
+fn series_probe() {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Dxgi::*;
+    let root = crate::log::folder().expect("LOCUM_DIR");
+    unsafe {
+        let mut raw = core::ptr::null_mut();
+        crate::CreateDXGIFactory2(0, &IDXGIFactory4::IID, &mut raw)
+            .ok()
+            .unwrap();
+        let factory = IDXGIFactory4::from_raw(raw);
+        let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+        locum_create(
+            adapter.as_raw(),
+            D3D_FEATURE_LEVEL_11_0,
+            &ID3D12Device::IID,
+            &mut raw,
+        )
+        .ok()
+        .unwrap();
+        let device = ID3D12Device::from_raw(raw);
+        journal::arm_now(&root, 2);
+        let taken_over = take_over(
+            &device,
+            &[(
+                std::mem::offset_of!(ID3D12Device_Vtbl, GetAdapterLuid),
+                taken_luid as *const () as usize,
+                &LUID,
+            )],
+        );
+        // Closes the first frame and arms the second.
+        journal::present(1, None);
+        drop(taken_over);
+        assert!(
+            ASKED.load(Ordering::SeqCst) > 0,
+            "the Present asked for the adapter"
+        );
+        assert!(
+            INSTRUMENTING.load(Ordering::SeqCst),
+            "lists reset while the first frame was written are instrumented"
+        );
+        assert!(passes::ARMED.load(Ordering::Acquire), "the second frame is armed");
+        assert!(
+            !passes::EARLY.load(Ordering::Acquire),
+            "and instruments lists itself"
+        );
+        drop((device, adapter, factory));
+    }
 }
