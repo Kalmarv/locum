@@ -356,6 +356,7 @@ pub unsafe fn after_frame(
                 subresources: 1,
                 layout: copy.layout,
                 joined: None,
+                note: None,
             });
     }
     for ((submission, queue), snapshots) in by_queue {
@@ -369,6 +370,7 @@ pub unsafe fn after_frame(
                             submission,
                             states: json!([]),
                             content: Err("the queue to copy it on after the frame was destroyed".into()),
+                            note: None,
                         },
                     )
                 })

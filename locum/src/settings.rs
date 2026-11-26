@@ -33,6 +33,10 @@ pub struct Settings {
     /// Readback memory one chunk of an armed frame's copies may use, and the size of the pieces a bigger buffer is
     /// copied in (`readback-chunk-mb`, 256 by default, 1 to 1024).
     pub readback_chunk: u64,
+    /// Readback memory an armed frame's copies may hold at once, waiting for the GPU and the collector
+    /// (`readback-budget-mb`, 1024 by default, 64 to 65536). Copies behind a wait the application signals later hold
+    /// theirs until it does: a frame that first uses more than this behind one gives up the rest after a while.
+    pub readback_budget: u64,
 }
 
 pub fn settings() -> &'static Settings {
@@ -46,6 +50,7 @@ pub fn settings() -> &'static Settings {
             dumps: None,
             crash_av_rvas: Vec::new(),
             readback_chunk: 256 << 20,
+            readback_budget: 1 << 30,
         };
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.txt")) {
             for (n, line) in text.lines().enumerate() {
@@ -81,6 +86,13 @@ pub fn settings() -> &'static Settings {
                             n + 1
                         ),
                     },
+                    "readback-budget-mb" => match value.parse::<u64>() {
+                        Ok(mb @ 64..=65536) => s.readback_budget = mb << 20,
+                        _ => log!(
+                            "settings.txt line {}: readback-budget-mb {value:?} is not 64 to 65536: ignored",
+                            n + 1
+                        ),
+                    },
                     other => log!("settings.txt line {}: unknown setting {other:?}: ignored", n + 1),
                 }
             }
@@ -89,10 +101,11 @@ pub fn settings() -> &'static Settings {
             s.blobs = Blobs::new(PathBuf::from(dir));
         }
         log!(
-            "settings: uploads {:?}, blobs {}, readback chunks of {} MiB, dumper {}, dumps {}",
+            "settings: uploads {:?}, blobs {}, readback chunks of {} MiB in {} MiB, dumper {}, dumps {}",
             s.uploads,
             s.blobs.root().display(),
             s.readback_chunk >> 20,
+            s.readback_budget >> 20,
             s.dumper
                 .as_ref()
                 .map_or("none".into(), |p| p.display().to_string()),

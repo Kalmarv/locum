@@ -579,6 +579,8 @@ pub struct FirstUse {
     pub states: Value,
     /// The key of the bytes in the canonical layout, and each subresource's key; or the reason there are none.
     pub content: Result<(String, Vec<String>), String>,
+    /// How copied contents may differ from those the frame began with (the resource's `content_note`).
+    pub note: Option<String>,
 }
 
 impl Prepared {
@@ -765,6 +767,7 @@ impl Prepared {
                     submission,
                     states: serde_json::json!([]),
                     content: Err(why.into()),
+                    note: None,
                 },
             );
         }
@@ -955,6 +958,7 @@ impl Prepared {
                         // Exact: d12_first_use says which submission it was copied before.
                         resource.content = Some(key.clone());
                         resource.content_source = Some("first-use");
+                        resource.content_note.clone_from(&first.note);
                         hashes.clone_from(subs);
                     }
                     Err(why) => {
@@ -2822,6 +2826,7 @@ mod tests {
             submission: 3,
             states: json!([]),
             content: Ok((key.to_string(), vec![key.to_string()])),
+            note: None,
         };
         prepared.set_after_frame(9, ok("k9"));
         prepared.set_after_frame(
@@ -2833,7 +2838,13 @@ mod tests {
         );
         prepared.set_after_frame(11, ok("k11"));
         prepared.set_after_frame(12, ok("k12"));
-        prepared.set_first_use(12, ok("k12-before"));
+        prepared.set_first_use(
+            12,
+            FirstUse {
+                note: Some("copied behind a wait".into()),
+                ..ok("k12-before")
+            },
+        );
         let dir = std::env::temp_dir().join(format!("locum-indirect-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         prepared.contents(&mut c, &crate::blobs::Blobs::new(&dir));
@@ -2848,6 +2859,8 @@ mod tests {
             assert!(r(id).content_note.as_ref().unwrap().contains("a UAV they name"));
         }
         assert_eq!(r(12).content.as_deref(), Some("k12-before"));
+        // A first use's note is the resource's.
+        assert_eq!(r(12).content_note.as_deref(), Some("copied behind a wait"));
         // Outputs: the last ExecuteIndirect's, of #11 and #12. The first writing #11 wrote it again later, and #10's
         // copy failed: gaps.
         let mut outputs: Vec<_> = c

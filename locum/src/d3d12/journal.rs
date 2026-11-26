@@ -762,6 +762,7 @@ fn first_uses(
                         submission,
                         states: json!([]),
                         content: Err(why.to_string()),
+                        note: None,
                     },
                 ));
                 continue;
@@ -781,7 +782,10 @@ fn first_uses(
         if reserved {
             page(live, resource, cpu_seq);
         }
-        let why = if let Some(why) = unknown {
+        // Behind a wait nothing submitted yet signals, a buffer is still copied: the copy runs on this queue past the
+        // wait, just before the lists, so it finds what they will; a texture's state there is not known.
+        let blocked = texture && !simultaneous;
+        let why = if let Some(why) = unknown.filter(|_| blocked) {
             Some(why.to_string())
         } else if let Some(why) = reserved.then(|| super::tiles::unreadable(resource)).flatten() {
             Some(why)
@@ -799,6 +803,7 @@ fn first_uses(
                     submission,
                     states: json!([]),
                     content: Err(why),
+                    note: None,
                 },
             ));
             continue;
@@ -824,6 +829,12 @@ fn first_uses(
                 .then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes)),
             states,
             layout,
+            note: unknown.map(|why| {
+                format!(
+                    "{why}: copied when the queue got past the wait, as this submission found it (work submitted later \
+                     that the GPU ran first may have changed it before)"
+                )
+            }),
         });
     }
     if !failed.is_empty() {

@@ -51,6 +51,8 @@ pub struct Snapshot {
     pub layout: Vec<Sub>,
     /// For a depth-stencil format D3D12 keeps in two planes, the bytes of its joined canonical texel.
     pub joined: Option<u32>,
+    /// How the copy may differ from the contents the frame began with.
+    pub note: Option<String>,
 }
 
 /// What one chunk of a submission's copies gave.
@@ -68,12 +70,14 @@ pub struct Batch {
 /// A capture's batches, filled by the collector.
 pub type Results = Arc<Mutex<Vec<Batch>>>;
 
-/// Readback memory all chunks waiting for the collector may use.
-const BUDGET: u64 = 1 << 30;
+/// Readback memory all chunks waiting for the collector may use (`readback-budget-mb`).
+fn budget() -> u64 {
+    crate::settings::settings().readback_budget
+}
 
 /// Readback memory a chunk may use (`readback-chunk-mb`), and the size of a big buffer's pieces.
 fn chunk() -> u64 {
-    crate::settings::settings().readback_chunk.clamp(ALIGN, BUDGET)
+    crate::settings::settings().readback_chunk.clamp(ALIGN, budget())
 }
 /// How long a submission waits for the budget before giving up its remaining copies: a queue can wait on a fence the
 /// application signals later, and the application cannot signal it while locum holds its submitting thread.
@@ -83,6 +87,8 @@ static IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 /// Offsets in the readback buffer are aligned like placed footprints, which keeps each copy's start aligned.
 const ALIGN: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
 
+// Items live only while one submission's copies are laid out and collected.
+#[allow(clippy::large_enum_variant)]
 enum Item {
     Upload {
         copy: Copy,
@@ -445,7 +451,7 @@ unsafe fn run(
         // Wait for the collector to make room; past our patience, the chunk is given up.
         loop {
             let in_flight = IN_FLIGHT.load(Ordering::Acquire);
-            if in_flight == 0 || in_flight + bytes <= BUDGET {
+            if in_flight == 0 || in_flight + bytes <= budget() {
                 break;
             }
             if start.elapsed() > PATIENCE {
@@ -454,7 +460,7 @@ unsafe fn run(
             std::thread::sleep(Duration::from_millis(1));
         }
         let in_flight = IN_FLIGHT.load(Ordering::Acquire);
-        if in_flight != 0 && in_flight + bytes > BUDGET {
+        if in_flight != 0 && in_flight + bytes > budget() {
             let reason = format!(
                 "readback budget: {in_flight} bytes of earlier copies still waited for the GPU after {} s",
                 PATIENCE.as_secs()
@@ -984,6 +990,7 @@ fn first_use(
         FirstUse {
             submission,
             states: Value::Array(snapshot.states.iter().map(|s| s.value()).collect()),
+            note: content.is_ok().then(|| snapshot.note.clone()).flatten(),
             content,
         },
     )

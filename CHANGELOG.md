@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Direct3D 12: a buffer a submission first uses behind a wait that nothing submitted yet signals (a wait across
+  queues, signalled later) is copied anyway, on that queue past the wait, as the submission finds it; its
+  `content_note` says so. It had no contents. A texture there is still refused: its state is not known.
+  `readback-budget-mb` in settings.txt sets the readback memory copies may hold at once (1024 MiB by default), which
+  copies behind such a wait hold until the application signals it.
 - Direct3D 12: `d12_draw_descriptors` holds what each register a draw's or dispatch's root signature reaches pointed
   at as it was submitted: the heap slot and descriptor version, the resource, a buffer or constant buffer view's (or a
   root descriptor's) GPU address, bytes and element size, the view's format and dimension, and a flag for a null or
