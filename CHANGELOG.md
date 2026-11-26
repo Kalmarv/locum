@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Direct3D 12: an armed frame's submissions no longer hold locum's journal lock while they make their copies on the
+  real device (first-use and upload copies, pass ends left open at Close, shader-table and page-table reads). A
+  translation layer that has taken the real device's methods over and calls a wrapped object from them, holding a lock
+  of its own, could hang the game against another thread waiting for that lock. The Present that closes the capture
+  waits up to 10 s for submissions still making their copies.
 - A sidecar: a tool beside the game (a translation layer's diagnostic) can write `sidecar.txt` in locum's folder
   (settings.txt `sidecar FILE` names another) to tell locum of the game's memory outside the graphics API: `region`
   lines name memory to copy into the capture (read as the capture is written, a pieced blob with pages of zeros or

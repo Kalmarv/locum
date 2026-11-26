@@ -376,6 +376,8 @@ pub struct Submitted {
     array: Vec<*mut c_void>,
     /// The acceleration structure builds the lists hold (see [`super::rays`]).
     pub rays: Vec<Arc<super::rays::Build>>,
+    /// Whether the armed frame counts the submission as still making its copies until it is forwarded.
+    pub in_flight: bool,
     /// The type of the queue's lists, which locum's own are.
     kind: D3D12_COMMAND_LIST_TYPE,
 }

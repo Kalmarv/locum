@@ -8,7 +8,7 @@
 //! name began the frame with, where nothing the frame recorded writes it, and what an ExecuteIndirect wrote through
 //! a root UAV, where nothing after it writes the buffer.
 //!
-//! A DispatchRays' shader tables are read once more as its submission is made ([`named_at_submission`]): what their
+//! A DispatchRays' shader tables are read once more as its submission is made ([`TableRead`]): what their
 //! records name then gets a first-use copy before the submission, as what its commands name does, so a buffer or
 //! texture only a local root argument names begins the frame with its contents.
 //!
@@ -118,81 +118,92 @@ impl Programs {
     }
 }
 
-/// The resources the shader tables of the DispatchRays a submission runs name, read as it is made (before its lists
-/// run, on `queue`, the real queue: what the queue ran before has written them), so that each gets a first-use copy
-/// before them. `projection` has projected the submission; its DispatchRays are those from `from` on in its list, and
-/// `events` are the frame's so far. A table something in the frame writes is not read: what it held when the
-/// DispatchRays ran is not known now. What cannot be read or placed names nothing here, and the Present that closes
-/// the capture, reading the tables again from the copies made right before each DispatchRays, says why.
+/// A read of the shader tables of a DispatchRays a submission runs, or of the instance pointers of a build it runs,
+/// as the submission is made (before its lists run, on the real queue: what the queue ran before has written them),
+/// so that what they name gets a first-use copy before them. In three steps, as the journal's lock allows: what to
+/// read ([`at_submission`]) and what the bytes name ([`named_at_submission`]) under it, the read itself
+/// ([`read_at_submission`]) without it, since it records and runs a list on the real device.
+pub struct TableRead {
+    /// The DispatchRays' or build's place in the projection's [`model::Projection::indirect`].
+    at: usize,
+    ranges: Vec<(super::Real<ID3D12Resource>, u64, u64)>,
+    bytes: Option<Vec<u8>>,
+}
+
+/// The reads the DispatchRays and builds a submission runs call for. `projection` has projected the submission;
+/// they are those from `from` on in its list, and `events` are the frame's so far. A table or pointer array
+/// something in the frame writes is not read: what it held when the call ran is not known now. What cannot be read
+/// or placed names nothing here, and the Present that closes the capture, reading them again from the copies made
+/// right before each call, says why.
+pub fn at_submission(projection: &model::Projection, events: &[db::Event], from: usize) -> Vec<TableRead> {
+    let written = |r: u64| events.iter().any(|e| e.writes.contains(&r));
+    let mut reads = Vec::new();
+    for (at, rays) in projection.indirect().iter().enumerate().skip(from) {
+        let ranges = if rays.arguments.pointers > 0 {
+            match super::slots::buffers_at(rays.arguments.pointers_at)[..] {
+                [(resource, offset)] if !written(resource) => super::real::<ID3D12Resource>(resource)
+                    .map(|real| vec![(real, offset, rays.arguments.bytes)]),
+                _ => None,
+            }
+        } else {
+            let mut ranges = Vec::new();
+            let tables = &rays.arguments.tables;
+            let readable = !tables.is_empty()
+                && tables
+                    .iter()
+                    .all(|t| match super::slots::buffers_at(t.address)[..] {
+                        [(resource, offset)] if !written(resource) => super::real::<ID3D12Resource>(resource)
+                            .map(|real| ranges.push((real, offset, t.bytes)))
+                            .is_some(),
+                        _ => false,
+                    });
+            readable.then_some(ranges)
+        };
+        if let Some(ranges) = ranges {
+            reads.push(TableRead {
+                at,
+                ranges,
+                bytes: None,
+            });
+        }
+    }
+    reads
+}
+
+/// Makes `reads` on `queue`, the real queue.
 ///
 /// # Safety
 /// Called while the queue lock is held, before the submission is forwarded to `queue`, which waits for nothing that
-/// is not yet submitted.
-pub unsafe fn named_at_submission(
-    projection: &model::Projection,
-    events: &[db::Event],
-    from: usize,
-    queue: &ID3D12CommandQueue,
-) -> Vec<u64> {
+/// is not yet submitted; not while the journal's lock is held.
+pub unsafe fn read_at_submission(reads: &mut [TableRead], queue: &ID3D12CommandQueue) {
+    for read in reads {
+        let ranges = std::mem::take(&mut read.ranges);
+        read.bytes = unsafe { super::passes::read_now(queue, ranges, PATIENCE) }.ok();
+    }
+}
+
+/// The resources what `reads` read names, against `projection`, which they were planned from.
+pub fn named_at_submission(projection: &model::Projection, reads: Vec<TableRead>) -> Vec<u64> {
     let programs = Programs::default();
-    let written = |r: u64| events.iter().any(|e| e.writes.contains(&r));
     let mut named = BTreeSet::new();
-    for rays in projection.indirect().get(from..).unwrap_or_default() {
-        if rays.arguments.pointers > 0 {
-            named.extend(unsafe { pointed_at_submission(rays, &written, queue) });
-            continue;
-        }
-        let tables = &rays.arguments.tables;
-        if tables.is_empty() {
-            continue;
-        }
-        let mut ranges = Vec::new();
-        let readable = tables
-            .iter()
-            .all(|t| match super::slots::buffers_at(t.address)[..] {
-                [(resource, offset)] if !written(resource) => super::real::<ID3D12Resource>(resource)
-                    .map(|real| ranges.push((real, offset, t.bytes)))
-                    .is_some(),
-                _ => false,
-            });
-        if !readable {
-            continue;
-        }
-        let Ok(bytes) = (unsafe { super::passes::read_now(queue, ranges, PATIENCE) }) else {
+    for read in reads {
+        let (Some(bytes), Some(rays)) = (read.bytes, projection.indirect().get(read.at)) else {
             continue;
         };
+        if rays.arguments.pointers > 0 {
+            named.extend(pointed(&bytes).0);
+            continue;
+        }
         let (reads, writes) = programs.named(
             Frame::Submitting(projection),
             rays,
-            tables,
+            &rays.arguments.tables,
             &bytes,
             &mut BTreeMap::new(),
         );
         named.extend(reads.into_iter().chain(writes));
     }
     named.into_iter().collect()
-}
-
-/// The buffers the instance pointers of build `build` point into, as its submission is made (`written`: whether the
-/// frame writes a resource): none where the frame writes the pointers.
-///
-/// # Safety
-/// As [`named_at_submission`].
-unsafe fn pointed_at_submission(
-    build: &model::Indirect,
-    written: &dyn Fn(u64) -> bool,
-    queue: &ID3D12CommandQueue,
-) -> Vec<u64> {
-    let ranges = match super::slots::buffers_at(build.arguments.pointers_at)[..] {
-        [(resource, offset)] if !written(resource) => super::real::<ID3D12Resource>(resource)
-            .map(|real| vec![(real, offset, build.arguments.bytes)])
-            .unwrap_or_default(),
-        _ => return Vec::new(),
-    };
-    let Ok(bytes) = (unsafe { super::passes::read_now(queue, ranges, PATIENCE) }) else {
-        return Vec::new();
-    };
-    pointed(&bytes).0
 }
 
 /// The buffers the instance pointers `bytes` point into, and whether one points into none.

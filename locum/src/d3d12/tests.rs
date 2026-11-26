@@ -360,3 +360,211 @@ fn armed_list_probe() {
         drop((list, allocator, device, adapter, factory));
     }
 }
+
+/// An armed submission makes its copies on the real device without holding the journal's state: a translation layer
+/// that took the real device's methods over may call a wrapped object, which takes the state, from them. The probe's
+/// device does, on the same thread, so under the state it would wait for itself; in a process of its own, which a
+/// deadlock fails by the time it takes.
+#[test]
+fn an_armed_submission_calls_the_real_device_without_the_journal_state() {
+    let mut probe = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "d3d12::tests::taken_over_device_probe",
+            "--ignored",
+            "--nocapture",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while probe.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(60) {
+            probe.kill().unwrap();
+            panic!("the submission waited for the journal state it held: deadlocked");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let output = probe.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+}
+
+/// The real device's CreateCommandAllocator and CreateCommandList before the probe took them over.
+static ALLOCATOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LIST: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// How often they were called while taken over.
+static TAKEN: AtomicU32 = AtomicU32::new(0);
+
+/// What a translation layer's method might do: call a wrapped object, which takes the journal state.
+fn through_a_wrapped_object() {
+    TAKEN.fetch_add(1, Ordering::SeqCst);
+    journal::owner_device(0);
+}
+
+unsafe extern "system" fn taken_allocator(
+    this: *mut c_void,
+    kind: D3D12_COMMAND_LIST_TYPE,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    through_a_wrapped_object();
+    let real: unsafe extern "system" fn(
+        *mut c_void,
+        D3D12_COMMAND_LIST_TYPE,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT = unsafe { std::mem::transmute(ALLOCATOR.load(Ordering::SeqCst)) };
+    unsafe { real(this, kind, iid, out) }
+}
+
+unsafe extern "system" fn taken_list(
+    this: *mut c_void,
+    mask: u32,
+    kind: D3D12_COMMAND_LIST_TYPE,
+    allocator: *mut c_void,
+    pso: *mut c_void,
+    iid: *const GUID,
+    out: *mut *mut c_void,
+) -> HRESULT {
+    through_a_wrapped_object();
+    type Real = unsafe extern "system" fn(
+        *mut c_void,
+        u32,
+        D3D12_COMMAND_LIST_TYPE,
+        *mut c_void,
+        *mut c_void,
+        *const GUID,
+        *mut *mut c_void,
+    ) -> HRESULT;
+    let real: Real = unsafe { std::mem::transmute(LIST.load(Ordering::SeqCst)) };
+    unsafe { real(this, mask, kind, allocator, pso, iid, out) }
+}
+
+#[test]
+#[ignore = "WARP subprocess fixture that takes the real device's methods over, run by an_armed_submission_calls_the_real_device_without_the_journal_state"]
+fn taken_over_device_probe() {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::*;
+    let root = std::env::temp_dir().join(format!("locum-taken-over-{}", std::process::id()));
+    unsafe {
+        let mut raw = core::ptr::null_mut();
+        crate::CreateDXGIFactory2(0, &IDXGIFactory4::IID, &mut raw)
+            .ok()
+            .unwrap();
+        let factory = IDXGIFactory4::from_raw(raw);
+        let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+        locum_create(
+            adapter.as_raw(),
+            D3D_FEATURE_LEVEL_11_0,
+            &ID3D12Device::IID,
+            &mut raw,
+        )
+        .ok()
+        .unwrap();
+        let device = ID3D12Device::from_raw(raw);
+        let queue: ID3D12CommandQueue = device
+            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })
+            .unwrap();
+        let allocator: ID3D12CommandAllocator = device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+            .unwrap();
+        let bundles: ID3D12CommandAllocator = device
+            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+            .unwrap();
+        let bundle: ID3D12GraphicsCommandList = device
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_BUNDLE, &bundles, None)
+            .unwrap();
+        bundle.Close().unwrap();
+        let mut target: Option<ID3D12Resource> = None;
+        device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: 64,
+                    Height: 64,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_RENDER_TARGET,
+                None,
+                &mut target,
+            )
+            .unwrap();
+        let target = target.unwrap();
+        let heap: ID3D12DescriptorHeap = device
+            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                NumDescriptors: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        let view = heap.GetCPUDescriptorHandleForHeapStart();
+        device.CreateRenderTargetView(&target, None, view);
+
+        // A list made while the frame is armed draws to the target (an empty bundle counts as a draw) and leaves its
+        // pass open at Close: the submission copies the target's first use, and the pass's end in a list of its own.
+        journal::arm_now(&root);
+        let list: ID3D12GraphicsCommandList = device
+            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+            .unwrap();
+        list.OMSetRenderTargets(1, Some(&view), false, None);
+        list.ExecuteBundle(&bundle);
+        list.Close().unwrap();
+
+        // The real device's methods taken over, as a translation layer adopting it does: its vtable pointer swapped
+        // for a copy of the table with two methods of its own.
+        let real = real::<ID3D12Device>(id(device.as_raw())).expect("a real device");
+        let object = real.as_raw() as *mut *const usize;
+        let original = *object;
+        let entries = if real.cast::<ID3D12Device10>().is_ok() {
+            size_of::<ID3D12Device10_Vtbl>()
+        } else {
+            size_of::<ID3D12Device_Vtbl>()
+        } / size_of::<usize>();
+        let mut table = std::slice::from_raw_parts(original, entries).to_vec();
+        let at = |offset: usize| offset / size_of::<usize>();
+        let allocator_at = at(std::mem::offset_of!(ID3D12Device_Vtbl, CreateCommandAllocator));
+        let list_at = at(std::mem::offset_of!(ID3D12Device_Vtbl, CreateCommandList));
+        ALLOCATOR.store(table[allocator_at], Ordering::SeqCst);
+        LIST.store(table[list_at], Ordering::SeqCst);
+        table[allocator_at] = taken_allocator as *const () as usize;
+        table[list_at] = taken_list as *const () as usize;
+        *object = table.as_ptr();
+
+        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+        let taken = TAKEN.load(Ordering::SeqCst);
+        *object = original;
+        drop(table);
+        assert!(taken > 0, "the submission made its copies on the real device");
+
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        queue.Signal(&fence, 1).unwrap();
+        while fence.GetCompletedValue() < 1 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        drop((
+            fence, list, heap, target, bundle, bundles, allocator, queue, device, adapter, factory,
+        ));
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

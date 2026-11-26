@@ -4,7 +4,7 @@ use core::ffi::c_void;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::cost::Counter;
 use locum_capture::{d3d12 as model, db, environment, writer};
@@ -216,6 +216,11 @@ struct State {
     lead: Option<(u32, Series)>,
     /// Fence values each queue has been told to wait for and no submitted Signal is known to reach, by queue.
     waits: HashMap<u64, Vec<(u64, u64)>>,
+    /// The captures armed so far: each armed frame's number.
+    armings: u64,
+    /// The armed frame's submissions between [`submit`] and [`submitted`], which let the state go while they make
+    /// their copies: the Present that closes the capture waits for them.
+    submitting: u32,
     /// The highest value submitted to signal each fence, by fence.
     signals: HashMap<u64, u64>,
 }
@@ -234,9 +239,13 @@ struct Series {
 const MAX_FRAMES: u32 = 64;
 /// The most Presents a request's lead (`early N`) runs before its first frame is armed.
 const MAX_EARLY: u32 = 64;
+/// How long the Present that closes a capture waits for its submissions still making their copies.
+const SUBMITTING: Duration = Duration::from_secs(10);
 
 /// An armed frame: its history so far, projected as it is submitted, and the copies its submissions made.
 struct Live {
+    /// Which capture of the process's it is (see [`State::armings`]).
+    number: u64,
     /// Its place in its series, when the request asked for more than one frame.
     series: Option<Series>,
     path: PathBuf,
@@ -570,18 +579,21 @@ pub unsafe fn submit(
         .get(&queue.id)
         .and_then(|o| o.description["type"].as_i64())
         .unwrap_or(0) as i32;
-    let State {
-        capture,
-        objects,
-        uploads,
-        constant_buffers,
-        states,
-        waits,
-        signals,
-        ..
-    } = &mut *s;
-    if let Some(live) = capture.as_mut() {
-        let start = Instant::now();
+    // The armed frame this submission belongs to. The state is let go while locum asks the real device for something
+    // (see below) and taken again after: it is still this submission's frame if the number is the same.
+    let number = s.capture.as_ref().map(|live| live.number);
+    // The first-use and upload copies to make before these lists, and where their results go.
+    let mut before = None;
+    let upload_start = Instant::now();
+    if armed {
+        s.submitting += 1;
+        let State {
+            capture,
+            waits,
+            signals,
+            ..
+        } = &mut *s;
+        let live = capture.as_mut().expect("armed");
         let first = live.frame.submissions.is_empty();
         live.frame.diagnostics.extend(diagnostics);
         live.frame.submissions.push(model::Submission {
@@ -599,28 +611,94 @@ pub unsafe fn submit(
         let mut touched = live.projection.submit(&mut live.capture, submission);
         let unknown = unsafe { unknown_wait(waits.entry(queue.id).or_default(), signals) };
         // What its DispatchRays' shader tables name, read now: the queue runs everything submitted before first.
-        if unknown.is_none()
-            && let Some(real) = unsafe { ID3D12CommandQueue::from_raw_borrowed(&real) }
-        {
-            let named = unsafe {
-                super::indirect::named_at_submission(&live.projection, &live.capture.events, from, real)
+        let real_queue = unsafe { ID3D12CommandQueue::from_raw_borrowed(&real) };
+        let mut reads = match (&unknown, real_queue) {
+            (None, Some(_)) => super::indirect::at_submission(&live.projection, &live.capture.events, from),
+            _ => Vec::new(),
+        };
+        // Reading the tables records and runs a list on the real device, and a reserved resource's page table is
+        // asked of it: whose methods a translation layer may have taken over, and one that holds a lock of its own
+        // while it calls a wrapped object, which takes this state, would wait for this thread while this thread waits
+        // for it. So they are made without the state, and the tables read name more resources (reserved ones, too).
+        let mut tiles = HashMap::new();
+        loop {
+            let pages: Vec<u64> = match &s.capture {
+                Some(live) if Some(live.number) == number => touched
+                    .iter()
+                    .copied()
+                    .filter(|r| !tiles.contains_key(r) && !live.used.contains(r))
+                    .filter(|r| {
+                        s.objects.get(r).is_some_and(|o| {
+                            o.description["dimension"].is_u64() && o.description["heap_properties"].is_null()
+                        })
+                    })
+                    .collect(),
+                _ => break,
             };
-            for r in named {
-                if !touched.contains(&r) {
-                    touched.push(r);
+            if reads.is_empty() && pages.is_empty() {
+                break;
+            }
+            drop(s);
+            if let Some(queue) = real_queue {
+                unsafe { super::indirect::read_at_submission(&mut reads, queue) };
+            }
+            for resource in pages {
+                tiles.insert(
+                    resource,
+                    Tiles {
+                        pages: super::tiles::pages(resource),
+                        unreadable: super::tiles::unreadable(resource),
+                    },
+                );
+            }
+            s = state();
+            if let Some(live) = s.capture.as_ref().filter(|live| Some(live.number) == number) {
+                let named =
+                    super::indirect::named_at_submission(&live.projection, std::mem::take(&mut reads));
+                for r in named {
+                    if !touched.contains(&r) {
+                        touched.push(r);
+                    }
                 }
             }
         }
-        let snapshots = first_uses(live, objects, states, touched, unknown.as_deref(), cpu_seq);
-        let copies = upload_copies(uploads, first, &lists, constant_buffers.values());
-        if !copies.is_empty() || !snapshots.is_empty() {
-            unsafe { super::readback::submit(queue.id, real, id, copies, snapshots, &live.results) };
+        let State {
+            capture,
+            objects,
+            uploads,
+            constant_buffers,
+            states,
+            ..
+        } = &mut *s;
+        if let Some(live) = capture.as_mut().filter(|live| Some(live.number) == number) {
+            let snapshots = first_uses(
+                live,
+                id,
+                objects,
+                states,
+                touched,
+                unknown.as_deref(),
+                cpu_seq,
+                &tiles,
+            );
+            let copies = upload_copies(uploads, first, &lists, constant_buffers.values());
+            if !copies.is_empty() || !snapshots.is_empty() {
+                before = Some((copies, snapshots, live.results.clone()));
+            }
         }
-        UPLOAD_COST.add(start, 0);
     }
+    let State { capture, states, .. } = &mut *s;
+    // A capture closed while the state was let go (after waiting long enough for this submission) is not this one's.
+    let mut other = None;
+    let capture = if capture.as_ref().map(|live| live.number) == number {
+        capture
+    } else {
+        &mut other
+    };
     // The copies run before these lists, which change states for the next submission.
     states.execute(&lists, queue_type);
     let mut submitted = super::passes::Submitted::new(id, D3D12_COMMAND_LIST_TYPE(queue_type));
+    submitted.in_flight = armed;
     submitted.rays = super::rays::executing(&lists.iter().map(|l| l.id).collect::<Vec<_>>());
     let mut executed = Vec::new();
     let ordinals_of = ordinals.clone();
@@ -645,6 +723,16 @@ pub unsafe fn submit(
             armed: capture.is_some(),
             first,
         });
+    }
+    let results = capture.as_ref().map(|live| live.results.clone());
+    // Everything from here on records locum's own lists on the real device, or runs them on the real queue: without
+    // the state, as above. The Present that closes the capture waits for this submission (see [`present`]).
+    drop(s);
+    if let Some((copies, snapshots, results)) = before {
+        unsafe { super::readback::submit(queue.id, real, id, copies, snapshots, &results) };
+    }
+    if armed {
+        UPLOAD_COST.add(upload_start, 0);
     }
     let continued = unsafe { super::passes::ends(&mut submitted, &executed) };
     // Buffers locum's copies promoted, moved between the lists (see [`super::promoted`]).
@@ -687,12 +775,12 @@ pub unsafe fn submit(
             }
         }
     }
-    if let Some(live) = capture.as_ref() {
+    if let Some(results) = results {
         if submitted.reads() {
-            submitted.results = Some(live.results.clone());
+            submitted.results = Some(results.clone());
         }
         if !continued.is_empty() {
-            live.results
+            results
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .push(super::readback::Batch {
@@ -709,8 +797,20 @@ pub unsafe fn submit(
 /// Called while the queue lock is held, immediately after forwarding ExecuteCommandLists to `real`, the real queue.
 pub unsafe fn submitted(queue: &Data, real: *mut c_void, mut submission: super::passes::Submitted) {
     let builds = std::mem::take(&mut submission.rays);
+    let in_flight = submission.in_flight;
     unsafe { super::passes::submitted(queue.id, real, submission) };
     unsafe { super::rays::submitted(queue.id, real, builds) };
+    if in_flight {
+        let mut s = state();
+        s.submitting = s.submitting.saturating_sub(1);
+    }
+}
+
+/// What a reserved resource's page table holds, and why it cannot be copied if it cannot, asked of the real device
+/// before a submission's first-use copies are decided (see [`submit`]).
+struct Tiles {
+    pages: Result<(Value, Value), String>,
+    unreadable: Option<String>,
 }
 
 /// The first wait this queue has been told of that no submitted Signal and no completed fence value is known to
@@ -739,15 +839,17 @@ unsafe fn prune(waits: &mut Vec<(u64, u64)>, signals: &HashMap<u64, u64>) {
 /// The snapshots to copy before a submission's lists: each resource it touches that no earlier submission of the
 /// frame used, unless its contents come another way (upload buffers, copied whole at the first submission;
 /// readback buffers, which only the GPU writes) or cannot be copied, which is recorded with the reason.
+#[allow(clippy::too_many_arguments)]
 fn first_uses(
     live: &mut Live,
+    submission: u64,
     objects: &BTreeMap<u64, model::Object>,
     states: &super::states::Tracker,
     touched: Vec<u64>,
     unknown: Option<&str>,
     cpu_seq: u64,
+    tiles: &HashMap<u64, Tiles>,
 ) -> Vec<super::readback::Snapshot> {
-    let submission = live.frame.submissions.last().map_or(0, |s| s.id);
     let mut snapshots = Vec::new();
     let mut failed = Vec::new();
     for resource in touched {
@@ -788,15 +890,23 @@ fn first_uses(
         let format = n("format");
         let layout = model::layout(d);
         let reserved = d["heap_properties"].is_null();
+        let tile = tiles.get(&resource);
         if reserved {
-            page(live, resource, cpu_seq);
+            let pages = tile.map_or_else(
+                || Err("its page table was not asked for".to_string()),
+                |t| t.pages.clone(),
+            );
+            page(live, resource, cpu_seq, pages);
         }
         // Behind a wait nothing submitted yet signals, a buffer is still copied: the copy runs on this queue past the
         // wait, just before the lists, so it finds what they will; a texture's state there is not known.
         let blocked = texture && !simultaneous;
         let why = if let Some(why) = unknown.filter(|_| blocked) {
             Some(why.to_string())
-        } else if let Some(why) = reserved.then(|| super::tiles::unreadable(resource)).flatten() {
+        } else if let Some(why) = reserved
+            .then(|| tile.and_then(|t| t.unreadable.clone()))
+            .flatten()
+        {
             Some(why)
         } else if layout.is_none() {
             Some(format!("format {format} has no canonical layout"))
@@ -958,24 +1068,31 @@ fn runs(mut ranges: Vec<(u64, u64, u64)>, gap: u64) -> Vec<(u64, u64, u64)> {
     merged
 }
 
-/// Records reserved resource `resource`'s page table as the armed frame finds it, once per frame.
-fn page(live: &mut Live, resource: u64, cpu_seq: u64) {
+/// Records reserved resource `resource`'s page table as the armed frame finds it, `pages` ([`super::tiles::pages`]),
+/// once per frame.
+fn page(live: &mut Live, resource: u64, cpu_seq: u64, pages: Result<(Value, Value), String>) {
     if resource != 0 && live.paged.insert(resource) {
         live.frame.tile_pages.push(model::TilePages {
             resource,
             cpu_seq,
-            pages: super::tiles::pages(resource),
+            pages,
         });
     }
 }
 
 /// Before a change to the tile mappings of `resources`: an armed frame records their page tables as it found them.
+/// They are asked for before the state is taken: a page table never asked for is asked of the real device (see
+/// [`submit`]).
 pub fn tiles_changing(resources: &[u64]) {
+    if !super::passes::ARMED.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let pages: Vec<_> = resources.iter().map(|&r| (r, super::tiles::pages(r))).collect();
     let mut s = state();
     let cpu_seq = s.cpu_seq;
     if let Some(live) = s.capture.as_mut() {
-        for &resource in resources {
-            page(live, resource, cpu_seq);
+        for (resource, pages) in pages {
+            page(live, resource, cpu_seq, pages);
         }
     }
 }
@@ -1156,6 +1273,21 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
     super::passes::sweep();
     let (finished, series) = {
         let mut s = state();
+        // A submission of the frame still making its copies adds their results after: the capture waits for it, as
+        // long as a copy may take (it may be waiting on what this thread holds).
+        let waiting = Instant::now();
+        while s.capture.is_some() && s.submitting > 0 && waiting.elapsed() < SUBMITTING {
+            drop(s);
+            std::thread::sleep(Duration::from_millis(1));
+            s = state();
+        }
+        if s.capture.is_some() && s.submitting > 0 {
+            log!(
+                "D3D12 capture closing with {} submissions still making their copies after {:?}: what they copy is not in it",
+                s.submitting,
+                SUBMITTING
+            );
+        }
         (s.capture.take(), s.series.take())
     };
     if finished.is_some() {
@@ -1356,7 +1488,9 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
     s.descriptors.clear();
     s.constant_buffers.clear();
     let objects: Vec<_> = s.objects.values().cloned().collect();
+    s.armings += 1;
     s.capture = Some(Live {
+        number: s.armings,
         series: (series.frames > 1).then(|| series.clone()),
         path,
         projection: model::Projection::new(&objects),
@@ -1378,6 +1512,20 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         series.index,
         series.frames,
         super::passes::recorded()
+    );
+}
+
+/// Arms the capture of the next frame into `root` at once, as a request read at a Present would.
+#[cfg(test)]
+pub(super) fn arm_now(root: &std::path::Path) {
+    arm(
+        root,
+        0,
+        Series {
+            label: None,
+            index: 1,
+            frames: 1,
+        },
     );
 }
 
