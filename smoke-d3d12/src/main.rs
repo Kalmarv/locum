@@ -7,6 +7,7 @@ use windows::Win32::Graphics::{Direct3D::*, Direct3D12::*, Dxgi::Common::*, Dxgi
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::*;
+mod big;
 mod cb_copied;
 mod compute_first;
 mod contents;
@@ -572,6 +573,7 @@ unsafe fn run() {
         if let Err(why) = rays::capture(&device, &queue, &fence, &chain, 64) {
             println!("rays SKIPPED: {why}");
         }
+        big::capture(&device, &queue, &fence, &chain, 200);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

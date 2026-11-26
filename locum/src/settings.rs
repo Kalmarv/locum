@@ -30,6 +30,9 @@ pub struct Settings {
     pub dumper: Option<PathBuf>,
     pub dumps: Option<PathBuf>,
     pub crash_av_rvas: Vec<usize>,
+    /// Readback memory one chunk of an armed frame's copies may use, and the size of the pieces a bigger buffer is
+    /// copied in (`readback-chunk-mb`, 256 by default, 1 to 1024).
+    pub readback_chunk: u64,
 }
 
 pub fn settings() -> &'static Settings {
@@ -42,6 +45,7 @@ pub fn settings() -> &'static Settings {
             dumper: None,
             dumps: None,
             crash_av_rvas: Vec::new(),
+            readback_chunk: 256 << 20,
         };
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.txt")) {
             for (n, line) in text.lines().enumerate() {
@@ -70,6 +74,13 @@ pub fn settings() -> &'static Settings {
                             n + 1
                         ),
                     },
+                    "readback-chunk-mb" => match value.parse::<u64>() {
+                        Ok(mb @ 1..=1024) => s.readback_chunk = mb << 20,
+                        _ => log!(
+                            "settings.txt line {}: readback-chunk-mb {value:?} is not 1 to 1024: ignored",
+                            n + 1
+                        ),
+                    },
                     other => log!("settings.txt line {}: unknown setting {other:?}: ignored", n + 1),
                 }
             }
@@ -78,9 +89,10 @@ pub fn settings() -> &'static Settings {
             s.blobs = Blobs::new(PathBuf::from(dir));
         }
         log!(
-            "settings: uploads {:?}, blobs {}, dumper {}, dumps {}",
+            "settings: uploads {:?}, blobs {}, readback chunks of {} MiB, dumper {}, dumps {}",
             s.uploads,
             s.blobs.root().display(),
+            s.readback_chunk >> 20,
             s.dumper
                 .as_ref()
                 .map_or("none".into(), |p| p.display().to_string()),

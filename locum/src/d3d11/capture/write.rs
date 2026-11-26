@@ -422,7 +422,7 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             } else {
                 dims.kind
             },
-            width: dims.width,
+            width: u64::from(dims.width),
             height: dims.height,
             depth: dims.depth,
             mips: dims.mips,

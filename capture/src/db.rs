@@ -169,7 +169,8 @@ pub struct Module {
 pub struct Resource {
     pub id: u64,
     pub kind: &'static str,
-    pub width: u32,
+    /// Texels, or a buffer's bytes (which may pass 4 GiB).
+    pub width: u64,
     pub height: u32,
     pub depth: u32,
     pub mips: u32,
@@ -463,7 +464,7 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
             s.execute(params![
                 r.id as i64,
                 r.kind,
-                r.width,
+                r.width as i64,
                 r.height,
                 r.depth,
                 r.mips,

@@ -131,6 +131,16 @@ pub fn buffer(bytes: u32) -> Vec<Sub> {
     }]
 }
 
+/// A buffer as one subresource of `bytes` bytes, which may pass 4 GiB (its width and row then say 4 GiB less one;
+/// its size is right).
+pub fn buffer_of(bytes: u64) -> Vec<Sub> {
+    let narrow = u32::try_from(bytes).unwrap_or(u32::MAX);
+    vec![Sub {
+        size: bytes,
+        ..buffer(narrow)[0]
+    }]
+}
+
 /// The total size of a set of subresources.
 pub fn total(subs: &[Sub]) -> u64 {
     subs.last().map_or(0, |s| s.offset + s.size)

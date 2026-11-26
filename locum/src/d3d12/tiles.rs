@@ -58,6 +58,21 @@ pub fn pages(id: u64) -> Result<(Value, Value), String> {
     })?
 }
 
+/// The tiles of reserved buffer `id` mapped now, in order (tile `i` holds bytes `i` × 64 KiB on); None when `id` is
+/// not a reserved buffer whose page table is known.
+pub fn mapped_buffer_tiles(id: u64) -> Option<Vec<u32>> {
+    let resource = super::real::<ID3D12Resource>(id)?;
+    if unsafe { resource.GetDesc() }.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER {
+        return None;
+    }
+    let all = entries();
+    let e = all.get(&id)?;
+    if e.error.is_some() {
+        return None;
+    }
+    Some(e.pages.tiles.keys().copied().collect())
+}
+
 pub fn destroyed(id: u64) {
     entries().remove(&id);
 }

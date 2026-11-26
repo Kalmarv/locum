@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Direct3D 12: a buffer bigger than one readback chunk is captured in pieces of a chunk each (it failed before: a
+  readback buffer of its size could not be made, `E_OUTOFMEMORY` for a 4 GiB one), and a reserved buffer bigger than
+  a chunk only as its mapped tiles, the rest as zeros (for a 4 GiB reserved buffer with 4,502 of its 65,536 tiles
+  mapped, 281 MiB to copy). The capture names such a buffer by one key, a pieced blob, which reads as the whole buffer.
+  `readback-chunk-mb` in settings.txt sets the chunk (256 MiB by default, 1 to 1024).
+- The blob store holds pieced blobs (codec `pieces`: the stored bytes list the pieces' keys and sizes, `-` for zeros
+  stored nowhere): `read`, `size` and `get` answer for one as for any blob, collecting keeps a kept one's pieces, and
+  copying a store copies its list. A locum from before reads none of them.
+- A buffer of 4 GiB or more has its width in the capture's `resources` table and in `resource`; it was recorded as
+  its width less 4 GiB (0 for a 4 GiB one), and its layout as that many bytes.
 - Direct3D 12: an interface the real object answers with the same pointer through the same table (`ID3D12Device` to
   `ID3D12Device14`, the command-list versions) gets the same face, as the runtime gives one pointer. Each had a face of
   its own, so a translation layer that adopts the runtime's objects by changing their table (XCL) never adopted the

@@ -8,8 +8,11 @@
 //! GENERIC_READ for their whole life and buffers are COMMON whenever a submission begins, so their copies need no
 //! barriers; a texture is transitioned from its tracked state (see [`super::states`]) to COPY_SOURCE and back.
 //!
-//! Copies go in chunks of at most [`CHUNK`] bytes, each its own submission and fence, and at most [`BUDGET`] bytes of
-//! readback memory wait for the collector at once: a frame's first-use contents can be gigabytes.
+//! Copies go in chunks of at most [`chunk`] bytes, each its own submission and fence, and at most [`BUDGET`] bytes of
+//! readback memory wait for the collector at once: a frame's first-use contents can be gigabytes. A buffer bigger than
+//! a chunk is copied in pieces of a chunk each, stored as blobs of their own and named together by one pieced blob
+//! (see [`locum_capture::blobs`]) once the last has arrived: a translation layer's 4 GiB window of memory is one
+//! buffer, which no readback buffer of its size could hold.
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,9 +68,13 @@ pub struct Batch {
 /// A capture's batches, filled by the collector.
 pub type Results = Arc<Mutex<Vec<Batch>>>;
 
-/// Readback memory a chunk may use, and all chunks waiting for the collector.
-const CHUNK: u64 = 256 << 20;
+/// Readback memory all chunks waiting for the collector may use.
 const BUDGET: u64 = 1 << 30;
+
+/// Readback memory a chunk may use (`readback-chunk-mb`), and the size of a big buffer's pieces.
+fn chunk() -> u64 {
+    crate::settings::settings().readback_chunk.clamp(ALIGN, BUDGET)
+}
 /// How long a submission waits for the budget before giving up its remaining copies: a queue can wait on a fence the
 /// application signals later, and the application cannot signal it while locum holds its submitting thread.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -89,6 +96,13 @@ enum Item {
         footprints: Vec<(D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u32, u64)>,
         /// A multisampled texture's passes, which draw its samples into images to copy.
         samples: Option<locum_capture::d3d12::samples::Reader>,
+    },
+    /// Piece `index` of a buffer bigger than a chunk, from `offset` bytes in (see [`pieces`]).
+    Piece {
+        snapshot: Arc<Snapshot>,
+        resource: super::Real<ID3D12Resource>,
+        offset: u64,
+        index: usize,
     },
 }
 
@@ -213,7 +227,7 @@ fn needs_direct(snapshot: &Snapshot, kind: D3D12_COMMAND_LIST_TYPE) -> bool {
 }
 
 /// Finds each item's real resource and footprints for lists of `kind`, and lays the items out in chunks of at most
-/// [`CHUNK`] bytes; items that cannot be copied go to `failed`.
+/// [`chunk`] bytes, a bigger buffer in pieces of a chunk each; items that cannot be copied go to `failed`.
 unsafe fn place(
     device: &ID3D12Device,
     kind: D3D12_COMMAND_LIST_TYPE,
@@ -223,6 +237,7 @@ unsafe fn place(
 ) -> Vec<Vec<Placed>> {
     let mut chunks: Vec<Vec<Placed>> = vec![Vec::new()];
     let mut chunk_bytes = 0;
+    let chunk = chunk();
     for item in items {
         let placed = match item {
             Ok(copy) => match super::real::<ID3D12Resource>(copy.resource) {
@@ -247,7 +262,44 @@ unsafe fn place(
                 continue;
             }
         };
-        if chunk_bytes > 0 && chunk_bytes + bytes > CHUNK {
+        let item = match item {
+            Item::Contents {
+                snapshot,
+                resource,
+                footprints,
+                samples: None,
+            } if footprints.is_empty() && bytes > chunk => {
+                // A reserved buffer: its mapped tiles only, the rest is zeros.
+                let mapped = super::tiles::mapped_buffer_tiles(snapshot.resource);
+                let segments = segments(bytes, chunk, mapped.as_deref());
+                let snapshot = Arc::new(snapshot);
+                if let Some(done) = pieces::expect(submission, &snapshot, &segments) {
+                    failed.contents.push(done);
+                }
+                for (index, &(offset, len, copied)) in segments.iter().enumerate() {
+                    if !copied {
+                        continue;
+                    }
+                    if chunk_bytes > 0 {
+                        chunks.push(Vec::new());
+                    }
+                    chunks.last_mut().unwrap().push(Placed {
+                        item: Item::Piece {
+                            snapshot: snapshot.clone(),
+                            resource: resource.clone(),
+                            offset,
+                            index,
+                        },
+                        at: 0,
+                        bytes: len,
+                    });
+                    chunk_bytes = len.next_multiple_of(ALIGN);
+                }
+                continue;
+            }
+            item => item,
+        };
+        if chunk_bytes > 0 && chunk_bytes + bytes > chunk {
             chunks.push(Vec::new());
             chunk_bytes = 0;
         }
@@ -734,6 +786,9 @@ unsafe fn record(
             Item::Upload { copy, resource } => unsafe {
                 list.CopyBufferRegion(&readback, p.at, &**resource, copy.offset, copy.len)
             },
+            Item::Piece { resource, offset, .. } => unsafe {
+                list.CopyBufferRegion(&readback, p.at, &**resource, *offset, p.bytes)
+            },
             Item::Contents {
                 resource, footprints, ..
             } if footprints.is_empty() => unsafe {
@@ -853,6 +908,14 @@ fn collect(pending: Pending) -> Batch {
                 }
                 batch.uploads.push((c.resource, content));
             }
+            Item::Piece { snapshot, index, .. } => {
+                let bytes = unsafe { core::slice::from_raw_parts(data, p.bytes as usize) }.to_vec();
+                let key = locum_capture::hash::key(&bytes);
+                locum_capture::writer::blob(&crate::settings::settings().blobs, key.clone(), bytes, true);
+                if let Some(done) = pieces::arrived(submission, &snapshot, index, Ok((key, p.bytes))) {
+                    batch.contents.push(done);
+                }
+            }
             Item::Contents {
                 snapshot, footprints, ..
             } => {
@@ -938,11 +1001,161 @@ fn fail(batch: &mut Batch, item: Result<Copy, Snapshot>, reason: &str) {
 fn fail_item(batch: &mut Batch, item: Item, reason: &str) {
     match item {
         Item::Upload { copy, .. } => batch.uploads.push(upload_failed(copy, reason)),
+        Item::Piece { snapshot, index, .. } => {
+            if let Some(done) = pieces::arrived(batch.submission, &snapshot, index, Err(reason.into())) {
+                batch.contents.push(done);
+            }
+        }
         Item::Contents { snapshot, .. } => {
             batch
                 .contents
                 .push(first_use(batch.submission, &snapshot, Err(reason.into())))
         }
+    }
+}
+
+/// A buffer of `bytes` in pieces of at most `chunk` bytes: (offset, size, copied). With `mapped` (a reserved
+/// buffer's mapped 64 KiB tiles, in order) only runs of mapped tiles are copied, and the rest is zeros.
+fn segments(bytes: u64, chunk: u64, mapped: Option<&[u32]>) -> Vec<(u64, u64, bool)> {
+    const TILE: u64 = 64 << 10;
+    let mut out = Vec::new();
+    let copy = |out: &mut Vec<(u64, u64, bool)>, from: u64, to: u64| {
+        let mut at = from;
+        while at < to {
+            let len = chunk.min(to - at);
+            out.push((at, len, true));
+            at += len;
+        }
+    };
+    let Some(mapped) = mapped else {
+        copy(&mut out, 0, bytes);
+        return out;
+    };
+    let mut at = 0;
+    let mut tiles = mapped.iter().map(|&t| u64::from(t)).peekable();
+    while let Some(first) = tiles.next() {
+        let mut last = first;
+        while tiles.peek() == Some(&(last + 1)) {
+            last = tiles.next().expect("peeked");
+        }
+        let (from, to) = ((first * TILE).min(bytes), ((last + 1) * TILE).min(bytes));
+        if from > at {
+            out.push((at, from - at, false));
+        }
+        copy(&mut out, from, to);
+        at = at.max(to);
+    }
+    if at < bytes {
+        out.push((at, bytes - at, false));
+    }
+    out
+}
+
+/// A big buffer's pieces as they arrive: once the last has, the buffer's contents are one pieced blob naming them all,
+/// or, if one failed, the first failure's reason.
+mod pieces {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use locum_capture::d3d12::FirstUse;
+
+    use super::Snapshot;
+
+    struct Assembly {
+        got: Vec<Option<(String, u64)>>,
+        left: usize,
+        failed: Option<String>,
+    }
+
+    static PENDING: Mutex<Option<HashMap<(u64, u64), Assembly>>> = Mutex::new(None);
+
+    /// `snapshot`'s buffer is copied before `submission` in `segments` (see [`super::segments`]): the pieces not
+    /// copied are zeros. Its first use at once when none is copied.
+    pub(super) fn expect(
+        submission: u64,
+        snapshot: &Snapshot,
+        segments: &[(u64, u64, bool)],
+    ) -> Option<(u64, FirstUse)> {
+        let got: Vec<Option<(String, u64)>> = segments
+            .iter()
+            .map(|&(_, len, copied)| (!copied).then(|| (locum_capture::blobs::ZEROS.to_owned(), len)))
+            .collect();
+        let left = segments.iter().filter(|s| s.2).count();
+        if left == 0 {
+            return Some(done(submission, snapshot, got, None));
+        }
+        PENDING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                (submission, snapshot.resource),
+                Assembly {
+                    got,
+                    left,
+                    failed: None,
+                },
+            );
+        None
+    }
+
+    /// Piece `index` of `snapshot`'s buffer: its blob's key and size, or why it was not copied. The buffer's first use
+    /// once this was the last piece.
+    pub(super) fn arrived(
+        submission: u64,
+        snapshot: &Snapshot,
+        index: usize,
+        piece: Result<(String, u64), String>,
+    ) -> Option<(u64, FirstUse)> {
+        let all_done = {
+            let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+            let all = pending.get_or_insert_with(HashMap::new);
+            let at = (submission, snapshot.resource);
+            let a = all.get_mut(&at)?;
+            let n = a.got.len();
+            match piece {
+                Ok(p) => a.got[index] = Some(p),
+                Err(why) => {
+                    a.failed
+                        .get_or_insert_with(|| format!("piece {} of {n}: {why}", index + 1));
+                }
+            }
+            a.left -= 1;
+            if a.left > 0 {
+                return None;
+            }
+            all.remove(&at)?
+        };
+        Some(done(submission, snapshot, all_done.got, all_done.failed))
+    }
+
+    /// The first use of a buffer whose pieces are `got`, or why it has none.
+    fn done(
+        submission: u64,
+        snapshot: &Snapshot,
+        got: Vec<Option<(String, u64)>>,
+        failed: Option<String>,
+    ) -> (u64, FirstUse) {
+        let content = match failed {
+            Some(why) => Err(why),
+            None => {
+                let list: Vec<(String, u64)> =
+                    got.into_iter().map(|p| p.expect("every piece arrived")).collect();
+                let key = key(&list);
+                crate::settings::settings()
+                    .blobs
+                    .put_pieces(&key, &list)
+                    .map(|_| (key.clone(), vec![key]))
+                    .map_err(|e| format!("storing the list of {} pieces: {e}", list.len()))
+            }
+        };
+        super::first_use(submission, snapshot, content)
+    }
+
+    /// The key of a buffer stored as `pieces`: of their keys and sizes, in order.
+    pub(super) fn key(pieces: &[(String, u64)]) -> String {
+        let named: String = pieces.iter().map(|(k, n)| format!("{k} {n}\n")).collect();
+        locum_capture::hash::key(format!("pieces\n{named}").as_bytes())
     }
 }
 
@@ -957,6 +1170,34 @@ fn upload_failed(c: Copy, reason: &str) -> (u64, Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn big_buffers_go_in_pieces_and_reserved_ones_as_their_mapped_tiles() {
+        const T: u64 = 64 << 10;
+        // Plain: chunks, the last shorter.
+        assert_eq!(
+            segments(10 * T + 5, 4 * T, None),
+            [(0, 4 * T, true), (4 * T, 4 * T, true), (8 * T, 2 * T + 5, true)]
+        );
+        // Reserved: tiles 1-2 and 5-10 mapped (the second run split at the chunk), the rest zeros; the last tile
+        // ends with the buffer.
+        assert_eq!(
+            segments(11 * T - 7, 4 * T, Some(&[1, 2, 5, 6, 7, 8, 9, 10])),
+            [
+                (0, T, false),
+                (T, 2 * T, true),
+                (3 * T, 2 * T, false),
+                (5 * T, 4 * T, true),
+                (9 * T, 2 * T - 7, true),
+            ]
+        );
+        // Nothing mapped: one run of zeros; everything mapped: as a plain buffer.
+        assert_eq!(segments(8 * T, 4 * T, Some(&[])), [(0, 8 * T, false)]);
+        assert_eq!(
+            segments(8 * T, 4 * T, Some(&[0, 1, 2, 3, 4, 5, 6, 7])),
+            segments(8 * T, 4 * T, None)
+        );
+    }
 
     #[test]
     fn copies_transition_only_from_states_that_cannot_be_read() {

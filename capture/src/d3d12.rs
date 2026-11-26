@@ -1417,7 +1417,8 @@ impl Frame {
                 capture.resources.push(db::Resource {
                     id: object.id,
                     kind,
-                    width: n("width"),
+                    // (a buffer's bytes, which may pass 4 GiB)
+                    width: d["width"].as_u64().unwrap_or(0),
                     height: n("height"),
                     depth,
                     array,
@@ -2156,7 +2157,7 @@ pub fn acceleration_structures(d: &Value) -> bool {
 pub fn layout(d: &Value) -> Option<Vec<crate::layout::Sub>> {
     let n = |key: &str| d[key].as_u64().unwrap_or(0) as u32;
     if d["dimension"] == 1 {
-        return Some(crate::layout::buffer(n("width")));
+        return Some(crate::layout::buffer_of(d["width"].as_u64().unwrap_or(0)));
     }
     let (depth, array) = extent(d);
     if n("sample_count") > 1 {

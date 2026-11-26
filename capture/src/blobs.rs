@@ -13,6 +13,11 @@
 //! blobs, rather than reading compressed bytes as the blob. [`Blobs::collect`] rewrites both older forms into
 //! compressed packs.
 //!
+//! A blob too big to hold in memory at once (a buffer of gigabytes) can be stored as pieces: each piece a blob of its
+//! own, or zeros (key [`ZEROS`]: a reserved buffer's unmapped tiles), and the blob's entry a list of them (codec
+//! `pieces`, the list as its stored bytes). [`Blobs::read`] and
+//! [`Blobs::size`] answer for it as for any blob; collecting keeps a kept blob's pieces, and copying copies the list.
+//!
 //! The index also lists the captures that use the store (table `captures(path)`): a capture is listed before its
 //! `capture.db` is written. [`Blobs::collect`] keeps the blobs those captures name and drops the rest, so deleting a
 //! run's captures and collecting gives their space back. Every process using a store holds `<root>/store.lock`
@@ -51,6 +56,8 @@ pub struct Blobs {
 enum Codec {
     Raw,
     Lz4,
+    /// The stored bytes list the blob's pieces (see [`manifest`]).
+    Pieces,
 }
 
 impl Codec {
@@ -58,6 +65,7 @@ impl Codec {
         match self {
             Codec::Raw => "raw",
             Codec::Lz4 => "lz4",
+            Codec::Pieces => "pieces",
         }
     }
 
@@ -65,6 +73,7 @@ impl Codec {
         match name {
             "raw" => Ok(Codec::Raw),
             "lz4" => Ok(Codec::Lz4),
+            "pieces" => Ok(Codec::Pieces),
             other => Err(rusqlite::Error::InvalidColumnType(
                 0,
                 format!("codec {other:?}, which this locum does not read"),
@@ -83,6 +92,31 @@ fn encode(bytes: &[u8]) -> io::Result<(std::borrow::Cow<'_, [u8]>, Codec)> {
         }
     }
     Ok((bytes.into(), Codec::Raw))
+}
+
+/// The key of a piece of a pieced blob that is zeros, stored nowhere.
+pub const ZEROS: &str = "-";
+
+/// The stored form of a pieced blob's list: a line `<key> <size>` per piece, in order.
+fn manifest(pieces: &[(String, u64)]) -> Vec<u8> {
+    pieces
+        .iter()
+        .map(|(k, n)| format!("{k} {n}\n"))
+        .collect::<String>()
+        .into_bytes()
+}
+
+/// A pieced blob's list from its stored bytes.
+fn pieces_of(key: &str, stored: &[u8]) -> io::Result<Vec<(String, u64)>> {
+    let bad = || io::Error::other(format!("blob {key}: a pieces list that does not read"));
+    std::str::from_utf8(stored)
+        .map_err(|_| bad())?
+        .lines()
+        .map(|line| {
+            let (k, n) = line.split_once(' ').ok_or_else(bad)?;
+            Ok((k.to_owned(), n.parse().map_err(|_| bad())?))
+        })
+        .collect()
 }
 
 /// Where a blob is: `stored` bytes in a pack decoding to `size`, or a file of its own (stores from before packs).
@@ -183,6 +217,42 @@ impl Blobs {
         self.store().append(key, bytes)
     }
 
+    /// Writes the blob `key` as the concatenation of `pieces` (keys and sizes, in order), unless `key` is there
+    /// already, and makes it visible to other processes. The pieces are blobs of their own, written before or after.
+    /// Returns whether it wrote.
+    pub fn put_pieces(&self, key: &str, pieces: &[(String, u64)]) -> io::Result<bool> {
+        let mut store = self.store();
+        let wrote = store.append_stored(
+            key,
+            &manifest(pieces),
+            Codec::Pieces,
+            pieces.iter().map(|p| p.1).sum(),
+        )?;
+        store.flush()?;
+        Ok(wrote)
+    }
+
+    /// The pieces of a pieced blob (keys and sizes, in order); None for a blob stored whole or not in the store.
+    pub fn pieces(&self, key: &str) -> io::Result<Option<Vec<(String, u64)>>> {
+        let mut store = self.store();
+        if store.pending.contains_key(key) {
+            store.flush()?;
+        }
+        match store.find(key) {
+            Some(Place::Pack {
+                pack,
+                offset,
+                stored,
+                codec: Codec::Pieces,
+                ..
+            }) => {
+                let list = read_at(store.reader(&pack)?, offset, stored as usize)?;
+                pieces_of(key, &list).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Makes everything appended so far visible to other processes.
     pub fn flush(&self) -> io::Result<()> {
         self.store().flush()
@@ -216,6 +286,38 @@ impl Blobs {
             let from = offset.min(total);
             (from, size.unwrap_or(total - from).min(total - from) as usize)
         };
+        if let Place::Pack {
+            pack,
+            offset: at,
+            stored,
+            size: total,
+            codec: Codec::Pieces,
+        } = &place
+        {
+            let (from, n) = span(*total);
+            let list = read_at(store.reader(pack)?, *at, *stored as usize)?;
+            drop(store);
+            let mut out = Vec::with_capacity(n);
+            let mut start = 0u64;
+            for (piece, len) in pieces_of(key, &list)? {
+                let (lo, hi) = (from.max(start), (from + n as u64).min(start + len));
+                if lo < hi && piece == ZEROS {
+                    out.resize(out.len() + (hi - lo) as usize, 0);
+                } else if lo < hi {
+                    let bytes = self.read(&piece, lo - start, Some(hi - lo))?;
+                    if bytes.len() as u64 != hi - lo {
+                        return Err(io::Error::other(format!(
+                            "blob {key}: piece {piece} has {} bytes where {} were asked for",
+                            bytes.len(),
+                            hi - lo
+                        )));
+                    }
+                    out.extend_from_slice(&bytes);
+                }
+                start += len;
+            }
+            return Ok(out);
+        }
         match place {
             Place::Pack {
                 pack,
@@ -228,6 +330,7 @@ impl Blobs {
                 let file = store.reader(&pack)?;
                 match codec {
                     Codec::Raw => read_at(file, at + from, n),
+                    Codec::Pieces => unreachable!("read above"),
                     Codec::Lz4 => {
                         let packed = read_at(file, at, stored as usize)?;
                         let mut whole = Lz4
@@ -337,6 +440,13 @@ impl Blobs {
                     )));
                 }
                 done.present += 1;
+                continue;
+            }
+            // A pieced blob goes as its list; its pieces are entries of their own.
+            if let Some(pieces) = from.pieces(&e.key)? {
+                self.store()
+                    .append_stored(&e.key, &manifest(&pieces), Codec::Pieces, e.size)?;
+                done.copied += 1;
                 continue;
             }
             let bytes = from.get(&e.key)?;
@@ -595,6 +705,21 @@ fn collect(root: &Path, keep: &dyn Fn(&str) -> bool, count_only: bool) -> io::Re
         }
     }
     let dir = root.join("packs");
+    // A kept pieced blob keeps its pieces.
+    let mut kept_pieces = std::collections::HashSet::new();
+    for (pack, rows) in &packs {
+        for r in rows
+            .iter()
+            .filter(|r| r.codec == Codec::Pieces && !r.key.is_empty() && keep(&r.key))
+        {
+            let Ok(file) = File::open(dir.join(pack)) else {
+                continue;
+            };
+            let list = read_at(&file, r.offset, r.stored as usize)?;
+            kept_pieces.extend(pieces_of(&r.key, &list)?.into_iter().map(|(k, _)| k));
+        }
+    }
+    let keep = |k: &str| keep(k) || kept_pieces.contains(k);
     // Packs on disk no entry names.
     if let Ok(found) = std::fs::read_dir(&dir) {
         for f in found {
@@ -627,9 +752,11 @@ fn collect(root: &Path, keep: &dyn Fn(&str) -> bool, count_only: bool) -> io::Re
             rows.into_iter().partition(|r| !r.key.is_empty() && keep(&r.key));
         let dropped_named = dropped.iter().filter(|r| !r.key.is_empty());
         done.kept += kept.len() as u64;
-        done.kept_bytes += kept.iter().map(|r| r.size).sum::<u64>();
+        // (a pieced blob's bytes are its pieces', counted with them)
+        let decoded = |r: &Row| if r.codec == Codec::Pieces { 0 } else { r.size };
+        done.kept_bytes += kept.iter().map(decoded).sum::<u64>();
         done.dropped += dropped_named.clone().count() as u64;
-        done.dropped_bytes += dropped_named.map(|r| r.size).sum::<u64>();
+        done.dropped_bytes += dropped_named.map(decoded).sum::<u64>();
         let converting = kept.iter().filter(|r| r.legacy).count() as u64;
         if dropped.is_empty() && converting == 0 {
             done.disk_after += on_disk;
@@ -922,6 +1049,14 @@ impl Store {
             return Ok(false);
         }
         let (stored, codec) = encode(bytes)?;
+        self.append_stored(key, &stored, codec, bytes.len() as u64)
+    }
+
+    /// Appends `stored` bytes that decode by `codec` to `size` under `key`, unless it is there already.
+    fn append_stored(&mut self, key: &str, stored: &[u8], codec: Codec, size: u64) -> io::Result<bool> {
+        if self.find(key).is_some() {
+            return Ok(false);
+        }
         if self
             .pack
             .as_ref()
@@ -937,19 +1072,19 @@ impl Store {
             self.pack = Some((name, BufWriter::with_capacity(16 << 20, file), 0));
         }
         let (name, file, len) = self.pack.as_mut().expect("a pack");
-        file.write_all(&stored)?;
+        file.write_all(stored)?;
         self.pending.insert(
             key.to_owned(),
             Place::Pack {
                 pack: name.clone(),
                 offset: *len,
                 stored: stored.len() as u64,
-                size: bytes.len() as u64,
+                size,
                 codec,
             },
         );
         *len += stored.len() as u64;
-        self.unflushed += bytes.len() as u64;
+        self.unflushed += size;
         Ok(true)
     }
 
@@ -1226,6 +1361,71 @@ mod tests {
 
     /// Collecting keeps what is asked for, wherever it was (packs, one-file blobs), drops the rest and deletes the
     /// packs that held it; what it kept reads back the same from a fresh process's view of the store.
+    #[test]
+    fn pieced_blobs_read_collect_and_copy_as_one() {
+        let dir = fresh("pieces");
+        let blobs = Blobs::new(&dir);
+        let parts = [compressible(5000), noise(3000, 7), compressible(1)];
+        let mut pieces: Vec<(String, u64)> = parts
+            .iter()
+            .map(|p| (crate::hash::key(p), p.len() as u64))
+            .collect();
+        // Zeros between the second and third, stored nowhere.
+        pieces.insert(2, (ZEROS.into(), 700));
+        let whole: Vec<u8> = [&parts[0][..], &parts[1], &[0; 700], &parts[2]].concat();
+        let key = crate::hash::key(b"the list");
+        // The list may come before its pieces.
+        assert!(blobs.put_pieces(&key, &pieces).unwrap());
+        assert!(!blobs.put_pieces(&key, &pieces).unwrap(), "written once");
+        for p in &parts {
+            blobs.append(&crate::hash::key(p), p).unwrap();
+        }
+        blobs.flush().unwrap();
+        assert_eq!(blobs.size(&key), Some(whole.len() as u64));
+        assert_eq!(blobs.get(&key).unwrap(), whole);
+        assert_eq!(blobs.pieces(&key).unwrap(), Some(pieces.clone()));
+        assert_eq!(
+            blobs.pieces(&pieces[0].0).unwrap(),
+            None,
+            "a piece is a blob of its own"
+        );
+        // Spans inside one piece, across all three, and past the end.
+        for (from, n) in [
+            (0, 10),
+            (4990, 20),
+            (4999, 3002),
+            (7999, 5),
+            (7990, 720),
+            (8100, 10),
+            (7000, 100_000),
+        ] {
+            let end = (from + n).min(whole.len());
+            assert_eq!(
+                blobs.read(&key, from as u64, Some(n as u64)).unwrap(),
+                &whole[from..end],
+                "read {from} +{n}"
+            );
+        }
+        // Another store: the list is copied as a list, its pieces as blobs.
+        let other = Blobs::new(fresh("pieces-copy"));
+        let copied = other.copy_from(&blobs).unwrap();
+        assert_eq!((copied.copied, copied.present), (4, 0));
+        assert_eq!(other.pieces(&key).unwrap(), Some(pieces.clone()));
+        assert_eq!(other.get(&key).unwrap(), whole);
+        // Collecting keeps a kept blob's pieces, and drops them with it.
+        let kept = blobs.collect(&|k| k == key, false).unwrap();
+        assert_eq!((kept.kept, kept.dropped), (4, 0));
+        assert_eq!(
+            kept.kept_bytes,
+            parts.iter().map(|p| p.len() as u64).sum::<u64>(),
+            "a list's bytes are its stored pieces' (zeros are stored nowhere)"
+        );
+        assert_eq!(blobs.get(&key).unwrap(), whole);
+        let gone = blobs.collect(&|_| false, false).unwrap();
+        assert_eq!((gone.kept, gone.dropped), (0, 4));
+        assert!(!blobs.has(&key) && !blobs.has(&pieces[1].0));
+    }
+
     #[test]
     fn collect_keeps_what_is_named() {
         let dir = fresh("collect");
