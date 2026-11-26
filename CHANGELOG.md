@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Direct3D 12 replay: a resource's contents move to and from the GPU in pieces of at most 256 MiB (whole
+  subresources, else bands of slices or rows of blocks), not through one staging buffer the resource's size, which a
+  4 GiB resource could not have. A reserved resource moves only what its mapped tiles hold (zeros elsewhere), unless
+  the frame changes its mappings. A buffer of 4 GiB or more is as long as its size (its 32-bit width said 0, so
+  replay left it empty).
 - Direct3D 12: an armed frame's submissions no longer hold locum's journal lock while they make their copies on the
   real device (first-use and upload copies, pass ends left open at Close, shader-table and page-table reads). A
   translation layer that has taken the real device's methods over and calls a wrapped object from them, holding a lock

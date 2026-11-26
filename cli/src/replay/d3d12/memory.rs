@@ -198,6 +198,9 @@ pub(super) struct Memory {
     lost: usize,
     /// Resources made in a heap (placed, or reserved with their tiles mapped).
     pub(super) shared: HashSet<i64>,
+    /// The tiles mapped of each reserved resource the frame does not map otherwise: only what they hold is written
+    /// and read (see [`super::staging`]).
+    pub(super) mapped: HashMap<i64, super::staging::Mapped>,
     /// First-use contents waiting for the submission they were copied at: by submission, (resource, blob key).
     pending: HashMap<i64, Vec<(i64, String)>>,
     /// The submission each resource's waiting contents belong to.
@@ -627,6 +630,22 @@ impl D3d12 {
                     };
                 }
                 self.memory.reserved += 1;
+                let remapped = c.has_table("d12_tile_mappings")
+                    && c.row(
+                        "SELECT 1 FROM d12_tile_mappings WHERE resource = ?1 LIMIT 1",
+                        [id],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .is_some();
+                if !remapped {
+                    self.memory.mapped.insert(
+                        id,
+                        super::staging::Mapped {
+                            layout,
+                            tiles: pages.tiles.keys().copied().collect(),
+                        },
+                    );
+                }
             }
         }
         self.memory.shared.insert(id);

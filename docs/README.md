@@ -451,6 +451,11 @@ or outputs skipped, a repeated list's earlier executions, the memory dump) are l
 (`event-<seq>-<resource>.{replay,game}.bin`, `draw-<n>-<target>.{replay,game}.bin`), and for a target in a format it
 can decode, both pictures and one of where they differ (`.replay.png`, `.game.png`, `.diff.png`).
 
+Direct3D 12 replay moves a resource's contents to and from the GPU through staging buffers of at most 256 MiB: larger
+contents go in pieces, each run before the next (whole subresources where they fit, else bands of slices or of rows
+of blocks). A reserved resource moves only what its tiles mapped as the frame began hold, and reads as zeros
+elsewhere; one the frame maps otherwise moves whole.
+
 `meta.environment` (JSON) records what the frame ran on: the adapter (description, vendor, device, subsystem and
 revision ids, LUID, video memory, whether it is a software adapter), its driver version as DXGI reports it and the
 user-mode driver the kernel names (path and file version), the Windows version with its update build revision and

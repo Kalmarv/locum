@@ -62,6 +62,15 @@ impl Shape {
         })
     }
 
+    /// A buffer's one subresource: from its size where it passes 4 GiB, which its width cannot say.
+    fn buffer(&self) -> Vec<locum_capture::layout::Sub> {
+        if self.bytes > u64::from(u32::MAX) {
+            locum_capture::layout::buffer_of(self.bytes)
+        } else {
+            locum_capture::layout::buffer(self.width)
+        }
+    }
+
     pub fn cube(&self) -> bool {
         self.misc & 4 != 0
     }
@@ -70,7 +79,7 @@ impl Shape {
     /// one image a sample.
     pub fn subs(&self) -> Vec<locum_capture::layout::Sub> {
         if self.kind == "buffer" {
-            return locum_capture::layout::buffer(self.width);
+            return self.buffer();
         }
         if self.samples > 1 {
             return locum_capture::layout::multisampled(
@@ -89,7 +98,7 @@ impl Shape {
     /// of a multisampled texture, its resolve.
     pub fn resolved_subs(&self) -> Vec<locum_capture::layout::Sub> {
         if self.kind == "buffer" {
-            return locum_capture::layout::buffer(self.width);
+            return self.buffer();
         }
         locum_capture::layout::texture(
             self.format,
@@ -490,4 +499,24 @@ pub fn call_args(call: &str, args: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Shape;
+
+    #[test]
+    fn a_buffer_past_4_gib_is_as_long_as_its_size() {
+        let shape = |width: u32, bytes: u64| Shape {
+            kind: "buffer".into(),
+            width,
+            bytes,
+            ..Shape::default()
+        };
+        // 4 GiB: its width column, read as 32 bits, is 0.
+        let big = shape(0, 1 << 32);
+        assert_eq!(locum_capture::layout::total(&big.subs()), 1 << 32);
+        assert_eq!(locum_capture::layout::total(&big.resolved_subs()), 1 << 32);
+        assert_eq!(locum_capture::layout::total(&shape(256, 256).subs()), 256);
+    }
 }

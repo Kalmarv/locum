@@ -38,6 +38,7 @@ mod memory;
 mod pipelines;
 mod queries;
 mod rays;
+mod staging;
 mod views;
 
 use views::Extent;
@@ -235,6 +236,8 @@ pub struct D3d12 {
     fenced: u64,
     /// Buffers the open list copies from or into, kept until it completes.
     kept: Vec<ID3D12Resource>,
+    /// The most bytes one of them holds (see [`staging`]).
+    limit: u64,
     resources: HashMap<i64, Made>,
     /// Mirrors of the game's shader-visible heaps (None for a heap that is not, or could not be made).
     heaps: HashMap<i64, Option<Mirror>>,
@@ -436,6 +439,7 @@ impl D3d12 {
                 fence,
                 fenced: 0,
                 kept: Vec::new(),
+                limit: staging::LIMIT,
                 resources: HashMap::new(),
                 heaps: HashMap::new(),
                 rtvs,
@@ -2221,96 +2225,7 @@ impl Backend for D3d12 {
                 make(&desc).map_err(|e| e.to_string())?
             }
         };
-        name(&resource, format!("#{id}"));
-        let desc = unsafe { resource.GetDesc() };
-        let planes = if locum_capture::format::is_depth_stencil(format) {
-            2
-        } else {
-            1
-        };
-        let extent = Extent {
-            mips: u32::from(desc.MipLevels).max(1),
-            slices: if dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 {
-                1
-            } else {
-                u32::from(desc.DepthOrArraySize).max(1)
-            },
-            planes,
-        };
-        // A multisampled texture's contents are copied through one-sample images of its samples (see
-        // `locum_capture::d3d12::samples`), whose footprints these are.
-        let copied = if samples > 1 {
-            locum_capture::d3d12::samples::images_desc(&desc)
-                .ok_or_else(|| format!("format {format}: its samples cannot be written or read"))?
-        } else {
-            desc
-        };
-        let (placed, footprints, copy_bytes) = if buffer {
-            (Vec::new(), Vec::new(), desc.Width)
-        } else {
-            let count = if samples > 1 {
-                u32::from(copied.DepthOrArraySize) as usize
-            } else {
-                extent.count() as usize
-            };
-            let mut placed = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count];
-            let mut rows = vec![0u32; count];
-            let mut row_bytes = vec![0u64; count];
-            let mut total = 0u64;
-            unsafe {
-                self.device.GetCopyableFootprints(
-                    &copied,
-                    0,
-                    count as u32,
-                    0,
-                    Some(placed.as_mut_ptr()),
-                    Some(rows.as_mut_ptr()),
-                    Some(row_bytes.as_mut_ptr()),
-                    Some(&mut total),
-                )
-            };
-            if total == u64::MAX {
-                return Err("GetCopyableFootprints refused its description".into());
-            }
-            let footprints = placed
-                .iter()
-                .zip(&rows)
-                .zip(&row_bytes)
-                .map(|((p, &rows), &row_bytes)| Footprint {
-                    offset: p.Offset,
-                    row_pitch: p.Footprint.RowPitch,
-                    depth: p.Footprint.Depth,
-                    rows,
-                    row_bytes,
-                })
-                .collect();
-            (placed, footprints, total)
-        };
-        let va = if buffer {
-            unsafe { resource.GetGPUVirtualAddress() }
-        } else {
-            0
-        };
-        // Sample images hold both planes of a texel.
-        let joined = (planes == 2 && samples == 1)
-            .then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes));
-        self.resources.insert(
-            id,
-            Made {
-                resource,
-                desc,
-                heap,
-                tracked: !buffer && desc.Flags.0 & SIMULTANEOUS == 0,
-                extent,
-                layout: s.subs(),
-                joined,
-                placed,
-                footprints,
-                copy_bytes,
-                va,
-                from: None,
-            },
-        );
+        self.adopt(id, resource, heap, format, s.subs())?;
         let subs = s.subs();
         // Captures before samples were read (2026-11-06) hold a multisampled texture's resolve.
         if samples > 1 && contents.is_some_and(|b| b.len() as u64 == layout::total(&s.resolved_subs())) {
@@ -2458,51 +2373,83 @@ impl Backend for D3d12 {
         } else {
             None
         };
-        let (readback, p) = self.staging(D3D12_HEAP_TYPE_READBACK, bytes)?;
+        let pieces = self.pieces(id);
+        // What a reserved resource's unmapped tiles hold: zeros.
+        let mut data = vec![0u8; bytes as usize];
         let needs = [self.need_all(id, 0x800)];
-        unsafe {
-            if buffer {
-                self.list.CopyBufferRegion(&readback, 0, &r, 0, bytes);
-            } else {
-                if tracked {
-                    self.barriers(&needs, false);
-                }
-                let source = match &samples {
-                    Some(reader) => {
-                        reader.record(&self.list, &r);
-                        reader.images().clone()
+        let source = match &samples {
+            Some(reader) => {
+                unsafe { reader.record(&self.list, &r) };
+                reader.images().clone()
+            }
+            None => r.clone(),
+        };
+        if tracked {
+            self.barriers(&needs, false);
+        }
+        let last = pieces.len().saturating_sub(1);
+        for (k, piece) in pieces.iter().enumerate() {
+            let (readback, p) = self.staging(D3D12_HEAP_TYPE_READBACK, piece.len)?;
+            for copy in &piece.copies {
+                match copy {
+                    staging::Copy::Buffer { at } => unsafe {
+                        self.list.CopyBufferRegion(&readback, 0, &r, *at, piece.len)
+                    },
+                    staging::Copy::Texture {
+                        sub,
+                        footprint,
+                        y,
+                        z,
+                        whole,
+                    } => {
+                        let dst = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: borrowed(&readback),
+                            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                                PlacedFootprint: *footprint,
+                            },
+                        };
+                        let src = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: borrowed(&source),
+                            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                                SubresourceIndex: *sub,
+                            },
+                        };
+                        let f = &footprint.Footprint;
+                        let band = D3D12_BOX {
+                            left: 0,
+                            top: *y,
+                            front: *z,
+                            right: f.Width,
+                            bottom: y + f.Height,
+                            back: z + f.Depth,
+                        };
+                        let band = (!whole).then_some(&raw const band);
+                        unsafe { self.list.CopyTextureRegion(&dst, 0, 0, 0, &src, band) };
                     }
-                    None => r.clone(),
-                };
-                let m = &self.resources[&id];
-                for (i, f) in m.placed.iter().enumerate() {
-                    let dst = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: borrowed(&readback),
-                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *f },
-                    };
-                    let src = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: borrowed(&source),
-                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            SubresourceIndex: i as u32,
-                        },
-                    };
-                    self.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-                }
-                if tracked {
-                    self.barriers(&needs, true);
                 }
             }
+            if k == last && tracked {
+                self.barriers(&needs, true);
+            }
+            self.flush()?;
+            let staged = unsafe { core::slice::from_raw_parts(p.cast_const(), piece.len as usize) };
+            data[piece.from as usize..(piece.from + piece.len) as usize].copy_from_slice(staged);
+            drop(readback);
         }
-        self.flush()?;
+        if pieces.is_empty() {
+            if tracked {
+                self.barriers(&needs, true);
+            }
+            self.flush()?;
+        }
         drop(samples);
-        let data = unsafe { core::slice::from_raw_parts(p.cast_const(), bytes as usize) };
         let m = &self.resources[&id];
         if buffer {
-            return Ok(data.to_vec());
+            return Ok(data);
         }
-        layout::from_footprints(&m.layout, m.joined, &m.footprints, data)
+        layout::from_footprints(&m.layout, m.joined, &m.footprints, &data)
     }
 
     fn write(&mut self, _c: &Capture, id: i64, contents: &[u8]) -> Result<(), String> {
@@ -2560,6 +2507,123 @@ impl Backend for D3d12 {
 }
 
 impl D3d12 {
+    /// Takes resource `id`, made as `resource` on `heap`, of `format`, whose contents lie in `subs` in the canonical
+    /// layout: where a copy of each subresource lies in a buffer, and its address for a buffer.
+    fn adopt(
+        &mut self,
+        id: i64,
+        resource: ID3D12Resource,
+        heap: Heap,
+        format: u32,
+        subs: Vec<Sub>,
+    ) -> Result<(), String> {
+        let desc = unsafe { resource.GetDesc() };
+        let buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+        let dimension = desc.Dimension.0;
+        let samples = desc.SampleDesc.Count.max(1);
+        name(&resource, format!("#{id}"));
+        let planes = if locum_capture::format::is_depth_stencil(format) {
+            2
+        } else {
+            1
+        };
+        let extent = Extent {
+            mips: u32::from(desc.MipLevels).max(1),
+            slices: if dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D.0 {
+                1
+            } else {
+                u32::from(desc.DepthOrArraySize).max(1)
+            },
+            planes,
+        };
+        // A multisampled texture's contents are copied through one-sample images of its samples (see
+        // `locum_capture::d3d12::samples`), whose footprints these are.
+        let copied = if samples > 1 {
+            locum_capture::d3d12::samples::images_desc(&desc)
+                .ok_or_else(|| format!("format {format}: its samples cannot be written or read"))?
+        } else {
+            desc
+        };
+        let (placed, footprints, copy_bytes) = if buffer {
+            (Vec::new(), Vec::new(), desc.Width)
+        } else {
+            let count = if samples > 1 {
+                u32::from(copied.DepthOrArraySize) as usize
+            } else {
+                extent.count() as usize
+            };
+            let mut placed = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count];
+            let mut rows = vec![0u32; count];
+            let mut row_bytes = vec![0u64; count];
+            let mut total = 0u64;
+            unsafe {
+                self.device.GetCopyableFootprints(
+                    &copied,
+                    0,
+                    count as u32,
+                    0,
+                    Some(placed.as_mut_ptr()),
+                    Some(rows.as_mut_ptr()),
+                    Some(row_bytes.as_mut_ptr()),
+                    Some(&mut total),
+                )
+            };
+            if total == u64::MAX {
+                return Err("GetCopyableFootprints refused its description".into());
+            }
+            let footprints = placed
+                .iter()
+                .zip(&rows)
+                .zip(&row_bytes)
+                .map(|((p, &rows), &row_bytes)| Footprint {
+                    offset: p.Offset,
+                    row_pitch: p.Footprint.RowPitch,
+                    depth: p.Footprint.Depth,
+                    rows,
+                    row_bytes,
+                })
+                .collect();
+            (placed, footprints, total)
+        };
+        let va = if buffer {
+            unsafe { resource.GetGPUVirtualAddress() }
+        } else {
+            0
+        };
+        // Sample images hold both planes of a texel.
+        let joined = (planes == 2 && samples == 1)
+            .then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes));
+        self.resources.insert(
+            id,
+            Made {
+                resource,
+                desc,
+                heap,
+                tracked: !buffer && desc.Flags.0 & SIMULTANEOUS == 0,
+                extent,
+                layout: subs,
+                joined,
+                placed,
+                footprints,
+                copy_bytes,
+                va,
+                from: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// The pieces resource `id`'s contents move in (see [`staging`]): a reserved one's mapped tiles only.
+    fn pieces(&self, id: i64) -> Vec<staging::Piece> {
+        let m = &self.resources[&id];
+        let mapped = self.memory.mapped.get(&id);
+        if m.buffer() {
+            staging::buffer(m.copy_bytes, mapped, self.limit)
+        } else {
+            staging::texture(&m.placed, &m.footprints, mapped, self.limit)
+        }
+    }
+
     /// Writes `contents` (canonical layout) into resource `id`.
     fn put(&mut self, id: i64, contents: &[u8]) -> Result<(), String> {
         let m = self.made(id)?;
@@ -2584,46 +2648,241 @@ impl D3d12 {
         } else {
             None
         };
-        let (upload, p) = self.staging(D3D12_HEAP_TYPE_UPLOAD, bytes)?;
-        let staged = unsafe { core::slice::from_raw_parts_mut(p, bytes as usize) };
+        let pieces = self.pieces(id);
+        // A texture's contents laid out as its copies read them, from which each piece is staged.
+        let laid = if buffer {
+            None
+        } else {
+            let m = &self.resources[&id];
+            let mut laid = vec![0u8; bytes as usize];
+            layout::into_footprints(&m.layout, m.joined, &m.footprints, contents, &mut laid)?;
+            Some(laid)
+        };
+        let laid = laid.as_deref().unwrap_or(contents);
         let needs = [self.need_all(id, 0x400)];
-        unsafe {
-            if buffer {
-                staged[..contents.len()].copy_from_slice(contents);
-                self.list
-                    .CopyBufferRegion(&r, 0, &upload, 0, contents.len() as u64);
-            } else {
-                let m = &self.resources[&id];
-                layout::into_footprints(&m.layout, m.joined, &m.footprints, contents, staged)?;
-                if tracked {
-                    self.barriers(&needs, false);
-                }
-                let target = samples.as_ref().map_or_else(|| r.clone(), |w| w.images().clone());
-                for (i, f) in m.placed.iter().enumerate() {
-                    let dst = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: borrowed(&target),
-                        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                            SubresourceIndex: i as u32,
-                        },
-                    };
-                    let src = D3D12_TEXTURE_COPY_LOCATION {
-                        pResource: borrowed(&upload),
-                        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *f },
-                    };
-                    self.list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-                }
-                if let Some(writer) = &samples {
-                    writer.record(&self.list, &r);
-                }
-                if tracked {
-                    self.barriers(&needs, true);
+        let target = samples.as_ref().map_or_else(|| r.clone(), |w| w.images().clone());
+        if tracked {
+            self.barriers(&needs, false);
+        }
+        let last = pieces.len().saturating_sub(1);
+        for (k, piece) in pieces.iter().enumerate() {
+            let (upload, p) = self.staging(D3D12_HEAP_TYPE_UPLOAD, piece.len)?;
+            let staged = unsafe { core::slice::from_raw_parts_mut(p, piece.len as usize) };
+            staged.copy_from_slice(&laid[piece.from as usize..(piece.from + piece.len) as usize]);
+            for copy in &piece.copies {
+                match copy {
+                    staging::Copy::Buffer { at } => unsafe {
+                        self.list.CopyBufferRegion(&r, *at, &upload, 0, piece.len)
+                    },
+                    staging::Copy::Texture {
+                        sub, footprint, y, z, ..
+                    } => {
+                        let dst = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: borrowed(&target),
+                            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                                SubresourceIndex: *sub,
+                            },
+                        };
+                        let src = D3D12_TEXTURE_COPY_LOCATION {
+                            pResource: borrowed(&upload),
+                            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                                PlacedFootprint: *footprint,
+                            },
+                        };
+                        unsafe { self.list.CopyTextureRegion(&dst, 0, *y, *z, &src, None) };
+                    }
                 }
             }
+            if k < last {
+                self.flush()?;
+            }
+        }
+        if let Some(writer) = &samples {
+            unsafe { writer.record(&self.list, &r) };
+        }
+        if tracked {
+            self.barriers(&needs, true);
         }
         let ran = self.flush();
         drop(samples);
         ran
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn committed(device: &ID3D12Device2, desc: &D3D12_RESOURCE_DESC) -> ID3D12Resource {
+        let mut r: Option<ID3D12Resource> = None;
+        unsafe {
+            device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                desc,
+                COMMON,
+                None,
+                &mut r,
+            )
+        }
+        .unwrap();
+        r.unwrap()
+    }
+
+    fn texture(
+        dimension: D3D12_RESOURCE_DIMENSION,
+        format: DXGI_FORMAT,
+        size: [u32; 3],
+        mips: u16,
+    ) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: dimension,
+            Width: u64::from(size[0]),
+            Height: size[1],
+            DepthOrArraySize: size[2] as u16,
+            MipLevels: mips,
+            Format: format,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        }
+    }
+
+    fn pattern(len: u64) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    /// Contents larger than one staging buffer go to the GPU and come back in pieces, as written: a buffer, a
+    /// block-compressed texture with mips (bands of rows), a volume (bands of slices); a reserved buffer's mapped tiles
+    /// only, its unmapped ones read as zeros.
+    #[test]
+    fn contents_larger_than_a_staging_buffer_go_and_come_back_in_pieces() {
+        let mut d = D3d12::new(true, super::super::Validation::Off).unwrap();
+        d.limit = 4096;
+
+        let bytes = 65539;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let buffer = committed(&d.device, &desc);
+        d.adopt(1, buffer, Heap::Default, 0, layout::buffer_of(bytes))
+            .unwrap();
+        assert!(d.pieces(1).len() > 16);
+        let contents = pattern(bytes);
+        d.put(1, &contents).unwrap();
+        assert_eq!(d.read(1).unwrap(), contents, "the buffer");
+
+        let bc1 = texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            DXGI_FORMAT_BC1_UNORM,
+            [256, 200, 1],
+            3,
+        );
+        let subs = layout::texture(DXGI_FORMAT_BC1_UNORM.0 as u32, 256, 200, 1, 3, 1).unwrap();
+        let contents = pattern(layout::total(&subs));
+        d.adopt(
+            2,
+            committed(&d.device, &bc1),
+            Heap::Default,
+            DXGI_FORMAT_BC1_UNORM.0 as u32,
+            subs,
+        )
+        .unwrap();
+        d.put(2, &contents).unwrap();
+        assert_eq!(d.read(2).unwrap(), contents, "the block-compressed texture");
+
+        let volume = texture(
+            D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            [32, 16, 8],
+            1,
+        );
+        let subs = layout::texture(DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 32, 16, 8, 1, 1).unwrap();
+        let contents = pattern(layout::total(&subs));
+        d.adopt(
+            3,
+            committed(&d.device, &volume),
+            Heap::Default,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            subs,
+        )
+        .unwrap();
+        d.put(3, &contents).unwrap();
+        assert_eq!(d.read(3).unwrap(), contents, "the volume");
+
+        // Four tiles, the first and third mapped.
+        let tiles = 4 * locum_capture::tiles::TILE_BYTES;
+        let reserved = D3D12_RESOURCE_DESC { Width: tiles, ..desc };
+        let mut r: Option<ID3D12Resource> = None;
+        unsafe { d.device.CreateReservedResource(&reserved, COMMON, None, &mut r) }.unwrap();
+        let r = r.unwrap();
+        let mut heap: Option<ID3D12Heap> = None;
+        unsafe {
+            d.device.CreateHeap(
+                &D3D12_HEAP_DESC {
+                    SizeInBytes: 2 * locum_capture::tiles::TILE_BYTES,
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    ..Default::default()
+                },
+                &mut heap,
+            )
+        }
+        .unwrap();
+        let heap = heap.unwrap();
+        let starts = [0u32, 2].map(|x| D3D12_TILED_RESOURCE_COORDINATE {
+            X: x,
+            ..Default::default()
+        });
+        let (offsets, counts) = ([0u32, 1], [1u32, 1]);
+        unsafe {
+            d.queue.UpdateTileMappings(
+                &r,
+                2,
+                Some(starts.as_ptr()),
+                None,
+                &heap,
+                2,
+                None,
+                Some(offsets.as_ptr()),
+                Some(counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            )
+        };
+        let tiled = locum_capture::tiles::d3d12(&r).unwrap();
+        d.memory.mapped.insert(
+            4,
+            staging::Mapped {
+                layout: tiled,
+                tiles: [0, 2].into(),
+            },
+        );
+        d.adopt(4, r, Heap::Default, 0, layout::buffer_of(tiles)).unwrap();
+        let contents = pattern(tiles);
+        d.put(4, &contents).unwrap();
+        let read = d.read(4).unwrap();
+        let tile = locum_capture::tiles::TILE_BYTES as usize;
+        for (t, (got, put)) in read.chunks(tile).zip(contents.chunks(tile)).enumerate() {
+            if t % 2 == 0 {
+                assert_eq!(got, put, "mapped tile {t}");
+            } else {
+                assert!(got.iter().all(|&b| b == 0), "unmapped tile {t}");
+            }
+        }
+        drop(heap);
     }
 }
