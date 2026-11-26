@@ -1161,8 +1161,7 @@ mod pieces {
 
     /// The key of a buffer stored as `pieces`: of their keys and sizes, in order.
     pub(super) fn key(pieces: &[(String, u64)]) -> String {
-        let named: String = pieces.iter().map(|(k, n)| format!("{k} {n}\n")).collect();
-        locum_capture::hash::key(format!("pieces\n{named}").as_bytes())
+        locum_capture::blobs::pieces_key(pieces)
     }
 }
 

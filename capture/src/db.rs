@@ -420,6 +420,8 @@ pub struct Capture {
     pub missing_targets: Vec<MissingTarget>,
     pub results: Vec<Output>,
     pub gaps: Vec<Gap>,
+    /// What a tool beside the application said of its memory (see [`crate::sidecar`]).
+    pub sidecar: Option<crate::sidecar::Captured>,
 }
 
 impl Capture {
@@ -702,6 +704,9 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
     if let Some(frame) = &capture.d3d12 {
         frame.write(&tx)?;
         crate::d3d12::write_draw_descriptors(&tx, &capture.draw_descriptors)?;
+    }
+    if let Some(sidecar) = &capture.sidecar {
+        crate::sidecar::write(&tx, sidecar)?;
     }
     tx.commit()?;
     drop(db);

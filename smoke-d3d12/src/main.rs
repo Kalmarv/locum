@@ -23,6 +23,7 @@ mod reserved;
 mod results;
 mod sample_values;
 mod samples;
+mod sidecar;
 
 fn identity<T: Interface, U: Interface>(a: &T, b: &U) {
     assert_eq!(
@@ -615,6 +616,7 @@ unsafe fn run() {
         }
         big::capture(&device, &queue, &fence, &chain, 200);
         behind_wait::capture(&device, &queue, &fence, &chain, 210);
+        sidecar::capture(&device, &queue, &fence, &chain, 220);
         chain
             .ResizeBuffers(2, 64, 64, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SWAP_CHAIN_FLAG(0))
             .unwrap();

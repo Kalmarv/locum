@@ -21,6 +21,7 @@ mod replay;
 mod resources;
 mod runtime;
 mod shaders;
+mod sidecar;
 mod states;
 mod store;
 mod table;
@@ -204,6 +205,19 @@ enum Command {
         /// Only registers the program reads.
         #[arg(long)]
         read: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What a tool beside the application (a translation layer's diagnostic) said of its memory as the capture was
+    /// written, from its sidecar file: the regions it had copied, the ranges the GPU sees, and each descriptor the
+    /// application wrote, found in the frame's buffers and checked against the capture's bytes there (matched,
+    /// differs, no-contents, no-buffer, not-visible). A flag names one resolving to no bytes or address 0 (empty) or
+    /// to memory no visible range holds (outside).
+    Sidecar {
+        capture: String,
+        /// Only descriptors with a flag.
+        #[arg(long)]
+        flagged: bool,
         #[arg(long)]
         json: bool,
     },
@@ -910,6 +924,11 @@ fn run(cli: Cli) -> Result<(), String> {
             },
             json,
         ),
+        Command::Sidecar {
+            capture,
+            flagged,
+            json,
+        } => sidecar::sidecar(&open(&capture)?, flagged, json),
         Command::Constants {
             captures,
             name,

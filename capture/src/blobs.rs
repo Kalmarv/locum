@@ -97,6 +97,26 @@ fn encode(bytes: &[u8]) -> io::Result<(std::borrow::Cow<'_, [u8]>, Codec)> {
 /// The key of a piece of a pieced blob that is zeros, stored nowhere.
 pub const ZEROS: &str = "-";
 
+/// A key for a pieced blob of `pieces`: of their keys and sizes, in order.
+pub fn pieces_key(pieces: &[(String, u64)]) -> String {
+    let named: String = pieces
+        .iter()
+        .map(|(k, n)| {
+            format!(
+                "{k} {n}
+"
+            )
+        })
+        .collect();
+    crate::hash::key(
+        format!(
+            "pieces
+{named}"
+        )
+        .as_bytes(),
+    )
+}
+
 /// The stored form of a pieced blob's list: a line `<key> <size>` per piece, in order.
 fn manifest(pieces: &[(String, u64)]) -> Vec<u8> {
     pieces

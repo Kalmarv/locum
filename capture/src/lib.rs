@@ -18,6 +18,7 @@ pub mod maps;
 pub mod rdef;
 pub mod rules;
 pub mod samples;
+pub mod sidecar;
 pub mod stacks;
 pub mod texels;
 pub mod tiles;

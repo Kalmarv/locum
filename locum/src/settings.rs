@@ -41,6 +41,11 @@ pub struct Settings {
     /// (`readback-budget-mb`, 1024 by default, 64 to 65536). Copies behind a wait the application signals later hold
     /// theirs until it does: a frame that first uses more than this behind one gives up the rest after a while.
     pub readback_budget: u64,
+    /// The sidecar a tool beside the game may write (`sidecar`, `sidecar.txt` in locum's folder by default; see
+    /// `locum_capture::sidecar`), and the bytes of memory its regions may copy into one capture (`sidecar-region-mb`,
+    /// 4096 by default).
+    pub sidecar: PathBuf,
+    pub sidecar_regions: u64,
 }
 
 pub fn settings() -> &'static Settings {
@@ -56,6 +61,8 @@ pub fn settings() -> &'static Settings {
             crash_av_rvas: Vec::new(),
             readback_chunk: 256 << 20,
             readback_budget: 1 << 30,
+            sidecar: dir.join("sidecar.txt"),
+            sidecar_regions: 4 << 30,
         };
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.txt")) {
             for (n, line) in text.lines().enumerate() {
@@ -103,6 +110,14 @@ pub fn settings() -> &'static Settings {
                         Ok(mb @ 64..=65536) => s.readback_budget = mb << 20,
                         _ => log!(
                             "settings.txt line {}: readback-budget-mb {value:?} is not 64 to 65536: ignored",
+                            n + 1
+                        ),
+                    },
+                    "sidecar" => s.sidecar = PathBuf::from(value),
+                    "sidecar-region-mb" => match value.parse::<u64>() {
+                        Ok(mb) => s.sidecar_regions = mb << 20,
+                        _ => log!(
+                            "settings.txt line {}: sidecar-region-mb {value:?} is not a number: ignored",
                             n + 1
                         ),
                     },

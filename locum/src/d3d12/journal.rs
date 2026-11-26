@@ -1244,6 +1244,10 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                 }
                 prepared.contents(&mut capture, &crate::settings::settings().blobs);
                 capture.d3d12 = Some(prepared);
+                if let Some((from, sidecar)) = crate::sidecar::captured(&crate::settings::settings().blobs) {
+                    capture.meta("sidecar", from);
+                    capture.sidecar = Some(sidecar);
+                }
                 let file = path.join("capture.db");
                 let result = std::fs::create_dir_all(&path)
                     .map_err(|e| e.to_string())

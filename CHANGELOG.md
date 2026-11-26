@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- A sidecar: a tool beside the game (a translation layer's diagnostic) can write `sidecar.txt` in locum's folder
+  (settings.txt `sidecar FILE` names another) to tell locum of the game's memory outside the graphics API: `region`
+  lines name memory to copy into the capture (read as the capture is written, a pieced blob with pages of zeros or
+  that could not be read stored nowhere; `sidecar-region-mb`, 4096 by default, caps them), `visible` lines the ranges
+  the GPU sees and at which GPU address, and `descriptor` lines descriptors the game wrote, as the tool resolved them.
+  locum decodes none of it. Tables `sidecar_regions`, `sidecar_visible` and `sidecar_descriptors`; `locum-cli sidecar`
+  finds each descriptor in the frame's buffers, checks the capture's bytes there against its words, and flags one
+  resolving to no bytes (`empty`) or to memory no visible range holds (`outside`).
 - Direct3D 12: lists recorded before the captured frame can copy their passes' targets. A request's `early N` (0 to
   64) instruments the lists reset or made from the Present that reads it and arms the capture N Presents later, for
   games that record their lists a frame or more ahead; `arm-early on` in settings.txt instruments every direct list

@@ -701,6 +701,10 @@ pub(super) fn finish(immediate: &ID3D11DeviceContext4) {
             environment::Api::D3d11,
             true,
         ));
+        if let Some((from, sidecar)) = crate::sidecar::captured(&crate::settings::settings().blobs) {
+            capture.meta("sidecar", from);
+            capture.sidecar = Some(sidecar);
+        }
         let t = std::time::Instant::now();
         match db::write(&path, &capture) {
             Ok(()) => log!(

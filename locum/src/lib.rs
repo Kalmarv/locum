@@ -19,6 +19,7 @@ mod faces;
 mod log;
 mod passthrough;
 mod settings;
+mod sidecar;
 mod system;
 #[cfg(test)]
 mod tests;
