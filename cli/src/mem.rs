@@ -203,6 +203,9 @@ pub struct TimelineArgs {
     /// Opt-in exact-size VidMm allocation lookup for the target PID (e.g. `1792MiB`): prints every alive match (resident, demoted, evicted, or uncommitted) with handle, CpuVisible flag, rundown priority, segment/residency, and CPU/GPU VA ranges, with no top-N cutoff and an explicit zero-match count.
     #[arg(long, value_name = "SIZE")]
     alloc_size: Option<String>,
+    /// Print every exact-size bucket of the PID's alive VidMm allocation histogram (by segment/residency, kind, and priority) and every handle-joined eviction row without top-N truncation.
+    #[arg(long)]
+    alloc_hist: bool,
     #[command(flatten)]
     view: TimelineFilterArgs,
 }
@@ -431,6 +434,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
                 between_presents: args.between_presents || args.frame.is_some(),
                 frame_index: args.frame,
                 alloc_size_bytes,
+                full_alloc_hist: args.alloc_hist,
             };
             let rep = if let Some(ref etl_path) = args.etl {
                 let pid = if args.target.pid.is_some()
