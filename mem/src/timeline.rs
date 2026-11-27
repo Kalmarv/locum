@@ -32,7 +32,9 @@ use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS
 use windows::core::{GUID, HSTRING, PWSTR};
 
 use crate::THREAD_SUSPENDS;
-use crate::etw::{CLASSIC_PAGEFAULT_GUID, DXGKRNL_PROVIDER, SYSTEM_MEMORY_PROVIDER};
+use crate::etw::{
+    CLASSIC_PAGEFAULT_GUID, DXGKRNL_PROVIDER, SYSTEM_MEMORY_PROVIDER, SegmentKind, classify_segment,
+};
 use crate::symbols::Symbolizer;
 use crate::win32::list_processes;
 
@@ -134,8 +136,109 @@ fn is_false(b: &bool) -> bool {
 
 fn parse_ctx_from_queue_label(label: &str) -> Option<u64> {
     let rest = label.strip_prefix("ctx=0x")?;
-    let hex = rest.split('/').next()?;
+    let hex = rest.split(['/', '(']).next()?;
     u64::from_str_radix(hex, 16).ok()
+}
+
+fn parse_seq_from_detail(detail: &str) -> Option<u64> {
+    for tok in detail.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("seq=").or_else(|| tok.strip_prefix("pf="))
+            && let Ok(n) = v.parse::<u64>()
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Classifies WDDM `DXGK_ENGINE_TYPE` + optional `NodeMetadata.FriendlyName` into a short queue kind.
+pub(crate) fn classify_engine_kind(engine_type: Option<u32>, friendly_name: Option<&str>) -> Option<String> {
+    if let Some(name) = friendly_name.map(str::trim).filter(|s| !s.is_empty()) {
+        let low = name.to_ascii_lowercase();
+        if low.contains("compute") {
+            return Some("compute".into());
+        }
+        if low.contains("copy") || low.contains("dma") {
+            return Some("copy".into());
+        }
+        if low.contains("3d") || low.contains("direct") || low.contains("gfx") {
+            return Some("direct".into());
+        }
+        if low.contains("decode") {
+            return Some("video_decode".into());
+        }
+        if low.contains("encode") {
+            return Some("video_encode".into());
+        }
+        if engine_type == Some(0) {
+            let clean: String = low
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            return Some(clean);
+        }
+    }
+    match engine_type {
+        Some(1) => Some("direct".into()),
+        Some(2) => Some("video_decode".into()),
+        Some(3) => Some("video_encode".into()),
+        Some(4) => Some("video_proc".into()),
+        Some(5) => Some("scene_asm".into()),
+        Some(6) => Some("copy".into()),
+        Some(7) => Some("overlay".into()),
+        Some(8) => Some("crypto".into()),
+        Some(9) => Some("video_codec".into()),
+        Some(0) => Some("other".into()),
+        _ => None,
+    }
+}
+
+fn fmt_bytes_short(b: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let bf = b as f64;
+    if bf >= GIB {
+        format!("{:.2}GiB", bf / GIB)
+    } else if bf >= MIB {
+        format!("{:.1}MiB", bf / MIB)
+    } else if bf >= KIB {
+        format!("{:.1}KiB", bf / KIB)
+    } else {
+        format!("{b}B")
+    }
+}
+
+fn fmt_heap_size_exact(b: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const KIB: u64 = 1024;
+    if b >= MIB && b.is_multiple_of(MIB) {
+        format!("{}MiB", b / MIB)
+    } else if b >= KIB && b.is_multiple_of(KIB) {
+        format!("{}KiB", b / KIB)
+    } else {
+        fmt_bytes_short(b)
+    }
+}
+
+fn read_utf16_le_slice(data: &[u8]) -> String {
+    let mut u16s = Vec::new();
+    let mut i = 0;
+    while i + 1 < data.len() {
+        let w = u16::from_le_bytes([data[i], data[i + 1]]);
+        if w == 0 {
+            break;
+        }
+        u16s.push(w);
+        i += 2;
+    }
+    String::from_utf16_lossy(&u16s)
 }
 
 // ---------------------------------------------------------------------------
@@ -403,12 +506,22 @@ pub struct QueueSummary {
     pub process_name: Option<String>,
     pub node_ordinal: Option<u32>,
     pub engine_type: Option<u32>,
+    /// Resolved hardware engine kind (`direct`, `compute`, `copy`, `video_decode`, ...) from `NodeMetadata` (id=250).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_kind: Option<String>,
     pub packets_started: u64,
     pub packets_completed: u64,
     pub in_flight_at_end: u64,
     pub busy_ms: f64,
     pub busy_pct: f64,
     pub max_packet_ms: f64,
+    /// Canonical present/frame index that the longest packet on this queue belonged to (when known).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_packet_frame: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_packet_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_packet_t_ms: Option<f64>,
     pub fence_signals: u64,
     pub fence_waits: u64,
     /// True in ring-buffer flight dumps when no packet completed in the retained window and `in_flight_at_end == 0`.
@@ -465,10 +578,82 @@ pub struct FrameSummary {
     pub gpu_fence_wait_ms: f64,
     pub os_wait_ms: f64,
     pub paging_events: u64,
+    #[serde(default)]
+    pub paging_bytes: u64,
+    #[serde(default)]
+    pub demote_evict_bytes: u64,
     pub virtual_protect_events: u64,
     pub hard_faults: u64,
     pub presents: u64,
     pub present_event_id: u16,
+}
+
+/// Grouped heap-size bucket for demoted or evicted VidMm allocations.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HeapSizeBucket {
+    pub heap_bytes: u64,
+    pub count: u64,
+    pub total_bytes: u64,
+}
+
+/// VidMm paging, residency, demotion, and eviction throughput summary (clipped to active window).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PagingTimelineSummary {
+    pub local_usage_bytes: Option<u64>,
+    pub local_budget_bytes: Option<u64>,
+    pub over_budget_bytes: u64,
+    pub non_local_usage_bytes: Option<u64>,
+    pub demoted_commitment_start_bytes: Option<u64>,
+    pub demoted_commitment_end_bytes: Option<u64>,
+    pub demoted_commitment_peak_bytes: u64,
+    pub demoted_added_bytes: u64,
+    pub demoted_added_mb_per_sec: f64,
+
+    pub make_resident_calls: u64,
+    pub make_resident_bytes: u64,
+    pub make_resident_mb_per_sec: f64,
+    pub make_resident_dur_ms: f64,
+    pub make_resident_max_ms: f64,
+    pub make_resident_trim_bytes: u64,
+
+    pub evict_count: u64,
+    pub evict_bytes: u64,
+    pub evict_mb_per_sec: f64,
+
+    pub page_in_count: u64,
+    pub page_in_bytes: u64,
+    pub page_in_mb_per_sec: f64,
+    pub demoted_page_in_count: u64,
+    pub demoted_page_in_bytes: u64,
+
+    pub migrate_count: u64,
+    pub migrate_bytes: u64,
+    pub migrate_dur_ms: f64,
+
+    pub demote_xfer_count: u64,
+    pub demote_xfer_bytes: u64,
+    pub demote_xfer_mb_per_sec: f64,
+    pub promote_xfer_count: u64,
+    pub promote_xfer_bytes: u64,
+    pub promote_xfer_mb_per_sec: f64,
+
+    pub paging_pkt_count: u64,
+    pub paging_pkt_gpu_ms: f64,
+    pub paging_pkt_wall_ms: f64,
+
+    pub active_demoted_alloc_count: u64,
+    pub active_demoted_alloc_bytes: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_demoted_heap_sizes: Vec<HeapSizeBucket>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evicted_or_demoted_heap_sizes: Vec<HeapSizeBucket>,
+}
+
+/// Optional present-to-present window slicing (`--between-presents`, `--frame N`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TimelineCutOptions {
+    pub between_presents: bool,
+    pub frame_index: Option<usize>,
 }
 
 /// Per-PID DxgKrnl activity summary (powers `--list-pids` and `pid=all` disambiguation).
@@ -568,6 +753,8 @@ pub struct TimelineReport {
     pub target_exited_at_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_note: Option<String>,
     pub thread_suspends: u64,
     pub ts_unit: String,
     pub qpc_freq_hz: u64,
@@ -593,6 +780,8 @@ pub struct TimelineReport {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pids: Vec<PidActivitySummary>,
     pub queues: Vec<QueueSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paging: Option<PagingTimelineSummary>,
     pub waits: Vec<WaitSummary>,
     pub frames: Vec<FrameSummary>,
     pub top_stacks: Vec<StackSummary>,
@@ -877,8 +1066,70 @@ struct SchemaKey {
 #[derive(Clone, Debug)]
 struct ContextMeta {
     pid: u32,
+    adapter: u64,
     node_ordinal: Option<u32>,
     engine_type: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct AllocMeta {
+    pid: u32,
+    adapter: u64,
+    size: u64,
+    preferred_seg_id: u32,
+    current_seg: Option<u32>,
+    alive: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PendingMakeResident {
+    start_qpc: i64,
+    pid: u32,
+    num_allocs: u64,
+    accum_bytes: u64,
+    raw_stack: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PagingOpKind {
+    MakeResidentCall,
+    MakeResidentAlloc,
+    Evict,
+    PageIn,
+    DemotedPageIn,
+    Migrate,
+    DemoteXfer,
+    PromoteXfer,
+    PagingPkt,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PagingOpRecord {
+    qpc: i64,
+    pid: u32,
+    kind: PagingOpKind,
+    bytes: u64,
+    heap_size: u64,
+    dur_qpc: i64,
+    gpu_dur_100ns: u64,
+    trim_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum VidMmCounterKind {
+    LocalBudget,
+    LocalUsage,
+    NonLocalUsage,
+    DemotedCommitment,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VidMmCounterSample {
+    qpc: i64,
+    pid: u32,
+    kind: VidMmCounterKind,
+    old_val: u64,
+    new_val: u64,
 }
 
 /// Pre-symbolization timeline event (keeps raw instruction pointers until report finalization).
@@ -913,6 +1164,7 @@ struct PendingFenceWait {
 /// `(total_count, measured_count, total_ms, max_ms, waker_counts, stack_counts)`
 type WaitAccEntry = (u64, u64, f64, f64, HashMap<u32, u64>, HashMap<String, u64>);
 type InFlightWaitPkt = (i64, u32, u32, u64, u64);
+type PendingPagingPkt = (i64, u32, u32, u64, u32);
 
 /// Stateful streaming QPC timeline builder used by both offline `.etl` parsing and the live 10s flight ring.
 pub(crate) struct TimelineBuilder {
@@ -937,6 +1189,12 @@ pub(crate) struct TimelineBuilder {
 
     // Persistent ownership maps (kept across ring evictions)
     device_pid: HashMap<u64, u32>,
+    device_adapter: HashMap<u64, u64>,
+    node_meta: HashMap<(u64, u32), (u32, String)>,
+    node_meta_by_ordinal: HashMap<u32, (u32, String)>,
+    segments: HashMap<(u64, u32), SegmentKind>,
+    alloc_to_global: HashMap<u64, u64>,
+    allocs: HashMap<u64, AllocMeta>,
     context_meta: HashMap<u64, ContextMeta>,
     hwqueue_ctx: HashMap<u64, u64>,
     /// `pDxgSyncObject` / `KMTHandle` -> canonical `VidSchSyncObject` (from DxgKrnl id=1070)
@@ -951,6 +1209,12 @@ pub(crate) struct TimelineBuilder {
     in_flight_dma_pkts: HashMap<(u64, u64), (i64, u32, u32)>,
     /// `(hHwQueue, progress_fence)` -> `(start_qpc, pid, tid)` for HAGS DmaPacket (450->451)
     in_flight_hwq_pkts: HashMap<(u64, u64), (i64, u32, u32)>,
+    /// Pending `MakeResident` (`338` -> `339`) keyed by `tid`
+    pending_make_resident: HashMap<u32, PendingMakeResident>,
+    /// Pending `MigrateAllocation` (`47` -> `49`) keyed by `hAllocationGlobalHandle`
+    pending_migrate: HashMap<u64, (i64, u32, u32, u64)>,
+    /// Pending `PagingQueuePacket` (`322`/`323` -> `325`) keyed by `(PagingQueue, SequenceId)`
+    pending_paging_pkts: HashMap<(u64, u64), PendingPagingPkt>,
     /// Pending CPU fence waits keyed by kernel `Event` pointer (`297` -> `300`)
     pending_cpu_waits_by_event: HashMap<u64, PendingFenceWait>,
     /// Pending CPU/GPU fence waits keyed by canonical `sync_obj` (`297`/`100`/`295`/`231` -> `300`/`550`/`551`/`294`/`296`/`245+180`)
@@ -980,8 +1244,9 @@ pub(crate) struct TimelineBuilder {
     pid_tid_submits: HashMap<(u32, u32), u64>,
 
     // Compact full-trace accumulators (used in offline / non-ring mode so 9M+ event ETLs never lose summary accuracy!)
-    full_gpu_spans: Vec<(i64, i64, u32, u64)>,
-    /// `(start_qpc, end_qpc, pid, tid, kind_code)` where `0=cpu_fence, 1=gpu_fence, 2=cswitch`
+    /// `(start_qpc, end_qpc, pid, ctx, seq)`
+    full_gpu_spans: Vec<(i64, i64, u32, u64, u64)>,
+    /// `(start_qpc, end_qpc, pid, tid, kind_code)` where `0=cpu_fence, 1=gpu_fence, 2=cswitch, 3=vidmm_make_resident`
     full_wait_spans: Vec<(i64, i64, u32, u32, u8)>,
     /// `(qpc, pid, event_id)` for canonical Present deduplication
     full_present_marks: Vec<(i64, u32, u16)>,
@@ -989,6 +1254,10 @@ pub(crate) struct TimelineBuilder {
     full_aux_marks: Vec<(i64, u32, u8)>,
     full_wait_acc: BTreeMap<(u32, String), WaitAccEntry>,
     full_measured_waits: u64,
+    /// Structured paging/eviction/demotion records (evicted with ring in flight mode; full in timeline mode).
+    paging_ops: VecDeque<PagingOpRecord>,
+    /// Per-process VidMm budget/usage/demoted-commitment samples (366/367/370/371).
+    vidmm_samples: VecDeque<VidMmCounterSample>,
 
     pub raw_events: VecDeque<RawTimelineEvent>,
     /// Optional ring capacity (`None` = keep up to 200k EV events; `Some(ring_qpc_window)` = evict older).
@@ -1026,6 +1295,12 @@ impl TimelineBuilder {
             saw_sysmem: false,
             saw_kmem: false,
             device_pid: HashMap::new(),
+            device_adapter: HashMap::new(),
+            node_meta: HashMap::new(),
+            node_meta_by_ordinal: HashMap::new(),
+            segments: HashMap::new(),
+            alloc_to_global: HashMap::new(),
+            allocs: HashMap::new(),
             context_meta: HashMap::new(),
             hwqueue_ctx: HashMap::new(),
             sync_alias: HashMap::new(),
@@ -1034,6 +1309,9 @@ impl TimelineBuilder {
             in_flight_sig_pkts: HashMap::new(),
             in_flight_dma_pkts: HashMap::new(),
             in_flight_hwq_pkts: HashMap::new(),
+            pending_make_resident: HashMap::new(),
+            pending_migrate: HashMap::new(),
+            pending_paging_pkts: HashMap::new(),
             pending_cpu_waits_by_event: HashMap::new(),
             pending_waits_by_sync: HashMap::new(),
             off_cpu_threads: HashMap::new(),
@@ -1057,6 +1335,8 @@ impl TimelineBuilder {
             full_aux_marks: Vec::new(),
             full_wait_acc: BTreeMap::new(),
             full_measured_waits: 0,
+            paging_ops: VecDeque::new(),
+            vidmm_samples: VecDeque::new(),
             raw_events: VecDeque::new(),
             ring_window_qpc: None,
             max_retained_events: 200_000,
@@ -1155,6 +1435,70 @@ impl TimelineBuilder {
             .entry(key)
             .or_insert_with(|| CachedSchema::from_record(rec).map(Arc::new))
             .clone()
+    }
+
+    fn resolve_context_meta(&self, ctx: u64) -> Option<&ContextMeta> {
+        self.context_meta
+            .get(&ctx)
+            .or_else(|| self.hwqueue_ctx.get(&ctx).and_then(|p| self.context_meta.get(p)))
+    }
+
+    fn resolve_engine_kind(&self, ctx: u64) -> (Option<u32>, Option<u32>, Option<String>) {
+        let Some(m) = self.resolve_context_meta(ctx) else {
+            return (None, None, None);
+        };
+        let node = m.node_ordinal;
+        let meta = node.and_then(|n| {
+            if m.adapter != 0 {
+                self.node_meta.get(&(m.adapter, n))
+            } else {
+                None
+            }
+            .or_else(|| self.node_meta_by_ordinal.get(&n))
+        });
+        let etype = meta.map(|(et, _)| *et).or(m.engine_type);
+        let fname = meta.map(|(_, nm)| nm.as_str());
+        let kind = classify_engine_kind(etype, fname);
+        (node, etype, kind)
+    }
+
+    fn segment_kind(&self, adapter: u64, seg_id: u32) -> SegmentKind {
+        if seg_id == 0 {
+            return SegmentKind::NonLocalHost;
+        }
+        if adapter != 0
+            && let Some(&k) = self.segments.get(&(adapter, seg_id))
+        {
+            return k;
+        }
+        for (&(_, sid), &k) in &self.segments {
+            if sid == seg_id {
+                return k;
+            }
+        }
+        SegmentKind::Unknown
+    }
+
+    fn push_paging_op(&mut self, rec: PagingOpRecord) {
+        self.paging_ops.push_back(rec);
+        if let Some(win) = self.ring_window_qpc
+            && let Some(end) = self.end_qpc
+        {
+            let cutoff = end.saturating_sub(win);
+            while self.paging_ops.len() > self.max_retained_events
+                || self.paging_ops.front().is_some_and(|o| o.qpc < cutoff)
+            {
+                self.paging_ops.pop_front();
+            }
+        }
+    }
+
+    fn push_vidmm_sample(&mut self, sample: VidMmCounterSample) {
+        self.vidmm_samples.push_back(sample);
+        // Keep last 50k samples in ring mode so baseline counters stay available.
+        if self.ring_window_qpc.is_some() && self.vidmm_samples.len() > 50_000 {
+            self.vidmm_samples.pop_front();
+        }
     }
 
     fn queue_label(&self, ctx: u64) -> String {
@@ -1527,11 +1871,17 @@ impl TimelineBuilder {
         let id = rec.EventHeader.EventDescriptor.Id;
         if !matches!(
             id,
-            27..=32
+            27..=38
                 | 47
+                | 49
+                | 50
+                | 53
+                | 67
                 | 71
                 | 73
                 | 74
+                | 78
+                | 80
                 | 100
                 | 101
                 | 171
@@ -1539,17 +1889,24 @@ impl TimelineBuilder {
                 | 178
                 | 180
                 | 184
+                | 227
                 | 230
                 | 231
                 | 242
                 | 244
                 | 245
+                | 250
                 | 294..=297
                 | 300
-                | 320
-                | 321
+                | 306
+                | 320..=323
+                | 325
                 | 338
-                | 374
+                | 339
+                | 366
+                | 367
+                | 370
+                | 371
                 | 422..=424
                 | 450
                 | 451
@@ -1582,13 +1939,19 @@ impl TimelineBuilder {
             // Device Start/Stop/DC_Start
             27..=29 => {
                 let hdev = schema.get_u64(data, "hDevice").unwrap_or(0);
+                let adapter = schema.get_u64(data, "pDxgAdapter").unwrap_or(0);
                 let pid = schema
                     .get_any_u64(data, &["hProcessId", "ProcessId"])
                     .map(|v| v as u32)
                     .filter(|&p| p != 0)
                     .unwrap_or(hdr_pid);
-                if hdev != 0 && pid != 0 {
-                    self.device_pid.insert(hdev, pid);
+                if hdev != 0 {
+                    if pid != 0 {
+                        self.device_pid.insert(hdev, pid);
+                    }
+                    if adapter != 0 {
+                        self.device_adapter.insert(hdev, adapter);
+                    }
                 }
             }
             // Context Start/Stop/DC_Start
@@ -1597,6 +1960,11 @@ impl TimelineBuilder {
                     .get_any_u64(data, &["hContext", "pDxgContext"])
                     .unwrap_or(0);
                 let hdev = schema.get_u64(data, "hDevice").unwrap_or(0);
+                let adapter = if hdev != 0 {
+                    self.device_adapter.get(&hdev).copied().unwrap_or(0)
+                } else {
+                    0
+                };
                 let mut pid = schema
                     .get_any_u64(data, &["hProcessId", "ProcessId"])
                     .map(|v| v as u32)
@@ -1610,9 +1978,7 @@ impl TimelineBuilder {
                 let node = schema
                     .get_any_u64(data, &["NodeOrdinal", "ulNodeOrdinal"])
                     .map(|v| v as u32);
-                let engine = schema
-                    .get_any_u64(data, &["ContextType", "EngineAffinity"])
-                    .map(|v| v as u32);
+                let engine = schema.get_any_u64(data, &["ContextType"]).map(|v| v as u32);
                 if hctx != 0 {
                     if id == 31 {
                         // Context Stop: clear any orphaned in-flight packets on the destroyed context.
@@ -1625,23 +1991,244 @@ impl TimelineBuilder {
                         hctx,
                         ContextMeta {
                             pid,
+                            adapter,
                             node_ordinal: node,
                             engine_type: engine,
                         },
                     );
                 }
             }
-            // HwQueue Start/Stop/DC_Start
+            // NodeMetadata (250): maps (pDxgAdapter, NodeOrdinal) -> (EngineType, FriendlyName)
+            250 => {
+                let adapter = schema.get_u64(data, "pDxgAdapter").unwrap_or(0);
+                let node = schema.get_u64(data, "NodeOrdinal").unwrap_or(0) as u32;
+                let etype = schema.get_u64(data, "EngineType").unwrap_or(0) as u32;
+                let ptr_sz = if (rec.EventHeader.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER as u16) != 0 {
+                    4usize
+                } else {
+                    8usize
+                };
+                let name_off = ptr_sz + 8;
+                let fname = if data.len() > name_off {
+                    read_utf16_le_slice(&data[name_off..])
+                } else {
+                    String::new()
+                };
+                if adapter != 0 {
+                    self.node_meta.insert((adapter, node), (etype, fname.clone()));
+                }
+                self.node_meta_by_ordinal.entry(node).or_insert((etype, fname));
+            }
+            // ReportSegment (78): classifies Local VRAM vs NonLocal/Shared segments
+            78 => {
+                let seg_id = schema.get_u64(data, "ulSegmentId").unwrap_or(0) as u32;
+                let adapter = schema.get_u64(data, "pDxgAdapter").unwrap_or(0);
+                let flags = schema.get_u64(data, "Flags").unwrap_or(0) as u32;
+                let group = schema.get_u64(data, "MemorySegmentGroup").unwrap_or(0) as u8;
+                let kind = classify_segment(flags, group);
+                self.segments.insert((adapter, seg_id), kind);
+            }
+            // AdapterAllocation Start (33) / Stop (34) / DC_Start (35): tracks heap size & preferred segment
+            33..=35 => {
+                let gh = schema.get_u64(data, "hVidMmGlobalAlloc").unwrap_or(0);
+                if gh == 0 {
+                    return;
+                }
+                if id == 34 {
+                    if let Some(a) = self.allocs.get_mut(&gh) {
+                        a.alive = false;
+                    }
+                    return;
+                }
+                let hdev = schema.get_u64(data, "hDevice").unwrap_or(0);
+                let mut pid = schema.get_u64(data, "hProcessId").unwrap_or(0) as u32;
+                if pid == 0 && hdev != 0 {
+                    pid = self.device_pid.get(&hdev).copied().unwrap_or(0);
+                }
+                if pid == 0 && hdr_pid != 4 {
+                    pid = hdr_pid;
+                }
+                let adapter = schema.get_u64(data, "pDxgAdapter").unwrap_or(0);
+                let size = schema.get_u64(data, "allocSize").unwrap_or(0);
+                let pref_id = (schema.get_u64(data, "PreferredSegment").unwrap_or(0) as u32) & 0x1F;
+                let entry = self.allocs.entry(gh).or_insert_with(|| AllocMeta {
+                    pid,
+                    adapter,
+                    size,
+                    preferred_seg_id: pref_id,
+                    current_seg: None,
+                    alive: true,
+                });
+                if pid != 0 {
+                    entry.pid = pid;
+                }
+                if adapter != 0 {
+                    entry.adapter = adapter;
+                }
+                if size != 0 {
+                    entry.size = size;
+                }
+                if pref_id != 0 {
+                    entry.preferred_seg_id = pref_id;
+                }
+                entry.alive = true;
+            }
+            // DeviceAllocation Start (36) / Stop (37) / DC_Start (38): maps hVidMmAlloc -> hVidMmGlobalAlloc
+            36..=38 => {
+                let h_alloc = schema.get_u64(data, "hVidMmAlloc").unwrap_or(0);
+                let gh = schema.get_u64(data, "hVidMmGlobalAlloc").unwrap_or(0);
+                if h_alloc != 0 && gh != 0 {
+                    self.alloc_to_global.insert(h_alloc, gh);
+                }
+                if id != 37 && gh != 0 {
+                    let hdev = schema.get_u64(data, "hDevice").unwrap_or(0);
+                    let mut pid = schema.get_u64(data, "hProcessId").unwrap_or(0) as u32;
+                    if pid == 0 && hdev != 0 {
+                        pid = self.device_pid.get(&hdev).copied().unwrap_or(0);
+                    }
+                    if pid != 0
+                        && let Some(a) = self.allocs.get_mut(&gh)
+                        && a.pid == 0
+                    {
+                        a.pid = pid;
+                    }
+                }
+            }
+            // ReportCommittedAllocation (80) & ReportCommittedGlobalAllocation (227)
+            80 | 227 => {
+                let gh_raw = schema
+                    .get_any_u64(data, &["hGlobalAllocationHandle", "hAllocationHandle"])
+                    .unwrap_or(0);
+                let gh = self.alloc_to_global.get(&gh_raw).copied().unwrap_or(gh_raw);
+                let seg_id = schema.get_u64(data, "ulSegmentId").unwrap_or(0) as u32;
+                let size = schema.get_u64(data, "Size").unwrap_or(0);
+                let pid = schema.get_u64(data, "hProcessId").unwrap_or(0) as u32;
+                if gh != 0 {
+                    let entry = self.allocs.entry(gh).or_insert_with(|| AllocMeta {
+                        pid,
+                        adapter: 0,
+                        size,
+                        preferred_seg_id: 0,
+                        current_seg: Some(seg_id),
+                        alive: true,
+                    });
+                    if entry.pid == 0 && pid != 0 {
+                        entry.pid = pid;
+                    }
+                    if entry.size == 0 && size != 0 {
+                        entry.size = size;
+                    }
+                    entry.current_seg = Some(seg_id);
+                }
+            }
+            // ReserveResource/Start (67): updates allocation's current segment
+            67 => {
+                let seg_id = schema.get_u64(data, "SegmentId").unwrap_or(0) as u32;
+                let gh_raw = schema
+                    .get_any_u64(data, &["hAllocationGlobalHandle", "hGlobalAllocationHandle"])
+                    .unwrap_or(0);
+                let gh = self.alloc_to_global.get(&gh_raw).copied().unwrap_or(gh_raw);
+                if gh != 0
+                    && let Some(a) = self.allocs.get_mut(&gh)
+                {
+                    a.current_seg = Some(seg_id);
+                }
+            }
+            // VidMm per-process budget / usage / demoted commitment counters (366/367/370/371)
+            366 => {
+                let pid = schema.get_u64(data, "ProcessId").unwrap_or(0) as u32;
+                let group = schema.get_u64(data, "MemorySegmentGroup").unwrap_or(0);
+                if pid != 0 && group == 0 && self.matches_pid(pid) {
+                    let new_b = schema.get_u64(data, "NewBudget").unwrap_or(0);
+                    let old_b = schema.get_u64(data, "OldBudget").unwrap_or(0);
+                    self.push_vidmm_sample(VidMmCounterSample {
+                        qpc,
+                        pid,
+                        kind: VidMmCounterKind::LocalBudget,
+                        old_val: old_b,
+                        new_val: new_b,
+                    });
+                }
+            }
+            367 => {
+                let pid = schema.get_u64(data, "ProcessId").unwrap_or(0) as u32;
+                let group = schema.get_u64(data, "MemorySegmentGroup").unwrap_or(0);
+                if pid != 0 && self.matches_pid(pid) {
+                    let new_u = schema.get_u64(data, "NewUsage").unwrap_or(0);
+                    let old_u = schema.get_u64(data, "OldUsage").unwrap_or(0);
+                    self.push_vidmm_sample(VidMmCounterSample {
+                        qpc,
+                        pid,
+                        kind: if group == 0 {
+                            VidMmCounterKind::LocalUsage
+                        } else {
+                            VidMmCounterKind::NonLocalUsage
+                        },
+                        old_val: old_u,
+                        new_val: new_u,
+                    });
+                }
+            }
+            370 => {
+                let pid = schema.get_u64(data, "ProcessId").unwrap_or(0) as u32;
+                if pid != 0 && self.matches_pid(pid) {
+                    let new_c = schema.get_u64(data, "Commitment").unwrap_or(0);
+                    let old_c = schema.get_u64(data, "OldCommitment").unwrap_or(0);
+                    self.push_vidmm_sample(VidMmCounterSample {
+                        qpc,
+                        pid,
+                        kind: VidMmCounterKind::DemotedCommitment,
+                        old_val: old_c,
+                        new_val: new_c,
+                    });
+                    if new_c > old_c {
+                        let delta = new_c - old_c;
+                        self.push_event(RawTimelineEvent {
+                            qpc,
+                            frame: self.current_frame,
+                            pid,
+                            tid: hdr_tid,
+                            kind: TimelineEventKind::Paging,
+                            queue: None,
+                            duration_qpc: None,
+                            detail: format!(
+                                "DemotedCommit +{} (total={})",
+                                fmt_bytes_short(delta),
+                                fmt_bytes_short(new_c)
+                            ),
+                            raw_stack: Vec::new(),
+                            waker_tid: None,
+                            wait_kind: None,
+                        });
+                    }
+                }
+            }
+            371 => {
+                // CommitmentChange observed (kept in whitelist for future use; budget/usage/demoted cover budget state)
+            }
+            // HwQueue Start/Stop/DC_Start (422..=424): links both hHwQueue and ParentDxgHwQueue -> hContext (DxgContext)
             422..=424 => {
                 let hq = schema.get_u64(data, "hHwQueue").unwrap_or(0);
+                let parent_hq = schema.get_u64(data, "ParentDxgHwQueue").unwrap_or(0);
                 let hctx = schema
                     .get_any_u64(data, &["hContext", "hParentContext"])
                     .unwrap_or(0);
-                if hq != 0 && id == 423 {
-                    self.in_flight_hwq_pkts.retain(|&(q, _), _| q != hq);
+                if id == 423 {
+                    if hq != 0 {
+                        self.in_flight_hwq_pkts.retain(|&(q, _), _| q != hq);
+                    }
+                    if parent_hq != 0 {
+                        self.in_flight_hwq_pkts.retain(|&(q, _), _| q != parent_hq);
+                        self.in_flight_queue_pkts.retain(|&(c, _), _| c != parent_hq);
+                    }
                 }
-                if hq != 0 && hctx != 0 {
-                    self.hwqueue_ctx.insert(hq, hctx);
+                if hctx != 0 {
+                    if hq != 0 {
+                        self.hwqueue_ctx.insert(hq, hctx);
+                    }
+                    if parent_hq != 0 {
+                        self.hwqueue_ctx.insert(parent_hq, hctx);
+                    }
                 }
             }
             // SyncObject handle alias map (`pSyncObject`, `KMTHandle`, `pDxgSyncObject`)
@@ -1853,7 +2440,7 @@ impl TimelineBuilder {
                         q.max_packet_ms = dur_ms;
                     }
                     if self.ring_window_qpc.is_none() && dur_qpc > 0 {
-                        self.full_gpu_spans.push((start_qpc, qpc, pid, ctx));
+                        self.full_gpu_spans.push((start_qpc, qpc, pid, ctx, seq));
                     }
                     let qname = self.queue_label(ctx);
                     self.push_event(RawTimelineEvent {
@@ -1915,7 +2502,7 @@ impl TimelineBuilder {
                         }
                     }
                     if self.ring_window_qpc.is_none() && dur_qpc > 0 {
-                        self.full_gpu_spans.push((start_qpc, qpc, pid, ctx));
+                        self.full_gpu_spans.push((start_qpc, qpc, pid, ctx, seq));
                     }
                     let qname = self.queue_label(ctx);
                     self.push_event(RawTimelineEvent {
@@ -1975,7 +2562,7 @@ impl TimelineBuilder {
                         }
                     }
                     if self.ring_window_qpc.is_none() && dur_qpc > 0 {
-                        self.full_gpu_spans.push((start_qpc, qpc, pid, ctx));
+                        self.full_gpu_spans.push((start_qpc, qpc, pid, ctx, pf));
                     }
                     let qname = self.queue_label(ctx);
                     self.push_event(RawTimelineEvent {
@@ -2254,8 +2841,8 @@ impl TimelineBuilder {
                     wait_kind: None,
                 });
             }
-            // VidMm Paging & Residency events (drop id=374 allocation rundown; also skip DC_Start=3 / DC_Stop=4 rundown snapshots)
-            47 | 71 | 73 | 74 | 242 | 320 | 321 | 338 => {
+            // MakeResident Start (338) -> paired with MakeResident Stop (339) for exact duration, bytes & trim!
+            338 => {
                 if matches!(opcode, 3 | 4) {
                     return;
                 }
@@ -2271,33 +2858,485 @@ impl TimelineBuilder {
                 if self.ring_window_qpc.is_none() {
                     self.full_aux_marks.push((qpc, hdr_pid, 0));
                 }
-                let label = match id {
-                    73 => "PageIn",
-                    74 => "Evict",
-                    71 => "AllocFault",
-                    47 => "Migrate",
-                    242 => "ResetBacking",
-                    320 | 338 => "MakeResident",
-                    321 => "VidMmEvict",
-                    _ => "Paging",
-                };
+                let num_allocs = schema.get_u64(data, "NumAllocations").unwrap_or(0);
                 let stack = extract_inline_stack(rec);
-                let is_wait = matches!(id, 320 | 338);
-                if is_wait {
-                    self.record_wait_acc(hdr_tid, "vidmm_make_resident", None, None, true);
+                self.record_wait_acc(hdr_tid, "vidmm_make_resident", None, None, true);
+                self.pending_make_resident.insert(
+                    hdr_tid,
+                    PendingMakeResident {
+                        start_qpc: qpc,
+                        pid: hdr_pid,
+                        num_allocs,
+                        accum_bytes: 0,
+                        raw_stack: stack,
+                    },
+                );
+            }
+            339 => {
+                let trim_bytes = schema.get_u64(data, "NumBytesToTrim").unwrap_or(0);
+                let status = schema.get_u64(data, "Status").unwrap_or(0) as u32;
+                if let Some(mr) = self.pending_make_resident.remove(&hdr_tid) {
+                    let dur_qpc = (qpc - mr.start_qpc).max(0);
+                    if self.ring_window_qpc.is_none() {
+                        self.full_wait_spans.push((mr.start_qpc, qpc, mr.pid, hdr_tid, 3));
+                        self.record_wait_acc(hdr_tid, "vidmm_make_resident", Some(dur_qpc), None, false);
+                    }
+                    self.push_paging_op(PagingOpRecord {
+                        qpc: mr.start_qpc,
+                        pid: mr.pid,
+                        kind: PagingOpKind::MakeResidentCall,
+                        bytes: mr.accum_bytes,
+                        heap_size: 0,
+                        dur_qpc,
+                        gpu_dur_100ns: 0,
+                        trim_bytes,
+                    });
+                    let mut detail = format!("MakeResident allocs={}", mr.num_allocs);
+                    if mr.accum_bytes > 0 {
+                        detail.push_str(&format!(" bytes={}", fmt_bytes_short(mr.accum_bytes)));
+                    }
+                    if trim_bytes > 0 {
+                        detail.push_str(&format!(" trim={}", fmt_bytes_short(trim_bytes)));
+                    }
+                    if status != 0 {
+                        detail.push_str(&format!(" status={status:#x}"));
+                    }
+                    self.push_event(RawTimelineEvent {
+                        qpc: mr.start_qpc,
+                        frame: self.current_frame,
+                        pid: mr.pid,
+                        tid: hdr_tid,
+                        kind: TimelineEventKind::Paging,
+                        queue: None,
+                        duration_qpc: Some(dur_qpc),
+                        detail,
+                        raw_stack: mr.raw_stack,
+                        waker_tid: None,
+                        wait_kind: Some("vidmm_make_resident".into()),
+                    });
                 }
+            }
+            // VidMmMakeResident (320) & VidMmEvict (321): resolve exact allocation heap size via pVidMmAlloc!
+            320 | 321 => {
+                if matches!(opcode, 3 | 4) {
+                    return;
+                }
+                let p_alloc = schema.get_u64(data, "pVidMmAlloc").unwrap_or(0);
+                let gh = self.alloc_to_global.get(&p_alloc).copied().unwrap_or(p_alloc);
+                let (alloc_pid, alloc_size) = self.allocs.get(&gh).map(|a| (a.pid, a.size)).unwrap_or((0, 0));
+                let pid = if alloc_pid != 0 { alloc_pid } else { hdr_pid };
+                if pid != 0 {
+                    let ps = self.bump_pid(pid);
+                    ps.dxg_events += 1;
+                    ps.paging_events += 1;
+                }
+                if !self.matches_pid(pid) && self.filter_pid.is_some() {
+                    return;
+                }
+                self.note_dxg_pid_match(pid, hdr_pid);
+                if id == 320 {
+                    if let Some(mr) = self.pending_make_resident.get_mut(&hdr_tid) {
+                        mr.accum_bytes = mr.accum_bytes.saturating_add(alloc_size);
+                        // Recorded on 339 stop (avoid double-counting); still emit per-alloc EV only if unenclosed.
+                        return;
+                    }
+                    self.push_paging_op(PagingOpRecord {
+                        qpc,
+                        pid,
+                        kind: PagingOpKind::MakeResidentAlloc,
+                        bytes: alloc_size,
+                        heap_size: alloc_size,
+                        dur_qpc: 0,
+                        gpu_dur_100ns: 0,
+                        trim_bytes: 0,
+                    });
+                    if self.ring_window_qpc.is_none() {
+                        self.full_aux_marks.push((qpc, pid, 0));
+                    }
+                    let stack = extract_inline_stack(rec);
+                    self.record_wait_acc(hdr_tid, "vidmm_make_resident", None, None, true);
+                    let detail = if alloc_size > 0 {
+                        format!("MakeResident id=320 heap={}", fmt_bytes_short(alloc_size))
+                    } else {
+                        "MakeResident id=320".into()
+                    };
+                    self.push_event(RawTimelineEvent {
+                        qpc,
+                        frame: self.current_frame,
+                        pid,
+                        tid: hdr_tid,
+                        kind: TimelineEventKind::Paging,
+                        queue: None,
+                        duration_qpc: None,
+                        detail,
+                        raw_stack: stack,
+                        waker_tid: None,
+                        wait_kind: Some("vidmm_make_resident".into()),
+                    });
+                } else {
+                    self.push_paging_op(PagingOpRecord {
+                        qpc,
+                        pid,
+                        kind: PagingOpKind::Evict,
+                        bytes: alloc_size,
+                        heap_size: alloc_size,
+                        dur_qpc: 0,
+                        gpu_dur_100ns: 0,
+                        trim_bytes: 0,
+                    });
+                    if self.ring_window_qpc.is_none() {
+                        self.full_aux_marks.push((qpc, pid, 0));
+                    }
+                    let stack = extract_inline_stack(rec);
+                    let detail = if alloc_size > 0 {
+                        format!("VidMmEvict id=321 heap={}", fmt_bytes_short(alloc_size))
+                    } else {
+                        "VidMmEvict id=321".into()
+                    };
+                    self.push_event(RawTimelineEvent {
+                        qpc,
+                        frame: self.current_frame,
+                        pid,
+                        tid: hdr_tid,
+                        kind: TimelineEventKind::Paging,
+                        queue: None,
+                        duration_qpc: None,
+                        detail,
+                        raw_stack: stack,
+                        waker_tid: None,
+                        wait_kind: None,
+                    });
+                }
+            }
+            // MigrateAllocation Start (47) -> Stop (49): exact duration & heap bytes
+            47 => {
+                if matches!(opcode, 3 | 4) {
+                    return;
+                }
+                let gh = schema.get_u64(data, "hAllocationGlobalHandle").unwrap_or(0);
+                let (alloc_pid, alloc_size) = self.allocs.get(&gh).map(|a| (a.pid, a.size)).unwrap_or((0, 0));
+                let pid = if alloc_pid != 0 { alloc_pid } else { hdr_pid };
+                if !self.matches_pid(pid) && self.filter_pid.is_some() {
+                    return;
+                }
+                self.pending_migrate.insert(gh, (qpc, pid, hdr_tid, alloc_size));
+            }
+            49 => {
+                let gh = schema.get_u64(data, "hAllocationGlobalHandle").unwrap_or(0);
+                if let Some((start_qpc, pid, tid, alloc_size)) = self.pending_migrate.remove(&gh) {
+                    let dur_qpc = (qpc - start_qpc).max(0);
+                    self.note_dxg_pid_match(pid, hdr_pid);
+                    if self.ring_window_qpc.is_none() {
+                        self.full_aux_marks.push((start_qpc, pid, 0));
+                    }
+                    self.push_paging_op(PagingOpRecord {
+                        qpc: start_qpc,
+                        pid,
+                        kind: PagingOpKind::Migrate,
+                        bytes: alloc_size,
+                        heap_size: alloc_size,
+                        dur_qpc,
+                        gpu_dur_100ns: 0,
+                        trim_bytes: 0,
+                    });
+                    let detail = if alloc_size > 0 {
+                        format!("Migrate heap={}", fmt_bytes_short(alloc_size))
+                    } else {
+                        "Migrate".into()
+                    };
+                    self.push_event(RawTimelineEvent {
+                        qpc: start_qpc,
+                        frame: self.current_frame,
+                        pid,
+                        tid,
+                        kind: TimelineEventKind::Paging,
+                        queue: None,
+                        duration_qpc: Some(dur_qpc),
+                        detail,
+                        raw_stack: Vec::new(),
+                        waker_tid: None,
+                        wait_kind: None,
+                    });
+                }
+            }
+            // PagingOpTransfer (53) & PagingOpVirtualTransfer (306): exact VRAM <-> Shared transfer bytes & direction!
+            53 | 306 => {
+                let adapter = schema.get_u64(data, "pDxgAdapter").unwrap_or(0);
+                let gh_raw = schema.get_u64(data, "hAllocationGlobalHandle").unwrap_or(0);
+                let gh = self.alloc_to_global.get(&gh_raw).copied().unwrap_or(gh_raw);
+                let xfer_bytes = schema.get_u64(data, "TransferSize").unwrap_or(0);
+                let src_seg = schema.get_u64(data, "SourceSegmentId").unwrap_or(0) as u32;
+                let dst_seg = schema.get_u64(data, "DestinationSegmentId").unwrap_or(0) as u32;
+                let (alloc_pid, alloc_size, alloc_adap) = self
+                    .allocs
+                    .get(&gh)
+                    .map(|a| (a.pid, a.size, a.adapter))
+                    .unwrap_or((0, 0, 0));
+                let pid = if alloc_pid != 0 { alloc_pid } else { hdr_pid };
+                if !self.matches_pid(pid) && self.filter_pid.is_some() {
+                    return;
+                }
+                let eff_adap = if adapter != 0 { adapter } else { alloc_adap };
+                let src_kind = self.segment_kind(eff_adap, src_seg);
+                let dst_kind = self.segment_kind(eff_adap, dst_seg);
+                let (op_kind, tag) = if src_kind.is_local() && !dst_kind.is_local() {
+                    (PagingOpKind::DemoteXfer, "DemoteXfer(VRAM->Shared)")
+                } else if !src_kind.is_local() && dst_kind.is_local() {
+                    (PagingOpKind::PromoteXfer, "PromoteXfer(Shared->VRAM)")
+                } else {
+                    (PagingOpKind::PromoteXfer, "PagingXfer")
+                };
+                if gh != 0
+                    && let Some(a) = self.allocs.get_mut(&gh)
+                {
+                    a.current_seg = Some(dst_seg);
+                }
+                self.note_dxg_pid_match(pid, hdr_pid);
+                if self.ring_window_qpc.is_none() {
+                    self.full_aux_marks.push((qpc, pid, 0));
+                }
+                self.push_paging_op(PagingOpRecord {
+                    qpc,
+                    pid,
+                    kind: op_kind,
+                    bytes: xfer_bytes,
+                    heap_size: alloc_size.max(xfer_bytes),
+                    dur_qpc: 0,
+                    gpu_dur_100ns: 0,
+                    trim_bytes: 0,
+                });
                 self.push_event(RawTimelineEvent {
                     qpc,
                     frame: self.current_frame,
-                    pid: hdr_pid,
+                    pid,
                     tid: hdr_tid,
                     kind: TimelineEventKind::Paging,
                     queue: None,
                     duration_qpc: None,
-                    detail: format!("{label} id={id}"),
+                    detail: format!(
+                        "{tag} bytes={} heap={} seg={src_seg}->{dst_seg}",
+                        fmt_bytes_short(xfer_bytes),
+                        fmt_bytes_short(alloc_size.max(xfer_bytes))
+                    ),
+                    raw_stack: Vec::new(),
+                    waker_tid: None,
+                    wait_kind: None,
+                });
+            }
+            // MemoryTransfer (50): DMA memory transfer bytes
+            50 => {
+                let gh_raw = schema.get_u64(data, "hAllocationGlobalHandle").unwrap_or(0);
+                let gh = self.alloc_to_global.get(&gh_raw).copied().unwrap_or(gh_raw);
+                let bytes = schema.get_u64(data, "size").unwrap_or(0);
+                let ev_pid = schema.get_u64(data, "hProcessId").unwrap_or(0) as u32;
+                let (alloc_pid, alloc_size) = self.allocs.get(&gh).map(|a| (a.pid, a.size)).unwrap_or((0, 0));
+                let pid = if ev_pid != 0 {
+                    ev_pid
+                } else if alloc_pid != 0 {
+                    alloc_pid
+                } else {
+                    hdr_pid
+                };
+                if !self.matches_pid(pid) && self.filter_pid.is_some() {
+                    return;
+                }
+                self.note_dxg_pid_match(pid, hdr_pid);
+                self.push_paging_op(PagingOpRecord {
+                    qpc,
+                    pid,
+                    kind: PagingOpKind::PromoteXfer,
+                    bytes,
+                    heap_size: alloc_size.max(bytes),
+                    dur_qpc: 0,
+                    gpu_dur_100ns: 0,
+                    trim_bytes: 0,
+                });
+            }
+            // PagingQueuePacket Start (322/323) -> Stop (325): exact GPU ExecutionTime100ns & wall dur!
+            322 | 323 => {
+                let pq = schema.get_u64(data, "PagingQueue").unwrap_or(0);
+                let seq = schema.get_u64(data, "SequenceId").unwrap_or(0);
+                let op_type = schema.get_u64(data, "VidMmOpType").unwrap_or(0) as u32;
+                let hdev = schema.get_u64(data, "DxgDevice").unwrap_or(0);
+                let alloc_raw = schema.get_u64(data, "Alloc").unwrap_or(0);
+                let gh = self.alloc_to_global.get(&alloc_raw).copied().unwrap_or(alloc_raw);
+                let (alloc_pid, alloc_size) = self.allocs.get(&gh).map(|a| (a.pid, a.size)).unwrap_or((0, 0));
+                let pid = if alloc_pid != 0 {
+                    alloc_pid
+                } else if hdev != 0 {
+                    self.device_pid.get(&hdev).copied().unwrap_or(hdr_pid)
+                } else {
+                    hdr_pid
+                };
+                if !self.matches_pid(pid) && self.filter_pid.is_some() {
+                    return;
+                }
+                if pq != 0 {
+                    self.pending_paging_pkts
+                        .insert((pq, seq), (qpc, pid, hdr_tid, alloc_size, op_type));
+                }
+            }
+            325 => {
+                let pq = schema.get_u64(data, "PagingQueue").unwrap_or(0);
+                let seq = schema.get_u64(data, "SequenceId").unwrap_or(0);
+                let exec_100ns = schema.get_u64(data, "ExecutionTime100ns").unwrap_or(0);
+                if let Some((start_qpc, pid, tid, alloc_size, op_type)) =
+                    self.pending_paging_pkts.remove(&(pq, seq))
+                {
+                    let dur_qpc = (qpc - start_qpc).max(0);
+                    self.note_dxg_pid_match(pid, hdr_pid);
+                    self.push_paging_op(PagingOpRecord {
+                        qpc: start_qpc,
+                        pid,
+                        kind: PagingOpKind::PagingPkt,
+                        bytes: alloc_size,
+                        heap_size: alloc_size,
+                        dur_qpc,
+                        gpu_dur_100ns: exec_100ns,
+                        trim_bytes: 0,
+                    });
+                    if dur_qpc > (self.qpc_freq_hz as i64) / 2000 || exec_100ns >= 1000 {
+                        let gpu_ms = exec_100ns as f64 / 10_000.0;
+                        let heap_s = if alloc_size > 0 {
+                            format!(" heap={}", fmt_bytes_short(alloc_size))
+                        } else {
+                            String::new()
+                        };
+                        self.push_event(RawTimelineEvent {
+                            qpc: start_qpc,
+                            frame: self.current_frame,
+                            pid,
+                            tid,
+                            kind: TimelineEventKind::Paging,
+                            queue: None,
+                            duration_qpc: Some(dur_qpc),
+                            detail: format!("PagingPkt op={op_type} gpu_dur={gpu_ms:.3}ms{heap_s}"),
+                            raw_stack: Vec::new(),
+                            waker_tid: None,
+                            wait_kind: None,
+                        });
+                    }
+                }
+            }
+            // Handle-keyed VidMm Paging events: PageIn (73), Evict (74), AllocFault (71), ResetBacking (242)
+            // Resolve owning PID and exact heap size from `allocs` (these often run on kernel worker pid=4!).
+            71 | 73 | 74 | 242 => {
+                if matches!(opcode, 3 | 4) {
+                    return;
+                }
+                let raw_h = match id {
+                    73 => schema.get_u64(data, "hAllocationHandle").unwrap_or(0),
+                    74 | 242 => schema.get_u64(data, "hGlobalAllocationHandle").unwrap_or(0),
+                    _ => schema
+                        .get_any_u64(data, &["hAllocationHandle", "pVidMmGlobalAlloc"])
+                        .unwrap_or(0),
+                };
+                let gh = self.alloc_to_global.get(&raw_h).copied().unwrap_or(raw_h);
+                let (alloc_pid, alloc_size, alloc_adap, pref_seg) = self
+                    .allocs
+                    .get(&gh)
+                    .map(|a| (a.pid, a.size, a.adapter, a.preferred_seg_id))
+                    .unwrap_or((0, 0, 0, 0));
+                let pid = if alloc_pid != 0 { alloc_pid } else { hdr_pid };
+                if pid != 0 {
+                    let ps = self.bump_pid(pid);
+                    ps.dxg_events += 1;
+                    ps.paging_events += 1;
+                }
+                if !self.matches_pid(pid) && self.filter_pid.is_some() {
+                    return;
+                }
+                self.note_dxg_pid_match(pid, hdr_pid);
+                if self.ring_window_qpc.is_none() {
+                    self.full_aux_marks.push((qpc, pid, 0));
+                }
+                let detail = match id {
+                    73 => {
+                        let seg_opt = schema.get_u64(data, "uiSegmentId").map(|v| v as u32);
+                        if let Some(s) = seg_opt
+                            && let Some(a) = self.allocs.get_mut(&gh)
+                        {
+                            a.current_seg = Some(s);
+                        }
+                        let seg_kind = seg_opt
+                            .map(|s| self.segment_kind(alloc_adap, s))
+                            .unwrap_or(SegmentKind::Unknown);
+                        let pref_local = pref_seg != 0 && self.segment_kind(alloc_adap, pref_seg).is_local();
+                        let demoted = pref_local && seg_kind.is_non_local();
+                        self.push_paging_op(PagingOpRecord {
+                            qpc,
+                            pid,
+                            kind: if demoted {
+                                PagingOpKind::DemotedPageIn
+                            } else {
+                                PagingOpKind::PageIn
+                            },
+                            bytes: alloc_size,
+                            heap_size: alloc_size,
+                            dur_qpc: 0,
+                            gpu_dur_100ns: 0,
+                            trim_bytes: 0,
+                        });
+                        let seg_s = seg_opt
+                            .map(|s| format!(" seg={s}({})", seg_kind.as_str()))
+                            .unwrap_or_default();
+                        let heap_s = if alloc_size > 0 {
+                            format!(" heap={}", fmt_bytes_short(alloc_size))
+                        } else {
+                            String::new()
+                        };
+                        if demoted {
+                            format!("PageIn(DEMOTED_TO_SHARED){heap_s}{seg_s}")
+                        } else {
+                            format!("PageIn{heap_s}{seg_s}")
+                        }
+                    }
+                    74 => {
+                        self.push_paging_op(PagingOpRecord {
+                            qpc,
+                            pid,
+                            kind: PagingOpKind::Evict,
+                            bytes: alloc_size,
+                            heap_size: alloc_size,
+                            dur_qpc: 0,
+                            gpu_dur_100ns: 0,
+                            trim_bytes: 0,
+                        });
+                        if alloc_size > 0 {
+                            format!("Evict heap={}", fmt_bytes_short(alloc_size))
+                        } else {
+                            "Evict id=74".into()
+                        }
+                    }
+                    71 => {
+                        if alloc_size > 0 {
+                            format!("AllocFault heap={}", fmt_bytes_short(alloc_size))
+                        } else {
+                            "AllocFault id=71".into()
+                        }
+                    }
+                    _ => {
+                        let pages = schema.get_u64(data, "cPages").unwrap_or(0);
+                        if pages > 0 {
+                            format!("ResetBacking bytes={}", fmt_bytes_short(pages * 4096))
+                        } else {
+                            "ResetBacking id=242".into()
+                        }
+                    }
+                };
+                let stack = extract_inline_stack(rec);
+                self.push_event(RawTimelineEvent {
+                    qpc,
+                    frame: self.current_frame,
+                    pid,
+                    tid: hdr_tid,
+                    kind: TimelineEventKind::Paging,
+                    queue: None,
+                    duration_qpc: None,
+                    detail,
                     raw_stack: stack,
                     waker_tid: None,
-                    wait_kind: is_wait.then(|| "vidmm_make_resident".into()),
+                    wait_kind: None,
                 });
             }
             // TDR / GPU Hang / Device Removal events (540, 541, 547, 548)
@@ -2574,6 +3613,12 @@ impl TimelineBuilder {
         copy.saw_dxgkrnl = self.saw_dxgkrnl;
         copy.saw_sysmem = self.saw_sysmem;
         copy.saw_kmem = self.saw_kmem;
+        copy.device_adapter = self.device_adapter.clone();
+        copy.node_meta = self.node_meta.clone();
+        copy.node_meta_by_ordinal = self.node_meta_by_ordinal.clone();
+        copy.segments = self.segments.clone();
+        copy.alloc_to_global = self.alloc_to_global.clone();
+        copy.allocs = self.allocs.clone();
         copy.context_meta = self.context_meta.clone();
         copy.hwqueue_ctx = self.hwqueue_ctx.clone();
         copy.in_flight_queue_pkts = self.in_flight_queue_pkts.clone();
@@ -2586,6 +3631,8 @@ impl TimelineBuilder {
         copy.queues = self.queues.clone();
         copy.ctx_pid_counts = self.ctx_pid_counts.clone();
         copy.pid_tid_submits = self.pid_tid_submits.clone();
+        copy.paging_ops = self.paging_ops.clone();
+        copy.vidmm_samples = self.vidmm_samples.clone();
         copy.raw_events = self.raw_events.clone();
         copy.ring_window_qpc = self.ring_window_qpc;
         copy.max_retained_events = self.max_retained_events;
@@ -2597,18 +3644,36 @@ impl TimelineBuilder {
     /// Finalizes the unified QPC timeline, symbolizing all captured stacks out-of-process,
     /// clipping per-frame GPU/wait intervals to exact canonical present bounds, and sorting EV lines.
     pub fn finish(
+        self,
+        source: String,
+        symbolizer: &mut Symbolizer,
+        warnings: Vec<String>,
+        flight_trigger: Option<FlightTriggerInfo>,
+    ) -> TimelineReport {
+        self.finish_with_options(
+            source,
+            symbolizer,
+            warnings,
+            flight_trigger,
+            TimelineCutOptions::default(),
+        )
+    }
+
+    /// Finalizes the unified QPC timeline with optional `--between-presents` / `--frame N` window cutting.
+    pub fn finish_with_options(
         mut self,
         source: String,
         symbolizer: &mut Symbolizer,
         mut warnings: Vec<String>,
         flight_trigger: Option<FlightTriggerInfo>,
+        cut: TimelineCutOptions,
     ) -> TimelineReport {
         for (base, size, path) in &self.etw_images {
             symbolizer.add_etw_image(*base, *size, path);
         }
 
         let is_ring = self.ring_window_qpc.is_some();
-        let start_qpc = if is_ring {
+        let mut start_qpc = if is_ring {
             self.raw_events
                 .front()
                 .map(|e| e.qpc)
@@ -2619,7 +3684,7 @@ impl TimelineBuilder {
                 .or_else(|| self.raw_events.front().map(|e| e.qpc))
                 .unwrap_or(0)
         };
-        let end_qpc = if is_ring {
+        let mut end_qpc = if is_ring {
             self.raw_events
                 .back()
                 .map(|e| e.qpc)
@@ -2629,15 +3694,6 @@ impl TimelineBuilder {
             self.end_qpc
                 .or_else(|| self.raw_events.back().map(|e| e.qpc))
                 .unwrap_or(start_qpc)
-        };
-        let trace_dur_ms = (end_qpc - start_qpc).max(0) as f64 * 1e3 / self.qpc_freq_hz as f64;
-        let target_span_ms = if is_ring {
-            trace_dur_ms
-        } else {
-            match (self.target_start_qpc, self.target_end_qpc) {
-                (Some(ts), Some(te)) => (te - ts).max(0) as f64 * 1e3 / self.qpc_freq_hz as f64,
-                _ => 0.0,
-            }
         };
         let qpc_to_ms = |ticks: i64| ticks as f64 * 1e3 / self.qpc_freq_hz as f64;
 
@@ -2680,30 +3736,14 @@ impl TimelineBuilder {
             .map(|q| (q.queue_id.clone(), q.context))
             .collect();
 
-        let mut events = Vec::with_capacity(self.raw_events.len());
+        let mut raw_list: Vec<RawTimelineEvent> = std::mem::take(&mut self.raw_events).into_iter().collect();
         let had_full_gpu = !gpu_spans.is_empty();
         let had_full_presents = !present_marks.is_empty();
         let had_full_waits = !wait_acc.is_empty();
         let had_full_wait_spans = !wait_spans.is_empty();
 
-        for raw in self.raw_events {
-            let t_ms = qpc_to_ms(raw.qpc - start_qpc);
-            let duration_ms = raw.duration_qpc.map(qpc_to_ms);
-            let stack = if raw.raw_stack.is_empty() {
-                Vec::new()
-            } else {
-                symbolizer.resolve_stack(&raw.raw_stack, 8)
-            };
-            let stack_line = if stack.is_empty() {
-                None
-            } else {
-                let joined = stack.iter().take(4).cloned().collect::<Vec<_>>().join(" <- ");
-                *stack_acc
-                    .entry((raw.kind.tag().to_string(), joined.clone()))
-                    .or_insert(0) += 1;
-                Some(joined)
-            };
-
+        // Populate spans/presents from raw_events when in ring mode or synthetic unit tests.
+        for raw in &raw_list {
             if (is_ring || !had_full_gpu)
                 && raw.kind == TimelineEventKind::GpuBusy
                 && let Some(dq) = raw.duration_qpc
@@ -2719,14 +3759,24 @@ impl TimelineBuilder {
                             .or_else(|| parse_ctx_from_queue_label(qn))
                     })
                     .unwrap_or(0);
-                gpu_spans.push((raw.qpc, raw.qpc.saturating_add(dq), raw.pid, ctx));
+                let seq = parse_seq_from_detail(&raw.detail).unwrap_or(0);
+                gpu_spans.push((raw.qpc, raw.qpc.saturating_add(dq), raw.pid, ctx, seq));
             }
             if (is_ring || !had_full_presents) && raw.kind == TimelineEventKind::Present {
                 present_marks.push((raw.qpc, raw.pid, 184));
             }
             if is_ring || !had_full_wait_spans {
                 match raw.kind {
-                    TimelineEventKind::Paging if is_ring => aux_marks.push((raw.qpc, raw.pid, 0)),
+                    TimelineEventKind::Paging => {
+                        if is_ring {
+                            aux_marks.push((raw.qpc, raw.pid, 0));
+                        }
+                        if raw.wait_kind.as_deref() == Some("vidmm_make_resident")
+                            && let Some(dq) = raw.duration_qpc
+                        {
+                            wait_spans.push((raw.qpc, raw.qpc.saturating_add(dq), raw.pid, raw.tid, 3));
+                        }
+                    }
                     TimelineEventKind::VirtualProtect if is_ring => aux_marks.push((raw.qpc, raw.pid, 1)),
                     TimelineEventKind::HardFault if is_ring => aux_marks.push((raw.qpc, raw.pid, 2)),
                     TimelineEventKind::FenceWait => {
@@ -2749,56 +3799,22 @@ impl TimelineBuilder {
                     _ => {}
                 }
             }
-
-            if let Some(ref wk) = raw.wait_kind {
-                if is_ring || !had_full_waits {
-                    let e = wait_acc
-                        .entry((raw.tid, wk.clone()))
-                        .or_insert_with(|| (0, 0, 0.0, 0.0, HashMap::new(), HashMap::new()));
-                    e.0 += 1;
-                    if let Some(d) = duration_ms {
-                        e.1 += 1;
-                        e.2 += d;
-                        if d > e.3 {
-                            e.3 = d;
-                        }
-                        measured_waits += 1;
-                    }
-                    if let Some(w) = raw.waker_tid {
-                        *e.4.entry(w).or_insert(0) += 1;
-                    }
-                    if let Some(ref s) = stack_line {
-                        *e.5.entry(s.clone()).or_insert(0) += 1;
-                    }
-                } else if let Some(ref s) = stack_line
-                    && let Some(e) = wait_acc.get_mut(&(raw.tid, wk.clone()))
-                {
-                    *e.5.entry(s.clone()).or_insert(0) += 1;
-                }
-            }
-
-            events.push(TimelineEvent {
-                qpc: raw.qpc,
-                t_ms,
-                frame: raw.frame,
-                pid: raw.pid,
-                tid: raw.tid,
-                kind: raw.kind,
-                queue: raw.queue,
-                duration_ms,
-                detail: raw.detail,
-                stack,
-            });
         }
 
-        events.sort_by_key(|e| e.qpc);
-
-        // Resolve true owning PID per `hContext` from final `context_meta` (or modal non-System PID)
-        // so late DC_Start rundowns or stray interrupted-thread hdr_pids never misattribute queues.
+        // Resolve true owning PID per `hContext` (including HAGS HwQueues via `hwqueue_ctx`)
+        // from final `context_meta` (or modal non-System PID).
         let mut ctx_true_pid: HashMap<u64, u32> = HashMap::new();
         for (&ctx, meta) in &self.context_meta {
             if meta.pid != 0 && meta.pid != 4 {
                 ctx_true_pid.insert(ctx, meta.pid);
+            }
+        }
+        for (&hq, &parent_ctx) in &self.hwqueue_ctx {
+            if let Some(meta) = self.context_meta.get(&parent_ctx)
+                && meta.pid != 0
+                && meta.pid != 4
+            {
+                ctx_true_pid.entry(hq).or_insert(meta.pid);
             }
         }
         for (&ctx, counts) in &self.ctx_pid_counts {
@@ -2819,73 +3835,7 @@ impl TimelineBuilder {
             }
         }
 
-        let mut queue_intervals: HashMap<u64, Vec<(i64, i64)>> = HashMap::new();
-        for &(s, e, _, ctx) in &gpu_spans {
-            let cs = s.max(start_qpc);
-            let ce = e.min(end_qpc);
-            if ce > cs {
-                queue_intervals.entry(ctx).or_default().push((cs, ce));
-            }
-        }
-        let mut queues: Vec<QueueSummary> = self
-            .queues
-            .into_values()
-            .map(|mut q| {
-                if let Some(&tp) = ctx_true_pid.get(&q.context)
-                    && tp != 0
-                {
-                    q.pid = tp;
-                    q.process_name = self.pid_names.get(&tp).cloned();
-                } else if q.process_name.is_none() && q.pid != 0 {
-                    q.process_name = self.pid_names.get(&q.pid).cloned();
-                }
-                if let Some(intervals) = queue_intervals.remove(&q.context) {
-                    q.busy_ms = qpc_to_ms(union_interval_qpc(intervals));
-                    q.stale_in_window = false;
-                } else if is_ring {
-                    // Never carry cumulative pre-window busy_ms into a ring snapshot when no packet
-                    // completed on this queue inside [start_qpc, end_qpc].
-                    q.busy_ms = 0.0;
-                    q.stale_in_window = q.in_flight_at_end == 0;
-                } else if had_full_gpu {
-                    q.busy_ms = 0.0;
-                    q.stale_in_window = false;
-                } else {
-                    q.busy_ms = q.busy_ms.min(trace_dur_ms);
-                    q.stale_in_window = false;
-                }
-                q.busy_pct = if trace_dur_ms > 0.0 {
-                    ((q.busy_ms / trace_dur_ms) * 100.0).min(100.0)
-                } else {
-                    0.0
-                };
-                q
-            })
-            .collect();
-        queues.sort_by(|a, b| {
-            a.stale_in_window
-                .cmp(&b.stale_in_window)
-                .then_with(|| b.busy_ms.total_cmp(&a.busy_ms))
-                .then_with(|| b.in_flight_at_end.cmp(&a.in_flight_at_end))
-                .then_with(|| b.packets_started.cmp(&a.packets_started))
-        });
-        // Annotate lockstep sibling contexts of the same PID (identical pkts and busy_ms within 5 ms).
-        let mut seen_sig: HashMap<(u32, u64, u64), (String, f64)> = HashMap::new();
-        for q in &mut queues {
-            if q.packets_started >= 4 && q.busy_ms >= 1.0 {
-                let key = (q.pid, q.packets_started, q.packets_completed);
-                if let Some((first_id, first_busy)) = seen_sig.get(&key) {
-                    if (q.busy_ms - first_busy).abs() <= 5.0 {
-                        q.sibling_note = Some(format!("sibling_of={first_id}"));
-                    }
-                } else {
-                    seen_sig.insert(key, (q.queue_id.clone(), q.busy_ms));
-                }
-            }
-        }
-
-        let mut pids: Vec<PidActivitySummary> = self
-            .pid_stats
+        let mut pids: Vec<PidActivitySummary> = std::mem::take(&mut self.pid_stats)
             .into_values()
             .map(|mut p| {
                 if p.process_name.is_none() {
@@ -2919,7 +3869,7 @@ impl TimelineBuilder {
                 .map(|(&(_, t), _)| t)
                 .or_else(|| {
                     let mut counts: HashMap<u32, u64> = HashMap::new();
-                    for ev in &events {
+                    for ev in &raw_list {
                         if ev.pid == fpid
                             && ev.tid != 0
                             && matches!(ev.kind, TimelineEventKind::GpuBusy | TimelineEventKind::GpuSubmit)
@@ -2944,17 +3894,246 @@ impl TimelineBuilder {
             ));
         }
 
+        // Deduplicate canonical presents for `frame_pid` and apply `--between-presents` / `--frame N` cut.
+        let dedup_presents = dedup_canonical_presents(frame_pid, self.qpc_freq_hz, &present_marks);
+        let mut window_note: Option<String> = None;
+        let mut cut_active = false;
+        let mut cut_frame_range: Option<(usize, usize)> = None;
+        if cut.between_presents || cut.frame_index.is_some() {
+            if dedup_presents.len() >= 2 {
+                let complete = dedup_presents.len() - 1;
+                if let Some(req_idx) = cut.frame_index {
+                    let idx = if req_idx < complete {
+                        req_idx
+                    } else {
+                        warnings.push(format!(
+                            "--frame {req_idx} out of range (only {complete} complete present-to-present frame(s): 0..{}); clamping to frame {}",
+                            complete - 1,
+                            complete - 1
+                        ));
+                        complete - 1
+                    };
+                    start_qpc = dedup_presents[idx].0;
+                    end_qpc = dedup_presents[idx + 1].0;
+                    cut_active = true;
+                    cut_frame_range = Some((idx, idx + 1));
+                    window_note = Some(format!(
+                        "between_presents(frame={idx}/{complete}, present[{idx}]->present[{}])",
+                        idx + 1
+                    ));
+                } else {
+                    start_qpc = dedup_presents[0].0;
+                    end_qpc = dedup_presents[complete].0;
+                    cut_active = true;
+                    cut_frame_range = Some((0, complete));
+                    window_note = Some(format!(
+                        "between_presents({complete}_frames, present[0]->present[{complete}])"
+                    ));
+                }
+            } else {
+                warnings.push(format!(
+                    "--between-presents requested but only {} canonical present(s) observed for pid={} (need >= 2); keeping full trace",
+                    dedup_presents.len(),
+                    frame_pid.map(|p| p.to_string()).unwrap_or_else(|| "none".into())
+                ));
+            }
+        }
+
+        let trace_dur_ms = (end_qpc - start_qpc).max(0) as f64 * 1e3 / self.qpc_freq_hz as f64;
+        let target_span_ms = if is_ring || cut_active {
+            trace_dur_ms
+        } else {
+            match (self.target_start_qpc, self.target_end_qpc) {
+                (Some(ts), Some(te)) => (te - ts).max(0) as f64 * 1e3 / self.qpc_freq_hz as f64,
+                _ => 0.0,
+            }
+        };
+
+        let paging_ops_slice: Vec<PagingOpRecord> = self.paging_ops.iter().copied().collect();
         let frames = build_clipped_frames(
             frame_pid,
             submit_tid,
             start_qpc,
             end_qpc,
             self.qpc_freq_hz,
-            &present_marks,
+            &dedup_presents,
+            cut_frame_range,
             &gpu_spans,
             &wait_spans,
             &aux_marks,
+            &paging_ops_slice,
         );
+
+        // Symbolize and filter events to [start_qpc, end_qpc] (when cut_active).
+        if cut_active {
+            raw_list.retain(|raw| raw.qpc >= start_qpc && raw.qpc <= end_qpc);
+            wait_acc.clear();
+            measured_waits = 0;
+        }
+        let mut events = Vec::with_capacity(raw_list.len());
+        let rebuild_waits = is_ring || cut_active || !had_full_waits;
+        for raw in raw_list {
+            let t_ms = qpc_to_ms(raw.qpc - start_qpc);
+            let duration_ms = raw.duration_qpc.map(qpc_to_ms);
+            let stack = if raw.raw_stack.is_empty() {
+                Vec::new()
+            } else {
+                symbolizer.resolve_stack(&raw.raw_stack, 8)
+            };
+            let stack_line = if stack.is_empty() {
+                None
+            } else {
+                let joined = stack.iter().take(4).cloned().collect::<Vec<_>>().join(" <- ");
+                *stack_acc
+                    .entry((raw.kind.tag().to_string(), joined.clone()))
+                    .or_insert(0) += 1;
+                Some(joined)
+            };
+
+            if let Some(ref wk) = raw.wait_kind {
+                if rebuild_waits {
+                    let e = wait_acc
+                        .entry((raw.tid, wk.clone()))
+                        .or_insert_with(|| (0, 0, 0.0, 0.0, HashMap::new(), HashMap::new()));
+                    e.0 += 1;
+                    if let Some(d) = duration_ms {
+                        e.1 += 1;
+                        e.2 += d;
+                        if d > e.3 {
+                            e.3 = d;
+                        }
+                        measured_waits += 1;
+                    }
+                    if let Some(w) = raw.waker_tid {
+                        *e.4.entry(w).or_insert(0) += 1;
+                    }
+                    if let Some(ref s) = stack_line {
+                        *e.5.entry(s.clone()).or_insert(0) += 1;
+                    }
+                } else if let Some(ref s) = stack_line
+                    && let Some(e) = wait_acc.get_mut(&(raw.tid, wk.clone()))
+                {
+                    *e.5.entry(s.clone()).or_insert(0) += 1;
+                }
+            }
+
+            let ev_frame = frame_for_qpc(&frames, raw.qpc).unwrap_or(raw.frame);
+            events.push(TimelineEvent {
+                qpc: raw.qpc,
+                t_ms,
+                frame: ev_frame,
+                pid: raw.pid,
+                tid: raw.tid,
+                kind: raw.kind,
+                queue: raw.queue,
+                duration_ms,
+                detail: raw.detail,
+                stack,
+            });
+        }
+        events.sort_by_key(|e| e.qpc);
+
+        // Compute per-queue busy union, packet counts in window, and max-packet present attribution.
+        let mut queue_intervals: HashMap<u64, Vec<(i64, i64)>> = HashMap::new();
+        let mut queue_win_pkts: HashMap<u64, u64> = HashMap::new();
+        // ctx -> (raw_dur_ms, start_qpc, end_qpc, seq)
+        let mut queue_max_pkt: HashMap<u64, (f64, i64, i64, u64)> = HashMap::new();
+        for &(s, e, _, ctx, seq) in &gpu_spans {
+            let cs = s.max(start_qpc);
+            let ce = e.min(end_qpc);
+            if ce > cs {
+                queue_intervals.entry(ctx).or_default().push((cs, ce));
+                *queue_win_pkts.entry(ctx).or_insert(0) += 1;
+                let pkt_ms = qpc_to_ms((e - s).max(0));
+                let best = queue_max_pkt.entry(ctx).or_insert((0.0, s, e, seq));
+                if pkt_ms > best.0 {
+                    *best = (pkt_ms, s, e, seq);
+                }
+            }
+        }
+        let mut queues: Vec<QueueSummary> = std::mem::take(&mut self.queues)
+            .into_values()
+            .map(|mut q| {
+                if let Some(&tp) = ctx_true_pid.get(&q.context)
+                    && tp != 0
+                {
+                    q.pid = tp;
+                    q.process_name = self.pid_names.get(&tp).cloned();
+                } else if q.process_name.is_none() && q.pid != 0 {
+                    q.process_name = self.pid_names.get(&q.pid).cloned();
+                }
+                let (node_ord, etype, ekind) = self.resolve_engine_kind(q.context);
+                if q.node_ordinal.is_none() {
+                    q.node_ordinal = node_ord;
+                }
+                if etype.is_some() {
+                    q.engine_type = etype;
+                }
+                q.engine_kind = ekind;
+
+                let win_pkts = queue_win_pkts.remove(&q.context).unwrap_or(0);
+                if cut_active {
+                    q.packets_started = win_pkts;
+                    q.packets_completed = win_pkts;
+                }
+                if let Some((max_ms, ms_start, ms_end, ms_seq)) = queue_max_pkt.remove(&q.context) {
+                    q.max_packet_ms = max_ms;
+                    q.max_packet_seq = (ms_seq != 0).then_some(ms_seq);
+                    q.max_packet_t_ms = Some(qpc_to_ms(ms_start - start_qpc));
+                    q.max_packet_frame =
+                        frame_for_qpc(&frames, ms_end).or_else(|| frame_for_qpc(&frames, ms_start));
+                } else if cut_active {
+                    q.max_packet_ms = 0.0;
+                    q.max_packet_seq = None;
+                    q.max_packet_t_ms = None;
+                    q.max_packet_frame = None;
+                }
+
+                if let Some(intervals) = queue_intervals.remove(&q.context) {
+                    q.busy_ms = qpc_to_ms(union_interval_qpc(intervals));
+                    q.stale_in_window = false;
+                } else if is_ring {
+                    q.busy_ms = 0.0;
+                    q.stale_in_window = q.in_flight_at_end == 0;
+                } else if cut_active || had_full_gpu {
+                    q.busy_ms = 0.0;
+                    q.stale_in_window = false;
+                } else {
+                    q.busy_ms = q.busy_ms.min(trace_dur_ms);
+                    q.stale_in_window = false;
+                }
+                q.busy_pct = if trace_dur_ms > 0.0 {
+                    ((q.busy_ms / trace_dur_ms) * 100.0).min(100.0)
+                } else {
+                    0.0
+                };
+                q
+            })
+            .collect();
+        if cut_active {
+            queues.retain(|q| q.packets_completed > 0 || q.busy_ms > 0.0 || q.in_flight_at_end > 0);
+        }
+        queues.sort_by(|a, b| {
+            a.stale_in_window
+                .cmp(&b.stale_in_window)
+                .then_with(|| b.busy_ms.total_cmp(&a.busy_ms))
+                .then_with(|| b.in_flight_at_end.cmp(&a.in_flight_at_end))
+                .then_with(|| b.packets_started.cmp(&a.packets_started))
+        });
+        // Annotate lockstep sibling contexts of the same PID (identical pkts and busy_ms within 5 ms).
+        let mut seen_sig: HashMap<(u32, u64, u64), (String, f64)> = HashMap::new();
+        for q in &mut queues {
+            if q.packets_started >= 4 && q.busy_ms >= 1.0 {
+                let key = (q.pid, q.packets_started, q.packets_completed);
+                if let Some((first_id, first_busy)) = seen_sig.get(&key) {
+                    if (q.busy_ms - first_busy).abs() <= 5.0 {
+                        q.sibling_note = Some(format!("sibling_of={first_id}"));
+                    }
+                } else {
+                    seen_sig.insert(key, (q.queue_id.clone(), q.busy_ms));
+                }
+            }
+        }
 
         // Compute union wall-clock ms per (tid, wait_kind) clipped to [start_qpc, end_qpc] (<= trace_dur_ms).
         let mut wait_intervals: HashMap<(u32, u8), Vec<(i64, i64)>> = HashMap::new();
@@ -2977,7 +4156,8 @@ impl TimelineBuilder {
                     let kc = match kind.as_str() {
                         "dxg_fence_cpu_wait" => Some(0u8),
                         "dxg_fence_gpu_wait" => Some(1u8),
-                        "cswitch_off_cpu" => Some(2u8),
+                        "cswitch_off_cpu" | "cswitch_wait" => Some(2u8),
+                        "vidmm_make_resident" => Some(3u8),
                         _ => None,
                     };
                     let wall_ms = kc
@@ -3004,6 +4184,17 @@ impl TimelineBuilder {
                 .then_with(|| b.total_ms.total_cmp(&a.total_ms))
                 .then_with(|| b.count.cmp(&a.count))
         });
+
+        let paging = build_paging_summary(
+            self.filter_pid.or(frame_pid),
+            start_qpc,
+            end_qpc,
+            self.qpc_freq_hz,
+            &paging_ops_slice,
+            &self.vidmm_samples,
+            &self.allocs,
+            &self.segments,
+        );
 
         let mut top_stacks: Vec<StackSummary> = stack_acc
             .into_iter()
@@ -3044,6 +4235,7 @@ impl TimelineBuilder {
             submit_tid,
             target_exited_at_ms: None,
             target_exit_code: None,
+            window_note,
             thread_suspends: THREAD_SUSPENDS,
             ts_unit: self.ts_unit,
             qpc_freq_hz: self.qpc_freq_hz,
@@ -3065,6 +4257,7 @@ impl TimelineBuilder {
             flight_trigger,
             pids,
             queues,
+            paging,
             waits,
             frames,
             top_stacks,
@@ -3073,26 +4266,15 @@ impl TimelineBuilder {
     }
 }
 
-/// Builds deduplicated canonical per-present frames for `frame_pid` and clips every GPU/wait interval
-/// strictly to `[frame.start_qpc, frame.end_qpc]` so `gpu_busy_ms <= dur_ms` is mathematically guaranteed!
-#[allow(clippy::too_many_arguments)]
-fn build_clipped_frames(
+fn dedup_canonical_presents(
     frame_pid: Option<u32>,
-    submit_tid: Option<u32>,
-    start_qpc: i64,
-    _end_qpc: i64,
     qpc_freq_hz: u64,
     present_marks: &[(i64, u32, u16)],
-    gpu_spans: &[(i64, i64, u32, u64)],
-    wait_spans: &[(i64, i64, u32, u32, u8)],
-    aux_marks: &[(i64, u32, u8)],
-) -> Vec<FrameSummary> {
+) -> Vec<(i64, u16)> {
     let Some(fpid) = frame_pid else {
         return Vec::new();
     };
-    let qpc_to_ms = |ticks: i64| ticks as f64 * 1e3 / qpc_freq_hz.max(1) as f64;
-    let min_gap = (qpc_freq_hz as i64) / 2000; // 0.5 ms dedup threshold for paired Present/PresentHistory
-
+    let min_gap = (qpc_freq_hz as i64) / 2000; // 0.5 ms dedup threshold
     let mut pid_presents: Vec<(i64, u16)> = present_marks
         .iter()
         .filter(|&&(_, p, _)| p == fpid)
@@ -3110,27 +4292,275 @@ fn build_clipped_frames(
     };
     pid_presents.retain(|&(_, id)| id == canon_id);
     pid_presents.sort_unstable_by_key(|&(q, _)| q);
-
     let mut dedup: Vec<(i64, u16)> = Vec::with_capacity(pid_presents.len());
     for (q, id) in pid_presents {
         if dedup.last().is_none_or(|&(prev, _)| q - prev >= min_gap) {
             dedup.push((q, id));
         }
     }
+    dedup
+}
+
+fn frame_for_qpc(frames: &[FrameSummary], qpc: i64) -> Option<u64> {
+    if frames.is_empty() {
+        return None;
+    }
+    let idx = frames.partition_point(|f| f.end_qpc < qpc);
+    if idx < frames.len() && qpc >= frames[idx].start_qpc && qpc <= frames[idx].end_qpc {
+        return Some(frames[idx].frame);
+    }
+    None
+}
+
+fn group_heap_buckets(counts: HashMap<u64, (u64, u64)>) -> Vec<HeapSizeBucket> {
+    let mut out: Vec<HeapSizeBucket> = counts
+        .into_iter()
+        .filter(|&(sz, (c, _))| sz > 0 && c > 0)
+        .map(|(heap_bytes, (count, total_bytes))| HeapSizeBucket {
+            heap_bytes,
+            count,
+            total_bytes,
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.total_bytes
+            .cmp(&a.total_bytes)
+            .then_with(|| b.heap_bytes.cmp(&a.heap_bytes))
+    });
+    out.truncate(8);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_paging_summary(
+    target_pid: Option<u32>,
+    start_qpc: i64,
+    end_qpc: i64,
+    qpc_freq_hz: u64,
+    paging_ops: &[PagingOpRecord],
+    vidmm_samples: &VecDeque<VidMmCounterSample>,
+    allocs: &HashMap<u64, AllocMeta>,
+    segments: &HashMap<(u64, u32), SegmentKind>,
+) -> Option<PagingTimelineSummary> {
+    let mut s = PagingTimelineSummary::default();
+    let dur_secs = ((end_qpc - start_qpc).max(0) as f64 / qpc_freq_hz.max(1) as f64).max(1e-6);
+    let qpc_to_ms = |ticks: i64| ticks as f64 * 1e3 / qpc_freq_hz.max(1) as f64;
+    let to_mb_s = |bytes: u64| (bytes as f64 / (1024.0 * 1024.0)) / dur_secs;
+
+    let mut any_data = false;
+    let mut demoted_start: Option<u64> = None;
+    let mut demoted_end: Option<u64> = None;
+    let mut demoted_peak: u64 = 0;
+
+    for sample in vidmm_samples {
+        if target_pid.is_some_and(|p| p != sample.pid) {
+            continue;
+        }
+        if sample.qpc > end_qpc {
+            continue;
+        }
+        any_data = true;
+        match sample.kind {
+            VidMmCounterKind::LocalBudget => s.local_budget_bytes = Some(sample.new_val),
+            VidMmCounterKind::LocalUsage => s.local_usage_bytes = Some(sample.new_val),
+            VidMmCounterKind::NonLocalUsage => s.non_local_usage_bytes = Some(sample.new_val),
+            VidMmCounterKind::DemotedCommitment => {
+                if sample.qpc < start_qpc {
+                    demoted_start = Some(sample.new_val);
+                    demoted_end = Some(sample.new_val);
+                } else {
+                    if demoted_start.is_none() {
+                        demoted_start = Some(sample.old_val);
+                    }
+                    demoted_end = Some(sample.new_val);
+                    demoted_peak = demoted_peak.max(sample.new_val);
+                    if sample.new_val > sample.old_val {
+                        s.demoted_added_bytes = s
+                            .demoted_added_bytes
+                            .saturating_add(sample.new_val - sample.old_val);
+                    }
+                }
+            }
+        }
+    }
+    if let (Some(u), Some(b)) = (s.local_usage_bytes, s.local_budget_bytes) {
+        s.over_budget_bytes = u.saturating_sub(b);
+    }
+    s.demoted_commitment_start_bytes = demoted_start;
+    s.demoted_commitment_end_bytes = demoted_end;
+    s.demoted_commitment_peak_bytes = demoted_peak
+        .max(demoted_end.unwrap_or(0))
+        .max(demoted_start.unwrap_or(0));
+    s.demoted_added_mb_per_sec = to_mb_s(s.demoted_added_bytes);
+
+    let mut evict_demote_heaps: HashMap<u64, (u64, u64)> = HashMap::new();
+    for op in paging_ops {
+        if target_pid.is_some_and(|p| p != op.pid) {
+            continue;
+        }
+        if op.qpc < start_qpc || op.qpc > end_qpc {
+            continue;
+        }
+        any_data = true;
+        match op.kind {
+            PagingOpKind::MakeResidentCall => {
+                let ms = qpc_to_ms(op.dur_qpc);
+                s.make_resident_calls += 1;
+                s.make_resident_bytes = s.make_resident_bytes.saturating_add(op.bytes);
+                s.make_resident_dur_ms += ms;
+                if ms > s.make_resident_max_ms {
+                    s.make_resident_max_ms = ms;
+                }
+                s.make_resident_trim_bytes = s.make_resident_trim_bytes.saturating_add(op.trim_bytes);
+            }
+            PagingOpKind::MakeResidentAlloc => {
+                s.make_resident_calls += 1;
+                s.make_resident_bytes = s.make_resident_bytes.saturating_add(op.bytes);
+            }
+            PagingOpKind::Evict => {
+                s.evict_count += 1;
+                s.evict_bytes = s.evict_bytes.saturating_add(op.bytes);
+                if op.heap_size > 0 {
+                    let e = evict_demote_heaps.entry(op.heap_size).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 = e.1.saturating_add(op.bytes.max(op.heap_size));
+                }
+            }
+            PagingOpKind::PageIn => {
+                s.page_in_count += 1;
+                s.page_in_bytes = s.page_in_bytes.saturating_add(op.bytes);
+            }
+            PagingOpKind::DemotedPageIn => {
+                s.page_in_count += 1;
+                s.page_in_bytes = s.page_in_bytes.saturating_add(op.bytes);
+                s.demoted_page_in_count += 1;
+                s.demoted_page_in_bytes = s.demoted_page_in_bytes.saturating_add(op.bytes);
+                if op.heap_size > 0 {
+                    let e = evict_demote_heaps.entry(op.heap_size).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 = e.1.saturating_add(op.bytes.max(op.heap_size));
+                }
+            }
+            PagingOpKind::Migrate => {
+                s.migrate_count += 1;
+                s.migrate_bytes = s.migrate_bytes.saturating_add(op.bytes);
+                s.migrate_dur_ms += qpc_to_ms(op.dur_qpc);
+            }
+            PagingOpKind::DemoteXfer => {
+                s.demote_xfer_count += 1;
+                s.demote_xfer_bytes = s.demote_xfer_bytes.saturating_add(op.bytes);
+                if op.heap_size > 0 {
+                    let e = evict_demote_heaps.entry(op.heap_size).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 = e.1.saturating_add(op.bytes);
+                }
+            }
+            PagingOpKind::PromoteXfer => {
+                s.promote_xfer_count += 1;
+                s.promote_xfer_bytes = s.promote_xfer_bytes.saturating_add(op.bytes);
+            }
+            PagingOpKind::PagingPkt => {
+                s.paging_pkt_count += 1;
+                s.paging_pkt_gpu_ms += op.gpu_dur_100ns as f64 / 10_000.0;
+                s.paging_pkt_wall_ms += qpc_to_ms(op.dur_qpc);
+            }
+        }
+    }
+    s.make_resident_mb_per_sec = to_mb_s(s.make_resident_bytes);
+    s.evict_mb_per_sec = to_mb_s(s.evict_bytes);
+    s.page_in_mb_per_sec = to_mb_s(s.page_in_bytes);
+    s.demote_xfer_mb_per_sec = to_mb_s(s.demote_xfer_bytes);
+    s.promote_xfer_mb_per_sec = to_mb_s(s.promote_xfer_bytes);
+    s.evicted_or_demoted_heap_sizes = group_heap_buckets(evict_demote_heaps);
+
+    // Count currently live allocations that preferred Local VRAM but sit in a NonLocal/Shared segment.
+    let lookup_seg = |adapter: u64, seg_id: u32| -> SegmentKind {
+        if seg_id == 0 {
+            return SegmentKind::NonLocalHost;
+        }
+        if adapter != 0
+            && let Some(&k) = segments.get(&(adapter, seg_id))
+        {
+            return k;
+        }
+        segments
+            .iter()
+            .find(|&(&(_, sid), _)| sid == seg_id)
+            .map(|(_, &k)| k)
+            .unwrap_or(SegmentKind::Unknown)
+    };
+    let mut active_demoted_heaps: HashMap<u64, (u64, u64)> = HashMap::new();
+    for a in allocs.values() {
+        if !a.alive || a.size == 0 {
+            continue;
+        }
+        if target_pid.is_some_and(|p| p != a.pid) {
+            continue;
+        }
+        if a.preferred_seg_id != 0
+            && lookup_seg(a.adapter, a.preferred_seg_id).is_local()
+            && let Some(cur) = a.current_seg
+            && lookup_seg(a.adapter, cur).is_non_local()
+        {
+            any_data = true;
+            s.active_demoted_alloc_count += 1;
+            s.active_demoted_alloc_bytes = s.active_demoted_alloc_bytes.saturating_add(a.size);
+            let e = active_demoted_heaps.entry(a.size).or_insert((0, 0));
+            e.0 += 1;
+            e.1 = e.1.saturating_add(a.size);
+        }
+    }
+    s.active_demoted_heap_sizes = group_heap_buckets(active_demoted_heaps);
+
+    any_data.then_some(s)
+}
+
+/// Builds deduplicated canonical per-present frames for `frame_pid` and clips every GPU/wait interval
+/// strictly to `[frame.start_qpc, frame.end_qpc]` so `gpu_busy_ms <= dur_ms` is mathematically guaranteed!
+#[allow(clippy::too_many_arguments)]
+fn build_clipped_frames(
+    frame_pid: Option<u32>,
+    submit_tid: Option<u32>,
+    start_qpc: i64,
+    _end_qpc: i64,
+    qpc_freq_hz: u64,
+    dedup: &[(i64, u16)],
+    cut_frame_range: Option<(usize, usize)>,
+    gpu_spans: &[(i64, i64, u32, u64, u64)],
+    wait_spans: &[(i64, i64, u32, u32, u8)],
+    aux_marks: &[(i64, u32, u8)],
+    paging_ops: &[PagingOpRecord],
+) -> Vec<FrameSummary> {
+    let Some(fpid) = frame_pid else {
+        return Vec::new();
+    };
+    if dedup.is_empty() {
+        return Vec::new();
+    }
+    let qpc_to_ms = |ticks: i64| ticks as f64 * 1e3 / qpc_freq_hz.max(1) as f64;
 
     let mut windows: Vec<(u64, i64, i64, u16)> = Vec::with_capacity(dedup.len());
-    let mut prev_qpc = start_qpc;
-    for (idx, &(pq, pid_ev)) in dedup.iter().enumerate() {
-        let f_start = if idx == 0 { prev_qpc.min(pq) } else { prev_qpc };
-        let f_end = pq.max(f_start);
-        windows.push((idx as u64, f_start, f_end, pid_ev));
-        prev_qpc = f_end;
+    if let Some((f_lo, f_hi)) = cut_frame_range {
+        // Complete present-to-present frames only: [dedup[i], dedup[i+1]] for i in f_lo..f_hi.
+        for i in f_lo..f_hi.min(dedup.len().saturating_sub(1)) {
+            let f_start = dedup[i].0;
+            let f_end = dedup[i + 1].0.max(f_start);
+            windows.push((i as u64, f_start, f_end, dedup[i + 1].1));
+        }
+    } else {
+        let mut prev_qpc = start_qpc;
+        for (idx, &(pq, pid_ev)) in dedup.iter().enumerate() {
+            let f_start = if idx == 0 { prev_qpc.min(pq) } else { prev_qpc };
+            let f_end = pq.max(f_start);
+            windows.push((idx as u64, f_start, f_end, pid_ev));
+            prev_qpc = f_end;
+        }
     }
 
     let mut g_spans: Vec<(i64, i64, u64)> = gpu_spans
         .iter()
-        .filter(|&&(_, _, p, _)| p == fpid)
-        .map(|&(s, e, _, ctx)| (s, e, ctx))
+        .filter(|&&(_, _, p, _, _)| p == fpid)
+        .map(|&(s, e, _, ctx, _)| (s, e, ctx))
         .collect();
     g_spans.sort_unstable_by_key(|&(s, _, _)| s);
 
@@ -3148,8 +4578,38 @@ fn build_clipped_frames(
         .collect();
     a_marks.sort_unstable_by_key(|&(q, _)| q);
 
+    let has_page_in = paging_ops
+        .iter()
+        .any(|o| o.pid == fpid && matches!(o.kind, PagingOpKind::PageIn | PagingOpKind::DemotedPageIn));
+    let mut p_ops: Vec<(i64, u64, u64)> = paging_ops
+        .iter()
+        .filter(|o| {
+            o.pid == fpid
+                && o.bytes > 0
+                && match o.kind {
+                    PagingOpKind::PageIn
+                    | PagingOpKind::DemotedPageIn
+                    | PagingOpKind::Evict
+                    | PagingOpKind::Migrate
+                    | PagingOpKind::DemoteXfer
+                    | PagingOpKind::PromoteXfer => true,
+                    PagingOpKind::MakeResidentCall | PagingOpKind::MakeResidentAlloc => !has_page_in,
+                    PagingOpKind::PagingPkt => false,
+                }
+        })
+        .map(|o| {
+            let is_demote = matches!(
+                o.kind,
+                PagingOpKind::Evict | PagingOpKind::DemotedPageIn | PagingOpKind::DemoteXfer
+            );
+            (o.qpc, o.bytes, if is_demote { o.bytes } else { 0 })
+        })
+        .collect();
+    p_ops.sort_unstable_by_key(|&(q, _, _)| q);
+
     let mut frames = Vec::with_capacity(windows.len());
     let mut aux_idx = 0usize;
+    let mut pop_idx = 0usize;
     let mut gpu_head = 0usize;
     let mut wait_head = 0usize;
 
@@ -3206,7 +4666,8 @@ fn build_clipped_frames(
                         }
                     }
                     1 => gpu_w.push((cs, ce)),
-                    _ => os_w.push((cs, ce)),
+                    2 => os_w.push((cs, ce)),
+                    _ => {}
                 }
             }
         }
@@ -3230,6 +4691,16 @@ fn build_clipped_frames(
             }
             aux_idx += 1;
         }
+        while pop_idx < p_ops.len() && p_ops[pop_idx].0 < f_start {
+            pop_idx += 1;
+        }
+        let mut paging_bytes = 0u64;
+        let mut demote_evict_bytes = 0u64;
+        while pop_idx < p_ops.len() && p_ops[pop_idx].0 <= f_end {
+            paging_bytes = paging_bytes.saturating_add(p_ops[pop_idx].1);
+            demote_evict_bytes = demote_evict_bytes.saturating_add(p_ops[pop_idx].2);
+            pop_idx += 1;
+        }
 
         frames.push(FrameSummary {
             frame: fnum,
@@ -3249,6 +4720,8 @@ fn build_clipped_frames(
             gpu_fence_wait_ms,
             os_wait_ms,
             paging_events: paging,
+            paging_bytes,
+            demote_evict_bytes,
             virtual_protect_events: vprot,
             hard_faults: hfault,
             presents: 1,
@@ -3332,6 +4805,16 @@ pub fn parse_timeline_etl(
     filter_pid: Option<u32>,
     symbolizer: &mut Symbolizer,
 ) -> Result<TimelineReport, String> {
+    parse_timeline_etl_with_options(etl_path, filter_pid, symbolizer, TimelineCutOptions::default())
+}
+
+/// Parses an existing `.etl` trace onto the unified QPC timeline with optional `--between-presents` / `--frame` cutting.
+pub fn parse_timeline_etl_with_options(
+    etl_path: &Path,
+    filter_pid: Option<u32>,
+    symbolizer: &mut Symbolizer,
+    cut: TimelineCutOptions,
+) -> Result<TimelineReport, String> {
     if !etl_path.is_file() {
         return Err(format!("ETL file not found: {}", etl_path.display()));
     }
@@ -3380,7 +4863,7 @@ pub fn parse_timeline_etl(
             rc.0
         ));
     }
-    Ok(builder.finish(etl_path.display().to_string(), symbolizer, Vec::new(), None))
+    Ok(builder.finish_with_options(etl_path.display().to_string(), symbolizer, Vec::new(), None, cut))
 }
 
 /// Live timeline capture options.
@@ -3392,6 +4875,7 @@ pub struct LiveTimelineOptions {
     pub max_etl_mb: u32,
     pub etl_out: Option<PathBuf>,
     pub keep_etl: bool,
+    pub cut: TimelineCutOptions,
 }
 
 /// Records a live non-admin unified QPC timeline (zero target suspends) and returns the symbolized report.
@@ -3470,7 +4954,7 @@ pub fn capture_live_timeline(opts: LiveTimelineOptions) -> Result<TimelineReport
     std::thread::sleep(Duration::from_millis(100));
     stop_session_handle(handle, &name);
 
-    let mut rep = parse_timeline_etl(&etl_path, Some(opts.pid), &mut symbolizer)?;
+    let mut rep = parse_timeline_etl_with_options(&etl_path, Some(opts.pid), &mut symbolizer, opts.cut)?;
     if let Some((exit_ms, exit_code)) = exited_info {
         rep.target_exited_at_ms = Some(exit_ms);
         rep.target_exit_code = exit_code;
@@ -3752,15 +5236,21 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
     } else {
         rep.measured_waits.to_string()
     };
+    let win_s = rep
+        .window_note
+        .as_deref()
+        .map(|w| format!(" window={w}"))
+        .unwrap_or_default();
     let _ = writeln!(
         out,
-        "HEADER source={} pid={} frame_pid={} submit_tid={} trace_dur_ms={:.2} target_span_ms={:.2} ts_unit={} freq_hz={} raw_events={} target_events={}{} dxg_pid_ev={} dxg_ctx_other_pid={} stacks={} measured_waits={} wait_mode={} providers={} thread_suspends={}",
+        "HEADER source={} pid={} frame_pid={} submit_tid={} trace_dur_ms={:.2} target_span_ms={:.2}{} ts_unit={} freq_hz={} raw_events={} target_events={}{} dxg_pid_ev={} dxg_ctx_other_pid={} stacks={} measured_waits={} wait_mode={} providers={} thread_suspends={}",
         rep.source,
         pid_s,
         fpid_s,
         stid_s,
         rep.duration_ms,
         rep.target_span_ms,
+        win_s,
         rep.ts_unit,
         rep.qpc_freq_hz,
         rep.total_raw_events,
@@ -3843,6 +5333,18 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                 .as_deref()
                 .map(|n| format!("({n})"))
                 .unwrap_or_default();
+            let kind_s = match (q.engine_kind.as_deref(), q.node_ordinal) {
+                (Some(k), Some(n)) => format!("{k}/n{n}"),
+                (Some(k), None) => k.to_string(),
+                (None, Some(n)) => format!("n{n}"),
+                (None, None) => "unknown".into(),
+            };
+            let max_attr = match (q.max_packet_frame, q.max_packet_seq) {
+                (Some(f), Some(seq)) => format!("(f={f},seq={seq})"),
+                (Some(f), None) => format!("(f={f})"),
+                (None, Some(seq)) => format!("(seq={seq})"),
+                (None, None) => String::new(),
+            };
             let sib = q
                 .sibling_note
                 .as_deref()
@@ -3855,8 +5357,9 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
             };
             let _ = writeln!(
                 out,
-                "QUEUE {:<20} pid={:<6}{:<16} pkts={}/{} in_flight={} busy_ms={:>8.2} ({:>5.1}%) max_pkt_ms={:>7.2} sig={} wait={}{}{}",
+                "QUEUE {:<20} kind={:<12} pid={:<6}{:<16} pkts={}/{} in_flight={} busy_ms={:>8.2} ({:>5.1}%) max_pkt_ms={:>7.2}{} sig={} wait={}{}{}",
                 q.queue_id,
+                kind_s,
                 q.pid,
                 pname,
                 q.packets_completed,
@@ -3865,10 +5368,103 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                 q.busy_ms,
                 q.busy_pct,
                 q.max_packet_ms,
+                max_attr,
                 q.fence_signals,
                 q.fence_waits,
                 sib,
                 stale,
+            );
+        }
+    }
+
+    if let Some(ref pg) = rep.paging {
+        let _ = writeln!(
+            out,
+            "\n== VidMm Paging & Demotion Summary (window={:.2}s) ==",
+            rep.duration_ms / 1000.0
+        );
+        if pg.local_usage_bytes.is_some()
+            || pg.local_budget_bytes.is_some()
+            || pg.non_local_usage_bytes.is_some()
+            || pg.demoted_commitment_end_bytes.is_some()
+        {
+            let lu = pg
+                .local_usage_bytes
+                .map(fmt_bytes_short)
+                .unwrap_or_else(|| "n/a".into());
+            let lb = pg
+                .local_budget_bytes
+                .map(fmt_bytes_short)
+                .unwrap_or_else(|| "n/a".into());
+            let ob = if pg.over_budget_bytes > 0 {
+                format!("+{}", fmt_bytes_short(pg.over_budget_bytes))
+            } else {
+                "0B".into()
+            };
+            let nlu = pg
+                .non_local_usage_bytes
+                .map(fmt_bytes_short)
+                .unwrap_or_else(|| "n/a".into());
+            let dem = pg
+                .demoted_commitment_end_bytes
+                .map(fmt_bytes_short)
+                .unwrap_or_else(|| "0B".into());
+            let _ = writeln!(
+                out,
+                "VIDMM_BUDGET local_usage={lu} local_budget={lb} over_budget={ob} nonlocal_usage={nlu} demoted_commit={dem} (peak={}, added=+{}, {:.1}MB/s)",
+                fmt_bytes_short(pg.demoted_commitment_peak_bytes),
+                fmt_bytes_short(pg.demoted_added_bytes),
+                pg.demoted_added_mb_per_sec,
+            );
+        }
+        let _ = writeln!(
+            out,
+            "PAGING_IO make_resident={} ({}, {:.1}MB/s, dur={:.2}ms, max={:.2}ms, trim={}) evict={} ({}, {:.1}MB/s) page_in={} ({}, {:.1}MB/s, demoted={} [{}]) migrate={} ({}, dur={:.2}ms) demote_xfer={} ({}, {:.1}MB/s) promote_xfer={} ({}, {:.1}MB/s) paging_pkts={} (gpu_dur={:.2}ms, wall={:.2}ms)",
+            pg.make_resident_calls,
+            fmt_bytes_short(pg.make_resident_bytes),
+            pg.make_resident_mb_per_sec,
+            pg.make_resident_dur_ms,
+            pg.make_resident_max_ms,
+            fmt_bytes_short(pg.make_resident_trim_bytes),
+            pg.evict_count,
+            fmt_bytes_short(pg.evict_bytes),
+            pg.evict_mb_per_sec,
+            pg.page_in_count,
+            fmt_bytes_short(pg.page_in_bytes),
+            pg.page_in_mb_per_sec,
+            pg.demoted_page_in_count,
+            fmt_bytes_short(pg.demoted_page_in_bytes),
+            pg.migrate_count,
+            fmt_bytes_short(pg.migrate_bytes),
+            pg.migrate_dur_ms,
+            pg.demote_xfer_count,
+            fmt_bytes_short(pg.demote_xfer_bytes),
+            pg.demote_xfer_mb_per_sec,
+            pg.promote_xfer_count,
+            fmt_bytes_short(pg.promote_xfer_bytes),
+            pg.promote_xfer_mb_per_sec,
+            pg.paging_pkt_count,
+            pg.paging_pkt_gpu_ms,
+            pg.paging_pkt_wall_ms,
+        );
+        if pg.active_demoted_alloc_count > 0 || !pg.evicted_or_demoted_heap_sizes.is_empty() {
+            let fmt_buckets = |bs: &[HeapSizeBucket]| -> String {
+                if bs.is_empty() {
+                    return "none".into();
+                }
+                bs.iter()
+                    .take(6)
+                    .map(|b| format!("{} x{}", fmt_heap_size_exact(b.heap_bytes), b.count))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let _ = writeln!(
+                out,
+                "DEMOTED_HEAPS active_demoted={} ({}) sizes=[{}] | evicted_or_demoted_in_window=[{}]",
+                pg.active_demoted_alloc_count,
+                fmt_bytes_short(pg.active_demoted_alloc_bytes),
+                fmt_buckets(&pg.active_demoted_heap_sizes),
+                fmt_buckets(&pg.evicted_or_demoted_heap_sizes),
             );
         }
     }
@@ -3911,9 +5507,18 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
             fpid_s, stid_s
         );
         for f in rep.frames.iter().take(opts.top.max(30)) {
+            let pg_b = if f.paging_bytes > 0 || f.demote_evict_bytes > 0 {
+                format!(
+                    " paging_bytes={} demote_evict={}",
+                    fmt_bytes_short(f.paging_bytes),
+                    fmt_bytes_short(f.demote_evict_bytes)
+                )
+            } else {
+                String::new()
+            };
             let _ = writeln!(
                 out,
-                "FRAME f={:<4} pid={:<6} ev_id={:<3} t_ms={:>9.2} dur_ms={:>7.2} gpu_busy_ms={:>7.2} gpu_idle_ms={:>7.2} busiest_q_ms={:>7.2} sub_cpu_wait_ms={:>6.2} all_cpu_wait_ms={:>6.2} gpu_wait_ms={:>6.2} paging={} vprot={} hfault={}",
+                "FRAME f={:<4} pid={:<6} ev_id={:<3} t_ms={:>9.2} dur_ms={:>7.2} gpu_busy_ms={:>7.2} gpu_idle_ms={:>7.2} busiest_q_ms={:>7.2} sub_cpu_wait_ms={:>6.2} all_cpu_wait_ms={:>6.2} gpu_wait_ms={:>6.2} paging={}{} vprot={} hfault={}",
                 f.frame,
                 f.pid,
                 f.present_event_id,
@@ -3926,6 +5531,7 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                 f.cpu_fence_wait_ms,
                 f.gpu_fence_wait_ms,
                 f.paging_events,
+                pg_b,
                 f.virtual_protect_events,
                 f.hard_faults,
             );
@@ -4029,13 +5635,17 @@ mod tests {
                 pid: 42,
                 process_name: Some("xcl.exe".into()),
                 node_ordinal: Some(0),
-                engine_type: Some(0),
+                engine_type: Some(1),
+                engine_kind: Some("direct".into()),
                 packets_started: 2,
                 packets_completed: 2,
                 in_flight_at_end: 0,
                 busy_ms: 8.5,
                 busy_pct: 0.0,
                 max_packet_ms: 5.0,
+                max_packet_frame: None,
+                max_packet_seq: None,
+                max_packet_t_ms: None,
                 fence_signals: 2,
                 fence_waits: 1,
                 stale_in_window: false,
@@ -4306,5 +5916,178 @@ mod tests {
         let text = format_timeline_text(&rep, &TimelineFormatOptions::default());
         assert!(text.contains("[stale:idle_in_window]"));
         assert!(!text.contains("100.0%"));
+    }
+
+    #[test]
+    fn between_presents_cuts_window_attributes_queue_kind_and_summarizes_demotion() {
+        let freq = 10_000_000u64; // 10 MHz: 10,000 ticks = 1 ms, 10_000_000 = 1 s
+        let mut b = TimelineBuilder::new(Some(77), freq);
+        b.start_qpc = Some(0);
+        b.end_qpc = Some(30_000_000); // 3.0 s
+        b.saw_dxgkrnl = true;
+
+        // Adapter 0x10 has Node 0 = 3D (direct) and Node 2 = Copy.
+        b.node_meta.insert((0x10, 0), (1, String::new()));
+        b.node_meta.insert((0x10, 2), (6, String::new()));
+        b.context_meta.insert(
+            0xC001,
+            ContextMeta {
+                pid: 77,
+                adapter: 0x10,
+                node_ordinal: Some(0),
+                engine_type: None,
+            },
+        );
+        b.context_meta.insert(
+            0xC002,
+            ContextMeta {
+                pid: 77,
+                adapter: 0x10,
+                node_ordinal: Some(2),
+                engine_type: None,
+            },
+        );
+        b.queues.insert(
+            0xC001,
+            QueueSummary {
+                queue_id: "ctx=0xc001/n0".into(),
+                context: 0xC001,
+                pid: 77,
+                ..Default::default()
+            },
+        );
+        b.queues.insert(
+            0xC002,
+            QueueSummary {
+                queue_id: "ctx=0xc002/n2".into(),
+                context: 0xC002,
+                pid: 77,
+                ..Default::default()
+            },
+        );
+
+        // Segment 1 = Local VRAM, Segment 2 = NonLocal/Shared.
+        b.segments.insert((0x10, 1), SegmentKind::LocalVram);
+        b.segments.insert((0x10, 2), SegmentKind::NonLocalHost);
+        // Active demoted 256 MiB heap (preferred Local seg 1, sitting in NonLocal seg 2).
+        b.allocs.insert(
+            0xA1,
+            AllocMeta {
+                pid: 77,
+                adapter: 0x10,
+                size: 256 * 1024 * 1024,
+                preferred_seg_id: 1,
+                current_seg: Some(2),
+                alive: true,
+            },
+        );
+
+        // VidMm budget/usage/demoted counters (5 GiB over budget, +128 MiB demoted in frame 0).
+        let gib = 1024u64 * 1024 * 1024;
+        let mib = 1024u64 * 1024;
+        b.vidmm_samples.push_back(VidMmCounterSample {
+            qpc: 500_000,
+            pid: 77,
+            kind: VidMmCounterKind::LocalBudget,
+            old_val: 13 * gib,
+            new_val: 13 * gib,
+        });
+        b.vidmm_samples.push_back(VidMmCounterSample {
+            qpc: 500_000,
+            pid: 77,
+            kind: VidMmCounterKind::LocalUsage,
+            old_val: 18 * gib,
+            new_val: 18 * gib,
+        });
+        b.vidmm_samples.push_back(VidMmCounterSample {
+            qpc: 15_000_000,
+            pid: 77,
+            kind: VidMmCounterKind::DemotedCommitment,
+            old_val: 4 * gib,
+            new_val: 4 * gib + 128 * mib,
+        });
+
+        // Presents at t=1.0s (10M), t=2.0s (20M), t=3.0s (30M).
+        b.full_present_marks.push((10_000_000, 77, 184));
+        b.full_present_marks.push((20_000_000, 77, 184));
+        b.full_present_marks.push((30_000_000, 77, 184));
+
+        // Pre-present startup packet (should be excluded by --between-presents --frame 0).
+        b.full_gpu_spans.push((1_000_000, 5_000_000, 77, 0xC001, 10));
+        // Frame 0 [10M, 20M]: 500 ms direct packet seq=42, 100 ms copy packet seq=99.
+        b.full_gpu_spans.push((11_000_000, 16_000_000, 77, 0xC001, 42));
+        b.full_gpu_spans.push((16_000_000, 17_000_000, 77, 0xC002, 99));
+        // Frame 1 [20M, 30M]: 800 ms direct packet seq=55 (excluded when --frame 0 is selected).
+        b.full_gpu_spans.push((21_000_000, 29_000_000, 77, 0xC001, 55));
+
+        // Paging ops: startup MakeResident before present 0 (excluded), DemoteXfer 64 MiB inside frame 0.
+        b.paging_ops.push_back(PagingOpRecord {
+            qpc: 2_000_000,
+            pid: 77,
+            kind: PagingOpKind::MakeResidentCall,
+            bytes: 512 * mib,
+            heap_size: 0,
+            dur_qpc: 50_000,
+            gpu_dur_100ns: 0,
+            trim_bytes: 0,
+        });
+        b.paging_ops.push_back(PagingOpRecord {
+            qpc: 12_000_000,
+            pid: 77,
+            kind: PagingOpKind::DemoteXfer,
+            bytes: 64 * mib,
+            heap_size: 256 * mib,
+            dur_qpc: 0,
+            gpu_dur_100ns: 0,
+            trim_bytes: 0,
+        });
+
+        let mut sym = Symbolizer::new(None);
+        let rep = b.finish_with_options(
+            "unit.etl".into(),
+            &mut sym,
+            Vec::new(),
+            None,
+            TimelineCutOptions {
+                between_presents: true,
+                frame_index: Some(0),
+            },
+        );
+
+        assert!((rep.duration_ms - 1000.0).abs() < 1e-3);
+        assert_eq!(rep.frames.len(), 1);
+        assert_eq!(rep.frames[0].frame, 0);
+        assert_eq!(rep.frames[0].demote_evict_bytes, 64 * mib);
+
+        // Queue kind & max-packet present/seq attribution in cut frame 0:
+        assert_eq!(rep.queues.len(), 2);
+        assert_eq!(rep.queues[0].engine_kind.as_deref(), Some("direct"));
+        assert!((rep.queues[0].max_packet_ms - 500.0).abs() < 1e-3);
+        assert_eq!(rep.queues[0].max_packet_frame, Some(0));
+        assert_eq!(rep.queues[0].max_packet_seq, Some(42));
+        assert_eq!(rep.queues[1].engine_kind.as_deref(), Some("copy"));
+        assert_eq!(rep.queues[1].max_packet_seq, Some(99));
+
+        // VidMm paging & demotion summary scoped to frame 0 [10M, 20M]:
+        let pg = rep.paging.as_ref().expect("paging summary present");
+        assert_eq!(pg.over_budget_bytes, 5 * gib);
+        assert_eq!(
+            pg.make_resident_calls, 0,
+            "pre-present MakeResident must be excluded"
+        );
+        assert_eq!(pg.demote_xfer_bytes, 64 * mib);
+        assert!((pg.demote_xfer_mb_per_sec - 64.0).abs() < 0.1);
+        assert_eq!(pg.demoted_added_bytes, 128 * mib);
+        assert_eq!(pg.active_demoted_alloc_count, 1);
+        assert_eq!(pg.active_demoted_heap_sizes[0].heap_bytes, 256 * mib);
+
+        let text = format_timeline_text(&rep, &TimelineFormatOptions::default());
+        assert!(text.contains("window=between_presents(frame=0/2"));
+        assert!(text.contains("kind=direct/n0"));
+        assert!(text.contains("kind=copy/n2"));
+        assert!(text.contains("500.00(f=0,seq=42)"));
+        assert!(text.contains("VIDMM_BUDGET"));
+        assert!(text.contains("over_budget=+5.00GiB"));
+        assert!(text.contains("DEMOTED_HEAPS active_demoted=1 (256.0MiB)"));
     }
 }

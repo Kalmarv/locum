@@ -16,8 +16,8 @@ use locum_mem::reconcile::{
 };
 use locum_mem::symbols::Symbolizer;
 use locum_mem::timeline::{
-    LiveTimelineOptions, TimelineEventKind, TimelineFormatOptions, capture_live_timeline,
-    format_capabilities_text, format_timeline_text, parse_timeline_etl, probe_etw_capabilities,
+    LiveTimelineOptions, TimelineCutOptions, TimelineEventKind, TimelineFormatOptions, capture_live_timeline,
+    format_capabilities_text, format_timeline_text, parse_timeline_etl_with_options, probe_etw_capabilities,
 };
 use locum_mem::win32::{InspectOptions, inspect_process, resolve_target_pid};
 
@@ -194,6 +194,12 @@ pub struct TimelineArgs {
     /// Keep the recorded `.etl` file on disk after parsing.
     #[arg(long)]
     keep_etl: bool,
+    /// Cut the timeline (queues, waits, paging/demotion, frames, stacks, EV) strictly to complete present-to-present boundaries `[present[0], present[last]]` (drops pre-first-present startup/rundown and post-last-present tail). Combine with `--frame N` to isolate a single frame.
+    #[arg(long)]
+    between_presents: bool,
+    /// Isolate one 0-based complete present-to-present frame `[present[N], present[N+1]]` (implies `--between-presents`).
+    #[arg(long)]
+    frame: Option<usize>,
     #[command(flatten)]
     view: TimelineFilterArgs,
 }
@@ -417,6 +423,10 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
                 limit: args.view.limit,
                 list_pids: args.view.list_pids,
             };
+            let cut = TimelineCutOptions {
+                between_presents: args.between_presents || args.frame.is_some(),
+                frame_index: args.frame,
+            };
             let rep = if let Some(ref etl_path) = args.etl {
                 let pid = if args.target.pid.is_some()
                     || args.target.pid_of_child.is_some()
@@ -433,7 +443,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
                 let mut sym = pid
                     .map(Symbolizer::for_process)
                     .unwrap_or_else(|| Symbolizer::new(None));
-                parse_timeline_etl(etl_path, pid, &mut sym)?
+                parse_timeline_etl_with_options(etl_path, pid, &mut sym, cut)?
             } else {
                 let pid = resolve_target_pid(
                     args.target.pid,
@@ -447,6 +457,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
                     max_etl_mb: args.max_etl_mb,
                     etl_out: args.out,
                     keep_etl: args.keep_etl,
+                    cut,
                 })?
             };
             if args.view.json {
