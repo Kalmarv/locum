@@ -192,7 +192,12 @@ fn format_residency_priority(prio: u32) -> String {
     format!("{prio:#x}")
 }
 
-fn classify_alloc_heap_kind(pref_kind: SegmentKind, flags: u32) -> &'static str {
+const ALLOC_CREATE_STACK_FRAMES: usize = 24;
+
+fn classify_alloc_heap_kind(pref_kind: SegmentKind, flags: u32, page_table: bool) -> &'static str {
+    if page_table {
+        return "page_table";
+    }
     if pref_kind.is_local() {
         if (flags & 0x0000_0001) != 0 {
             "local_cpu_vis(GPU_UPLOAD)"
@@ -740,6 +745,17 @@ pub struct AllocLookupMatch {
     pub created_during_trace: bool,
 }
 
+/// Aggregated creation stack for alive VidMm allocations created during the trace window.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AllocCreateStackSummary {
+    pub size_bytes: u64,
+    pub heap_kind: String,
+    pub priority_label: String,
+    pub count: u64,
+    pub total_bytes: u64,
+    pub stack: String,
+}
+
 /// Opt-in exact-size allocation lookup result (`--alloc-size <SIZE>`), with no top-N cutoff and explicit zero-match count.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AllocLookupSummary {
@@ -747,11 +763,14 @@ pub struct AllocLookupSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
     pub match_count: usize,
+    pub in_trace_count: usize,
     pub resident_local_count: usize,
     pub demoted_count: usize,
     pub resident_nonlocal_count: usize,
     pub evicted_count: usize,
     pub uncommitted_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_create_stacks: Vec<AllocCreateStackSummary>,
     pub matches: Vec<AllocLookupMatch>,
 }
 
@@ -802,6 +821,8 @@ pub struct AllocHistogramSummary {
     pub tail_bucket_count: usize,
     pub tail_alloc_count: u64,
     pub tail_bytes: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_create_stacks: Vec<AllocCreateStackSummary>,
 }
 
 /// Handle-joined identity of an allocation evicted or demoted inside the timeline window.
@@ -1352,6 +1373,7 @@ struct AllocMeta {
     priority: u32,
     preferred_seg_id: u32,
     current_seg: Option<u32>,
+    page_table: bool,
     evicted: bool,
     cpu_va: Option<u64>,
     gpu_va_start: Option<u64>,
@@ -2346,6 +2368,9 @@ impl TimelineBuilder {
                 let flags = schema.get_u64(data, "Flags").unwrap_or(0) as u32;
                 let priority = schema.get_u64(data, "Priority").unwrap_or(0) as u32;
                 let pref_id = (schema.get_u64(data, "PreferredSegment").unwrap_or(0) as u32) & 0x1F;
+                let page_table = schema
+                    .get_u64(data, "PageTableOrDirectory")
+                    .is_some_and(|v| v != 0);
                 let stack = if id == 33 && self.matches_pid(pid) {
                     extract_inline_stack(rec)
                 } else {
@@ -2359,6 +2384,7 @@ impl TimelineBuilder {
                     priority,
                     preferred_seg_id: pref_id,
                     current_seg: None,
+                    page_table,
                     evicted: false,
                     cpu_va: None,
                     gpu_va_start: None,
@@ -2380,6 +2406,7 @@ impl TimelineBuilder {
                     entry.size = size;
                 }
                 entry.flags = flags;
+                entry.page_table = page_table;
                 if priority != 0 {
                     entry.priority = priority;
                 }
@@ -2408,8 +2435,14 @@ impl TimelineBuilder {
                         pid = self.device_pid.get(&hdev).copied().unwrap_or(0);
                     }
                     let cpu_va = schema.get_u64(data, "pVirtualAddress").filter(|&v| v != 0);
+                    let stack = if id == 36 && self.matches_pid(pid) {
+                        extract_inline_stack(rec)
+                    } else {
+                        Vec::new()
+                    };
                     let a = self.allocs.entry(gh).or_insert_with(|| AllocMeta {
                         pid,
+                        created_during_trace: id == 36,
                         alive: true,
                         ..Default::default()
                     });
@@ -2418,6 +2451,12 @@ impl TimelineBuilder {
                     }
                     if a.cpu_va.is_none() && cpu_va.is_some() {
                         a.cpu_va = cpu_va;
+                    }
+                    if id == 36 {
+                        a.created_during_trace = true;
+                        if a.create_stack.is_empty() && !stack.is_empty() {
+                            a.create_stack = stack;
+                        }
                     }
                 }
             }
@@ -2488,6 +2527,9 @@ impl TimelineBuilder {
                 }
             }
             // ReportCommittedAllocation (80) & ReportCommittedGlobalAllocation (227)
+            // Note: id=80 carries per-device `hAllocationHandle`, which has no `alloc_to_global` entry for
+            // kernel GPU page tables (which lack DeviceAllocation id=38). Only id=227 carries the true
+            // `hGlobalAllocationHandle`, so id=80 only updates known entries rather than creating ghost duplicates.
             80 | 227 => {
                 let gh_raw = schema
                     .get_any_u64(data, &["hGlobalAllocationHandle", "hAllocationHandle"])
@@ -2497,22 +2539,35 @@ impl TimelineBuilder {
                 let size = schema.get_u64(data, "Size").unwrap_or(0);
                 let pid = schema.get_u64(data, "hProcessId").unwrap_or(0) as u32;
                 if gh != 0 {
-                    let entry = self.allocs.entry(gh).or_insert_with(|| AllocMeta {
-                        pid,
-                        size,
-                        current_seg: Some(seg_id),
-                        evicted: false,
-                        alive: true,
-                        ..Default::default()
-                    });
-                    if entry.pid == 0 && pid != 0 {
-                        entry.pid = pid;
+                    if id == 80 {
+                        if let Some(entry) = self.allocs.get_mut(&gh) {
+                            if entry.pid == 0 && pid != 0 {
+                                entry.pid = pid;
+                            }
+                            if entry.size == 0 && size != 0 {
+                                entry.size = size;
+                            }
+                            entry.current_seg = Some(seg_id);
+                            entry.evicted = false;
+                        }
+                    } else {
+                        let entry = self.allocs.entry(gh).or_insert_with(|| AllocMeta {
+                            pid,
+                            size,
+                            current_seg: Some(seg_id),
+                            evicted: false,
+                            alive: true,
+                            ..Default::default()
+                        });
+                        if entry.pid == 0 && pid != 0 {
+                            entry.pid = pid;
+                        }
+                        if entry.size == 0 && size != 0 {
+                            entry.size = size;
+                        }
+                        entry.current_seg = Some(seg_id);
+                        entry.evicted = false;
                     }
-                    if entry.size == 0 && size != 0 {
-                        entry.size = size;
-                    }
-                    entry.current_seg = Some(seg_id);
-                    entry.evicted = false;
                 }
             }
             // ReserveResource/Start (67): updates allocation's current segment
@@ -5026,12 +5081,12 @@ fn build_paging_summary(
             let pref_kind = lookup_seg(a.adapter, a.preferred_seg_id);
             let cur_kind = lookup_seg(a.adapter, cur);
             let create_stack = (!a.create_stack.is_empty())
-                .then(|| symbolizer.format_stack_oneline(&a.create_stack, 8))
+                .then(|| symbolizer.format_stack_oneline(&a.create_stack, ALLOC_CREATE_STACK_FRAMES))
                 .filter(|st| !st.is_empty());
             active_demoted_details.push(DemotedAllocDetail {
                 handle: gh,
                 size_bytes: a.size,
-                heap_kind: classify_alloc_heap_kind(pref_kind, a.flags).into(),
+                heap_kind: classify_alloc_heap_kind(pref_kind, a.flags, a.page_table).into(),
                 flags: a.flags,
                 flags_decoded: format_alloc_flags(a.flags),
                 priority: a.priority,
@@ -5097,7 +5152,7 @@ fn build_paging_summary(
                 let cur_kind = a.current_seg.map(|c| lookup_seg(a.adapter, c));
                 let residency = classify_residency(a, pref_kind, cur_kind);
                 let create_stack = (!a.create_stack.is_empty())
-                    .then(|| symbolizer.format_stack_oneline(&a.create_stack, 8))
+                    .then(|| symbolizer.format_stack_oneline(&a.create_stack, ALLOC_CREATE_STACK_FRAMES))
                     .filter(|st| !st.is_empty());
                 evicted_details.push(EvictedAllocDetail {
                     handle: gh,
@@ -5112,7 +5167,7 @@ fn build_paging_summary(
                     offset_min: acc.off_min,
                     offset_max: acc.off_max,
                     residency: residency.into(),
-                    heap_kind: classify_alloc_heap_kind(pref_kind, a.flags).into(),
+                    heap_kind: classify_alloc_heap_kind(pref_kind, a.flags, a.page_table).into(),
                     cpu_visible: (a.flags & 0x0000_0001) != 0,
                     flags: a.flags,
                     flags_decoded: format_alloc_flags(a.flags),
@@ -5173,12 +5228,14 @@ fn build_paging_summary(
     type GroupKey = (&'static str, String, &'static str, String);
     type GroupAccVal = (u64, u64, HashMap<u64, (u64, u64)>);
     type SizeAccVal = (u64, u64, u64, Option<Vec<u64>>);
+    type CreateStackKey = (u64, &'static str, String, String);
     let mut hist = AllocHistogramSummary {
         pid: target_pid,
         ..Default::default()
     };
     let mut group_acc: HashMap<GroupKey, GroupAccVal> = HashMap::new();
     let mut size_acc: HashMap<(GroupKey, u64), SizeAccVal> = HashMap::new();
+    let mut hist_create_stacks: HashMap<CreateStackKey, (u64, u64)> = HashMap::new();
     for a in allocs.values() {
         if !a.alive || a.size == 0 {
             continue;
@@ -5218,9 +5275,9 @@ fn build_paging_summary(
             (Some(cid), Some(ck)) => format!("s{}({})", cid, ck.as_str()),
             _ => format!("s{}({})->none", a.preferred_seg_id, pref_kind.as_str()),
         };
-        let heap_kind = classify_alloc_heap_kind(pref_kind, a.flags);
+        let heap_kind = classify_alloc_heap_kind(pref_kind, a.flags, a.page_table);
         let prio_label = format_residency_priority(a.priority);
-        let gk: GroupKey = (residency, seg_label, heap_kind, prio_label);
+        let gk: GroupKey = (residency, seg_label, heap_kind, prio_label.clone());
         let ge = group_acc.entry(gk.clone()).or_default();
         ge.0 += 1;
         ge.1 = ge.1.saturating_add(a.size);
@@ -5236,6 +5293,15 @@ fn build_paging_summary(
             if se.3.is_none() && !a.create_stack.is_empty() {
                 se.3 = Some(a.create_stack.clone());
             }
+            let stack_s = (!a.create_stack.is_empty())
+                .then(|| symbolizer.format_stack_oneline(&a.create_stack, ALLOC_CREATE_STACK_FRAMES))
+                .filter(|st| !st.is_empty())
+                .unwrap_or_else(|| "no_stack".into());
+            let cs = hist_create_stacks
+                .entry((a.size, heap_kind, prio_label, stack_s))
+                .or_insert((0, 0));
+            cs.0 += 1;
+            cs.1 = cs.1.saturating_add(a.size);
         }
     }
     if hist.total_allocs > 0 {
@@ -5275,7 +5341,7 @@ fn build_paging_summary(
                 )| {
                     let sample_create_stack = st
                         .as_deref()
-                        .map(|ips| symbolizer.format_stack_oneline(ips, 8))
+                        .map(|ips| symbolizer.format_stack_oneline(ips, ALLOC_CREATE_STACK_FRAMES))
                         .filter(|s| !s.is_empty());
                     AllocSizeHistBucket {
                         residency: residency.into(),
@@ -5307,6 +5373,31 @@ fn build_paging_summary(
             }
         }
         hist.buckets = buckets;
+        let mut top_create_stacks: Vec<AllocCreateStackSummary> = hist_create_stacks
+            .into_iter()
+            .map(
+                |((size_bytes, heap_kind, priority_label, stack), (count, total_bytes))| {
+                    AllocCreateStackSummary {
+                        size_bytes,
+                        heap_kind: heap_kind.into(),
+                        priority_label,
+                        count,
+                        total_bytes,
+                        stack,
+                    }
+                },
+            )
+            .collect();
+        top_create_stacks.sort_by(|a, b| {
+            b.total_bytes
+                .cmp(&a.total_bytes)
+                .then_with(|| b.count.cmp(&a.count))
+                .then_with(|| a.stack.cmp(&b.stack))
+        });
+        if !full_alloc_hist {
+            top_create_stacks.truncate(16);
+        }
+        hist.top_create_stacks = top_create_stacks;
         s.alloc_histogram = Some(hist);
     }
 
@@ -5317,6 +5408,7 @@ fn build_paging_summary(
             pid: target_pid,
             ..Default::default()
         };
+        let mut lookup_stacks: HashMap<(&'static str, String, String), (u64, u64)> = HashMap::new();
         for (&gh, a) in allocs {
             if !a.alive || a.size != wanted_size {
                 continue;
@@ -5348,20 +5440,31 @@ fn build_paging_summary(
             } else {
                 "resident_unknown"
             };
+            let heap_kind = classify_alloc_heap_kind(pref_kind, a.flags, a.page_table);
+            let prio_label = format_residency_priority(a.priority);
             let create_stack = (!a.create_stack.is_empty())
-                .then(|| symbolizer.format_stack_oneline(&a.create_stack, 8))
+                .then(|| symbolizer.format_stack_oneline(&a.create_stack, ALLOC_CREATE_STACK_FRAMES))
                 .filter(|st| !st.is_empty());
+            if a.created_during_trace {
+                lookup.in_trace_count += 1;
+                let stack_s = create_stack.clone().unwrap_or_else(|| "no_stack".into());
+                let cs = lookup_stacks
+                    .entry((heap_kind, prio_label.clone(), stack_s))
+                    .or_insert((0, 0));
+                cs.0 += 1;
+                cs.1 = cs.1.saturating_add(a.size);
+            }
             lookup.matches.push(AllocLookupMatch {
                 handle: gh,
                 pid: a.pid,
                 size_bytes: a.size,
                 residency: residency.into(),
-                heap_kind: classify_alloc_heap_kind(pref_kind, a.flags).into(),
+                heap_kind: heap_kind.into(),
                 cpu_visible: (a.flags & 0x0000_0001) != 0,
                 flags: a.flags,
                 flags_decoded: format_alloc_flags(a.flags),
                 priority: a.priority,
-                priority_label: format_residency_priority(a.priority),
+                priority_label: prio_label,
                 preferred_seg_id: a.preferred_seg_id,
                 preferred_seg_kind: pref_kind.as_str().into(),
                 current_seg_id: a.current_seg,
@@ -5379,6 +5482,24 @@ fn build_paging_summary(
         }
         lookup.matches.sort_by_key(|m| m.handle);
         lookup.match_count = lookup.matches.len();
+        let mut lcs: Vec<AllocCreateStackSummary> = lookup_stacks
+            .into_iter()
+            .map(
+                |((heap_kind, priority_label, stack), (count, total_bytes))| AllocCreateStackSummary {
+                    size_bytes: wanted_size,
+                    heap_kind: heap_kind.into(),
+                    priority_label,
+                    count,
+                    total_bytes,
+                    stack,
+                },
+            )
+            .collect();
+        lcs.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.stack.cmp(&b.stack)));
+        if !full_alloc_hist {
+            lcs.truncate(16);
+        }
+        lookup.top_create_stacks = lcs;
         s.alloc_lookup = Some(lookup);
     }
 
@@ -6468,17 +6589,30 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
             let pid_s = lk.pid.map(|p| p.to_string()).unwrap_or_else(|| "all".into());
             let _ = writeln!(
                 out,
-                "ALLOC_LOOKUP size={} ({}B) pid={} matches={} (resident_local={} demoted={} resident_nonlocal={} evicted={} uncommitted={})",
+                "ALLOC_LOOKUP size={} ({}B) pid={} matches={} (in_trace={} resident_local={} demoted={} resident_nonlocal={} evicted={} uncommitted={})",
                 fmt_heap_size_exact(lk.query_size_bytes),
                 lk.query_size_bytes,
                 pid_s,
                 lk.match_count,
+                lk.in_trace_count,
                 lk.resident_local_count,
                 lk.demoted_count,
                 lk.resident_nonlocal_count,
                 lk.evicted_count,
                 lk.uncommitted_count,
             );
+            for cs in &lk.top_create_stacks {
+                let _ = writeln!(
+                    out,
+                    "ALLOC_LOOKUP_STACK size={} n={} total={} kind={} prio={} stack={}",
+                    fmt_heap_size_exact(cs.size_bytes),
+                    cs.count,
+                    fmt_bytes_short(cs.total_bytes),
+                    cs.heap_kind,
+                    cs.priority_label,
+                    cs.stack,
+                );
+            }
             for m in &lk.matches {
                 let seg_cur = match (m.current_seg_id, m.current_seg_kind.as_deref()) {
                     (Some(id), Some(k)) => format!("s{id}({k})"),
@@ -6600,6 +6734,18 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                     hist.tail_bucket_count,
                     hist.tail_alloc_count,
                     fmt_bytes_short(hist.tail_bytes),
+                );
+            }
+            for cs in &hist.top_create_stacks {
+                let _ = writeln!(
+                    out,
+                    "ALLOC_CREATE_STACK size={} n={} total={} kind={} prio={} stack={}",
+                    fmt_heap_size_exact(cs.size_bytes),
+                    cs.count,
+                    fmt_bytes_short(cs.total_bytes),
+                    cs.heap_kind,
+                    cs.priority_label,
+                    cs.stack,
                 );
             }
         }
@@ -7116,6 +7262,7 @@ mod tests {
                 priority: 0x7800_0000,
                 preferred_seg_id: 1,
                 current_seg: Some(2),
+                page_table: false,
                 evicted: false,
                 cpu_va: Some(0x1c_41ea_0000),
                 gpu_va_start: Some(0x13_6000_0000),
@@ -7282,6 +7429,7 @@ mod tests {
                 priority: 0xC800_0000,
                 preferred_seg_id: 2,
                 current_seg: Some(2),
+                page_table: false,
                 evicted: false,
                 cpu_va: Some(0x1c_41ea_0000),
                 gpu_va_start: Some(0x13_6000_0000),
@@ -7305,6 +7453,7 @@ mod tests {
                 priority: 0x7800_0000,
                 preferred_seg_id: 2,
                 current_seg: Some(2),
+                page_table: false,
                 evicted: false,
                 cpu_va: None,
                 gpu_va_start: Some(0x14_0000_0000),
@@ -7328,6 +7477,7 @@ mod tests {
                 priority: 0x7800_0000,
                 preferred_seg_id: 2,
                 current_seg: Some(2),
+                page_table: false,
                 evicted: true,
                 cpu_va: None,
                 gpu_va_start: None,
@@ -7404,7 +7554,7 @@ mod tests {
 
         let text = format_timeline_text(&rep, &TimelineFormatOptions::default());
         assert!(text.contains(
-            "ALLOC_LOOKUP size=1792MiB (1879048192B) pid=77 matches=3 (resident_local=2 demoted=0 resident_nonlocal=0 evicted=1 uncommitted=0)"
+            "ALLOC_LOOKUP size=1792MiB (1879048192B) pid=77 matches=3 (in_trace=0 resident_local=2 demoted=0 resident_nonlocal=0 evicted=1 uncommitted=0)"
         ));
         assert!(text.contains(
             "ALLOC_MATCH handle=0x1001 size=1792MiB residency=resident_local kind=local_cpu_vis(GPU_UPLOAD) cpu_vis=true flags=0x1(CpuVisible) prio=MAXIMUM(0xc8000000) seg=s2(local_bar_vram)->s2(local_bar_vram) cpu_va=0x1c41ea0000..0x1cb1ea0000 gpu_va=0x1360000000..0x13d0000000 origin=pre_trace"
@@ -7431,7 +7581,7 @@ mod tests {
         );
         let text_zero = format_timeline_text(&rep_zero, &TimelineFormatOptions::default());
         assert!(text_zero.contains(
-            "ALLOC_LOOKUP size=1792MiB (1879048192B) pid=77 matches=0 (resident_local=0 demoted=0 resident_nonlocal=0 evicted=0 uncommitted=0)"
+            "ALLOC_LOOKUP size=1792MiB (1879048192B) pid=77 matches=0 (in_trace=0 resident_local=0 demoted=0 resident_nonlocal=0 evicted=0 uncommitted=0)"
         ));
 
         // No top-N cutoff: 25 matching 64 MiB allocations all appear in matches and text output.
@@ -7495,6 +7645,7 @@ mod tests {
                 priority: 0x7800_0000,
                 preferred_seg_id: 2,
                 current_seg: Some(2),
+                page_table: false,
                 evicted: false,
                 cpu_va: Some(0x20_0000_0000),
                 gpu_va_start: Some(0x10_0000_0000),
@@ -7518,6 +7669,7 @@ mod tests {
                 priority: 0x7800_0000,
                 preferred_seg_id: 2,
                 current_seg: Some(3),
+                page_table: false,
                 evicted: false,
                 cpu_va: None,
                 gpu_va_start: None,
@@ -7638,5 +7790,92 @@ mod tests {
         assert!(text.contains(
             "ALLOC_HIST residency=resident_local seg=s2(local_bar_vram) kind=local_default(DEFAULT) prio=NORMAL(0x78000000) size=32640KiB count=1"
         ));
+    }
+
+    #[test]
+    fn alloc_create_stacks_reach_deep_caller_frames_and_label_page_tables() {
+        let kib = 1024u64;
+        let mut b = TimelineBuilder::new(Some(55), 10_000_000);
+        b.start_qpc = Some(0);
+        b.end_qpc = Some(10_000_000);
+        b.segments.insert((0x40, 2), SegmentKind::LocalCpuVisibleVram);
+
+        // 12-frame user stack (10 driver/runtime frames + 2 xcl.exe frames past the old 8-frame cap).
+        let mut deep_stack: Vec<u64> = (0..10u64)
+            .map(|i| 0x7FF8_1000_0000 + 0x1000 + i * 0x100)
+            .collect();
+        deep_stack.push(0x7FF6_2000_1234);
+        deep_stack.push(0x7FF6_2000_5678);
+
+        for i in 0..3u64 {
+            b.allocs.insert(
+                0x5000 + i,
+                AllocMeta {
+                    pid: 55,
+                    adapter: 0x40,
+                    size: 64 * kib,
+                    flags: 0x0,
+                    priority: 0x7800_0000,
+                    preferred_seg_id: 2,
+                    current_seg: Some(2),
+                    page_table: false,
+                    evicted: false,
+                    create_stack: deep_stack.clone(),
+                    created_during_trace: true,
+                    alive: true,
+                    ..Default::default()
+                },
+            );
+        }
+        // GPU page table allocation (PageTableOrDirectory=true).
+        b.allocs.insert(
+            0x6000,
+            AllocMeta {
+                pid: 55,
+                adapter: 0x40,
+                size: 4 * kib,
+                flags: 0x40,
+                priority: 0xA000_0000,
+                preferred_seg_id: 0,
+                current_seg: Some(2),
+                page_table: true,
+                evicted: false,
+                created_during_trace: true,
+                alive: true,
+                ..Default::default()
+            },
+        );
+
+        let mut sym = Symbolizer::new(None);
+        sym.add_etw_image(0x7FF8_1000_0000, 0x100_000, r"C:\Windows\System32\nvwgf2umx.dll");
+        sym.add_etw_image(0x7FF6_2000_0000, 0x100_000, r"C:\Games\xcl.exe");
+
+        let rep = b.finish_with_options(
+            "create_stacks.etl".into(),
+            &mut sym,
+            Vec::new(),
+            None,
+            TimelineCutOptions {
+                between_presents: false,
+                frame_index: None,
+                alloc_size_bytes: Some(64 * kib),
+                full_alloc_hist: false,
+            },
+        );
+        let text = format_timeline_text(&rep, &TimelineFormatOptions::default());
+        assert!(
+            text.contains("ALLOC_LOOKUP size=64KiB (65536B) pid=55 matches=3 (in_trace=3 resident_local=3")
+        );
+        assert!(text.contains(
+            "ALLOC_LOOKUP_STACK size=64KiB n=3 total=192.0KiB kind=local_default(DEFAULT) prio=NORMAL(0x78000000) stack="
+        ));
+        assert!(
+            text.contains("xcl.exe+0x1234 <- xcl.exe+0x5678"),
+            "24-frame create stack must reach xcl.exe callers past 10 driver frames"
+        );
+        assert!(text.contains(
+            "ALLOC_CREATE_STACK size=64KiB n=3 total=192.0KiB kind=local_default(DEFAULT) prio=NORMAL(0x78000000) stack="
+        ));
+        assert!(text.contains("kind=page_table prio=HIGH(0xa0000000) size=4KiB count=1"));
     }
 }
