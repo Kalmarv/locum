@@ -60,8 +60,8 @@ pub const CLASSIC_IMAGE_GUID: GUID = GUID::from_u128(0x2cb15d1d_5fc1_11d2_abe1_0
 pub const CLASSIC_STACKWALK_GUID: GUID = GUID::from_u128(0xdef2fe46_7bd6_4b80_bd94_f57fe20d0ce3);
 
 /// DxgKrnl keywords for unified QPC timeline:
-/// `Base (0x1) | References (0x4) | Resource (0x40) | Memory (0x80) | LongHaul (0x800) | Present (0x0800_0000)`.
-pub const DXGKRNL_KEYWORDS_TIMELINE: u64 = 0x0800_08C5;
+/// `Base (0x1) | References (0x4) | Resource (0x40) | Memory (0x80) | LongHaul (0x800) | GPUVA (0x100000) | Present (0x0800_0000)`.
+pub const DXGKRNL_KEYWORDS_TIMELINE: u64 = 0x0810_08C5;
 /// `SystemMemoryProvider`: `HardFaults (0x2000) | VirtualAlloc (0x4000)`.
 pub const SYSTEM_MEMORY_KW_TIMELINE: u64 = 0x6000;
 /// `SystemSchedulerProvider`: `CSwitch (0x10) | ReadyThread (0x20)`.
@@ -132,6 +132,84 @@ pub(crate) fn probe_process_alive(pid: u32) -> (bool, Option<u32>) {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+fn format_alloc_flags(flags: u32) -> String {
+    if flags == 0 {
+        return "0x0".into();
+    }
+    let mut parts = Vec::new();
+    const BITS: &[(u32, &str)] = &[
+        (0x0000_0001, "CpuVisible"),
+        (0x0000_0002, "PermanentSysMem"),
+        (0x0000_0004, "Cached"),
+        (0x0000_0008, "Protected"),
+        (0x0000_0010, "ExistingSysMem"),
+        (0x0000_0020, "ExistingKernelSysMem"),
+        (0x0000_0040, "FromEndOfSeg"),
+        (0x0000_0080, "Swizzled"),
+        (0x0000_0400, "AltVA"),
+        (0x0000_0800, "SyncPaging"),
+        (0x0001_0000, "ExplicitResidency"),
+        (0x0004_0000, "CpuVisOnDemand"),
+    ];
+    for &(bit, name) in BITS {
+        if (flags & bit) != 0 {
+            parts.push(name);
+        }
+    }
+    if parts.is_empty() {
+        format!("{flags:#x}")
+    } else {
+        format!("{flags:#x}({})", parts.join("|"))
+    }
+}
+
+fn format_residency_priority(prio: u32) -> String {
+    if prio == 0 {
+        return "unset(0x0)".into();
+    }
+    const BANDS: &[(u32, &str)] = &[
+        (0xC800_0000, "MAXIMUM"),
+        (0xA000_0000, "HIGH"),
+        (0x7800_0000, "NORMAL"),
+        (0x5000_0000, "LOW"),
+        (0x2800_0000, "MINIMUM"),
+    ];
+    for &(base, name) in BANDS {
+        if prio == base {
+            return format!("{name}({prio:#x})");
+        }
+        if prio > base && prio.saturating_sub(base) < 0x2800_0000 {
+            let delta = prio - base;
+            return format!("{name}+{delta:#x}({prio:#x})");
+        }
+    }
+    format!("{prio:#x}")
+}
+
+fn classify_alloc_heap_kind(pref_kind: SegmentKind, flags: u32) -> &'static str {
+    if pref_kind.is_local() {
+        if (flags & 0x0000_0001) != 0 || pref_kind == SegmentKind::LocalCpuVisibleVram {
+            "local_cpu_vis(GPU_UPLOAD)"
+        } else if (flags & 0x0004_0000) != 0 {
+            "local_cpu_vis_on_demand"
+        } else {
+            "local_default(DEFAULT)"
+        }
+    } else if pref_kind.is_non_local() {
+        if (flags & 0x0000_0004) != 0 {
+            "nonlocal_cached(READBACK)"
+        } else {
+            "nonlocal(UPLOAD/SHARED)"
+        }
+    } else {
+        "unknown"
+    }
 }
 
 fn parse_ctx_from_queue_label(label: &str) -> Option<u64> {
@@ -596,6 +674,33 @@ pub struct HeapSizeBucket {
     pub total_bytes: u64,
 }
 
+/// Detailed identity of an active demoted VidMm allocation (preferred Local VRAM, resident in NonLocal/Shared).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DemotedAllocDetail {
+    pub handle: u64,
+    pub size_bytes: u64,
+    pub heap_kind: String,
+    pub flags: u32,
+    pub flags_decoded: String,
+    pub priority: u32,
+    pub priority_label: String,
+    pub preferred_seg_id: u32,
+    pub preferred_seg_kind: String,
+    pub current_seg_id: u32,
+    pub current_seg_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_va: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_va_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_va_end: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub gpu_va_mappings: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_stack: Option<String>,
+    pub created_during_trace: bool,
+}
+
 /// VidMm paging, residency, demotion, and eviction throughput summary (clipped to active window).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PagingTimelineSummary {
@@ -645,6 +750,8 @@ pub struct PagingTimelineSummary {
     pub active_demoted_alloc_bytes: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_demoted_heap_sizes: Vec<HeapSizeBucket>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_demoted_allocs: Vec<DemotedAllocDetail>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evicted_or_demoted_heap_sizes: Vec<HeapSizeBucket>,
 }
@@ -1071,13 +1178,21 @@ struct ContextMeta {
     engine_type: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct AllocMeta {
     pid: u32,
     adapter: u64,
     size: u64,
+    flags: u32,
+    priority: u32,
     preferred_seg_id: u32,
     current_seg: Option<u32>,
+    cpu_va: Option<u64>,
+    gpu_va_start: Option<u64>,
+    gpu_va_end: Option<u64>,
+    gpu_va_mappings: u32,
+    create_stack: Vec<u64>,
+    created_during_trace: bool,
     alive: bool,
 }
 
@@ -1871,7 +1986,8 @@ impl TimelineBuilder {
         let id = rec.EventHeader.EventDescriptor.Id;
         if !matches!(
             id,
-            27..=38
+            27..=40
+                | 46
                 | 47
                 | 49
                 | 50
@@ -1901,6 +2017,8 @@ impl TimelineBuilder {
                 | 306
                 | 320..=323
                 | 325
+                | 333
+                | 334
                 | 338
                 | 339
                 | 366
@@ -1908,6 +2026,7 @@ impl TimelineBuilder {
                 | 370
                 | 371
                 | 422..=424
+                | 435
                 | 450
                 | 451
                 | 462
@@ -2028,7 +2147,7 @@ impl TimelineBuilder {
                 let kind = classify_segment(flags, group);
                 self.segments.insert((adapter, seg_id), kind);
             }
-            // AdapterAllocation Start (33) / Stop (34) / DC_Start (35): tracks heap size & preferred segment
+            // AdapterAllocation Start (33) / Stop (34) / DC_Start (35): tracks heap size, flags, priority, preferred segment & creation stack
             33..=35 => {
                 let gh = schema.get_u64(data, "hVidMmGlobalAlloc").unwrap_or(0);
                 if gh == 0 {
@@ -2050,13 +2169,28 @@ impl TimelineBuilder {
                 }
                 let adapter = schema.get_u64(data, "pDxgAdapter").unwrap_or(0);
                 let size = schema.get_u64(data, "allocSize").unwrap_or(0);
+                let flags = schema.get_u64(data, "Flags").unwrap_or(0) as u32;
+                let priority = schema.get_u64(data, "Priority").unwrap_or(0) as u32;
                 let pref_id = (schema.get_u64(data, "PreferredSegment").unwrap_or(0) as u32) & 0x1F;
+                let stack = if id == 33 && self.matches_pid(pid) {
+                    extract_inline_stack(rec)
+                } else {
+                    Vec::new()
+                };
                 let entry = self.allocs.entry(gh).or_insert_with(|| AllocMeta {
                     pid,
                     adapter,
                     size,
+                    flags,
+                    priority,
                     preferred_seg_id: pref_id,
                     current_seg: None,
+                    cpu_va: None,
+                    gpu_va_start: None,
+                    gpu_va_end: None,
+                    gpu_va_mappings: 0,
+                    create_stack: Vec::new(),
+                    created_during_trace: id == 33,
                     alive: true,
                 });
                 if pid != 0 {
@@ -2068,12 +2202,22 @@ impl TimelineBuilder {
                 if size != 0 {
                     entry.size = size;
                 }
+                entry.flags = flags;
+                if priority != 0 {
+                    entry.priority = priority;
+                }
                 if pref_id != 0 {
                     entry.preferred_seg_id = pref_id;
                 }
+                if id == 33 {
+                    entry.created_during_trace = true;
+                    if !stack.is_empty() && entry.create_stack.is_empty() {
+                        entry.create_stack = stack;
+                    }
+                }
                 entry.alive = true;
             }
-            // DeviceAllocation Start (36) / Stop (37) / DC_Start (38): maps hVidMmAlloc -> hVidMmGlobalAlloc
+            // DeviceAllocation Start (36) / Stop (37) / DC_Start (38): maps hVidMmAlloc -> hVidMmGlobalAlloc & captures pVirtualAddress
             36..=38 => {
                 let h_alloc = schema.get_u64(data, "hVidMmAlloc").unwrap_or(0);
                 let gh = schema.get_u64(data, "hVidMmGlobalAlloc").unwrap_or(0);
@@ -2086,11 +2230,75 @@ impl TimelineBuilder {
                     if pid == 0 && hdev != 0 {
                         pid = self.device_pid.get(&hdev).copied().unwrap_or(0);
                     }
-                    if pid != 0
-                        && let Some(a) = self.allocs.get_mut(&gh)
-                        && a.pid == 0
-                    {
+                    let cpu_va = schema.get_u64(data, "pVirtualAddress").filter(|&v| v != 0);
+                    let a = self.allocs.entry(gh).or_insert_with(|| AllocMeta {
+                        pid,
+                        alive: true,
+                        ..Default::default()
+                    });
+                    if pid != 0 && a.pid == 0 {
                         a.pid = pid;
+                    }
+                    if a.cpu_va.is_none() && cpu_va.is_some() {
+                        a.cpu_va = cpu_va;
+                    }
+                }
+            }
+            // TerminateAllocation (39) / ProcessTerminateAllocation (40)
+            39 | 40 => {
+                if let Some(h_alloc) = schema.get_u64(data, "hVidMmAlloc")
+                    && let Some(&gh) = self.alloc_to_global.get(&h_alloc)
+                    && let Some(a) = self.allocs.get_mut(&gh)
+                {
+                    a.alive = false;
+                }
+            }
+            // SetAllocationPriority (46): tracks live residency-priority updates (SetResidencyPriority)
+            46 => {
+                let h_raw = schema.get_u64(data, "hAllocationHandle").unwrap_or(0);
+                let prio = schema.get_u64(data, "Priority").unwrap_or(0) as u32;
+                let gh = self.alloc_to_global.get(&h_raw).copied().unwrap_or(h_raw);
+                if gh != 0
+                    && prio != 0
+                    && let Some(a) = self.allocs.get_mut(&gh)
+                {
+                    a.priority = prio;
+                }
+            }
+            // GpuVirtualAddressRangeMapping DC_Start (333) / Start (334) / Stop (435): links allocation -> GPU VA range
+            333 | 334 | 435 => {
+                let owner = schema.get_u64(data, "pOwner").unwrap_or(0);
+                let start = schema.get_u64(data, "StartAddress").unwrap_or(0);
+                let end = schema.get_u64(data, "EndAddress").unwrap_or(0);
+                if owner == 0 || start == 0 || end <= start {
+                    return;
+                }
+                let gh = self.alloc_to_global.get(&owner).copied().unwrap_or(owner);
+                let Some(a) = self.allocs.get_mut(&gh) else {
+                    return;
+                };
+                if id == 435 {
+                    if a.gpu_va_start == Some(start) && a.gpu_va_end == Some(end) && a.gpu_va_mappings <= 1 {
+                        a.gpu_va_start = None;
+                        a.gpu_va_end = None;
+                        a.gpu_va_mappings = 0;
+                    }
+                } else {
+                    let span = end - start;
+                    match (a.gpu_va_start, a.gpu_va_end) {
+                        (Some(cs), Some(ce)) if cs == start && ce == end => {}
+                        (Some(cs), Some(ce)) => {
+                            a.gpu_va_mappings = a.gpu_va_mappings.saturating_add(1);
+                            if span > ce.saturating_sub(cs) {
+                                a.gpu_va_start = Some(start);
+                                a.gpu_va_end = Some(end);
+                            }
+                        }
+                        _ => {
+                            a.gpu_va_start = Some(start);
+                            a.gpu_va_end = Some(end);
+                            a.gpu_va_mappings = 1;
+                        }
                     }
                 }
             }
@@ -2106,11 +2314,10 @@ impl TimelineBuilder {
                 if gh != 0 {
                     let entry = self.allocs.entry(gh).or_insert_with(|| AllocMeta {
                         pid,
-                        adapter: 0,
                         size,
-                        preferred_seg_id: 0,
                         current_seg: Some(seg_id),
                         alive: true,
+                        ..Default::default()
                     });
                     if entry.pid == 0 && pid != 0 {
                         entry.pid = pid;
@@ -4194,6 +4401,7 @@ impl TimelineBuilder {
             &self.vidmm_samples,
             &self.allocs,
             &self.segments,
+            symbolizer,
         );
 
         let mut top_stacks: Vec<StackSummary> = stack_acc
@@ -4341,6 +4549,7 @@ fn build_paging_summary(
     vidmm_samples: &VecDeque<VidMmCounterSample>,
     allocs: &HashMap<u64, AllocMeta>,
     segments: &HashMap<(u64, u32), SegmentKind>,
+    symbolizer: &mut Symbolizer,
 ) -> Option<PagingTimelineSummary> {
     let mut s = PagingTimelineSummary::default();
     let dur_secs = ((end_qpc - start_qpc).max(0) as f64 / qpc_freq_hz.max(1) as f64).max(1e-6);
@@ -4490,7 +4699,8 @@ fn build_paging_summary(
             .unwrap_or(SegmentKind::Unknown)
     };
     let mut active_demoted_heaps: HashMap<u64, (u64, u64)> = HashMap::new();
-    for a in allocs.values() {
+    let mut active_demoted_details: Vec<DemotedAllocDetail> = Vec::new();
+    for (&gh, a) in allocs {
         if !a.alive || a.size == 0 {
             continue;
         }
@@ -4508,9 +4718,41 @@ fn build_paging_summary(
             let e = active_demoted_heaps.entry(a.size).or_insert((0, 0));
             e.0 += 1;
             e.1 = e.1.saturating_add(a.size);
+
+            let pref_kind = lookup_seg(a.adapter, a.preferred_seg_id);
+            let cur_kind = lookup_seg(a.adapter, cur);
+            let create_stack = (!a.create_stack.is_empty())
+                .then(|| symbolizer.format_stack_oneline(&a.create_stack, 8))
+                .filter(|st| !st.is_empty());
+            active_demoted_details.push(DemotedAllocDetail {
+                handle: gh,
+                size_bytes: a.size,
+                heap_kind: classify_alloc_heap_kind(pref_kind, a.flags).into(),
+                flags: a.flags,
+                flags_decoded: format_alloc_flags(a.flags),
+                priority: a.priority,
+                priority_label: format_residency_priority(a.priority),
+                preferred_seg_id: a.preferred_seg_id,
+                preferred_seg_kind: pref_kind.as_str().into(),
+                current_seg_id: cur,
+                current_seg_kind: cur_kind.as_str().into(),
+                cpu_va: a.cpu_va,
+                gpu_va_start: a.gpu_va_start,
+                gpu_va_end: a.gpu_va_end,
+                gpu_va_mappings: a.gpu_va_mappings,
+                create_stack,
+                created_during_trace: a.created_during_trace,
+            });
         }
     }
+    active_demoted_details.sort_by(|a, b| {
+        b.size_bytes
+            .cmp(&a.size_bytes)
+            .then_with(|| a.handle.cmp(&b.handle))
+    });
+    active_demoted_details.truncate(16);
     s.active_demoted_heap_sizes = group_heap_buckets(active_demoted_heaps);
+    s.active_demoted_allocs = active_demoted_details;
 
     any_data.then_some(s)
 }
@@ -5466,6 +5708,37 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                 fmt_buckets(&pg.active_demoted_heap_sizes),
                 fmt_buckets(&pg.evicted_or_demoted_heap_sizes),
             );
+            for a in &pg.active_demoted_allocs {
+                let cpu_va = a.cpu_va.map(|v| format!("{v:#x}")).unwrap_or_else(|| "-".into());
+                let gpu_va = match (a.gpu_va_start, a.gpu_va_end) {
+                    (Some(s), Some(e)) if a.gpu_va_mappings > 1 => {
+                        format!("{s:#x}..{e:#x}(+{}maps)", a.gpu_va_mappings - 1)
+                    }
+                    (Some(s), Some(e)) => format!("{s:#x}..{e:#x}"),
+                    _ => "-".into(),
+                };
+                let origin = match a.create_stack.as_deref() {
+                    Some(st) => format!(" create_stack={st}"),
+                    None if a.created_during_trace => " origin=in_trace(no_stack)".into(),
+                    None => " origin=pre_trace".into(),
+                };
+                let _ = writeln!(
+                    out,
+                    "DEMOTED_ALLOC handle={:#x} size={} kind={} flags={} prio={} seg=s{}({})->s{}({}) cpu_va={} gpu_va={}{}",
+                    a.handle,
+                    fmt_heap_size_exact(a.size_bytes),
+                    a.heap_kind,
+                    a.flags_decoded,
+                    a.priority_label,
+                    a.preferred_seg_id,
+                    a.preferred_seg_kind,
+                    a.current_seg_id,
+                    a.current_seg_kind,
+                    cpu_va,
+                    gpu_va,
+                    origin,
+                );
+            }
         }
     }
 
@@ -5969,15 +6242,23 @@ mod tests {
         // Segment 1 = Local VRAM, Segment 2 = NonLocal/Shared.
         b.segments.insert((0x10, 1), SegmentKind::LocalVram);
         b.segments.insert((0x10, 2), SegmentKind::NonLocalHost);
-        // Active demoted 256 MiB heap (preferred Local seg 1, sitting in NonLocal seg 2).
+        // Active demoted 1792 MiB GPU_UPLOAD heap (preferred Local seg 1, CpuVisible flag 0x1, sitting in NonLocal seg 2).
         b.allocs.insert(
             0xA1,
             AllocMeta {
                 pid: 77,
                 adapter: 0x10,
-                size: 256 * 1024 * 1024,
+                size: 1792 * 1024 * 1024,
+                flags: 0x1,
+                priority: 0x7800_0000,
                 preferred_seg_id: 1,
                 current_seg: Some(2),
+                cpu_va: Some(0x1c_41ea_0000),
+                gpu_va_start: Some(0x13_6000_0000),
+                gpu_va_end: Some(0x13_d000_0000),
+                gpu_va_mappings: 1,
+                create_stack: Vec::new(),
+                created_during_trace: false,
                 alive: true,
             },
         );
@@ -6079,7 +6360,16 @@ mod tests {
         assert!((pg.demote_xfer_mb_per_sec - 64.0).abs() < 0.1);
         assert_eq!(pg.demoted_added_bytes, 128 * mib);
         assert_eq!(pg.active_demoted_alloc_count, 1);
-        assert_eq!(pg.active_demoted_heap_sizes[0].heap_bytes, 256 * mib);
+        assert_eq!(pg.active_demoted_heap_sizes[0].heap_bytes, 1792 * mib);
+        assert_eq!(pg.active_demoted_allocs.len(), 1);
+        let da = &pg.active_demoted_allocs[0];
+        assert_eq!(da.handle, 0xA1);
+        assert_eq!(da.heap_kind, "local_cpu_vis(GPU_UPLOAD)");
+        assert_eq!(da.flags_decoded, "0x1(CpuVisible)");
+        assert_eq!(da.priority_label, "NORMAL(0x78000000)");
+        assert_eq!(da.cpu_va, Some(0x1c_41ea_0000));
+        assert_eq!(da.gpu_va_start, Some(0x13_6000_0000));
+        assert_eq!(da.gpu_va_end, Some(0x13_d000_0000));
 
         let text = format_timeline_text(&rep, &TimelineFormatOptions::default());
         assert!(text.contains("window=between_presents(frame=0/2"));
@@ -6088,6 +6378,9 @@ mod tests {
         assert!(text.contains("500.00(f=0,seq=42)"));
         assert!(text.contains("VIDMM_BUDGET"));
         assert!(text.contains("over_budget=+5.00GiB"));
-        assert!(text.contains("DEMOTED_HEAPS active_demoted=1 (256.0MiB)"));
+        assert!(text.contains("DEMOTED_HEAPS active_demoted=1 (1.75GiB)"));
+        assert!(text.contains(
+            "DEMOTED_ALLOC handle=0xa1 size=1792MiB kind=local_cpu_vis(GPU_UPLOAD) flags=0x1(CpuVisible) prio=NORMAL(0x78000000) seg=s1(local_vram)->s2(non_local_host) cpu_va=0x1c41ea0000 gpu_va=0x1360000000..0x13d0000000 origin=pre_trace"
+        ));
     }
 }
