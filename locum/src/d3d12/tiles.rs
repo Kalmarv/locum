@@ -48,14 +48,33 @@ fn real(wrapped: *mut c_void) -> Option<ID3D12Resource> {
     unsafe { ID3D12Resource::from_raw_borrowed(&raw) }.cloned()
 }
 
+/// Reserved resource tile numbering and page table as captures record them ([`Layout::json`], [`Pages::runs`]).
+pub type PagesSnapshot = Result<(Value, Value), String>;
+
 /// Reserved resource `id`'s tile numbering and page table as captures record them ([`Layout::json`],
 /// [`Pages::runs`]); one never mapped has an empty page table.
-pub fn pages(id: u64) -> Result<(Value, Value), String> {
-    let resource = super::real::<ID3D12Resource>(id).ok_or("no live resource")?;
-    with_entry(id, &resource, |e| match &e.error {
-        Some(error) => Err(error.clone()),
-        None => Ok((e.layout.json(), json!(e.pages.runs()))),
-    })?
+pub fn pages(id: u64) -> PagesSnapshot {
+    pages_and_mapped_buffer_tiles(id).0
+}
+
+/// Reserved resource `id`'s tile numbering and page table as captures record them ([`Layout::json`],
+/// [`Pages::runs`]), together with its mapped 64 KiB tiles in order when `id` is a reserved buffer whose page table
+/// is known. Both are read under the same lock so room accounting and readback see identical capture-time coverage.
+pub fn pages_and_mapped_buffer_tiles(id: u64) -> (PagesSnapshot, Option<Vec<u32>>) {
+    let Some(resource) = super::real::<ID3D12Resource>(id) else {
+        return (Err("no live resource".into()), None);
+    };
+    let is_buffer = unsafe { resource.GetDesc() }.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    match with_entry(id, &resource, |e| match &e.error {
+        Some(error) => (Err(error.clone()), None),
+        None => (
+            Ok((e.layout.json(), json!(e.pages.runs()))),
+            is_buffer.then(|| e.pages.tiles.keys().copied().collect()),
+        ),
+    }) {
+        Ok(both) => both,
+        Err(error) => (Err(error), None),
+    }
 }
 
 /// The tiles of reserved buffer `id` mapped now, in order (tile `i` holds bytes `i` × 64 KiB on); None when `id` is

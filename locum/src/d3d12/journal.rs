@@ -712,11 +712,13 @@ pub unsafe fn submit(
                 unsafe { super::indirect::read_at_submission(&mut reads, queue) };
             }
             for resource in pages {
+                let (pages, mapped_buffer_tiles) = super::tiles::pages_and_mapped_buffer_tiles(resource);
                 tiles.insert(
                     resource,
                     Tiles {
-                        pages: super::tiles::pages(resource),
+                        pages,
                         unreadable: super::tiles::unreadable(resource),
+                        mapped_buffer_tiles,
                     },
                 );
             }
@@ -881,6 +883,8 @@ pub unsafe fn submitted(queue: &Data, real: *mut c_void, mut submission: super::
 struct Tiles {
     pages: Result<(Value, Value), String>,
     unreadable: Option<String>,
+    /// Mapped 64 KiB tiles of a reserved buffer, captured under the same lock as `pages`.
+    mapped_buffer_tiles: Option<Vec<u32>>,
 }
 
 /// The first wait this queue has been told of that no submitted Signal and no completed fence value is known to
@@ -1006,7 +1010,17 @@ fn first_uses(
         };
         let layout = layout.expect("checked");
         let heap_only = heap.contains(&resource);
-        if let Err(why) = live.room.take(locum_capture::layout::total(&layout), heap_only) {
+        let mapped_tiles = if reserved && !texture {
+            tile.and_then(|t| t.mapped_buffer_tiles.clone())
+        } else {
+            None
+        };
+        let planned_bytes = if texture {
+            locum_capture::layout::total(&layout)
+        } else {
+            super::readback::buffer_copy_bytes(locum_capture::layout::total(&layout), mapped_tiles.as_deref())
+        };
+        if let Err(why) = live.room.take(planned_bytes, heap_only) {
             let named = if heap_only {
                 ", named only by a descriptor heap its root signature indexes directly"
             } else {
@@ -1037,6 +1051,7 @@ fn first_uses(
                 .then(|| locum_capture::format::layout(format).map_or(4, |f| f.block_bytes)),
             states,
             layout,
+            mapped_tiles,
             note: unknown
                 .map(|why| {
                     format!(
@@ -1802,7 +1817,53 @@ pub(super) fn arm_now(root: &std::path::Path, frames: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DISK_KEPT, Room, runs};
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::path::PathBuf;
+
+    use locum_capture::{d3d12 as model, db};
+    use serde_json::json;
+
+    use super::{DISK_KEPT, Live, Room, Tiles, first_uses, runs};
+
+    fn reserved_buffer(id: u64, width: u64) -> model::Object {
+        model::Object {
+            id,
+            kind: "ID3D12Resource",
+            device: 1,
+            description: json!({
+                "dimension": 1,
+                "width": width,
+                "height": 1,
+                "depth_or_array": 1,
+                "mips": 1,
+                "format": 0,
+                "sample_count": 1,
+                "flags": 0,
+                "heap_properties": null,
+            }),
+        }
+    }
+
+    fn test_live(objects: &BTreeMap<u64, model::Object>, room: Room) -> Live {
+        let list: Vec<_> = objects.values().cloned().collect();
+        Live {
+            number: 1,
+            series: None,
+            path: PathBuf::new(),
+            projection: model::Projection::new(&list),
+            frame: model::Frame {
+                objects: list,
+                ..model::Frame::default()
+            },
+            capture: db::Capture::default(),
+            results: Default::default(),
+            used: HashSet::new(),
+            executed: HashSet::new(),
+            paged: HashSet::new(),
+            rays: Vec::new(),
+            room,
+        }
+    }
 
     #[test]
     fn first_use_copies_stop_at_the_heap_cap_and_short_of_the_disk() {
@@ -1852,5 +1913,183 @@ mod tests {
             vec![(7, 0, 1256), (7, 5000, 5100), (8, 300, 400)]
         );
         assert_eq!(runs(ranges, 1 << 20), vec![(7, 0, 5100), (8, 300, 400)]);
+    }
+
+    #[test]
+    fn reserved_buffers_charge_mapped_tiles_not_virtual_size_and_keep_disk_reserve() {
+        const GIB4: u64 = 1 << 32;
+        const MIB: u64 = 1 << 20;
+        const TILE: u64 = locum_capture::tiles::TILE_BYTES;
+        const CHUNK: u64 = 256 << 20;
+
+        // 4 GiB reserved buffer with one mapped tile (id=10, heap-only) and a genuinely empty 4 GiB one (id=11),
+        // with only 1 MiB above the 8 GiB disk reserve and 1 MiB heap-indexed cap.
+        let mut objects = BTreeMap::new();
+        objects.insert(10, reserved_buffer(10, GIB4));
+        objects.insert(11, reserved_buffer(11, GIB4));
+        objects.insert(12, reserved_buffer(12, GIB4));
+        let states = super::super::states::Tracker::default();
+        let mut tiles = HashMap::new();
+        tiles.insert(
+            10,
+            Tiles {
+                pages: Ok((json!({}), json!([[17, 1, 99, 0]]))),
+                unreadable: None,
+                mapped_buffer_tiles: Some(vec![17]),
+            },
+        );
+        tiles.insert(
+            11,
+            Tiles {
+                pages: Ok((json!({}), json!([]))),
+                unreadable: None,
+                mapped_buffer_tiles: Some(Vec::new()),
+            },
+        );
+        // Unknown page table falls back to charging the full virtual size.
+        tiles.insert(
+            12,
+            Tiles {
+                pages: Err("page table tracking failed".into()),
+                unreadable: None,
+                mapped_buffer_tiles: None,
+            },
+        );
+        let mut live = test_live(
+            &objects,
+            Room {
+                heap: Some(MIB),
+                disk: Some(DISK_KEPT + MIB),
+                ..Room::default()
+            },
+        );
+        let heap = HashSet::from([10u64]);
+        let snapshots = first_uses(
+            &mut live,
+            1,
+            &objects,
+            &states,
+            vec![10, 11, 12],
+            &heap,
+            None,
+            1,
+            &tiles,
+        );
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].resource, 10);
+        assert_eq!(snapshots[0].mapped_tiles.as_deref(), Some(&[17][..]));
+        assert_eq!(snapshots[1].resource, 11);
+        assert_eq!(snapshots[1].mapped_tiles.as_deref(), Some(&[][..]));
+
+        // Room charge matches the exact bytes readback::segments copies for both snapshots.
+        let copied_by_reader: u64 = snapshots
+            .iter()
+            .map(|s| {
+                super::super::readback::segments(
+                    locum_capture::layout::total(&s.layout),
+                    CHUNK,
+                    s.mapped_tiles.as_deref(),
+                )
+                .into_iter()
+                .filter(|seg| seg.2)
+                .map(|seg| seg.1)
+                .sum::<u64>()
+            })
+            .sum();
+        assert_eq!(copied_by_reader, TILE);
+        assert_eq!(live.room.planned, TILE);
+        assert_eq!(live.room.heap_bytes, TILE);
+        // Resource 12 (unknown page table) was conservatively charged 4 GiB and rejected for disk room.
+        assert_eq!(live.room.uncopied.get("disk"), Some(&(1, GIB4)));
+
+        // Nine 4 GiB reserved windows (36 GiB virtual) with 1 MiB mapped each fit in 10 MiB above DISK_KEPT.
+        let mut nine_objects = BTreeMap::new();
+        let mut nine_tiles = HashMap::new();
+        let mut nine_ids = Vec::new();
+        for id in 100..109u64 {
+            nine_objects.insert(id, reserved_buffer(id, GIB4));
+            nine_tiles.insert(
+                id,
+                Tiles {
+                    pages: Ok((json!({}), json!([[0, 16, 1, 0]]))),
+                    unreadable: None,
+                    mapped_buffer_tiles: Some((0..16).collect()),
+                },
+            );
+            nine_ids.push(id);
+        }
+        let mut nine_live = test_live(
+            &nine_objects,
+            Room {
+                heap: Some(10 * MIB),
+                disk: Some(DISK_KEPT + 10 * MIB),
+                ..Room::default()
+            },
+        );
+        let nine_heap: HashSet<u64> = nine_ids.iter().copied().collect();
+        let nine_snaps = first_uses(
+            &mut nine_live,
+            2,
+            &nine_objects,
+            &states,
+            nine_ids,
+            &nine_heap,
+            None,
+            2,
+            &nine_tiles,
+        );
+        assert_eq!(nine_snaps.len(), 9);
+        assert_eq!(nine_live.room.planned, 9 * MIB);
+        assert_eq!(nine_live.room.heap_bytes, 9 * MIB);
+
+        // The 8 GiB reserve is still enforced: below DISK_KEPT rejects even an empty resource; DISK_KEPT + 32 KiB
+        // rejects a single 64 KiB mapped tile.
+        let mut below_reserve = test_live(
+            &objects,
+            Room {
+                heap: Some(MIB),
+                disk: Some(DISK_KEPT - 1),
+                ..Room::default()
+            },
+        );
+        assert!(
+            first_uses(
+                &mut below_reserve,
+                3,
+                &objects,
+                &states,
+                vec![11],
+                &HashSet::new(),
+                None,
+                3,
+                &tiles
+            )
+            .is_empty()
+        );
+        assert_eq!(below_reserve.room.uncopied.get("disk"), Some(&(1, 0)));
+
+        let mut tight_reserve = test_live(
+            &objects,
+            Room {
+                heap: Some(MIB),
+                disk: Some(DISK_KEPT + TILE / 2),
+                ..Room::default()
+            },
+        );
+        assert!(
+            first_uses(
+                &mut tight_reserve,
+                4,
+                &objects,
+                &states,
+                vec![10],
+                &HashSet::new(),
+                None,
+                4,
+                &tiles
+            )
+            .is_empty()
+        );
+        assert_eq!(tight_reserve.room.uncopied.get("disk"), Some(&(1, TILE)));
     }
 }

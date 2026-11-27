@@ -51,6 +51,10 @@ pub struct Snapshot {
     pub layout: Vec<Sub>,
     /// For a depth-stencil format D3D12 keeps in two planes, the bytes of its joined canonical texel.
     pub joined: Option<u32>,
+    /// For a reserved buffer whose page table is known at capture time, its mapped 64 KiB tiles in order; None for
+    /// non-reserved resources, textures, or unknown page tables. Shared with room accounting so both use identical
+    /// capture-time tile coverage.
+    pub mapped_tiles: Option<Vec<u32>>,
     /// How the copy may differ from the contents the frame began with.
     pub note: Option<String>,
 }
@@ -261,7 +265,8 @@ unsafe fn place(
                 failed.uploads.push(upload_failed(copy, "no live upload buffer"));
                 continue;
             }
-            Err(Err((snapshot, reason))) => {
+            Err(Err(err)) => {
+                let (snapshot, reason) = *err;
                 failed
                     .contents
                     .push(first_use(submission, &snapshot, Err(reason)));
@@ -274,10 +279,9 @@ unsafe fn place(
                 resource,
                 footprints,
                 samples: None,
-            } if footprints.is_empty() && bytes > chunk => {
+            } if footprints.is_empty() && (bytes > chunk || snapshot.mapped_tiles.is_some()) => {
                 // A reserved buffer: its mapped tiles only, the rest is zeros.
-                let mapped = super::tiles::mapped_buffer_tiles(snapshot.resource);
-                let segments = segments(bytes, chunk, mapped.as_deref());
+                let segments = segments(bytes, chunk, snapshot.mapped_tiles.as_deref());
                 let snapshot = Arc::new(snapshot);
                 if let Some(done) = pieces::expect(submission, &snapshot, &segments) {
                     failed.contents.push(done);
@@ -524,12 +528,12 @@ unsafe fn contents(
     device: &ID3D12Device,
     kind: D3D12_COMMAND_LIST_TYPE,
     snapshot: Snapshot,
-) -> Result<(Item, u64), (Snapshot, String)> {
+) -> Result<(Item, u64), Box<(Snapshot, String)>> {
     let Some(resource) = super::real::<ID3D12Resource>(snapshot.resource) else {
-        return Err((snapshot, "no live resource".into()));
+        return Err(Box::new((snapshot, "no live resource".into())));
     };
     if let Some(reason) = snapshot.states.iter().find_map(|s| unreadable(*s, kind)) {
-        return Err((snapshot, reason));
+        return Err(Box::new((snapshot, reason)));
     }
     let desc = unsafe { resource.GetDesc() };
     if desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
@@ -546,17 +550,17 @@ unsafe fn contents(
     // A multisampled texture is copied as its samples' images.
     let (samples, desc) = if desc.SampleDesc.Count > 1 {
         if kind != D3D12_COMMAND_LIST_TYPE_DIRECT {
-            return Err((
+            return Err(Box::new((
                 snapshot,
                 "multisampled: its samples are drawn out, on a direct queue only".into(),
-            ));
+            )));
         }
         match unsafe { locum_capture::d3d12::samples::Reader::new(device, &desc, None) } {
             Ok(reader) => {
                 let images = reader.images_desc();
                 (Some(reader), images)
             }
-            Err(why) => return Err((snapshot, format!("multisampled: {why}"))),
+            Err(why) => return Err(Box::new((snapshot, format!("multisampled: {why}")))),
         }
     } else {
         (None, desc)
@@ -583,10 +587,10 @@ unsafe fn contents(
         )
     };
     if total == u64::MAX || row_bytes.contains(&u64::MAX) {
-        return Err((
+        return Err(Box::new((
             snapshot,
             format!("GetCopyableFootprints refused the description ({n} subresources)"),
-        ));
+        )));
     }
     Ok((
         Item::Contents {
@@ -1021,36 +1025,53 @@ fn fail_item(batch: &mut Batch, item: Item, reason: &str) {
     }
 }
 
-/// A buffer of `bytes` in pieces of at most `chunk` bytes: (offset, size, copied). With `mapped` (a reserved
-/// buffer's mapped 64 KiB tiles, in order) only runs of mapped tiles are copied, and the rest is zeros.
-fn segments(bytes: u64, chunk: u64, mapped: Option<&[u32]>) -> Vec<(u64, u64, bool)> {
-    const TILE: u64 = 64 << 10;
-    let mut out = Vec::new();
-    let copy = |out: &mut Vec<(u64, u64, bool)>, from: u64, to: u64| {
-        let mut at = from;
-        while at < to {
-            let len = chunk.min(to - at);
-            out.push((at, len, true));
-            at += len;
-        }
-    };
+/// Byte ranges `[from, to)` of a buffer of `bytes` that are backed by `mapped` 64 KiB tiles (sorted, unique),
+/// merged across adjacent tiles and clamped to `bytes`; or the whole `[0, bytes)` when `mapped` is `None`.
+fn copied_runs(bytes: u64, mapped: Option<&[u32]>) -> Vec<(u64, u64)> {
+    const TILE: u64 = locum_capture::tiles::TILE_BYTES;
     let Some(mapped) = mapped else {
-        copy(&mut out, 0, bytes);
-        return out;
+        return (bytes > 0).then_some((0, bytes)).into_iter().collect();
     };
-    let mut at = 0;
+    let mut out = Vec::new();
     let mut tiles = mapped.iter().map(|&t| u64::from(t)).peekable();
     while let Some(first) = tiles.next() {
         let mut last = first;
         while tiles.peek() == Some(&(last + 1)) {
             last = tiles.next().expect("peeked");
         }
-        let (from, to) = ((first * TILE).min(bytes), ((last + 1) * TILE).min(bytes));
+        let from = first.saturating_mul(TILE).min(bytes);
+        let to = (last + 1).saturating_mul(TILE).min(bytes);
+        if from < to {
+            out.push((from, to));
+        }
+    }
+    out
+}
+
+/// Bytes of a buffer of `bytes` that [`segments`] copies from the GPU and stores in the blob store.
+pub(super) fn buffer_copy_bytes(bytes: u64, mapped: Option<&[u32]>) -> u64 {
+    copied_runs(bytes, mapped)
+        .into_iter()
+        .map(|(from, to)| to - from)
+        .sum()
+}
+
+/// A buffer of `bytes` in pieces of at most `chunk` bytes: (offset, size, copied). With `mapped` (a reserved
+/// buffer's mapped 64 KiB tiles, in order) only runs of mapped tiles are copied, and the rest is zeros.
+pub(super) fn segments(bytes: u64, chunk: u64, mapped: Option<&[u32]>) -> Vec<(u64, u64, bool)> {
+    let mut out = Vec::new();
+    let mut at = 0u64;
+    for (from, to) in copied_runs(bytes, mapped) {
         if from > at {
             out.push((at, from - at, false));
         }
-        copy(&mut out, from, to);
-        at = at.max(to);
+        let mut cur = from;
+        while cur < to {
+            let len = chunk.min(to - cur);
+            out.push((cur, len, true));
+            cur += len;
+        }
+        at = to;
     }
     if at < bytes {
         out.push((at, bytes - at, false));
@@ -1202,6 +1223,31 @@ mod tests {
         assert_eq!(
             segments(8 * T, 4 * T, Some(&[0, 1, 2, 3, 4, 5, 6, 7])),
             segments(8 * T, 4 * T, None)
+        );
+        // 4 GiB reserved buffer: one mapped tile copies 64 KiB; genuinely empty copies 0; unknown copies 4 GiB.
+        const GIB4: u64 = 1 << 32;
+        const CHUNK: u64 = 256 << 20;
+        let one_tile = segments(GIB4, CHUNK, Some(&[17]));
+        assert_eq!(
+            one_tile,
+            [
+                (0, 17 * T, false),
+                (17 * T, T, true),
+                (18 * T, GIB4 - 18 * T, false)
+            ]
+        );
+        assert_eq!(buffer_copy_bytes(GIB4, Some(&[17])), T);
+        assert_eq!(
+            one_tile.iter().filter(|s| s.2).map(|s| s.1).sum::<u64>(),
+            buffer_copy_bytes(GIB4, Some(&[17]))
+        );
+        let empty = segments(GIB4, CHUNK, Some(&[]));
+        assert_eq!(empty, [(0, GIB4, false)]);
+        assert_eq!(buffer_copy_bytes(GIB4, Some(&[])), 0);
+        assert_eq!(buffer_copy_bytes(GIB4, None), GIB4);
+        assert_eq!(
+            buffer_copy_bytes(11 * T - 7, Some(&[1, 2, 5, 6, 7, 8, 9, 10])),
+            8 * T - 7
         );
     }
 

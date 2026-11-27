@@ -367,6 +367,7 @@ pub unsafe fn after_frame(
                 subresources: 1,
                 layout: copy.layout,
                 joined: None,
+                mapped_tiles: super::tiles::mapped_buffer_tiles(copy.resource),
                 note: None,
             });
     }
