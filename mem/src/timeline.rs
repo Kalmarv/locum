@@ -9,13 +9,16 @@
 //! - CPU stacks (inline `EVENT_HEADER_EXT_TYPE_STACK_TRACE64` + classic `StackWalk` / `SampledProfile`), symbolized out-of-process via `dbghelp` + `TH32CS_SNAPMODULE` / ETW `ImageLoad`
 //! - Thread wait attribution: full `CSwitch` + `ReadyThread` when permitted (offline WPR/xperf or one-time ACL), and automatic non-admin fallback via DxgKrnl CPU/GPU fence waits + `MakeResident` stalls + CPU stacks.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS,
+};
 use windows::Win32::System::Diagnostics::Etw::{
     CONTROLTRACE_HANDLE, CloseTrace, ControlTraceW, ENABLE_TRACE_PARAMETERS,
     EVENT_CONTROL_CODE_CAPTURE_STATE, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_HEADER_FLAG_32_BIT_HEADER,
@@ -25,6 +28,7 @@ use windows::Win32::System::Diagnostics::Etw::{
     StartTraceW, TRACE_EVENT_INFO, TdhGetEventInformation, WNODE_FLAG_TRACED_GUID,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
+use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::core::{GUID, HSTRING, PWSTR};
 
 use crate::THREAD_SUSPENDS;
@@ -94,6 +98,44 @@ pub fn qpc_now() -> i64 {
     let mut now = 0i64;
     let _ = unsafe { QueryPerformanceCounter(&mut now) };
     now
+}
+
+/// Checks whether `pid` is still running (zero target suspends).
+/// Returns `(alive, exit_code)` where `exit_code` is populated when the process has terminated
+/// and its handle is still queryable. Treats `ERROR_ACCESS_DENIED` (5) on protected processes as alive.
+pub(crate) fn probe_process_alive(pid: u32) -> (bool, Option<u32>) {
+    const STILL_ACTIVE: u32 = 259;
+    let h = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => h,
+        Err(_) => {
+            let err = std::io::Error::last_os_error().raw_os_error();
+            return (err == Some(5), None);
+        }
+    };
+    let mut code = 0u32;
+    let ok = unsafe { GetExitCodeProcess(h, &mut code) }.is_ok();
+    unsafe {
+        let _ = CloseHandle(h);
+    }
+    if ok {
+        if code == STILL_ACTIVE {
+            (true, None)
+        } else {
+            (false, Some(code))
+        }
+    } else {
+        (false, None)
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn parse_ctx_from_queue_label(label: &str) -> Option<u64> {
+    let rest = label.strip_prefix("ctx=0x")?;
+    let hex = rest.split('/').next()?;
+    u64::from_str_radix(hex, 16).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +411,9 @@ pub struct QueueSummary {
     pub max_packet_ms: f64,
     pub fence_signals: u64,
     pub fence_waits: u64,
+    /// True in ring-buffer flight dumps when no packet completed in the retained window and `in_flight_at_end == 0`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stale_in_window: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sibling_note: Option<String>,
 }
@@ -503,6 +548,9 @@ pub struct FlightTriggerInfo {
     pub evicted_ring_events: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stalled_packet: Option<StalledPacketInfo>,
+    /// Sibling-context stalled packets merged into the same trigger (prevents duplicate `--rearm` dumps).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sibling_stalled_packets: Vec<StalledPacketInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub oldest_wait_packet: Option<StalledPacketInfo>,
 }
@@ -516,6 +564,10 @@ pub struct TimelineReport {
     pub frame_pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submit_tid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_exited_at_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_exit_code: Option<u32>,
     pub thread_suspends: u64,
     pub ts_unit: String,
     pub qpc_freq_hz: u64,
@@ -1187,25 +1239,46 @@ impl TimelineBuilder {
         }
     }
 
-    /// Returns detailed identity of the oldest unresolved GPU work packet (`queue_pkt` / `dma_pkt` / `hwq_dma`),
-    /// skipping any `(ctx, seq)` already acknowledged in `ack_pkts` (for `--rearm`).
-    pub fn oldest_in_flight_work_packet(
+    /// Returns the oldest unresolved GPU work packet (`queue_pkt` / `dma_pkt` / `hwq_dma`) together
+    /// with any sibling-context in-flight work packets belonging to the same stall event (same
+    /// submitting thread within 50 ms, OR lockstep sibling context sharing `(packets_started,
+    /// packets_completed)` within 500 ms).
+    ///
+    /// Skips any `(ctx, seq)` already acknowledged in `ack_pkts` AND any later packet queued on a
+    /// context that already has an acknowledged still-in-flight packet (FIFO queue blocked behind
+    /// the same stall).
+    pub fn oldest_in_flight_work_packet_group(
         &self,
         now_qpc: i64,
-        ack_pkts: Option<&std::collections::HashSet<(u64, u64)>>,
-    ) -> Option<StalledPacketInfo> {
-        let mut best: Option<StalledPacketInfo> = None;
-        let mut consider = |info: StalledPacketInfo| {
-            if best.as_ref().is_none_or(|b| info.submit_qpc < b.submit_qpc) {
-                best = Some(info);
+        ack_pkts: Option<&HashSet<(u64, u64)>>,
+    ) -> Option<(StalledPacketInfo, Vec<StalledPacketInfo>)> {
+        let mut acked_live_ctxs: HashSet<u64> = HashSet::new();
+        if let Some(acks) = ack_pkts {
+            for &(ctx, seq) in self.in_flight_queue_pkts.keys() {
+                if acks.contains(&(ctx, seq)) {
+                    acked_live_ctxs.insert(ctx);
+                }
             }
-        };
+            for &(ctx, seq) in self.in_flight_dma_pkts.keys() {
+                if acks.contains(&(ctx, seq)) {
+                    acked_live_ctxs.insert(ctx);
+                }
+            }
+            for &(hq, pf) in self.in_flight_hwq_pkts.keys() {
+                let ctx = self.hwqueue_ctx.get(&hq).copied().unwrap_or(hq);
+                if acks.contains(&(ctx, pf)) {
+                    acked_live_ctxs.insert(ctx);
+                }
+            }
+        }
+
         let freq = self.qpc_freq_hz.max(1) as f64;
+        let mut all: Vec<StalledPacketInfo> = Vec::new();
         for (&(ctx, seq), &(start, _, tid, ptype)) in &self.in_flight_queue_pkts {
-            if ack_pkts.is_some_and(|a| a.contains(&(ctx, seq))) {
+            if ack_pkts.is_some_and(|a| a.contains(&(ctx, seq))) || acked_live_ctxs.contains(&ctx) {
                 continue;
             }
-            consider(StalledPacketInfo {
+            all.push(StalledPacketInfo {
                 kind: "queue_pkt".into(),
                 packet_type: Some(ptype),
                 context: ctx,
@@ -1219,10 +1292,10 @@ impl TimelineBuilder {
             });
         }
         for (&(ctx, seq), &(start, _, tid)) in &self.in_flight_dma_pkts {
-            if ack_pkts.is_some_and(|a| a.contains(&(ctx, seq))) {
+            if ack_pkts.is_some_and(|a| a.contains(&(ctx, seq))) || acked_live_ctxs.contains(&ctx) {
                 continue;
             }
-            consider(StalledPacketInfo {
+            all.push(StalledPacketInfo {
                 kind: "dma_pkt".into(),
                 packet_type: None,
                 context: ctx,
@@ -1237,10 +1310,10 @@ impl TimelineBuilder {
         }
         for (&(hq, pf), &(start, _, tid)) in &self.in_flight_hwq_pkts {
             let ctx = self.hwqueue_ctx.get(&hq).copied().unwrap_or(hq);
-            if ack_pkts.is_some_and(|a| a.contains(&(ctx, pf))) {
+            if ack_pkts.is_some_and(|a| a.contains(&(ctx, pf))) || acked_live_ctxs.contains(&ctx) {
                 continue;
             }
-            consider(StalledPacketInfo {
+            all.push(StalledPacketInfo {
                 kind: "hwq_dma".into(),
                 packet_type: None,
                 context: ctx,
@@ -1253,7 +1326,40 @@ impl TimelineBuilder {
                 fence_val: None,
             });
         }
-        best
+        if all.is_empty() {
+            return None;
+        }
+        all.sort_by_key(|p| (p.submit_qpc, p.context, p.seq));
+        let primary = all.remove(0);
+
+        let same_tid_win = (self.qpc_freq_hz as i64) / 20; // 50 ms
+        let lockstep_win = (self.qpc_freq_hz as i64) / 2; // 500 ms
+        let primary_counts = self
+            .queues
+            .get(&primary.context)
+            .map(|q| (q.packets_started, q.packets_completed));
+
+        let mut siblings = Vec::new();
+        for p in all {
+            if p.context == primary.context {
+                continue;
+            }
+            let dt = (p.submit_qpc - primary.submit_qpc).abs();
+            let same_tid_pair = primary.tid != 0 && p.tid == primary.tid && dt <= same_tid_win;
+            let lockstep_pair = dt <= lockstep_win
+                && primary_counts.is_some_and(|(ps, pc)| {
+                    ps >= 2
+                        && self
+                            .queues
+                            .get(&p.context)
+                            .is_some_and(|q| q.packets_started == ps && q.packets_completed == pc)
+                });
+            if same_tid_pair || lockstep_pair {
+                siblings.push(p);
+            }
+        }
+
+        Some((primary, siblings))
     }
 
     /// Returns detailed identity of the oldest unresolved queue-side fence wait packet (`244` -> `180`), if any.
@@ -2469,7 +2575,10 @@ impl TimelineBuilder {
         copy.saw_sysmem = self.saw_sysmem;
         copy.saw_kmem = self.saw_kmem;
         copy.context_meta = self.context_meta.clone();
+        copy.hwqueue_ctx = self.hwqueue_ctx.clone();
         copy.in_flight_queue_pkts = self.in_flight_queue_pkts.clone();
+        copy.in_flight_dma_pkts = self.in_flight_dma_pkts.clone();
+        copy.in_flight_hwq_pkts = self.in_flight_hwq_pkts.clone();
         copy.etw_images = self.etw_images.clone();
         copy.pid_names = self.pid_names.clone();
         copy.alerts = self.alerts.clone();
@@ -2603,7 +2712,12 @@ impl TimelineBuilder {
                 let ctx = raw
                     .queue
                     .as_deref()
-                    .and_then(|qn| qname_to_ctx.get(qn).copied())
+                    .and_then(|qn| {
+                        qname_to_ctx
+                            .get(qn)
+                            .copied()
+                            .or_else(|| parse_ctx_from_queue_label(qn))
+                    })
                     .unwrap_or(0);
                 gpu_spans.push((raw.qpc, raw.qpc.saturating_add(dq), raw.pid, ctx));
             }
@@ -2727,8 +2841,18 @@ impl TimelineBuilder {
                 }
                 if let Some(intervals) = queue_intervals.remove(&q.context) {
                     q.busy_ms = qpc_to_ms(union_interval_qpc(intervals));
+                    q.stale_in_window = false;
+                } else if is_ring {
+                    // Never carry cumulative pre-window busy_ms into a ring snapshot when no packet
+                    // completed on this queue inside [start_qpc, end_qpc].
+                    q.busy_ms = 0.0;
+                    q.stale_in_window = q.in_flight_at_end == 0;
+                } else if had_full_gpu {
+                    q.busy_ms = 0.0;
+                    q.stale_in_window = false;
                 } else {
                     q.busy_ms = q.busy_ms.min(trace_dur_ms);
+                    q.stale_in_window = false;
                 }
                 q.busy_pct = if trace_dur_ms > 0.0 {
                     ((q.busy_ms / trace_dur_ms) * 100.0).min(100.0)
@@ -2739,8 +2863,10 @@ impl TimelineBuilder {
             })
             .collect();
         queues.sort_by(|a, b| {
-            b.busy_ms
-                .total_cmp(&a.busy_ms)
+            a.stale_in_window
+                .cmp(&b.stale_in_window)
+                .then_with(|| b.busy_ms.total_cmp(&a.busy_ms))
+                .then_with(|| b.in_flight_at_end.cmp(&a.in_flight_at_end))
                 .then_with(|| b.packets_started.cmp(&a.packets_started))
         });
         // Annotate lockstep sibling contexts of the same PID (identical pkts and busy_ms within 5 ms).
@@ -2916,6 +3042,8 @@ impl TimelineBuilder {
             pid: self.filter_pid,
             frame_pid,
             submit_tid,
+            target_exited_at_ms: None,
+            target_exit_code: None,
             thread_suspends: THREAD_SUSPENDS,
             ts_unit: self.ts_unit,
             qpc_freq_hz: self.qpc_freq_hz,
@@ -3268,6 +3396,17 @@ pub struct LiveTimelineOptions {
 
 /// Records a live non-admin unified QPC timeline (zero target suspends) and returns the symbolized report.
 pub fn capture_live_timeline(opts: LiveTimelineOptions) -> Result<TimelineReport, String> {
+    let (alive_at_start, start_exit_code) = probe_process_alive(opts.pid);
+    if !alive_at_start {
+        let code_note = start_exit_code
+            .map(|c| format!(" (exit_code={c:#x})"))
+            .unwrap_or_default();
+        return Err(format!(
+            "target pid {} exited at +0 ms{code_note} (process was not running when timeline capture started)",
+            opts.pid
+        ));
+    }
+
     let is_temp = opts.etl_out.is_none();
     let etl_path = opts.etl_out.unwrap_or_else(|| {
         std::env::temp_dir().join(format!("locum_timeline_{}_{}.etl", opts.pid, std::process::id()))
@@ -3294,9 +3433,22 @@ pub fn capture_live_timeline(opts: LiveTimelineOptions) -> Result<TimelineReport
     // Snapshot modules out-of-process while target is live (zero suspends).
     let mut symbolizer = Symbolizer::for_process(opts.pid);
 
-    std::thread::sleep(std::time::Duration::from_millis(
-        (opts.duration_secs.max(0.1) * 1000.0) as u64,
-    ));
+    let capture_start = Instant::now();
+    let total_dur = Duration::from_secs_f64(opts.duration_secs.max(0.1));
+    let mut exited_info: Option<(f64, Option<u32>)> = None;
+    loop {
+        let elapsed = capture_start.elapsed();
+        let (alive, exit_code) = probe_process_alive(opts.pid);
+        if !alive {
+            exited_info = Some((elapsed.as_secs_f64() * 1000.0, exit_code));
+            break;
+        }
+        if elapsed >= total_dur {
+            break;
+        }
+        let remain = total_dur.saturating_sub(elapsed);
+        std::thread::sleep(remain.min(Duration::from_millis(50)));
+    }
 
     // Final rundown for devices/contexts/hwqueues.
     let ep = ENABLE_TRACE_PARAMETERS {
@@ -3315,10 +3467,21 @@ pub fn capture_live_timeline(opts: LiveTimelineOptions) -> Result<TimelineReport
             Some(&ep),
         )
     };
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    std::thread::sleep(Duration::from_millis(100));
     stop_session_handle(handle, &name);
 
     let mut rep = parse_timeline_etl(&etl_path, Some(opts.pid), &mut symbolizer)?;
+    if let Some((exit_ms, exit_code)) = exited_info {
+        rep.target_exited_at_ms = Some(exit_ms);
+        rep.target_exit_code = exit_code;
+        let code_note = exit_code
+            .map(|c| format!(" (exit_code={c:#x})"))
+            .unwrap_or_default();
+        warnings.push(format!(
+            "target pid {} exited at +{exit_ms:.0} ms{code_note} during capture",
+            opts.pid
+        ));
+    }
     rep.warnings.extend(warnings);
     if is_temp && !opts.keep_etl {
         let _ = std::fs::remove_file(&etl_path);
@@ -3636,6 +3799,9 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
         if let Some(ref pkt) = trig.stalled_packet {
             let _ = writeln!(out, "STALLED_PKT {}", pkt.format_compact());
         }
+        for sib in &trig.sibling_stalled_packets {
+            let _ = writeln!(out, "STALLED_SIBLING {}", sib.format_compact());
+        }
         if let Some(ref wpkt) = trig.oldest_wait_packet {
             let _ = writeln!(out, "IN_FLIGHT_WAIT {}", wpkt.format_compact());
         }
@@ -3682,9 +3848,14 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                 .as_deref()
                 .map(|s| format!(" [{s}]"))
                 .unwrap_or_default();
+            let stale = if q.stale_in_window {
+                " [stale:idle_in_window]"
+            } else {
+                ""
+            };
             let _ = writeln!(
                 out,
-                "QUEUE {:<20} pid={:<6}{:<16} pkts={}/{} in_flight={} busy_ms={:>8.2} ({:>5.1}%) max_pkt_ms={:>7.2} sig={} wait={}{}",
+                "QUEUE {:<20} pid={:<6}{:<16} pkts={}/{} in_flight={} busy_ms={:>8.2} ({:>5.1}%) max_pkt_ms={:>7.2} sig={} wait={}{}{}",
                 q.queue_id,
                 q.pid,
                 pname,
@@ -3697,6 +3868,7 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                 q.fence_signals,
                 q.fence_waits,
                 sib,
+                stale,
             );
         }
     }
@@ -3866,6 +4038,7 @@ mod tests {
                 max_packet_ms: 5.0,
                 fence_signals: 2,
                 fence_waits: 1,
+                stale_in_window: false,
                 sibling_note: None,
             },
         );
@@ -3990,11 +4163,12 @@ mod tests {
         assert!(!b.in_flight_queue_pkts.contains_key(&(0xabc, 10)));
         assert!(b.in_flight_queue_pkts.contains_key(&(0xabc, 16)));
 
-        let work = b
-            .oldest_in_flight_work_packet(100_300_000, None)
+        let (work, sibs) = b
+            .oldest_in_flight_work_packet_group(100_300_000, None)
             .expect("seq 16 still in-flight");
         assert_eq!(work.seq, 16);
         assert_eq!(work.context, 0xabc);
+        assert!(sibs.is_empty());
         assert!(work.format_compact().contains("kind=queue_pkt(type=0)"));
         assert!(work.format_compact().contains("submit_qpc=300000"));
 
@@ -4004,5 +4178,133 @@ mod tests {
         assert_eq!(wait.sync_obj, Some(0xfeed_face));
         assert_eq!(wait.fence_val, Some(777));
         assert!(wait.format_compact().contains("sync=0xfeedface val=777"));
+    }
+
+    #[test]
+    fn sibling_stall_contexts_merge_into_one_trigger_and_suppress_duplicate_rearm() {
+        let freq = 10_000_000u64;
+        let mut b = TimelineBuilder::new(Some(27408), freq);
+        // Mirror NR2 flight.1/flight.2: two sibling contexts submitted 108 ticks (10.8 us) apart by tid 14412.
+        b.in_flight_queue_pkts
+            .insert((0xffff_d58f_e4b3_1470, 36), (817_820_465_605, 27408, 14412, 0));
+        b.in_flight_queue_pkts
+            .insert((0xffff_d58f_d9b4_0a90, 18), (817_820_465_713, 27408, 14412, 0));
+        // A later packet queued behind seq=36 on the same stalled context.
+        b.in_flight_queue_pkts
+            .insert((0xffff_d58f_e4b3_1470, 37), (817_840_000_000, 27408, 14412, 0));
+
+        let now = 817_920_901_919;
+        let (primary, siblings) = b
+            .oldest_in_flight_work_packet_group(now, None)
+            .expect("stalled group present");
+        assert_eq!(primary.context, 0xffff_d58f_e4b3_1470);
+        assert_eq!(primary.seq, 36);
+        assert_eq!(siblings.len(), 1);
+        assert_eq!(siblings[0].context, 0xffff_d58f_d9b4_0a90);
+        assert_eq!(siblings[0].seq, 18);
+
+        // Once primary + sibling are acknowledged, neither the sibling nor seq=37 on the same stalled ctx re-fires!
+        let mut acks = HashSet::new();
+        acks.insert((primary.context, primary.seq));
+        for s in &siblings {
+            acks.insert((s.context, s.seq));
+        }
+        assert!(
+            b.oldest_in_flight_work_packet_group(now + 10_000_000, Some(&acks))
+                .is_none(),
+            "acked sibling and FIFO-blocked packet on same stalled ctx must not fire duplicate trigger"
+        );
+
+        // Once the stalled packet completes and is removed, a brand new stall on that ctx WILL fire again.
+        b.in_flight_queue_pkts.remove(&(0xffff_d58f_e4b3_1470, 36));
+        b.in_flight_queue_pkts.remove(&(0xffff_d58f_e4b3_1470, 37));
+        b.in_flight_queue_pkts
+            .insert((0xffff_d58f_e4b3_1470, 100), (now + 50_000_000, 27408, 14412, 0));
+        let (next, _) = b
+            .oldest_in_flight_work_packet_group(now + 200_000_000, Some(&acks))
+            .expect("new stall after recovery must trigger");
+        assert_eq!(next.seq, 100);
+    }
+
+    #[test]
+    fn ring_snapshot_zeroes_idle_queue_busy_and_marks_stale_rows() {
+        let freq = 10_000_000u64;
+        let mut b = TimelineBuilder::new(Some(27408), freq).with_ring(10.0, 10_000);
+        // Historical queue with huge cumulative busy_ms from earlier in the run, 0 packets in the current ring window.
+        b.queues.insert(
+            0xAAAA,
+            QueueSummary {
+                queue_id: "ctx=0xaaaa".into(),
+                context: 0xAAAA,
+                pid: 27408,
+                process_name: Some("xcl.exe".into()),
+                packets_started: 152_098,
+                packets_completed: 152_098,
+                busy_ms: 85_000.0,
+                max_packet_ms: 163.85,
+                ..Default::default()
+            },
+        );
+        // Active queue that ran 1 short packet inside the ring window (even with /n0 label suffix!).
+        b.queues.insert(
+            0xBBBB,
+            QueueSummary {
+                queue_id: "ctx=0xbbbb".into(),
+                context: 0xBBBB,
+                pid: 27408,
+                process_name: Some("xcl.exe".into()),
+                packets_started: 4,
+                packets_completed: 4,
+                busy_ms: 0.4,
+                max_packet_ms: 0.15,
+                ..Default::default()
+            },
+        );
+        // Ring spans 9.73 s (97_300_000 ticks), only 0xBBBB has a completed packet in window.
+        b.end_qpc = Some(100_000_000);
+        b.push_event(RawTimelineEvent {
+            qpc: 2_700_000,
+            frame: 1730,
+            pid: 27408,
+            tid: 1,
+            kind: TimelineEventKind::GpuBusy,
+            queue: Some("ctx=0xbbbb/n0".into()),
+            duration_qpc: Some(1_500), // 0.15 ms
+            detail: "hwq_dma pf=1".into(),
+            raw_stack: Vec::new(),
+            waker_tid: None,
+            wait_kind: None,
+        });
+        b.push_event(RawTimelineEvent {
+            qpc: 100_000_000,
+            frame: 1730,
+            pid: 27408,
+            tid: 1,
+            kind: TimelineEventKind::VirtualProtect,
+            queue: None,
+            duration_qpc: None,
+            detail: "KernelMemory id=1".into(),
+            raw_stack: Vec::new(),
+            waker_tid: None,
+            wait_kind: None,
+        });
+
+        let mut sym = Symbolizer::new(None);
+        let rep = b.snapshot_report("flight_ring(pid=27408, 10s)".into(), &mut sym, Vec::new(), None);
+        assert_eq!(rep.queues.len(), 2);
+        // Active queue must sort FIRST with its exact 0.15 ms window busy, not buried below stale queues!
+        assert_eq!(rep.queues[0].context, 0xBBBB);
+        assert!(!rep.queues[0].stale_in_window);
+        assert!((rep.queues[0].busy_ms - 0.15).abs() < 1e-4);
+
+        // Idle historical queue must have busy_ms == 0.0 (NOT 9730.0 / 100%!) and be marked stale.
+        assert_eq!(rep.queues[1].context, 0xAAAA);
+        assert!(rep.queues[1].stale_in_window);
+        assert_eq!(rep.queues[1].busy_ms, 0.0);
+        assert_eq!(rep.queues[1].busy_pct, 0.0);
+
+        let text = format_timeline_text(&rep, &TimelineFormatOptions::default());
+        assert!(text.contains("[stale:idle_in_window]"));
+        assert!(!text.contains("100.0%"));
     }
 }

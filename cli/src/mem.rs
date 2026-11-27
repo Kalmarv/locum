@@ -455,6 +455,18 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
             } else {
                 out!("{}", format_timeline_text(&rep, &fmt_opts));
             }
+            if rep.target_events == 0
+                && let Some(exit_ms) = rep.target_exited_at_ms
+            {
+                let code_note = rep
+                    .target_exit_code
+                    .map(|c| format!(" (exit_code={c:#x})"))
+                    .unwrap_or_default();
+                return Err(format!(
+                    "target pid {} exited at +{exit_ms:.0} ms{code_note} with 0 target events",
+                    rep.pid.unwrap_or(0)
+                ));
+            }
             Ok(())
         }
         MemCommand::Flight(args) => {

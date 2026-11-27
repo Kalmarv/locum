@@ -11,18 +11,17 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
+use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::System::Diagnostics::Etw::{
     CloseTrace, EVENT_RECORD, EVENT_TRACE_LOGFILEW, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
     PROCESS_TRACE_MODE_RAW_TIMESTAMP, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace,
 };
-use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::core::PWSTR;
 
 use crate::symbols::Symbolizer;
 use crate::timeline::{
-    FlightTriggerInfo, StalledPacketInfo, TimelineBuilder, TimelineReport, qpc_frequency, qpc_now,
-    start_timeline_session, stop_session_handle,
+    FlightTriggerInfo, StalledPacketInfo, TimelineBuilder, TimelineReport, probe_process_alive,
+    qpc_frequency, qpc_now, start_timeline_session, stop_session_handle,
 };
 
 /// Which conditions should trigger a flight-recorder dump (`--on removal,tdr`, `--on all`, etc.).
@@ -133,16 +132,7 @@ unsafe extern "system" fn flight_event_cb(rec: *mut EVENT_RECORD) {
 }
 
 fn is_process_alive(pid: u32) -> bool {
-    const STILL_ACTIVE: u32 = 259;
-    let Ok(h) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
-        return false;
-    };
-    let mut code = 0u32;
-    let alive = unsafe { GetExitCodeProcess(h, &mut code) }.is_ok() && code == STILL_ACTIVE;
-    unsafe {
-        let _ = CloseHandle(h);
-    }
-    alive
+    probe_process_alive(pid).0
 }
 
 /// Arms the real-time in-memory flight recorder and blocks until a trigger fires (device removal /
@@ -220,12 +210,20 @@ where
     let mut ack_stalled_pkts: HashSet<(u64, u64)> = HashSet::new();
     let mut last_silence_dump: Option<Instant> = None;
     let mut dump_count = 0usize;
-    let final_trigger: Option<(i64, String, Option<StalledPacketInfo>, Option<StalledPacketInfo>)>;
+    type FinalTrigger = (
+        i64,
+        String,
+        Option<StalledPacketInfo>,
+        Vec<StalledPacketInfo>,
+        Option<StalledPacketInfo>,
+    );
+    let final_trigger: Option<FinalTrigger>;
 
     let make_trigger_info = |b: &TimelineBuilder,
                              trigger_qpc: i64,
                              reason: String,
                              stalled_packet: Option<StalledPacketInfo>,
+                             sibling_stalled_packets: Vec<StalledPacketInfo>,
                              oldest_wait_packet: Option<StalledPacketInfo>| {
         let retained_secs = b.retained_ring_secs();
         let capped = b.raw_events.len() >= opts.max_ring_events && retained_secs + 0.25 < opts.ring_secs;
@@ -239,6 +237,7 @@ where
             total_observed_events: b.total_raw_events,
             evicted_ring_events: b.evicted_events,
             stalled_packet,
+            sibling_stalled_packets,
             oldest_wait_packet,
         }
     };
@@ -249,13 +248,20 @@ where
 
         // Check device-removal / TDR and submit stall conditions under lock.
         enum TriggerEvent {
-            Fatal(i64, String, Option<StalledPacketInfo>, Option<StalledPacketInfo>),
+            Fatal(
+                i64,
+                String,
+                Option<StalledPacketInfo>,
+                Vec<StalledPacketInfo>,
+                Option<StalledPacketInfo>,
+            ),
             RearmableStall(
                 i64,
                 String,
                 Option<StalledPacketInfo>,
+                Vec<StalledPacketInfo>,
                 Option<StalledPacketInfo>,
-                Option<(u64, u64)>,
+                Vec<(u64, u64)>,
             ),
         }
 
@@ -265,20 +271,39 @@ where
             if opts.triggers.removal_tdr
                 && let Some((qpc, ref msg)) = b.tdr_or_removal_alert
             {
-                let stalled = b.oldest_in_flight_work_packet(now_qpc, None);
+                let (stalled, siblings) = b
+                    .oldest_in_flight_work_packet_group(now_qpc, None)
+                    .map(|(p, s)| (Some(p), s))
+                    .unwrap_or((None, Vec::new()));
                 Some(TriggerEvent::Fatal(
                     qpc,
                     format!("device_removal_or_tdr: {msg}"),
                     stalled,
+                    siblings,
                     oldest_wait,
                 ))
             } else if opts.triggers.stall && opts.stall_secs > 0.0 && b.total_target_submits > 0 {
-                if let Some(pkt) = b.oldest_in_flight_work_packet(now_qpc, Some(&ack_stalled_pkts))
+                if let Some((pkt, siblings)) =
+                    b.oldest_in_flight_work_packet_group(now_qpc, Some(&ack_stalled_pkts))
                     && pkt.age_secs >= opts.stall_secs
                 {
-                    let key = (pkt.context, pkt.seq);
+                    let mut ack_keys = Vec::with_capacity(1 + siblings.len());
+                    ack_keys.push((pkt.context, pkt.seq));
+                    for s in &siblings {
+                        ack_keys.push((s.context, s.seq));
+                    }
+                    let sib_note = if siblings.is_empty() {
+                        String::new()
+                    } else {
+                        let list = siblings
+                            .iter()
+                            .map(|s| format!("{} seq={}", s.queue, s.seq))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!(" (+{} sibling: {list})", siblings.len())
+                    };
                     let reason = format!(
-                        "gpu_packet_stall: {} (>= {:.1}s threshold)",
+                        "gpu_packet_stall: {}{sib_note} (>= {:.1}s threshold)",
                         pkt.format_compact(),
                         opts.stall_secs
                     );
@@ -287,11 +312,18 @@ where
                             now_qpc,
                             reason,
                             Some(pkt),
+                            siblings,
                             oldest_wait,
-                            Some(key),
+                            ack_keys,
                         ))
                     } else {
-                        Some(TriggerEvent::Fatal(now_qpc, reason, Some(pkt), oldest_wait))
+                        Some(TriggerEvent::Fatal(
+                            now_qpc,
+                            reason,
+                            Some(pkt),
+                            siblings,
+                            oldest_wait,
+                        ))
                     }
                 } else if let Some(last_sub) = b.last_submit_qpc {
                     let silence = (now_qpc - last_sub).max(0) as f64 / freq as f64;
@@ -307,11 +339,18 @@ where
                                 now_qpc,
                                 reason,
                                 None,
+                                Vec::new(),
                                 oldest_wait,
-                                None,
+                                Vec::new(),
                             ))
                         } else {
-                            Some(TriggerEvent::Fatal(now_qpc, reason, None, oldest_wait))
+                            Some(TriggerEvent::Fatal(
+                                now_qpc,
+                                reason,
+                                None,
+                                Vec::new(),
+                                oldest_wait,
+                            ))
                         }
                     } else {
                         None
@@ -326,13 +365,15 @@ where
 
         if let Some(ev) = check {
             match ev {
-                TriggerEvent::Fatal(qpc, reason, stalled, oldest_wait) => {
-                    final_trigger = Some((qpc, reason, stalled, oldest_wait));
+                TriggerEvent::Fatal(qpc, reason, stalled, siblings, oldest_wait) => {
+                    final_trigger = Some((qpc, reason, stalled, siblings, oldest_wait));
                     break;
                 }
-                TriggerEvent::RearmableStall(qpc, reason, stalled, oldest_wait, ack_key) => {
-                    if let Some(k) = ack_key {
-                        ack_stalled_pkts.insert(k);
+                TriggerEvent::RearmableStall(qpc, reason, stalled, siblings, oldest_wait, ack_keys) => {
+                    if !ack_keys.is_empty() {
+                        for k in ack_keys {
+                            ack_stalled_pkts.insert(k);
+                        }
                     } else {
                         last_silence_dump = Some(Instant::now());
                     }
@@ -343,7 +384,7 @@ where
                     }
                     let rep = {
                         let b = shared.builder.lock().unwrap_or_else(|e| e.into_inner());
-                        let trig = make_trigger_info(&b, qpc, reason, stalled, oldest_wait);
+                        let trig = make_trigger_info(&b, qpc, reason, stalled, siblings, oldest_wait);
                         b.snapshot_report(
                             format!("flight_ring(pid={}, {:.0}s)", opts.pid, opts.ring_secs),
                             &mut symbolizer,
@@ -360,17 +401,19 @@ where
 
         if !is_process_alive(opts.pid) {
             if opts.dump_on_exit && opts.triggers.exit {
-                let (stalled, oldest_wait) = {
+                let (stalled, siblings, oldest_wait) = {
                     let b = shared.builder.lock().unwrap_or_else(|e| e.into_inner());
-                    (
-                        b.oldest_in_flight_work_packet(now_qpc, None),
-                        b.oldest_in_flight_wait_packet(now_qpc),
-                    )
+                    let (p, s) = b
+                        .oldest_in_flight_work_packet_group(now_qpc, None)
+                        .map(|(p, s)| (Some(p), s))
+                        .unwrap_or((None, Vec::new()));
+                    (p, s, b.oldest_in_flight_wait_packet(now_qpc))
                 };
                 final_trigger = Some((
                     now_qpc,
                     format!("process_exited: pid={} terminated", opts.pid),
                     stalled,
+                    siblings,
                     oldest_wait,
                 ));
             } else {
@@ -383,17 +426,19 @@ where
             && started.elapsed().as_secs_f64() >= max_s
         {
             if !opts.rearm || dump_count == 0 {
-                let (stalled, oldest_wait) = {
+                let (stalled, siblings, oldest_wait) = {
                     let b = shared.builder.lock().unwrap_or_else(|e| e.into_inner());
-                    (
-                        b.oldest_in_flight_work_packet(now_qpc, None),
-                        b.oldest_in_flight_wait_packet(now_qpc),
-                    )
+                    let (p, s) = b
+                        .oldest_in_flight_work_packet_group(now_qpc, None)
+                        .map(|(p, s)| (Some(p), s))
+                        .unwrap_or((None, Vec::new()));
+                    (p, s, b.oldest_in_flight_wait_packet(now_qpc))
                 };
                 final_trigger = Some((
                     now_qpc,
                     format!("max_wait_elapsed: {max_s:.1}s window completed cleanly"),
                     stalled,
+                    siblings,
                     oldest_wait,
                 ));
             } else {
@@ -424,8 +469,15 @@ where
         }
     };
 
-    if let Some((trigger_qpc, trigger_reason, stalled, oldest_wait)) = final_trigger {
-        let trig = make_trigger_info(&builder, trigger_qpc, trigger_reason, stalled, oldest_wait);
+    if let Some((trigger_qpc, trigger_reason, stalled, siblings, oldest_wait)) = final_trigger {
+        let trig = make_trigger_info(
+            &builder,
+            trigger_qpc,
+            trigger_reason,
+            stalled,
+            siblings,
+            oldest_wait,
+        );
         let rep = builder.finish(
             format!("flight_ring(pid={}, {:.0}s)", opts.pid, opts.ring_secs),
             &mut symbolizer,
