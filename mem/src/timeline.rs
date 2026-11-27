@@ -369,6 +369,8 @@ pub struct QueueSummary {
     pub max_packet_ms: f64,
     pub fence_signals: u64,
     pub fence_waits: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sibling_note: Option<String>,
 }
 
 /// Per-thread wait attribution summary (CSwitch+ReadyThread when available, or DxgKrnl fence/MakeResident waits).
@@ -379,6 +381,9 @@ pub struct WaitSummary {
     pub count: u64,
     /// Number of waits in `count` that had a measured start->stop duration (`0` = count-only event).
     pub measured_count: u64,
+    /// Union wall-clock ms waited by this thread for this wait kind (non-overlapping; guaranteed `<= trace_dur_ms`).
+    pub wall_ms: f64,
+    /// Sum of individual wait durations (can exceed `trace_dur_ms` when multiple GPU waits overlap).
     pub total_ms: f64,
     pub max_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -398,10 +403,17 @@ pub struct FrameSummary {
     pub duration_ms: f64,
     /// Clipped union wall-clock GPU busy ms (any queue of `pid` busy; guaranteed `<= duration_ms`).
     pub gpu_busy_ms: f64,
+    /// Clipped GPU idle ms in this frame (`duration_ms - gpu_busy_ms`, `>= 0`).
+    pub gpu_idle_ms: f64,
     /// Clipped wall-clock busy ms of the single busiest queue of `pid` (`<= gpu_busy_ms <= duration_ms`).
     pub busiest_queue_ms: f64,
     /// Sum of clipped busy ms across all queues of `pid` (shows multi-queue overlap separately from saturation).
     pub queue_sum_ms: f64,
+    /// Top GPU-submitting thread ID for `pid` (when known).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit_tid: Option<u32>,
+    /// Clipped CPU fence wait ms specifically for `submit_tid` (discriminates submit-thread blocking from background threads).
+    pub submit_tid_cpu_wait_ms: f64,
     /// Clipped measured fence wait ms in this frame (`cpu_fence_wait_ms + gpu_fence_wait_ms`).
     pub fence_wait_ms: f64,
     pub cpu_fence_wait_ms: f64,
@@ -453,6 +465,8 @@ pub struct TimelineReport {
     pub pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub frame_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submit_tid: Option<u32>,
     pub thread_suspends: u64,
     pub ts_unit: String,
     pub qpc_freq_hz: u64,
@@ -859,11 +873,15 @@ pub(crate) struct TimelineBuilder {
     pub alerts: Vec<String>,
     pub pid_stats: HashMap<u32, PidActivitySummary>,
     pub queues: BTreeMap<u64, QueueSummary>,
+    /// Modal PID counts observed per `hContext` (recovers true owning PID when `DC_Start` arrives late).
+    ctx_pid_counts: HashMap<u64, HashMap<u32, u64>>,
+    /// Per-`(pid, tid)` GPU packet submit counts (identifies the top submitting thread for `frame_pid`).
+    pid_tid_submits: HashMap<(u32, u32), u64>,
 
     // Compact full-trace accumulators (used in offline / non-ring mode so 9M+ event ETLs never lose summary accuracy!)
     full_gpu_spans: Vec<(i64, i64, u32, u64)>,
-    /// `(start_qpc, end_qpc, pid, kind_code)` where `0=cpu_fence, 1=gpu_fence, 2=cswitch`
-    full_wait_spans: Vec<(i64, i64, u32, u8)>,
+    /// `(start_qpc, end_qpc, pid, tid, kind_code)` where `0=cpu_fence, 1=gpu_fence, 2=cswitch`
+    full_wait_spans: Vec<(i64, i64, u32, u32, u8)>,
     /// `(qpc, pid, event_id)` for canonical Present deduplication
     full_present_marks: Vec<(i64, u32, u16)>,
     /// `(qpc, pid, aux_code)` where `0=paging, 1=vprot, 2=hfault`
@@ -930,6 +948,8 @@ impl TimelineBuilder {
             alerts: Vec::new(),
             pid_stats: HashMap::new(),
             queues: BTreeMap::new(),
+            ctx_pid_counts: HashMap::new(),
+            pid_tid_submits: HashMap::new(),
             full_gpu_spans: Vec::new(),
             full_wait_spans: Vec::new(),
             full_present_marks: Vec::new(),
@@ -1043,6 +1063,25 @@ impl TimelineBuilder {
             return format!("ctx={ctx:#x}/n{node}");
         }
         format!("ctx={ctx:#x}")
+    }
+
+    #[inline]
+    fn note_ctx_pid(&mut self, ctx: u64, pid: u32) {
+        if ctx != 0 && pid != 0 && pid != 4 {
+            *self
+                .ctx_pid_counts
+                .entry(ctx)
+                .or_default()
+                .entry(pid)
+                .or_insert(0) += 1;
+        }
+    }
+
+    #[inline]
+    fn note_submit_tid(&mut self, pid: u32, tid: u32) {
+        if pid != 0 && pid != 4 && tid != 0 {
+            *self.pid_tid_submits.entry((pid, tid)).or_insert(0) += 1;
+        }
     }
 
     fn ensure_queue(&mut self, ctx: u64, pid_hint: u32) -> &mut QueueSummary {
@@ -1186,7 +1225,7 @@ impl TimelineBuilder {
         let waker = (waker_tid != 0).then_some(waker_tid);
         if self.ring_window_qpc.is_none() {
             self.full_wait_spans
-                .push((w.wait_qpc, end_qpc, w.pid, if w.is_cpu { 0 } else { 1 }));
+                .push((w.wait_qpc, end_qpc, w.pid, w.tid, if w.is_cpu { 0 } else { 1 }));
             // `count` was already incremented when the wait started (`297`/`100`/`295`/`231`);
             // record the measured duration without double-counting `n`.
             self.record_wait_acc(w.tid, kind_name, Some(dur_qpc), waker, false);
@@ -1382,6 +1421,8 @@ impl TimelineBuilder {
                     return;
                 }
                 self.note_dxg_pid_match(pid, hdr_pid);
+                self.note_submit_tid(pid, hdr_tid);
+                self.note_ctx_pid(ctx, pid);
                 self.last_submit_qpc = Some(qpc);
                 self.total_target_submits += 1;
                 if ctx != 0 {
@@ -1491,7 +1532,7 @@ impl TimelineBuilder {
                     let dur_qpc = (qpc - start_qpc).max(0);
                     self.last_complete_qpc = Some(qpc);
                     if self.ring_window_qpc.is_none() {
-                        self.full_wait_spans.push((start_qpc, qpc, pid, 1));
+                        self.full_wait_spans.push((start_qpc, qpc, pid, start_tid, 1));
                         self.record_wait_acc(start_tid, "dxg_fence_gpu_wait", Some(dur_qpc), None, true);
                     }
                     let qname = self.queue_label(ctx);
@@ -1581,6 +1622,8 @@ impl TimelineBuilder {
                     return;
                 }
                 self.note_dxg_pid_match(pid, hdr_pid);
+                self.note_submit_tid(pid, hdr_tid);
+                self.note_ctx_pid(ctx, pid);
                 self.last_submit_qpc = Some(qpc);
                 self.total_target_submits += 1;
                 if ctx != 0 {
@@ -1639,6 +1682,8 @@ impl TimelineBuilder {
                     return;
                 }
                 self.note_dxg_pid_match(pid, hdr_pid);
+                self.note_submit_tid(pid, hdr_tid);
+                self.note_ctx_pid(ctx, pid);
                 self.last_submit_qpc = Some(qpc);
                 self.total_target_submits += 1;
                 if hq != 0 && pf != 0 {
@@ -2117,7 +2162,7 @@ impl TimelineBuilder {
                     let dur_qpc = (qpc - out_qpc).max(0);
                     let waker = self.last_waker.remove(&new_tid);
                     if self.ring_window_qpc.is_none() {
-                        self.full_wait_spans.push((out_qpc, qpc, pid, 2));
+                        self.full_wait_spans.push((out_qpc, qpc, pid, new_tid, 2));
                         self.record_wait_acc(new_tid, "cswitch_wait", Some(dur_qpc), waker, true);
                     }
                     self.push_event(RawTimelineEvent {
@@ -2324,6 +2369,7 @@ impl TimelineBuilder {
         let had_full_gpu = !gpu_spans.is_empty();
         let had_full_presents = !present_marks.is_empty();
         let had_full_waits = !wait_acc.is_empty();
+        let had_full_wait_spans = !wait_spans.is_empty();
 
         for raw in self.raw_events {
             let t_ms = qpc_to_ms(raw.qpc - start_qpc);
@@ -2358,11 +2404,11 @@ impl TimelineBuilder {
             if (is_ring || !had_full_presents) && raw.kind == TimelineEventKind::Present {
                 present_marks.push((raw.qpc, raw.pid, 184));
             }
-            if is_ring {
+            if is_ring || !had_full_wait_spans {
                 match raw.kind {
-                    TimelineEventKind::Paging => aux_marks.push((raw.qpc, raw.pid, 0)),
-                    TimelineEventKind::VirtualProtect => aux_marks.push((raw.qpc, raw.pid, 1)),
-                    TimelineEventKind::HardFault => aux_marks.push((raw.qpc, raw.pid, 2)),
+                    TimelineEventKind::Paging if is_ring => aux_marks.push((raw.qpc, raw.pid, 0)),
+                    TimelineEventKind::VirtualProtect if is_ring => aux_marks.push((raw.qpc, raw.pid, 1)),
+                    TimelineEventKind::HardFault if is_ring => aux_marks.push((raw.qpc, raw.pid, 2)),
                     TimelineEventKind::FenceWait => {
                         if let Some(dq) = raw.duration_qpc {
                             let is_cpu = raw.wait_kind.as_deref() == Some("dxg_fence_cpu_wait");
@@ -2370,13 +2416,14 @@ impl TimelineBuilder {
                                 raw.qpc,
                                 raw.qpc.saturating_add(dq),
                                 raw.pid,
+                                raw.tid,
                                 if is_cpu { 0 } else { 1 },
                             ));
                         }
                     }
                     TimelineEventKind::CSwitchWait => {
                         if let Some(dq) = raw.duration_qpc {
-                            wait_spans.push((raw.qpc, raw.qpc.saturating_add(dq), raw.pid, 2));
+                            wait_spans.push((raw.qpc, raw.qpc.saturating_add(dq), raw.pid, raw.tid, 2));
                         }
                     }
                     _ => {}
@@ -2426,6 +2473,32 @@ impl TimelineBuilder {
 
         events.sort_by_key(|e| e.qpc);
 
+        // Resolve true owning PID per `hContext` from final `context_meta` (or modal non-System PID)
+        // so late DC_Start rundowns or stray interrupted-thread hdr_pids never misattribute queues.
+        let mut ctx_true_pid: HashMap<u64, u32> = HashMap::new();
+        for (&ctx, meta) in &self.context_meta {
+            if meta.pid != 0 && meta.pid != 4 {
+                ctx_true_pid.insert(ctx, meta.pid);
+            }
+        }
+        for (&ctx, counts) in &self.ctx_pid_counts {
+            ctx_true_pid.entry(ctx).or_insert_with(|| {
+                counts
+                    .iter()
+                    .max_by_key(|&(_, &c)| c)
+                    .map(|(&p, _)| p)
+                    .unwrap_or(0)
+            });
+        }
+        for span in &mut gpu_spans {
+            if span.3 != 0
+                && let Some(&tp) = ctx_true_pid.get(&span.3)
+                && tp != 0
+            {
+                span.2 = tp;
+            }
+        }
+
         let mut queue_intervals: HashMap<u64, Vec<(i64, i64)>> = HashMap::new();
         for &(s, e, _, ctx) in &gpu_spans {
             let cs = s.max(start_qpc);
@@ -2438,7 +2511,12 @@ impl TimelineBuilder {
             .queues
             .into_values()
             .map(|mut q| {
-                if q.process_name.is_none() && q.pid != 0 {
+                if let Some(&tp) = ctx_true_pid.get(&q.context)
+                    && tp != 0
+                {
+                    q.pid = tp;
+                    q.process_name = self.pid_names.get(&tp).cloned();
+                } else if q.process_name.is_none() && q.pid != 0 {
                     q.process_name = self.pid_names.get(&q.pid).cloned();
                 }
                 if let Some(intervals) = queue_intervals.remove(&q.context) {
@@ -2459,6 +2537,20 @@ impl TimelineBuilder {
                 .total_cmp(&a.busy_ms)
                 .then_with(|| b.packets_started.cmp(&a.packets_started))
         });
+        // Annotate lockstep sibling contexts of the same PID (identical pkts and busy_ms within 5 ms).
+        let mut seen_sig: HashMap<(u32, u64, u64), (String, f64)> = HashMap::new();
+        for q in &mut queues {
+            if q.packets_started >= 4 && q.busy_ms >= 1.0 {
+                let key = (q.pid, q.packets_started, q.packets_completed);
+                if let Some((first_id, first_busy)) = seen_sig.get(&key) {
+                    if (q.busy_ms - first_busy).abs() <= 5.0 {
+                        q.sibling_note = Some(format!("sibling_of={first_id}"));
+                    }
+                } else {
+                    seen_sig.insert(key, (q.queue_id.clone(), q.busy_ms));
+                }
+            }
+        }
 
         let mut pids: Vec<PidActivitySummary> = self
             .pid_stats
@@ -2487,6 +2579,25 @@ impl TimelineBuilder {
                 .map(|p| p.pid)
                 .or_else(|| present_marks.first().map(|m| m.1))
         });
+        let submit_tid = frame_pid.and_then(|fpid| {
+            self.pid_tid_submits
+                .iter()
+                .filter(|&(&(p, t), _)| p == fpid && t != 0)
+                .max_by_key(|&(_, &c)| c)
+                .map(|(&(_, t), _)| t)
+                .or_else(|| {
+                    let mut counts: HashMap<u32, u64> = HashMap::new();
+                    for ev in &events {
+                        if ev.pid == fpid
+                            && ev.tid != 0
+                            && matches!(ev.kind, TimelineEventKind::GpuBusy | TimelineEventKind::GpuSubmit)
+                        {
+                            *counts.entry(ev.tid).or_insert(0) += 1;
+                        }
+                    }
+                    counts.into_iter().max_by_key(|&(_, c)| c).map(|(t, _)| t)
+                })
+        });
         if self.filter_pid.is_none()
             && let Some(fp) = frame_pid
             && pids.iter().filter(|p| p.presents > 0).count() > 1
@@ -2503,6 +2614,7 @@ impl TimelineBuilder {
 
         let frames = build_clipped_frames(
             frame_pid,
+            submit_tid,
             start_qpc,
             end_qpc,
             self.qpc_freq_hz,
@@ -2512,6 +2624,15 @@ impl TimelineBuilder {
             &aux_marks,
         );
 
+        // Compute union wall-clock ms per (tid, wait_kind) clipped to [start_qpc, end_qpc] (<= trace_dur_ms).
+        let mut wait_intervals: HashMap<(u32, u8), Vec<(i64, i64)>> = HashMap::new();
+        for &(s, e, _, tid, kc) in &wait_spans {
+            let cs = s.max(start_qpc);
+            let ce = e.min(end_qpc);
+            if ce > cs {
+                wait_intervals.entry((tid, kc)).or_default().push((cs, ce));
+            }
+        }
         let mut waits: Vec<WaitSummary> = wait_acc
             .into_iter()
             .map(
@@ -2521,11 +2642,22 @@ impl TimelineBuilder {
                         .max_by_key(|&(_, n)| n)
                         .map(|(w, n)| format!("tid={w} ({n}x)"));
                     let top_stack = stacks.into_iter().max_by_key(|(_, n)| *n).map(|(s, _)| s);
+                    let kc = match kind.as_str() {
+                        "dxg_fence_cpu_wait" => Some(0u8),
+                        "dxg_fence_gpu_wait" => Some(1u8),
+                        "cswitch_off_cpu" => Some(2u8),
+                        _ => None,
+                    };
+                    let wall_ms = kc
+                        .and_then(|c| wait_intervals.remove(&(tid, c)))
+                        .map(|ivs| qpc_to_ms(union_interval_qpc(ivs)).min(trace_dur_ms))
+                        .unwrap_or_else(|| total_ms.min(trace_dur_ms));
                     WaitSummary {
                         tid,
                         kind,
                         count,
                         measured_count,
+                        wall_ms,
                         total_ms,
                         max_ms,
                         top_waker,
@@ -2535,8 +2667,9 @@ impl TimelineBuilder {
             )
             .collect();
         waits.sort_by(|a, b| {
-            b.total_ms
-                .total_cmp(&a.total_ms)
+            b.wall_ms
+                .total_cmp(&a.wall_ms)
+                .then_with(|| b.total_ms.total_cmp(&a.total_ms))
                 .then_with(|| b.count.cmp(&a.count))
         });
 
@@ -2576,6 +2709,7 @@ impl TimelineBuilder {
             source,
             pid: self.filter_pid,
             frame_pid,
+            submit_tid,
             thread_suspends: THREAD_SUSPENDS,
             ts_unit: self.ts_unit,
             qpc_freq_hz: self.qpc_freq_hz,
@@ -2610,12 +2744,13 @@ impl TimelineBuilder {
 #[allow(clippy::too_many_arguments)]
 fn build_clipped_frames(
     frame_pid: Option<u32>,
+    submit_tid: Option<u32>,
     start_qpc: i64,
     _end_qpc: i64,
     qpc_freq_hz: u64,
     present_marks: &[(i64, u32, u16)],
     gpu_spans: &[(i64, i64, u32, u64)],
-    wait_spans: &[(i64, i64, u32, u8)],
+    wait_spans: &[(i64, i64, u32, u32, u8)],
     aux_marks: &[(i64, u32, u8)],
 ) -> Vec<FrameSummary> {
     let Some(fpid) = frame_pid else {
@@ -2665,12 +2800,12 @@ fn build_clipped_frames(
         .collect();
     g_spans.sort_unstable_by_key(|&(s, _, _)| s);
 
-    let mut w_spans: Vec<(i64, i64, u8)> = wait_spans
+    let mut w_spans: Vec<(i64, i64, u32, u8)> = wait_spans
         .iter()
-        .filter(|&&(_, _, p, _)| p == fpid)
-        .map(|&(s, e, _, kc)| (s, e, kc))
+        .filter(|&&(_, _, p, _, _)| p == fpid)
+        .map(|&(s, e, _, tid, kc)| (s, e, tid, kc))
         .collect();
-    w_spans.sort_unstable_by_key(|&(s, _, _)| s);
+    w_spans.sort_unstable_by_key(|&(s, _, _, _)| s);
 
     let mut a_marks: Vec<(i64, u8)> = aux_marks
         .iter()
@@ -2719,9 +2854,10 @@ fn build_clipped_frames(
             wait_head += 1;
         }
         let mut cpu_w = Vec::new();
+        let mut sub_cpu_w = Vec::new();
         let mut gpu_w = Vec::new();
         let mut os_w = Vec::new();
-        for &(s, e, kc) in &w_spans[wait_head..] {
+        for &(s, e, tid, kc) in &w_spans[wait_head..] {
             if s >= f_end {
                 break;
             }
@@ -2729,13 +2865,20 @@ fn build_clipped_frames(
             let ce = e.min(f_end);
             if ce > cs {
                 match kc {
-                    0 => cpu_w.push((cs, ce)),
+                    0 => {
+                        cpu_w.push((cs, ce));
+                        if submit_tid == Some(tid) {
+                            sub_cpu_w.push((cs, ce));
+                        }
+                    }
                     1 => gpu_w.push((cs, ce)),
                     _ => os_w.push((cs, ce)),
                 }
             }
         }
+        let gpu_idle_ms = (dur_ms - gpu_busy_ms).max(0.0);
         let cpu_fence_wait_ms = qpc_to_ms(union_interval_qpc(cpu_w)).min(dur_ms);
+        let submit_tid_cpu_wait_ms = qpc_to_ms(union_interval_qpc(sub_cpu_w)).min(dur_ms);
         let gpu_fence_wait_ms = qpc_to_ms(union_interval_qpc(gpu_w)).min(dur_ms);
         let os_wait_ms = qpc_to_ms(union_interval_qpc(os_w)).min(dur_ms);
 
@@ -2762,8 +2905,11 @@ fn build_clipped_frames(
             t_ms: qpc_to_ms(f_start - start_qpc),
             duration_ms: dur_ms,
             gpu_busy_ms,
+            gpu_idle_ms,
             busiest_queue_ms: busiest_q_ms,
             queue_sum_ms: q_sum_ms,
+            submit_tid,
+            submit_tid_cpu_wait_ms,
             fence_wait_ms: cpu_fence_wait_ms + gpu_fence_wait_ms,
             cpu_fence_wait_ms,
             gpu_fence_wait_ms,
@@ -3223,6 +3369,10 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
         .frame_pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "none".into());
+    let stid_s = rep
+        .submit_tid
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "none".into());
     let stacks_s = if rep.stack_samples_captured == 0 {
         "0(no_stack_events)".to_string()
     } else {
@@ -3235,10 +3385,11 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
     };
     let _ = writeln!(
         out,
-        "HEADER source={} pid={} frame_pid={} trace_dur_ms={:.2} target_span_ms={:.2} ts_unit={} freq_hz={} raw_events={} target_events={}{} dxg_pid_ev={} dxg_ctx_other_pid={} stacks={} measured_waits={} wait_mode={} providers={} thread_suspends={}",
+        "HEADER source={} pid={} frame_pid={} submit_tid={} trace_dur_ms={:.2} target_span_ms={:.2} ts_unit={} freq_hz={} raw_events={} target_events={}{} dxg_pid_ev={} dxg_ctx_other_pid={} stacks={} measured_waits={} wait_mode={} providers={} thread_suspends={}",
         rep.source,
         pid_s,
         fpid_s,
+        stid_s,
         rep.duration_ms,
         rep.target_span_ms,
         rep.ts_unit,
@@ -3302,9 +3453,14 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                 .as_deref()
                 .map(|n| format!("({n})"))
                 .unwrap_or_default();
+            let sib = q
+                .sibling_note
+                .as_deref()
+                .map(|s| format!(" [{s}]"))
+                .unwrap_or_default();
             let _ = writeln!(
                 out,
-                "QUEUE {:<20} pid={:<6}{:<16} pkts={}/{} in_flight={} busy_ms={:>8.2} ({:>5.1}%) max_pkt_ms={:>7.2} sig={} wait={}",
+                "QUEUE {:<20} pid={:<6}{:<16} pkts={}/{} in_flight={} busy_ms={:>8.2} ({:>5.1}%) max_pkt_ms={:>7.2} sig={} wait={}{}",
                 q.queue_id,
                 q.pid,
                 pname,
@@ -3316,26 +3472,30 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                 q.max_packet_ms,
                 q.fence_signals,
                 q.fence_waits,
+                sib,
             );
         }
     }
 
     if !rep.waits.is_empty() {
-        let _ = writeln!(out, "\n== Wait Attribution (per thread) ==");
+        let _ = writeln!(
+            out,
+            "\n== Wait Attribution (per thread; wall_ms=union <= trace_dur) =="
+        );
         for w in rep.waits.iter().take(opts.top) {
             let waker = w.top_waker.as_deref().unwrap_or("-");
             let stack = w.top_stack.as_deref().unwrap_or("-");
             if w.measured_count == 0 {
                 let _ = writeln!(
                     out,
-                    "WAIT tid={:<6} kind={:<22} n={:<6} total_ms=n/a(count-only) max_ms=n/a     waker={:<18} stack={}",
+                    "WAIT tid={:<6} kind={:<22} n={:<6} wall_ms=n/a      sum_ms=n/a(count-only) max_ms=n/a     waker={:<18} stack={}",
                     w.tid, w.kind, w.count, waker, stack
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    "WAIT tid={:<6} kind={:<22} n={:<6} measured={:<6} total_ms={:>8.2} max_ms={:>7.2} waker={:<18} stack={}",
-                    w.tid, w.kind, w.count, w.measured_count, w.total_ms, w.max_ms, waker, stack
+                    "WAIT tid={:<6} kind={:<22} n={:<6} measured={:<6} wall_ms={:>8.2} sum_ms={:>10.2} max_ms={:>7.2} waker={:<18} stack={}",
+                    w.tid, w.kind, w.count, w.measured_count, w.wall_ms, w.total_ms, w.max_ms, waker, stack
                 );
             }
         }
@@ -3351,23 +3511,24 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
     if !rep.frames.is_empty() {
         let _ = writeln!(
             out,
-            "\n== Per-Present Frames (clipped to frame bounds; union gpu_busy <= dur) =="
+            "\n== Per-Present Frames (pid={}, submit_tid={}, clipped to frame bounds; gpu_busy+gpu_idle=dur) ==",
+            fpid_s, stid_s
         );
         for f in rep.frames.iter().take(opts.top.max(30)) {
             let _ = writeln!(
                 out,
-                "FRAME f={:<4} pid={:<6} ev_id={:<3} t_ms={:>9.2} dur_ms={:>7.2} gpu_busy_ms={:>7.2} busiest_q_ms={:>7.2} q_sum_ms={:>7.2} cpu_wait_ms={:>6.2} gpu_wait_ms={:>6.2} os_wait_ms={:>6.2} paging={} vprot={} hfault={}",
+                "FRAME f={:<4} pid={:<6} ev_id={:<3} t_ms={:>9.2} dur_ms={:>7.2} gpu_busy_ms={:>7.2} gpu_idle_ms={:>7.2} busiest_q_ms={:>7.2} sub_cpu_wait_ms={:>6.2} all_cpu_wait_ms={:>6.2} gpu_wait_ms={:>6.2} paging={} vprot={} hfault={}",
                 f.frame,
                 f.pid,
                 f.present_event_id,
                 f.t_ms,
                 f.duration_ms,
                 f.gpu_busy_ms,
+                f.gpu_idle_ms,
                 f.busiest_queue_ms,
-                f.queue_sum_ms,
+                f.submit_tid_cpu_wait_ms,
                 f.cpu_fence_wait_ms,
                 f.gpu_fence_wait_ms,
-                f.os_wait_ms,
                 f.paging_events,
                 f.virtual_protect_events,
                 f.hard_faults,
@@ -3481,6 +3642,7 @@ mod tests {
                 max_packet_ms: 5.0,
                 fence_signals: 2,
                 fence_waits: 1,
+                sibling_note: None,
             },
         );
         b.push_event(RawTimelineEvent {
@@ -3532,17 +3694,27 @@ mod tests {
             rep.frames[0].gpu_busy_ms <= rep.frames[0].duration_ms,
             "clipped frame gpu_busy_ms must never exceed dur_ms"
         );
+        assert!(
+            (rep.frames[0].gpu_busy_ms + rep.frames[0].gpu_idle_ms - rep.frames[0].duration_ms).abs() < 1e-6
+        );
+        assert_eq!(rep.submit_tid, Some(1001));
+        assert!(rep.frames[0].submit_tid_cpu_wait_ms > 0.0);
         assert_eq!(rep.waits.len(), 1);
         assert_eq!(rep.waits[0].measured_count, 1);
+        assert!(rep.waits[0].wall_ms <= rep.duration_ms);
         assert_eq!(rep.waits[0].top_waker.as_deref(), Some("tid=1002 (1x)"));
         // Kernel ETW prefix must be skipped in favor of the user-mode frame!
         assert_eq!(rep.events[0].stack, vec!["xcl.exe+0x1234"]);
 
         let text = format_timeline_text(&rep, &TimelineFormatOptions::default());
         assert!(text.contains("HEADER source=unit.etl pid=42"));
+        assert!(text.contains("submit_tid=1001"));
         assert!(text.contains("QUEUE ctx=0x1000/n0"));
         assert!(text.contains("WAIT tid=1001"));
+        assert!(text.contains("wall_ms="));
         assert!(text.contains("FRAME f=0"));
+        assert!(text.contains("gpu_idle_ms="));
+        assert!(text.contains("sub_cpu_wait_ms="));
         assert!(text.contains("[GPU_BUSY]"));
         assert!(text.contains("xcl.exe+0x1234"));
     }

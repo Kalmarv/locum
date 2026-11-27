@@ -46,7 +46,7 @@ pub struct ProbeDescArgs {
     /// Optional byte offset of the buffer size field inside the raw descriptor.
     #[arg(long)]
     pub size_offset: Option<usize>,
-    /// Optional 2-level indirection heap base GPU VA (reads a u32 slot index at `row+desc_offset`, then decodes the guest view at `heap_va + slot_index * indirect_stride`, e.g. `0x4c610000`).
+    /// Optional 2-level indirection heap base GPU VA (reads a u32 slot index at `row+desc_offset`, then decodes the guest view at `heap_va + slot_index * indirect_stride`, e.g. `0x44c610000`).
     #[arg(long)]
     pub indirect_heap_va: Option<String>,
     /// Stride in bytes of entries in `--indirect-heap-va` (default 32).
