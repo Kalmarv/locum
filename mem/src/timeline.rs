@@ -448,14 +448,63 @@ pub struct StackSummary {
     pub stack: String,
 }
 
+/// Detailed identity of an unresolved in-flight GPU packet (for flight-recorder stall diagnostics).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StalledPacketInfo {
+    /// `"queue_pkt"`, `"dma_pkt"`, `"hwq_dma"`, or `"wait_pkt"`.
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub packet_type: Option<u64>,
+    pub context: u64,
+    pub queue: String,
+    pub seq: u64,
+    pub tid: u32,
+    pub submit_qpc: i64,
+    pub age_secs: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sync_obj: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fence_val: Option<u64>,
+}
+
+impl StalledPacketInfo {
+    pub fn format_compact(&self) -> String {
+        let mut s = match self.packet_type {
+            Some(pt) => format!(
+                "kind={}(type={pt}) queue={} ctx={:#x} seq={} tid={} submit_qpc={} age={:.2}s",
+                self.kind, self.queue, self.context, self.seq, self.tid, self.submit_qpc, self.age_secs
+            ),
+            None => format!(
+                "kind={} queue={} ctx={:#x} seq={} tid={} submit_qpc={} age={:.2}s",
+                self.kind, self.queue, self.context, self.seq, self.tid, self.submit_qpc, self.age_secs
+            ),
+        };
+        if let Some(sync) = self.sync_obj {
+            s.push_str(&format!(" sync={sync:#x}"));
+        }
+        if let Some(val) = self.fence_val {
+            s.push_str(&format!(" val={val}"));
+        }
+        s
+    }
+}
+
 /// Trigger metadata when produced by the 10-second flight recorder.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FlightTriggerInfo {
     pub reason: String,
     pub trigger_qpc: i64,
     pub ring_secs: f64,
+    /// Actual QPC duration retained in the dumped ring (can be less than `ring_secs` if `max_ring_events` cap hit).
+    pub retained_secs: f64,
+    pub max_ring_events: usize,
+    pub capped_by_event_limit: bool,
     pub total_observed_events: u64,
     pub evicted_ring_events: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stalled_packet: Option<StalledPacketInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_wait_packet: Option<StalledPacketInfo>,
 }
 
 /// Complete unified QPC timeline report (text-greppable + JSON).
@@ -1138,19 +1187,117 @@ impl TimelineBuilder {
         }
     }
 
-    /// Returns the oldest unresolved in-flight GPU packet age in seconds relative to `now_qpc`, if any.
-    pub fn oldest_in_flight_secs(&self, now_qpc: i64) -> Option<f64> {
-        let mut oldest: Option<i64> = None;
-        for &(start, _, _, _) in self.in_flight_queue_pkts.values() {
-            oldest = Some(oldest.map_or(start, |o| o.min(start)));
+    /// Returns detailed identity of the oldest unresolved GPU work packet (`queue_pkt` / `dma_pkt` / `hwq_dma`),
+    /// skipping any `(ctx, seq)` already acknowledged in `ack_pkts` (for `--rearm`).
+    pub fn oldest_in_flight_work_packet(
+        &self,
+        now_qpc: i64,
+        ack_pkts: Option<&std::collections::HashSet<(u64, u64)>>,
+    ) -> Option<StalledPacketInfo> {
+        let mut best: Option<StalledPacketInfo> = None;
+        let mut consider = |info: StalledPacketInfo| {
+            if best.as_ref().is_none_or(|b| info.submit_qpc < b.submit_qpc) {
+                best = Some(info);
+            }
+        };
+        let freq = self.qpc_freq_hz.max(1) as f64;
+        for (&(ctx, seq), &(start, _, tid, ptype)) in &self.in_flight_queue_pkts {
+            if ack_pkts.is_some_and(|a| a.contains(&(ctx, seq))) {
+                continue;
+            }
+            consider(StalledPacketInfo {
+                kind: "queue_pkt".into(),
+                packet_type: Some(ptype),
+                context: ctx,
+                queue: self.queue_label(ctx),
+                seq,
+                tid,
+                submit_qpc: start,
+                age_secs: (now_qpc - start).max(0) as f64 / freq,
+                sync_obj: None,
+                fence_val: None,
+            });
         }
-        for &(start, _, _) in self.in_flight_dma_pkts.values() {
-            oldest = Some(oldest.map_or(start, |o| o.min(start)));
+        for (&(ctx, seq), &(start, _, tid)) in &self.in_flight_dma_pkts {
+            if ack_pkts.is_some_and(|a| a.contains(&(ctx, seq))) {
+                continue;
+            }
+            consider(StalledPacketInfo {
+                kind: "dma_pkt".into(),
+                packet_type: None,
+                context: ctx,
+                queue: self.queue_label(ctx),
+                seq,
+                tid,
+                submit_qpc: start,
+                age_secs: (now_qpc - start).max(0) as f64 / freq,
+                sync_obj: None,
+                fence_val: None,
+            });
         }
-        for &(start, _, _) in self.in_flight_hwq_pkts.values() {
-            oldest = Some(oldest.map_or(start, |o| o.min(start)));
+        for (&(hq, pf), &(start, _, tid)) in &self.in_flight_hwq_pkts {
+            let ctx = self.hwqueue_ctx.get(&hq).copied().unwrap_or(hq);
+            if ack_pkts.is_some_and(|a| a.contains(&(ctx, pf))) {
+                continue;
+            }
+            consider(StalledPacketInfo {
+                kind: "hwq_dma".into(),
+                packet_type: None,
+                context: ctx,
+                queue: self.queue_label(ctx),
+                seq: pf,
+                tid,
+                submit_qpc: start,
+                age_secs: (now_qpc - start).max(0) as f64 / freq,
+                sync_obj: None,
+                fence_val: None,
+            });
         }
-        oldest.map(|o| (now_qpc - o).max(0) as f64 / self.qpc_freq_hz as f64)
+        best
+    }
+
+    /// Returns detailed identity of the oldest unresolved queue-side fence wait packet (`244` -> `180`), if any.
+    pub fn oldest_in_flight_wait_packet(&self, now_qpc: i64) -> Option<StalledPacketInfo> {
+        let freq = self.qpc_freq_hz.max(1) as f64;
+        self.in_flight_wait_pkts
+            .iter()
+            .min_by_key(|&(_, &(start, _, _, _, _))| start)
+            .map(|(&(ctx, seq), &(start, _, tid, sync, val))| StalledPacketInfo {
+                kind: "wait_pkt".into(),
+                packet_type: None,
+                context: ctx,
+                queue: self.queue_label(ctx),
+                seq,
+                tid,
+                submit_qpc: start,
+                age_secs: (now_qpc - start).max(0) as f64 / freq,
+                sync_obj: (sync != 0).then_some(sync),
+                fence_val: Some(val),
+            })
+    }
+
+    /// Prunes stale in-flight entries on `ctx` with sequence strictly earlier than `completed_seq`
+    /// (FIFO hardware queues cannot leave an older sequence permanently in-flight once newer packets complete).
+    #[inline]
+    fn prune_older_in_flight_seq<V>(map: &mut HashMap<(u64, u64), V>, ctx: u64, completed_seq: u64) {
+        if completed_seq == 0 || map.is_empty() {
+            return;
+        }
+        map.retain(|&(c, s), _| {
+            if c != ctx || s == 0 {
+                return true;
+            }
+            let diff = completed_seq.wrapping_sub(s);
+            !(diff > 0 && diff < (1u64 << 31))
+        });
+    }
+
+    /// Returns the actual QPC span currently held in the ring buffer, in seconds.
+    pub fn retained_ring_secs(&self) -> f64 {
+        match (self.raw_events.front(), self.raw_events.back()) {
+            (Some(f), Some(b)) => (b.qpc - f.qpc).max(0) as f64 / self.qpc_freq_hz.max(1) as f64,
+            _ => 0.0,
+        }
     }
 
     /// Ingests one ETW `EVENT_RECORD` onto the unified QPC timeline.
@@ -1361,6 +1508,13 @@ impl TimelineBuilder {
                     .get_any_u64(data, &["ContextType", "EngineAffinity"])
                     .map(|v| v as u32);
                 if hctx != 0 {
+                    if id == 31 {
+                        // Context Stop: clear any orphaned in-flight packets on the destroyed context.
+                        self.in_flight_queue_pkts.retain(|&(c, _), _| c != hctx);
+                        self.in_flight_wait_pkts.retain(|&(c, _), _| c != hctx);
+                        self.in_flight_sig_pkts.retain(|&(c, _), _| c != hctx);
+                        self.in_flight_dma_pkts.retain(|&(c, _), _| c != hctx);
+                    }
                     self.context_meta.insert(
                         hctx,
                         ContextMeta {
@@ -1377,6 +1531,9 @@ impl TimelineBuilder {
                 let hctx = schema
                     .get_any_u64(data, &["hContext", "hParentContext"])
                     .unwrap_or(0);
+                if hq != 0 && id == 423 {
+                    self.in_flight_hwq_pkts.retain(|&(q, _), _| q != hq);
+                }
                 if hq != 0 && hctx != 0 {
                     self.hwqueue_ctx.insert(hq, hctx);
                 }
@@ -1529,6 +1686,7 @@ impl TimelineBuilder {
                 if let Some((start_qpc, pid, start_tid, sync, val)) =
                     self.in_flight_wait_pkts.remove(&(ctx, seq))
                 {
+                    Self::prune_older_in_flight_seq(&mut self.in_flight_wait_pkts, ctx, seq);
                     let dur_qpc = (qpc - start_qpc).max(0);
                     self.last_complete_qpc = Some(qpc);
                     if self.ring_window_qpc.is_none() {
@@ -1577,6 +1735,7 @@ impl TimelineBuilder {
                 if let Some((start_qpc, pid, start_tid, ptype)) =
                     self.in_flight_queue_pkts.remove(&(ctx, seq))
                 {
+                    Self::prune_older_in_flight_seq(&mut self.in_flight_queue_pkts, ctx, seq);
                     let dur_qpc = (qpc - start_qpc).max(0);
                     let dur_ms = dur_qpc as f64 * 1e3 / self.qpc_freq_hz as f64;
                     self.last_complete_qpc = Some(qpc);
@@ -1636,6 +1795,7 @@ impl TimelineBuilder {
                     .get_any_u64(data, &["SubmitSequence", "ulSubmitSequence"])
                     .unwrap_or(0);
                 if let Some((start_qpc, pid, start_tid)) = self.in_flight_dma_pkts.remove(&(ctx, seq)) {
+                    Self::prune_older_in_flight_seq(&mut self.in_flight_dma_pkts, ctx, seq);
                     let dur_qpc = (qpc - start_qpc).max(0);
                     let dur_ms = dur_qpc as f64 * 1e3 / self.qpc_freq_hz as f64;
                     self.last_complete_qpc = Some(qpc);
@@ -1694,6 +1854,7 @@ impl TimelineBuilder {
                 let hq = schema.get_u64(data, "hHwQueue").unwrap_or(0);
                 let pf = schema.get_u64(data, "ProgressFenceValue").unwrap_or(0);
                 if let Some((start_qpc, pid, start_tid)) = self.in_flight_hwq_pkts.remove(&(hq, pf)) {
+                    Self::prune_older_in_flight_seq(&mut self.in_flight_hwq_pkts, hq, pf);
                     let ctx = self.hwqueue_ctx.get(&hq).copied().unwrap_or(hq);
                     let dur_qpc = (qpc - start_qpc).max(0);
                     let dur_ms = dur_qpc as f64 * 1e3 / self.qpc_freq_hz as f64;
@@ -2283,6 +2444,47 @@ impl TimelineBuilder {
         }
     }
 
+    /// Non-consuming snapshot of the current ring state (used by `--rearm` so the flight recorder stays armed).
+    pub fn snapshot_report(
+        &self,
+        source: String,
+        symbolizer: &mut Symbolizer,
+        warnings: Vec<String>,
+        flight_trigger: Option<FlightTriggerInfo>,
+    ) -> TimelineReport {
+        let mut copy = TimelineBuilder::new(self.filter_pid, self.qpc_freq_hz);
+        copy.ts_unit = self.ts_unit.clone();
+        copy.start_qpc = self.start_qpc;
+        copy.end_qpc = self.end_qpc;
+        copy.target_start_qpc = self.target_start_qpc;
+        copy.target_end_qpc = self.target_end_qpc;
+        copy.total_raw_events = self.total_raw_events;
+        copy.dxg_pid_events = self.dxg_pid_events;
+        copy.dxg_ctx_other_pid_events = self.dxg_ctx_other_pid_events;
+        copy.stack_samples_captured = self.stack_samples_captured;
+        copy.saw_cswitch = self.saw_cswitch;
+        copy.saw_ready_thread = self.saw_ready_thread;
+        copy.saw_sampled_profile = self.saw_sampled_profile;
+        copy.saw_dxgkrnl = self.saw_dxgkrnl;
+        copy.saw_sysmem = self.saw_sysmem;
+        copy.saw_kmem = self.saw_kmem;
+        copy.context_meta = self.context_meta.clone();
+        copy.in_flight_queue_pkts = self.in_flight_queue_pkts.clone();
+        copy.etw_images = self.etw_images.clone();
+        copy.pid_names = self.pid_names.clone();
+        copy.alerts = self.alerts.clone();
+        copy.pid_stats = self.pid_stats.clone();
+        copy.queues = self.queues.clone();
+        copy.ctx_pid_counts = self.ctx_pid_counts.clone();
+        copy.pid_tid_submits = self.pid_tid_submits.clone();
+        copy.raw_events = self.raw_events.clone();
+        copy.ring_window_qpc = self.ring_window_qpc;
+        copy.max_retained_events = self.max_retained_events;
+        copy.evicted_events = self.evicted_events;
+        copy.ev_truncated = self.ev_truncated;
+        copy.finish(source, symbolizer, warnings, flight_trigger)
+    }
+
     /// Finalizes the unified QPC timeline, symbolizing all captured stacks out-of-process,
     /// clipping per-frame GPU/wait intervals to exact canonical present bounds, and sorting EV lines.
     pub fn finish(
@@ -2320,9 +2522,13 @@ impl TimelineBuilder {
                 .unwrap_or(start_qpc)
         };
         let trace_dur_ms = (end_qpc - start_qpc).max(0) as f64 * 1e3 / self.qpc_freq_hz as f64;
-        let target_span_ms = match (self.target_start_qpc, self.target_end_qpc) {
-            (Some(ts), Some(te)) => (te - ts).max(0) as f64 * 1e3 / self.qpc_freq_hz as f64,
-            _ => 0.0,
+        let target_span_ms = if is_ring {
+            trace_dur_ms
+        } else {
+            match (self.target_start_qpc, self.target_end_qpc) {
+                (Some(ts), Some(te)) => (te - ts).max(0) as f64 * 1e3 / self.qpc_freq_hz as f64,
+                _ => 0.0,
+            }
         };
         let qpc_to_ms = |ticks: i64| ticks as f64 * 1e3 / self.qpc_freq_hz as f64;
 
@@ -3406,15 +3612,33 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
         rep.thread_suspends,
     );
     if let Some(ref trig) = rep.flight_trigger {
+        let cap_note = if trig.capped_by_event_limit && trig.retained_secs > 0.01 {
+            let rate = rep.target_events as f64 / trig.retained_secs;
+            let needed = ((rate * trig.ring_secs * 1.15).ceil() as usize).max(trig.max_ring_events);
+            format!(
+                "(capped_by_max_ring_events={}; ~{rate:.0} ev/s -> pass --max-ring-events {needed} for {:.0}s)",
+                trig.max_ring_events, trig.ring_secs
+            )
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "TRIGGER reason={:?} trigger_qpc={} ring_secs={:.1} observed={} evicted={}",
+            "TRIGGER reason={:?} trigger_qpc={} ring_secs={:.1} retained_secs={:.2}{} observed={} evicted={}",
             trig.reason,
             trig.trigger_qpc,
             trig.ring_secs,
+            trig.retained_secs,
+            cap_note,
             trig.total_observed_events,
             trig.evicted_ring_events,
         );
+        if let Some(ref pkt) = trig.stalled_packet {
+            let _ = writeln!(out, "STALLED_PKT {}", pkt.format_compact());
+        }
+        if let Some(ref wpkt) = trig.oldest_wait_packet {
+            let _ = writeln!(out, "IN_FLIGHT_WAIT {}", wpkt.format_compact());
+        }
     }
     for w in &rep.warnings {
         let _ = writeln!(out, "WARN {w}");
@@ -3747,5 +3971,38 @@ mod tests {
             span_secs <= 10.5,
             "retained ring span should be ~10s, got {span_secs:.2}s"
         );
+    }
+
+    #[test]
+    fn fifo_prune_drops_missed_older_packets_and_formats_stalled_wait_detail() {
+        let freq = 10_000_000u64;
+        let mut b = TimelineBuilder::new(Some(99), freq);
+        // Simulate seq=10 whose stop event was missed, plus seq=15 and seq=16 on ctx=0xabc.
+        b.in_flight_queue_pkts.insert((0xabc, 10), (100_000, 99, 1, 0));
+        b.in_flight_queue_pkts.insert((0xabc, 15), (200_000, 99, 1, 0));
+        b.in_flight_queue_pkts.insert((0xabc, 16), (300_000, 99, 1, 0));
+        b.in_flight_wait_pkts
+            .insert((0xdef, 42), (150_000, 99, 2, 0xfeed_face, 777));
+
+        // Completing seq=15 must prune missed seq=10 while keeping newer seq=16.
+        b.in_flight_queue_pkts.remove(&(0xabc, 15));
+        TimelineBuilder::prune_older_in_flight_seq(&mut b.in_flight_queue_pkts, 0xabc, 15);
+        assert!(!b.in_flight_queue_pkts.contains_key(&(0xabc, 10)));
+        assert!(b.in_flight_queue_pkts.contains_key(&(0xabc, 16)));
+
+        let work = b
+            .oldest_in_flight_work_packet(100_300_000, None)
+            .expect("seq 16 still in-flight");
+        assert_eq!(work.seq, 16);
+        assert_eq!(work.context, 0xabc);
+        assert!(work.format_compact().contains("kind=queue_pkt(type=0)"));
+        assert!(work.format_compact().contains("submit_qpc=300000"));
+
+        let wait = b
+            .oldest_in_flight_wait_packet(100_300_000)
+            .expect("wait pkt in-flight");
+        assert_eq!(wait.sync_obj, Some(0xfeed_face));
+        assert_eq!(wait.fence_val, Some(777));
+        assert!(wait.format_compact().contains("sync=0xfeedface val=777"));
     }
 }

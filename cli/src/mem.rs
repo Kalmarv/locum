@@ -9,7 +9,7 @@ use locum_mem::diff::{diff_reports, format_diff_text, load_report_or_etl};
 use locum_mem::etw::{
     DXGKRNL_KEYWORDS_ALLOCS_ONLY, DXGKRNL_KEYWORDS_DEFAULT, LiveTraceOptions, TraceSession, parse_etl,
 };
-use locum_mem::flight::{FlightRecorderOptions, run_flight_recorder};
+use locum_mem::flight::{FlightRecorderOptions, FlightTriggers, run_flight_recorder_with_callback};
 use locum_mem::labels::LabelMap;
 use locum_mem::reconcile::{
     AllocSort, FormatOptions, PlacementFilter, format_text_with_options, parse_byte_size, reconcile,
@@ -208,6 +208,12 @@ pub struct FlightArgs {
     /// Submit stall threshold in seconds (default 2.0): dumps ring on in-flight GPU stall or submit silence while process is alive.
     #[arg(long, default_value_t = 2.0)]
     stall_secs: f64,
+    /// Comma-separated trigger set (`all`, or subset of `removal,tdr,stall,exit`, e.g. `--on removal,tdr`).
+    #[arg(long, default_value = "all")]
+    on: String,
+    /// Keep watching after a non-fatal dump (e.g. stall) until `--max-wait`, fatal removal/TDR, or exit (writes numbered files when `--out` is set).
+    #[arg(long)]
+    rearm: bool,
     /// Optional maximum wall-clock seconds to stay armed before dumping cleanly.
     #[arg(long)]
     max_wait: Option<f64>,
@@ -217,8 +223,8 @@ pub struct FlightArgs {
     /// Disable inline ETW stack capture.
     #[arg(long)]
     no_stacks: bool,
-    /// Maximum retained events in the in-memory ring (default 250000).
-    #[arg(long, default_value_t = 250_000)]
+    /// Maximum retained events in the in-memory ring (default 600000 ~ 10s at 60k target ev/s).
+    #[arg(long, default_value_t = 600_000)]
     max_ring_events: usize,
     /// Optional output file path for the dumped flight report (also prints a one-line summary to stdout).
     #[arg(long)]
@@ -471,36 +477,69 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
                 limit: args.view.limit,
                 list_pids: args.view.list_pids,
             };
-            let rep = run_flight_recorder(FlightRecorderOptions {
-                pid,
-                ring_secs: args.ring_secs,
-                stall_secs: args.stall_secs,
-                max_wait_secs: args.max_wait,
-                dump_on_exit: !args.no_dump_on_exit,
-                enable_stacks: !args.no_stacks,
-                max_ring_events: args.max_ring_events,
-            })?;
-            let rendered = if args.view.json {
-                serde_json::to_string_pretty(&rep).map_err(|e| format!("serialize flight report: {e}"))?
-            } else {
-                format_timeline_text(&rep, &fmt_opts)
-            };
-            if let Some(ref out_path) = args.out {
-                if let Some(parent) = out_path.parent()
-                    && !parent.as_os_str().is_empty()
-                {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                std::fs::write(out_path, &rendered)
-                    .map_err(|e| format!("write flight report {}: {e}", out_path.display()))?;
+            let triggers = FlightTriggers::parse(&args.on)?;
+            let rearm = args.rearm;
+            let out_base = args.out.clone();
+            let as_json = args.view.json;
+            let dumps = run_flight_recorder_with_callback(
+                FlightRecorderOptions {
+                    pid,
+                    ring_secs: args.ring_secs,
+                    stall_secs: args.stall_secs,
+                    triggers,
+                    rearm,
+                    max_wait_secs: args.max_wait,
+                    dump_on_exit: !args.no_dump_on_exit,
+                    enable_stacks: !args.no_stacks,
+                    max_ring_events: args.max_ring_events,
+                },
+                |dump_idx, rep| {
+                    let rendered = if as_json {
+                        serde_json::to_string_pretty(&rep)
+                            .map_err(|e| format!("serialize flight report: {e}"))?
+                    } else {
+                        format_timeline_text(&rep, &fmt_opts)
+                    };
+                    if let Some(ref base) = out_base {
+                        let dest = if rearm {
+                            let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("flight");
+                            let ext = base.extension().and_then(|s| s.to_str());
+                            let name = match ext {
+                                Some(e) => format!("{stem}.{dump_idx}.{e}"),
+                                None => format!("{stem}.{dump_idx}"),
+                            };
+                            base.with_file_name(name)
+                        } else {
+                            base.clone()
+                        };
+                        if let Some(parent) = dest.parent()
+                            && !parent.as_os_str().is_empty()
+                        {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        std::fs::write(&dest, &rendered)
+                            .map_err(|e| format!("write flight report {}: {e}", dest.display()))?;
+                        out!(
+                            "flight dump #{dump_idx} written to {} (trigger={:?}, events={}, retained_secs={:.2})",
+                            dest.display(),
+                            rep.flight_trigger.as_ref().map(|t| t.reason.as_str()),
+                            rep.target_events,
+                            rep.flight_trigger
+                                .as_ref()
+                                .map(|t| t.retained_secs)
+                                .unwrap_or(rep.duration_ms / 1000.0),
+                        );
+                    } else {
+                        out!("{rendered}");
+                    }
+                    Ok(())
+                },
+            )?;
+            if dumps == 0 {
                 out!(
-                    "flight dump written to {} (trigger={:?}, events={})",
-                    out_path.display(),
-                    rep.flight_trigger.as_ref().map(|t| t.reason.as_str()),
-                    rep.target_events
+                    "flight recorder exited cleanly without firing any configured trigger (--on={})",
+                    args.on
                 );
-            } else {
-                out!("{rendered}");
             }
             Ok(())
         }

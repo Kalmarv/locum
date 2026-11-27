@@ -1117,133 +1117,166 @@ where
         sparse_tiles: None,
     };
 
-    let (desc_source, desc_sample_point, desc_note, decoded, target_va_opt, view_len_hint) =
-        if let Some(va) = query.binding.direct_gpu_va {
-            view.binding_status = "bound".into();
-            view.gpu_va = Some(va.saturating_add(desc_byte_offset));
-            if !query.follow_descriptor {
+    let (
+        desc_source,
+        desc_sample_point,
+        desc_note,
+        decoded,
+        target_va_opt,
+        view_len_hint,
+        unverified_hop_reason,
+    ) = if let Some(va) = query.binding.direct_gpu_va {
+        view.binding_status = "bound".into();
+        view.gpu_va = Some(va.saturating_add(desc_byte_offset));
+        if !query.follow_descriptor {
+            (
+                format!("va:{va:#x}"),
+                "direct".into(),
+                None,
+                None,
+                Some(va.saturating_add(desc_byte_offset)),
+                None,
+                None,
+            )
+        } else {
+            let raw_va = va.saturating_add(desc_byte_offset);
+            let (src, sp, note, dec, target, unver) = read_and_decode_at_va(
+                conn,
+                blobs,
+                live_buffers,
+                disp,
+                raw_va,
+                format!("va:{va:#x}+{desc_byte_offset:#x}"),
+                &query.layout,
+            );
+            let sz = dec.as_ref().and_then(|d| d.decoded_size);
+            (src, sp, note, dec, target, sz, unver)
+        }
+    } else {
+        match select_binding(&disp.descriptors, &query.binding) {
+            Some(b) => {
+                let base_label = format!(
+                    "{}:{}:{} space={} param={}",
+                    b.stage, b.kind, b.slot, b.space, b.parameter
+                );
+                view.stage = b.stage.clone();
+                view.kind = Some(b.kind.clone());
+                view.slot = Some(b.slot);
+                view.space = Some(b.space);
+                view.parameter = Some(b.parameter);
+                view.heap = b.heap;
+                view.heap_slot = b.heap_slot;
+                view.descriptor_version = b.version;
+                view.flag = b.flag.clone();
+                view.stride = b.stride;
+                view.format = b.format;
+                view.dimension = b.dimension;
+
+                let base_va = b.address.or_else(|| {
+                    b.resource.and_then(|rid| {
+                        live_buffers
+                            .iter()
+                            .find(|lb| lb.resource == rid)
+                            .map(|lb| lb.gpu_address)
+                    })
+                });
+
+                if let Some(ref flg) = b.flag {
+                    view.binding_status = match flg.as_str() {
+                        "empty" => "empty_descriptor_slot".into(),
+                        "other-type" => "other_descriptor_type".into(),
+                        "no-heap" => "no_heap".into(),
+                        "no-resource" | "null" => "null_or_unmapped_va".into(),
+                        other => format!("flagged:{other}"),
+                    };
+                    let why = format!(
+                        "binding {base_label} flagged '{flg}' (heap={:?}, slot={:?}, version={:?})",
+                        b.heap, b.heap_slot, b.version
+                    );
+                    view.binding_reason = Some(why.clone());
+                    (
+                        base_label,
+                        "unavailable".into(),
+                        Some(why),
+                        None,
+                        None,
+                        b.size,
+                        None,
+                    )
+                } else if let Some(va) = base_va {
+                    view.binding_status = "bound".into();
+                    if !query.follow_descriptor {
+                        let eff_va = va.saturating_add(desc_byte_offset);
+                        let eff_size = b.size.map(|s| s.saturating_sub(desc_byte_offset));
+                        view.gpu_va = Some(eff_va);
+                        view.byte_length = eff_size;
+                        (
+                            if desc_byte_offset > 0 {
+                                format!("{base_label}+{desc_byte_offset:#x}")
+                            } else {
+                                base_label
+                            },
+                            "bound-descriptor".into(),
+                            None,
+                            None,
+                            Some(eff_va),
+                            eff_size,
+                            None,
+                        )
+                    } else {
+                        let raw_va = va.saturating_add(desc_byte_offset);
+                        let (src, sp, note, dec, target, unver) = read_and_decode_at_va(
+                            conn,
+                            blobs,
+                            live_buffers,
+                            disp,
+                            raw_va,
+                            format!("{base_label}+{desc_byte_offset:#x}"),
+                            &query.layout,
+                        );
+                        let sz = dec.as_ref().and_then(|d| d.decoded_size);
+                        if target.is_none() {
+                            view.binding_status = "null_or_unmapped_va".into();
+                            view.binding_reason = note
+                                .clone()
+                                .or_else(|| Some("raw descriptor decoded to null/zero GPU VA".into()));
+                        }
+                        (src, sp, note, dec, target, sz, unver)
+                    }
+                } else {
+                    view.binding_status = "null_or_unmapped_va".into();
+                    let why = format!(
+                        "binding {base_label} has no GPU address / live resource (resource={:?})",
+                        b.resource
+                    );
+                    view.binding_reason = Some(why.clone());
+                    (
+                        base_label,
+                        "unavailable".into(),
+                        Some(why),
+                        None,
+                        None,
+                        b.size,
+                        None,
+                    )
+                }
+            }
+            None => {
+                let why = diagnose_missing_binding(conn, disp, &query.binding);
+                view.binding_status = "missing_root_arg".into();
+                view.binding_reason = Some(why.clone());
                 (
-                    format!("va:{va:#x}"),
-                    "direct".into(),
+                    "none".into(),
+                    "unavailable".into(),
+                    Some(why),
                     None,
                     None,
-                    Some(va.saturating_add(desc_byte_offset)),
+                    None,
                     None,
                 )
-            } else {
-                let raw_va = va.saturating_add(desc_byte_offset);
-                let (src, sp, note, dec, target) = read_and_decode_at_va(
-                    conn,
-                    blobs,
-                    live_buffers,
-                    disp,
-                    raw_va,
-                    format!("va:{va:#x}+{desc_byte_offset:#x}"),
-                    &query.layout,
-                );
-                let sz = dec.as_ref().and_then(|d| d.decoded_size);
-                (src, sp, note, dec, target, sz)
             }
-        } else {
-            match select_binding(&disp.descriptors, &query.binding) {
-                Some(b) => {
-                    let base_label = format!(
-                        "{}:{}:{} space={} param={}",
-                        b.stage, b.kind, b.slot, b.space, b.parameter
-                    );
-                    view.stage = b.stage.clone();
-                    view.kind = Some(b.kind.clone());
-                    view.slot = Some(b.slot);
-                    view.space = Some(b.space);
-                    view.parameter = Some(b.parameter);
-                    view.heap = b.heap;
-                    view.heap_slot = b.heap_slot;
-                    view.descriptor_version = b.version;
-                    view.flag = b.flag.clone();
-                    view.stride = b.stride;
-                    view.format = b.format;
-                    view.dimension = b.dimension;
-
-                    let base_va = b.address.or_else(|| {
-                        b.resource.and_then(|rid| {
-                            live_buffers
-                                .iter()
-                                .find(|lb| lb.resource == rid)
-                                .map(|lb| lb.gpu_address)
-                        })
-                    });
-
-                    if let Some(ref flg) = b.flag {
-                        view.binding_status = match flg.as_str() {
-                            "empty" => "empty_descriptor_slot".into(),
-                            "other-type" => "other_descriptor_type".into(),
-                            "no-heap" => "no_heap".into(),
-                            "no-resource" | "null" => "null_or_unmapped_va".into(),
-                            other => format!("flagged:{other}"),
-                        };
-                        let why = format!(
-                            "binding {base_label} flagged '{flg}' (heap={:?}, slot={:?}, version={:?})",
-                            b.heap, b.heap_slot, b.version
-                        );
-                        view.binding_reason = Some(why.clone());
-                        (base_label, "unavailable".into(), Some(why), None, None, b.size)
-                    } else if let Some(va) = base_va {
-                        view.binding_status = "bound".into();
-                        if !query.follow_descriptor {
-                            let eff_va = va.saturating_add(desc_byte_offset);
-                            let eff_size = b.size.map(|s| s.saturating_sub(desc_byte_offset));
-                            view.gpu_va = Some(eff_va);
-                            view.byte_length = eff_size;
-                            (
-                                if desc_byte_offset > 0 {
-                                    format!("{base_label}+{desc_byte_offset:#x}")
-                                } else {
-                                    base_label
-                                },
-                                "bound-descriptor".into(),
-                                None,
-                                None,
-                                Some(eff_va),
-                                eff_size,
-                            )
-                        } else {
-                            let raw_va = va.saturating_add(desc_byte_offset);
-                            let (src, sp, note, dec, target) = read_and_decode_at_va(
-                                conn,
-                                blobs,
-                                live_buffers,
-                                disp,
-                                raw_va,
-                                format!("{base_label}+{desc_byte_offset:#x}"),
-                                &query.layout,
-                            );
-                            let sz = dec.as_ref().and_then(|d| d.decoded_size);
-                            if target.is_none() {
-                                view.binding_status = "null_or_unmapped_va".into();
-                                view.binding_reason = note
-                                    .clone()
-                                    .or_else(|| Some("raw descriptor decoded to null/zero GPU VA".into()));
-                            }
-                            (src, sp, note, dec, target, sz)
-                        }
-                    } else {
-                        view.binding_status = "null_or_unmapped_va".into();
-                        let why = format!(
-                            "binding {base_label} has no GPU address / live resource (resource={:?})",
-                            b.resource
-                        );
-                        view.binding_reason = Some(why.clone());
-                        (base_label, "unavailable".into(), Some(why), None, None, b.size)
-                    }
-                }
-                None => {
-                    let why = diagnose_missing_binding(conn, disp, &query.binding);
-                    view.binding_status = "missing_root_arg".into();
-                    view.binding_reason = Some(why.clone());
-                    ("none".into(), "unavailable".into(), Some(why), None, None, None)
-                }
-            }
-        };
+        }
+    };
 
     // Step 2: Resolve target GPU VA -> (resource, offset, byte range, sparse tiles, last-writer, D3D12 placement).
     let mut last_writer = LastWriterInfo {
@@ -1412,6 +1445,28 @@ where
             },
         };
 
+    // Propagate unverified indirect slot / descriptor hop provenance into `ResolvedView` so
+    // `--summary-only` (`VERDICT`) never presents an unverified indirection as an execution-time binding.
+    if let Some(ref why) = unverified_hop_reason
+        && matches!(
+            view.binding_status.as_str(),
+            "bound" | "partially_mapped_sparse_tile"
+        )
+    {
+        view.binding_status = if query.layout.indirect_heap_va.is_some() {
+            "unverified_indirect".into()
+        } else {
+            "unverified_descriptor".into()
+        };
+        let extra = format!(
+            "slot/descriptor hop read from earlier snapshot ({why}); target contents valid only if that binding was used at execution"
+        );
+        view.binding_reason = Some(match view.binding_reason.take() {
+            Some(prev) => format!("{prev}; {extra}"),
+            None => extra,
+        });
+    }
+
     let content_verdict = classify_content(
         &view,
         gpu_bytes.as_deref(),
@@ -1574,7 +1629,14 @@ fn classify_content(
             }),
         };
     }
-    if view.binding_status != "bound" && view.binding_status != "partially_mapped_sparse_tile" {
+    let is_conditional = matches!(
+        view.binding_status.as_str(),
+        "unverified_indirect" | "unverified_descriptor"
+    );
+    if view.binding_status != "bound"
+        && view.binding_status != "partially_mapped_sparse_tile"
+        && !is_conditional
+    {
         return ContentVerdict {
             verdict: "missing_binding".into(),
             inspected_bytes: 0,
@@ -1604,28 +1666,47 @@ fn classify_content(
                 }
             }
         }
+        let cond_suffix = if is_conditional {
+            format!(
+                "; CONDITIONAL ({})",
+                view.binding_reason
+                    .as_deref()
+                    .unwrap_or("unverified indirect slot/descriptor hop; valid only if that binding was used at execution")
+            )
+        } else {
+            String::new()
+        };
         if nonzero == 0 {
             ContentVerdict {
-                verdict: "legitimate_zero".into(),
+                verdict: if is_conditional {
+                    "conditional_zero".into()
+                } else {
+                    "legitimate_zero".into()
+                },
                 inspected_bytes: n,
                 nonzero_bytes: 0,
                 first_nonzero_offset: None,
                 summary: format!(
-                    "valid bound view ({n} B inspected) legitimately contains all zeros; supplied by {} ({})",
-                    last_writer.kind, last_writer.detail
+                    "valid bound view ({n} B inspected) legitimately contains all zeros; supplied by {} ({}){}",
+                    last_writer.kind, last_writer.detail, cond_suffix
                 ),
             }
         } else {
             ContentVerdict {
-                verdict: "non_zero".into(),
+                verdict: if is_conditional {
+                    "conditional_non_zero".into()
+                } else {
+                    "non_zero".into()
+                },
                 inspected_bytes: n,
                 nonzero_bytes: nonzero,
                 first_nonzero_offset: first_nz,
                 summary: format!(
-                    "valid bound view has {nonzero}/{n} non-zero bytes (first non-zero at +{:#x}); supplied by {} ({})",
+                    "valid bound view has {nonzero}/{n} non-zero bytes (first non-zero at +{:#x}); supplied by {} ({}){}",
                     first_nz.unwrap_or(0),
                     last_writer.kind,
                     last_writer.detail,
+                    cond_suffix,
                 ),
             }
         }
@@ -1837,6 +1918,7 @@ fn inspect_sparse_tiles(
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn read_and_decode_at_va(
     conn: &Connection,
     blobs: &Blobs,
@@ -1851,6 +1933,7 @@ fn read_and_decode_at_va(
     Option<String>,
     Option<DecodedDescriptor>,
     Option<u64>,
+    Option<String>,
 ) {
     let Some((buf, off)) = find_buffer(live_buffers, raw_va) else {
         return (
@@ -1861,6 +1944,7 @@ fn read_and_decode_at_va(
             )),
             None,
             None,
+            None,
         );
     };
 
@@ -1868,25 +1952,29 @@ fn read_and_decode_at_va(
     // guest view at `indirect_heap_va + slot_index * indirect_stride`!
     if let Some(heap_base) = layout.indirect_heap_va {
         let r1 = read_buffer_with_provenance(conn, blobs, live_buffers, buf, off, 4, disp);
-        let (slot_opt, sp1, note1) = match (r1.bytes, r1.earlier_snapshot_bytes) {
-            (Some(b), _) => (Some(b), r1.sample_point, r1.unavailable_reason),
-            (None, Some(eb)) => (
-                Some(eb),
-                format!(
-                    "{} [UNVERIFIED: {}]",
-                    r1.earlier_snapshot_sample_point
-                        .as_deref()
-                        .unwrap_or("earlier-snapshot"),
-                    r1.unavailable_reason
-                        .as_deref()
-                        .unwrap_or("tainted by earlier unrecorded write")
-                ),
-                r1.unavailable_reason,
-            ),
-            (None, None) => (None, r1.sample_point, r1.unavailable_reason),
+        let (slot_opt, sp1, note1, unver1) = match (r1.bytes, r1.earlier_snapshot_bytes) {
+            (Some(b), _) => (Some(b), r1.sample_point, r1.unavailable_reason, None),
+            (None, Some(eb)) => {
+                let why = r1
+                    .unavailable_reason
+                    .clone()
+                    .unwrap_or_else(|| "tainted by earlier unrecorded write".into());
+                (
+                    Some(eb),
+                    format!(
+                        "{} [UNVERIFIED: {why}]",
+                        r1.earlier_snapshot_sample_point
+                            .as_deref()
+                            .unwrap_or("earlier-snapshot"),
+                    ),
+                    Some(why.clone()),
+                    Some(format!("slot index {why}")),
+                )
+            }
+            (None, None) => (None, r1.sample_point, r1.unavailable_reason, None),
         };
         let Some(slot_bytes) = slot_opt else {
-            return (source_label, sp1, note1, None, None);
+            return (source_label, sp1, note1, None, None, unver1);
         };
         if slot_bytes.len() < 4 {
             return (
@@ -1895,6 +1983,7 @@ fn read_and_decode_at_va(
                 Some("slot index read returned fewer than 4 bytes".into()),
                 None,
                 None,
+                unver1,
             );
         }
         let slot_idx = u32::from_le_bytes(slot_bytes[0..4].try_into().unwrap());
@@ -1918,26 +2007,37 @@ fn read_and_decode_at_va(
                     decode_note: "indirect view address outside live buffers".into(),
                 }),
                 None,
+                unver1,
             );
         };
         let view_len = layout.indirect_view_size.max(8) as u64;
         let r2 = read_buffer_with_provenance(conn, blobs, live_buffers, vbuf, voff, view_len, disp);
-        let (view_opt, sp2, note2) = match (r2.bytes, r2.earlier_snapshot_bytes) {
-            (Some(b), _) => (Some(b), r2.sample_point, r2.unavailable_reason),
-            (None, Some(eb)) => (
-                Some(eb),
-                format!(
-                    "{} [UNVERIFIED: {}]",
-                    r2.earlier_snapshot_sample_point
-                        .as_deref()
-                        .unwrap_or("earlier-snapshot"),
-                    r2.unavailable_reason
-                        .as_deref()
-                        .unwrap_or("tainted by earlier unrecorded write")
-                ),
-                r2.unavailable_reason,
-            ),
-            (None, None) => (None, r2.sample_point, r2.unavailable_reason),
+        let (view_opt, sp2, note2, unver2) = match (r2.bytes, r2.earlier_snapshot_bytes) {
+            (Some(b), _) => (Some(b), r2.sample_point, r2.unavailable_reason, None),
+            (None, Some(eb)) => {
+                let why = r2
+                    .unavailable_reason
+                    .clone()
+                    .unwrap_or_else(|| "tainted by earlier unrecorded write".into());
+                (
+                    Some(eb),
+                    format!(
+                        "{} [UNVERIFIED: {why}]",
+                        r2.earlier_snapshot_sample_point
+                            .as_deref()
+                            .unwrap_or("earlier-snapshot"),
+                    ),
+                    Some(why.clone()),
+                    Some(format!("indirect view {why}")),
+                )
+            }
+            (None, None) => (None, r2.sample_point, r2.unavailable_reason, None),
+        };
+        let combined_unver = match (unver1, unver2) {
+            (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
         };
         return match view_opt {
             Some(vraw) => {
@@ -1945,9 +2045,9 @@ fn read_and_decode_at_va(
                 dec.slot_index = Some(slot_idx);
                 dec.indirect_view_va = Some(view_va);
                 let target = dec.gpu_va;
-                (hop_label, sp2, note2.or(note1), Some(dec), target)
+                (hop_label, sp2, note2.or(note1), Some(dec), target, combined_unver)
             }
-            None => (hop_label, sp2, note2.or(note1), None, None),
+            None => (hop_label, sp2, note2.or(note1), None, None, combined_unver),
         };
     }
 
@@ -1960,30 +2060,34 @@ fn read_and_decode_at_va(
         layout.desc_size.max(8) as u64,
         disp,
     );
-    let (raw_opt, sp, note) = match (r.bytes, r.earlier_snapshot_bytes) {
-        (Some(b), _) => (Some(b), r.sample_point, r.unavailable_reason),
-        (None, Some(eb)) => (
-            Some(eb),
-            format!(
-                "{} [UNVERIFIED: {}]",
-                r.earlier_snapshot_sample_point
-                    .as_deref()
-                    .unwrap_or("earlier-snapshot"),
-                r.unavailable_reason
-                    .as_deref()
-                    .unwrap_or("tainted by earlier unrecorded write")
-            ),
-            r.unavailable_reason,
-        ),
-        (None, None) => (None, r.sample_point, r.unavailable_reason),
+    let (raw_opt, sp, note, unver) = match (r.bytes, r.earlier_snapshot_bytes) {
+        (Some(b), _) => (Some(b), r.sample_point, r.unavailable_reason, None),
+        (None, Some(eb)) => {
+            let why = r
+                .unavailable_reason
+                .clone()
+                .unwrap_or_else(|| "tainted by earlier unrecorded write".into());
+            (
+                Some(eb),
+                format!(
+                    "{} [UNVERIFIED: {why}]",
+                    r.earlier_snapshot_sample_point
+                        .as_deref()
+                        .unwrap_or("earlier-snapshot"),
+                ),
+                Some(why.clone()),
+                Some(format!("descriptor {why}")),
+            )
+        }
+        (None, None) => (None, r.sample_point, r.unavailable_reason, None),
     };
     match raw_opt {
         Some(raw) => {
             let dec = decode_raw_descriptor(&raw, layout, live_buffers);
             let target = dec.gpu_va;
-            (source_label, sp, note, Some(dec), target)
+            (source_label, sp, note, Some(dec), target, unver)
         }
-        None => (source_label, sp, note, None, None),
+        None => (source_label, sp, note, None, None, unver),
     }
 }
 
@@ -3746,6 +3850,105 @@ mod tests {
         assert_eq!(r_dj.content_verdict.nonzero_bytes, 4);
         assert_eq!(r_dj.last_writer.kind, "first_use_initial");
         assert!(r_dj.earlier_snapshot.is_none());
+
+        // Case C: indirect follow through the tainted slot index (+0x120) -> MUST propagate unverified
+        // hop provenance into binding_status="unverified_indirect" and verdict="conditional_non_zero"!
+        let mut heap = vec![0u8; 4096];
+        // Note: reuse slot_idx = 0x10 at +0x200 so heap[0x200] points into resource #10+0x500 (disjoint, non-zero!).
+        // Update resource #10 at +0x120 in a second capture to slot 0x10 -> points to untainted #17+0x0!
+        heap[0x10 * 32..0x10 * 32 + 8].copy_from_slice(&0x6000_0000u64.to_le_bytes());
+        heap[0x10 * 32 + 8..0x10 * 32 + 12].copy_from_slice(&64u32.to_le_bytes());
+        let heap_key = hash::key(&heap);
+        blobs.put(&heap_key, &heap).unwrap();
+        let mut tgt = vec![0xABu8; 256];
+        tgt[0] = 0x42;
+        let tgt_key = hash::key(&tgt);
+        blobs.put(&tgt_key, &tgt).unwrap();
+
+        let mut buf2 = vec![0u8; 4096];
+        buf2[0x120..0x124].copy_from_slice(&0x10u32.to_le_bytes());
+        let buf2_key = hash::key(&buf2);
+        blobs.put(&buf2_key, &buf2).unwrap();
+
+        cap.resources[0].content = Some(buf2_key);
+        cap.resources.push(db::Resource {
+            id: 11,
+            kind: "buffer",
+            width: 4096,
+            bytes: 4096,
+            used: true,
+            content: Some(heap_key),
+            content_source: Some("first-use"),
+            ..Default::default()
+        });
+        cap.resources.push(db::Resource {
+            id: 17,
+            kind: "buffer",
+            width: 256,
+            bytes: 256,
+            used: true,
+            content: Some(tgt_key),
+            content_source: Some("first-use"),
+            ..Default::default()
+        });
+        let frame2 = crate::d3d12::Frame {
+            objects: vec![
+                crate::d3d12::Object {
+                    id: 10,
+                    kind: "ID3D12Resource",
+                    device: 1,
+                    description: json!({"dimension": 1, "width": 4096, "gpu_address": 0x4_0000_0000u64, "heap_properties": {"type": 1}}),
+                },
+                crate::d3d12::Object {
+                    id: 11,
+                    kind: "ID3D12Resource",
+                    device: 1,
+                    description: json!({"dimension": 1, "width": 4096, "gpu_address": 0x4_4c61_0000u64, "heap_properties": {"type": 1}}),
+                },
+                crate::d3d12::Object {
+                    id: 17,
+                    kind: "ID3D12Resource",
+                    device: 1,
+                    description: json!({"dimension": 1, "width": 256, "gpu_address": 0x6000_0000u64, "heap_properties": {"type": 1}}),
+                },
+            ],
+            ..Default::default()
+        };
+        let proj2 = crate::d3d12::Projection::new(&frame2.objects);
+        cap.d3d12 = Some(frame2.finish(&mut db::Capture::default(), proj2));
+        let db_path2 = dir.join("capture2.db");
+        db::write(&db_path2, &cap).unwrap();
+
+        let q_ind = ProbeQuery {
+            event: Some(13106),
+            binding: BindingSelector::parse("uav:2").unwrap(),
+            layout: DescriptorLayout {
+                desc_offset: 0x120,
+                indirect_heap_va: Some(0x4_4c61_0000),
+                indirect_stride: 32,
+                indirect_view_size: 16,
+                ..Default::default()
+            },
+            follow_descriptor: true,
+            compare_bytes: 64,
+            ..Default::default()
+        };
+        let r_ind = &probe_capture::<fn(u64, usize) -> Result<Vec<u8>, String>>(
+            &db_path2,
+            &q_ind,
+            &AliasMap::default(),
+            None,
+        )
+        .unwrap()[0];
+        assert_eq!(r_ind.resolved_view.binding_status, "unverified_indirect");
+        assert_eq!(r_ind.content_verdict.verdict, "conditional_non_zero");
+        assert!(
+            r_ind
+                .content_verdict
+                .summary
+                .contains("valid only if that binding was used")
+        );
+        assert_eq!(r_ind.target_resource, Some(17));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
