@@ -45,7 +45,10 @@ pub struct ProbeDescArgs {
     /// Optional byte offset of the buffer size field inside the raw descriptor.
     #[arg(long)]
     pub size_offset: Option<usize>,
-    /// Do not dereference a descriptor inside the buffer; compare bytes directly at the bound buffer + offset.
+    /// Explicitly dereference a shader-decoded descriptor inside the bound buffer (auto-enabled when `--row-stride`, `--desc-offset`, `--table-offset`, `--va-offset`, or `--size-offset` is set).
+    #[arg(long)]
+    pub follow: bool,
+    /// Do not dereference a descriptor inside the buffer; inspect the bound view directly (default when no descriptor layout offsets are given).
     #[arg(long)]
     pub no_follow: bool,
 }
@@ -54,15 +57,21 @@ pub struct ProbeDescArgs {
 pub struct ProbeArgs {
     /// Path to a `locum` `capture.db` (or capture folder containing `capture.db`).
     pub capture: PathBuf,
-    /// Compute shader hash prefix or debug name substring (e.g. `7700e4c3`).
+    /// Specific event sequence number (`events.seq`) to inspect (supports both compute dispatches and graphics draws).
+    #[arg(long)]
+    pub event: Option<u64>,
+    /// Compute or graphics shader hash prefix or debug name substring (e.g. `7700e4c3`).
     #[arg(long)]
     pub shader: Option<String>,
-    /// Specific dispatch draw number (`draws.n`).
+    /// Shader stage filter (`cs`, `vs`, `hs`, `ds`, `gs`, `ps`, `all`).
+    #[arg(long)]
+    pub stage: Option<String>,
+    /// Specific dispatch/draw number (`draws.n`).
     #[arg(long, alias = "dispatch")]
     pub draw: Option<u64>,
     #[command(flatten)]
     pub desc: ProbeDescArgs,
-    /// Number of bytes to compare between shader-visible GPU address and CPU alias (default 4096).
+    /// Number of bytes to inspect/compare between shader-visible GPU address and CPU alias (default 4096).
     #[arg(long, default_value_t = 4096)]
     pub bytes: usize,
     /// App-supplied GPU VA <-> CPU VA alias map (`gpu_start<TAB>cpu_start<TAB>bytes[<TAB>label]` or `sidecar.txt` `visible` lines).
@@ -76,9 +85,12 @@ pub struct ProbeArgs {
     pub labels: Option<PathBuf>,
     #[command(flatten)]
     pub target: crate::mem::TargetArgs,
-    /// Maximum matching compute dispatches to probe (default 10).
+    /// Maximum matching dispatches/draws to probe (default 10; pass 0 for all matching events).
     #[arg(long, default_value_t = 10)]
     pub limit: usize,
+    /// Print only one greppable `VERDICT` summary line per matched event (ideal for scanning 100+ culling calls).
+    #[arg(long)]
+    pub summary_only: bool,
     /// Emit structured JSON.
     #[arg(long)]
     pub json: bool,
@@ -99,11 +111,14 @@ pub fn run(args: ProbeArgs) -> Result<(), String> {
         Some(spec) => BindingSelector::parse(spec)?,
         None => BindingSelector::default(),
     };
+    let table_offset = parse_u64_arg("--table-offset", &args.desc.table_offset)?;
+    let row_stride = parse_u64_arg("--row-stride", &args.desc.row_stride)?;
+    let desc_offset = parse_u64_arg("--desc-offset", &args.desc.desc_offset)?;
     let layout = DescriptorLayout {
-        table_offset: parse_u64_arg("--table-offset", &args.desc.table_offset)?,
-        row_stride: parse_u64_arg("--row-stride", &args.desc.row_stride)?,
+        table_offset,
+        row_stride,
         row_index: args.desc.row,
-        desc_offset: parse_u64_arg("--desc-offset", &args.desc.desc_offset)?,
+        desc_offset,
         desc_size: args.desc.desc_size.max(8),
         va_offset: args.desc.va_offset,
         va_mask: match args.desc.va_mask.as_deref() {
@@ -114,14 +129,28 @@ pub fn run(args: ProbeArgs) -> Result<(), String> {
         size_offset: args.desc.size_offset,
         size_width: 4,
     };
+    let has_indexed_layout = table_offset != 0
+        || row_stride != 0
+        || desc_offset != 0
+        || args.desc.va_offset.is_some()
+        || args.desc.size_offset.is_some();
+    let follow_descriptor = if args.desc.no_follow {
+        false
+    } else if args.desc.follow {
+        true
+    } else {
+        has_indexed_layout
+    };
     let query = ProbeQuery {
         shader: args.shader,
         draw: args.draw,
+        event: args.event,
+        stage: args.stage,
         binding,
         layout,
-        follow_descriptor: !args.desc.no_follow,
+        follow_descriptor,
         compare_bytes: args.bytes.max(1),
-        limit: args.limit.max(1),
+        limit: args.limit,
     };
     let alias_map = match args.alias_map.as_deref() {
         Some(p) => AliasMap::from_file(p)?,
@@ -168,11 +197,13 @@ pub fn run(args: ProbeArgs) -> Result<(), String> {
     for r in &mut results {
         if let Some(gva) = r.target_gpu_va {
             if let Some(ref etw) = etw_rep {
-                r.gpu_vidmm_placement = Some(
-                    etw.placement_of_gpu_va(gva)
-                        .unwrap_or("unmapped_in_etw")
-                        .to_string(),
-                );
+                let vidmm = etw.placement_of_gpu_va(gva).unwrap_or("unmapped_in_etw");
+                r.gpu_vidmm_placement = Some(vidmm.to_string());
+                r.observed_placement = if r.d3d12_placement != "unknown" {
+                    format!("vidmm={vidmm} | d3d12={}", r.d3d12_placement)
+                } else {
+                    format!("vidmm={vidmm}")
+                };
             }
             if !label_map.is_empty() {
                 r.gpu_label_owner = Some(label_map.owner_of(gva).unwrap_or("<unlabeled>").to_string());
@@ -206,12 +237,12 @@ pub fn run(args: ProbeArgs) -> Result<(), String> {
         let s = serde_json::to_string_pretty(&results).map_err(|e| format!("serialize probe: {e}"))?;
         out!("{s}");
     } else {
-        out!("{}", format_probe_text(&results));
+        out!("{}", format_probe_text(&results, args.summary_only));
     }
     Ok(())
 }
 
-pub fn format_probe_text(results: &[DispatchProbeResult]) -> String {
+pub fn format_probe_text(results: &[DispatchProbeResult], summary_only: bool) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(
@@ -220,6 +251,41 @@ pub fn format_probe_text(results: &[DispatchProbeResult]) -> String {
         results.len()
     );
     for r in results {
+        let v = &r.resolved_view;
+        let lw = &r.last_writer;
+        let cv = &r.content_verdict;
+        let res_s = v
+            .resource
+            .map(|id| format!("#{id}"))
+            .unwrap_or_else(|| "none".into());
+        let range_s = match (v.byte_offset, v.byte_length) {
+            (Some(off), Some(len)) => format!("[{off:#x}, {:#x}) ({len} B)", off.saturating_add(len)),
+            (Some(off), None) => format!("[{off:#x}, ?)"),
+            _ => "-".into(),
+        };
+        let writer_at = match (lw.event, lw.submission) {
+            (Some(ev), Some(sub)) => format!("{}@ev={ev}/sub={sub}", lw.kind),
+            (Some(ev), None) => format!("{}@ev={ev}", lw.kind),
+            (None, Some(sub)) => format!("{}@sub={sub}", lw.kind),
+            (None, None) => lw.kind.clone(),
+        };
+        let _ = writeln!(
+            out,
+            "VERDICT event={:<6} draw={:<5} call={:<18} verdict={:<21} binding={:<22} res={:<6} range={:<26} writer={:<28} placement={}",
+            r.dispatch.event,
+            r.dispatch.draw,
+            r.dispatch.call,
+            cv.verdict,
+            v.binding_status,
+            res_s,
+            range_s,
+            writer_at,
+            r.observed_placement,
+        );
+        if summary_only {
+            continue;
+        }
+
         let cs_name = r.dispatch.cs_name.as_deref().unwrap_or("-");
         let sub = r
             .dispatch
@@ -228,36 +294,107 @@ pub fn format_probe_text(results: &[DispatchProbeResult]) -> String {
             .unwrap_or_else(|| "-".into());
         let _ = writeln!(
             out,
-            "\n== Dispatch draw={} event={} sub={} call={} args={} cs={} ({}) ==",
-            r.dispatch.draw,
+            "\n== Event {} (draw={} sub={} stage={} call={} args={} shader={} ({})) ==",
             r.dispatch.event,
+            r.dispatch.draw,
             sub,
+            r.dispatch.stage,
             r.dispatch.call,
             r.dispatch.args,
             r.dispatch.cs_hash,
             cs_name,
         );
-        let _ = writeln!(out, "  CS Descriptors ({}):", r.dispatch.descriptors.len());
-        for d in r.dispatch.descriptors.iter().take(16) {
-            let res_s = d.resource.map(|v| format!("#{v}")).unwrap_or_else(|| "-".into());
-            let va_s = d.address.map(|v| format!("{v:#x}")).unwrap_or_else(|| "-".into());
-            let sz_s = d.size.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
-            let flg = d.flag.as_deref().unwrap_or("-");
+        let _ = writeln!(
+            out,
+            "  1. Resolved View    : status={} binding={}:{}:{} space={} param={} heap={:?} slot={:?} ver={:?} flag={}",
+            v.binding_status,
+            v.stage,
+            v.kind.as_deref().unwrap_or("-"),
+            v.slot.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+            v.space.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+            v.parameter.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+            v.heap,
+            v.heap_slot,
+            v.descriptor_version,
+            v.flag.as_deref().unwrap_or("-"),
+        );
+        let _ = writeln!(
+            out,
+            "     Byte Range       : res={} gpu_va={} range={} buf_width={} stride={} fmt={}",
+            res_s,
+            v.gpu_va.map(|a| format!("{a:#x}")).unwrap_or_else(|| "-".into()),
+            range_s,
+            v.resource_width
+                .map(|w| format!("{w} B"))
+                .unwrap_or_else(|| "-".into()),
+            v.stride.map(|s| format!("{s} B")).unwrap_or_else(|| "-".into()),
+            v.format.map(|f| f.to_string()).unwrap_or_else(|| "-".into()),
+        );
+        if let Some(ref why) = v.binding_reason {
+            let _ = writeln!(out, "     Binding Note     : {why}");
+        }
+        if let Some(ref sp) = v.sparse_tiles {
             let _ = writeln!(
                 out,
-                "    {}:{} space={} param={} res={:<6} gpu_va={:<18} size={:<10} flag={}",
-                d.kind, d.slot, d.space, d.parameter, res_s, va_s, sz_s, flg
+                "     Sparse Tiles     : tiles=[{}..{}) mapped={}/{} unmapped={} heaps={:?}{}{}",
+                sp.first_tile,
+                sp.first_tile + sp.tile_count,
+                sp.mapped_tiles,
+                sp.tile_count,
+                sp.unmapped_tiles,
+                sp.backing_heaps,
+                sp.last_tile_mapping
+                    .as_deref()
+                    .map(|m| format!(" last_op={m}"))
+                    .unwrap_or_default(),
+                sp.diagnostic
+                    .as_deref()
+                    .map(|d| format!(" diag={d}"))
+                    .unwrap_or_default(),
             );
         }
         let _ = writeln!(
             out,
-            "  Descriptor Source   : {} [sample_point: {}]",
-            r.descriptor_source, r.descriptor_sample_point
+            "  2. Last Writer      : kind={} event={} sub={} call={} | {}",
+            lw.kind,
+            lw.event.map(|e| e.to_string()).unwrap_or_else(|| "-".into()),
+            lw.submission.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+            lw.call.as_deref().unwrap_or("-"),
+            lw.detail,
         );
-        if let Some(ref note) = r.descriptor_note {
-            let _ = writeln!(out, "  Descriptor Note     : {note}");
+        let _ = writeln!(
+            out,
+            "     Content Verdict  : {} ({})",
+            cv.verdict.to_ascii_uppercase(),
+            cv.summary,
+        );
+        let _ = writeln!(
+            out,
+            "  3. Placement        : {} (vidmm={} | gpu_owner={} | cpu_owner={} | cpu_ws={})",
+            r.observed_placement,
+            r.gpu_vidmm_placement.as_deref().unwrap_or("unknown"),
+            r.gpu_label_owner.as_deref().unwrap_or("n/a"),
+            r.cpu_label_owner.as_deref().unwrap_or("n/a"),
+            r.cpu_win32_residency.as_deref().unwrap_or("n/a"),
+        );
+        let _ = writeln!(out, "  Descriptors ({}):", r.dispatch.descriptors.len());
+        for d in r.dispatch.descriptors.iter().take(16) {
+            let d_res = d.resource.map(|x| format!("#{x}")).unwrap_or_else(|| "-".into());
+            let d_va = d.address.map(|x| format!("{x:#x}")).unwrap_or_else(|| "-".into());
+            let d_sz = d.size.map(|x| x.to_string()).unwrap_or_else(|| "-".into());
+            let flg = d.flag.as_deref().unwrap_or("-");
+            let _ = writeln!(
+                out,
+                "    {}:{}:{} space={} param={} res={:<6} gpu_va={:<18} size={:<10} flag={}",
+                d.stage, d.kind, d.slot, d.space, d.parameter, d_res, d_va, d_sz, flg
+            );
         }
         if let Some(ref dec) = r.decoded {
+            let _ = writeln!(
+                out,
+                "  Descriptor Source   : {} [sample_point: {}]",
+                r.descriptor_source, r.descriptor_sample_point
+            );
             let _ = writeln!(out, "  Raw Descriptor Hex  : {}", dec.raw_hex);
             let words: Vec<String> = dec.words_u32.iter().map(|w| format!("{w:#010x}")).collect();
             let _ = writeln!(out, "  Raw Descriptor u32s : [{}]", words.join(", "));
@@ -265,30 +402,14 @@ pub fn format_probe_text(results: &[DispatchProbeResult]) -> String {
                 out,
                 "  Decoded Target      : gpu_va={} size={} ({})",
                 dec.gpu_va
-                    .map(|v| format!("{v:#x}"))
+                    .map(|a| format!("{a:#x}"))
                     .unwrap_or_else(|| "-".into()),
                 dec.decoded_size
-                    .map(|v| format!("{v} B"))
+                    .map(|s| format!("{s} B"))
                     .unwrap_or_else(|| "-".into()),
                 dec.decode_note,
             );
         }
-        let _ = writeln!(
-            out,
-            "  Resolved Resource   : res={} offset={} buf_width={} gpu_va={}",
-            r.target_resource
-                .map(|v| format!("#{v}"))
-                .unwrap_or_else(|| "none".into()),
-            r.target_offset
-                .map(|v| format!("{v:#x}"))
-                .unwrap_or_else(|| "-".into()),
-            r.target_buffer_width
-                .map(|v| format!("{v} B"))
-                .unwrap_or_else(|| "-".into()),
-            r.target_gpu_va
-                .map(|v| format!("{v:#x}"))
-                .unwrap_or_else(|| "-".into()),
-        );
         let _ = writeln!(
             out,
             "  GPU Sample Point    : {}{}",
@@ -298,59 +419,47 @@ pub fn format_probe_text(results: &[DispatchProbeResult]) -> String {
                 .map(|u| format!(" ({u})"))
                 .unwrap_or_default(),
         );
-        let _ = writeln!(
-            out,
-            "  CPU Alias           : va={} label={} [sample_point: {}]{}",
-            r.cpu_alias_va
-                .map(|v| format!("{v:#x}"))
-                .unwrap_or_else(|| "unmapped".into()),
-            r.cpu_alias_label.as_deref().unwrap_or("-"),
-            r.cpu_sample_point,
-            r.cpu_unavailable_reason
-                .as_deref()
-                .map(|u| format!(" ({u})"))
-                .unwrap_or_default(),
-        );
-        if r.gpu_vidmm_placement.is_some()
-            || r.gpu_label_owner.is_some()
-            || r.cpu_label_owner.is_some()
-            || r.cpu_win32_residency.is_some()
-        {
+        if r.cpu_alias_va.is_some() || r.comparison.is_some() {
             let _ = writeln!(
                 out,
-                "  locum-mem Placement : vidmm={} | gpu_owner={} | cpu_owner={} | cpu_ws={}",
-                r.gpu_vidmm_placement.as_deref().unwrap_or("n/a"),
-                r.gpu_label_owner.as_deref().unwrap_or("n/a"),
-                r.cpu_label_owner.as_deref().unwrap_or("n/a"),
-                r.cpu_win32_residency.as_deref().unwrap_or("n/a"),
+                "  CPU Alias           : va={} label={} [sample_point: {}]{}",
+                r.cpu_alias_va
+                    .map(|a| format!("{a:#x}"))
+                    .unwrap_or_else(|| "unmapped".into()),
+                r.cpu_alias_label.as_deref().unwrap_or("-"),
+                r.cpu_sample_point,
+                r.cpu_unavailable_reason
+                    .as_deref()
+                    .map(|u| format!(" ({u})"))
+                    .unwrap_or_default(),
             );
-        }
-        match &r.comparison {
-            Some(cmp) => {
-                let _ = writeln!(
-                    out,
-                    "  Byte Comparison     : {} ({}/{} bytes compared, {} differing bytes{})",
-                    cmp.status.to_ascii_uppercase(),
-                    cmp.compared_bytes,
-                    cmp.requested_bytes,
-                    cmp.mismatch_count,
-                    cmp.first_mismatch_offset
-                        .map(|o| format!(", first mismatch at +{o:#x}"))
-                        .unwrap_or_default(),
-                );
-                if let Some(ref d) = cmp.first_mismatch_detail {
-                    let _ = writeln!(out, "  First Mismatch      : {d}");
-                } else {
-                    let _ = writeln!(out, "  Head 32B Preview    : {}", cmp.gpu_preview_hex);
+            match &r.comparison {
+                Some(cmp) => {
+                    let _ = writeln!(
+                        out,
+                        "  Byte Comparison     : {} ({}/{} bytes compared, {} differing bytes{})",
+                        cmp.status.to_ascii_uppercase(),
+                        cmp.compared_bytes,
+                        cmp.requested_bytes,
+                        cmp.mismatch_count,
+                        cmp.first_mismatch_offset
+                            .map(|o| format!(", first mismatch at +{o:#x}"))
+                            .unwrap_or_default(),
+                    );
+                    if let Some(ref d) = cmp.first_mismatch_detail {
+                        let _ = writeln!(out, "  First Mismatch      : {d}");
+                    } else {
+                        let _ = writeln!(out, "  Head 32B Preview    : {}", cmp.gpu_preview_hex);
+                    }
                 }
-            }
-            None => {
-                let _ = writeln!(
-                    out,
-                    "  Byte Comparison     : UNAVAILABLE (gpu={}, cpu={})",
-                    r.gpu_unavailable_reason.as_deref().unwrap_or("ok"),
-                    r.cpu_unavailable_reason.as_deref().unwrap_or("ok"),
-                );
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "  Byte Comparison     : UNAVAILABLE (gpu={}, cpu={})",
+                        r.gpu_unavailable_reason.as_deref().unwrap_or("ok"),
+                        r.cpu_unavailable_reason.as_deref().unwrap_or("ok"),
+                    );
+                }
             }
         }
     }

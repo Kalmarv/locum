@@ -477,6 +477,16 @@ pub fn decode_raw_descriptor(
 // Dispatch-Scoped Probe Engine against `capture.db`
 // ---------------------------------------------------------------------------
 
+/// Live `ID3D12Heap` metadata loaded from `d12_objects`.
+#[derive(Clone, Debug, Default)]
+pub struct HeapMeta {
+    pub id: u64,
+    pub bytes: u64,
+    pub heap_type: Option<u64>,
+    pub cpu_page: Option<u64>,
+    pub memory_pool: Option<u64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct LiveBuffer {
     pub resource: u64,
@@ -485,6 +495,12 @@ pub struct LiveBuffer {
     pub content: Option<String>,
     pub content_source: Option<String>,
     pub content_note: Option<String>,
+    pub heap: Option<u64>,
+    pub heap_offset: Option<u64>,
+    pub heap_type: Option<u64>,
+    pub cpu_page: Option<u64>,
+    pub memory_pool: Option<u64>,
+    pub reserved: bool,
 }
 
 pub fn find_buffer(buffers: &[LiveBuffer], gpu_va: u64) -> Option<(&LiveBuffer, u64)> {
@@ -493,6 +509,84 @@ pub fn find_buffer(buffers: &[LiveBuffer], gpu_va: u64) -> Option<(&LiveBuffer, 
         .filter(|b| gpu_va >= b.gpu_address && gpu_va < b.gpu_address.saturating_add(b.width))
         .min_by_key(|b| b.width)
         .map(|b| (b, gpu_va - b.gpu_address))
+}
+
+fn format_heap_props(htype: Option<u64>, cpu_page: Option<u64>, pool: Option<u64>) -> String {
+    let ty = match htype {
+        Some(1) => "DEFAULT",
+        Some(2) => "UPLOAD",
+        Some(3) => "READBACK",
+        Some(4) => "CUSTOM",
+        _ => "UNKNOWN",
+    };
+    let mut parts = vec![ty.to_string()];
+    match pool {
+        Some(1) => parts.push("L0_SYS".into()),
+        Some(2) => parts.push("L1_VRAM".into()),
+        _ => {}
+    }
+    match cpu_page {
+        Some(1) => parts.push("CPU_NONE".into()),
+        Some(2) => parts.push("CPU_WC".into()),
+        Some(3) => parts.push("CPU_WB".into()),
+        _ => {}
+    }
+    parts.join("/")
+}
+
+fn describe_d3d12_placement(
+    buf: &LiveBuffer,
+    heaps: &BTreeMap<u64, HeapMeta>,
+    sparse: Option<&SparseTileCoverage>,
+) -> String {
+    if buf.reserved {
+        return match sparse {
+            Some(sp) if sp.mapped_tiles == 0 => {
+                if let Some(ref diag) = sp.diagnostic {
+                    format!("reserved(tile_table_unknown: {diag})")
+                } else {
+                    "reserved(unmapped_tiles)".into()
+                }
+            }
+            Some(sp) => {
+                let heap_desc: Vec<String> = sp
+                    .backing_heaps
+                    .iter()
+                    .map(|hid| match heaps.get(hid) {
+                        Some(h) => format!(
+                            "heap#{hid}:{}",
+                            format_heap_props(h.heap_type, h.cpu_page, h.memory_pool)
+                        ),
+                        None => format!("heap#{hid}"),
+                    })
+                    .collect();
+                let state = if sp.unmapped_tiles == 0 {
+                    "mapped".to_string()
+                } else {
+                    format!("partial {}/{} tiles", sp.mapped_tiles, sp.tile_count)
+                };
+                format!("reserved({state} -> {})", heap_desc.join(","))
+            }
+            None => "reserved(tile_table_unknown)".into(),
+        };
+    }
+    if let Some(hid) = buf.heap {
+        let off = buf.heap_offset.unwrap_or(0);
+        if let Some(h) = heaps.get(&hid) {
+            return format!(
+                "placed(heap#{hid}+{off:#x}, {})",
+                format_heap_props(h.heap_type, h.cpu_page, h.memory_pool)
+            );
+        }
+        return format!("placed(heap#{hid}+{off:#x})");
+    }
+    if buf.heap_type.is_some() {
+        return format!(
+            "committed({})",
+            format_heap_props(buf.heap_type, buf.cpu_page, buf.memory_pool)
+        );
+    }
+    "unknown".into()
 }
 
 /// Binding selector for which compute-dispatch resource holds the raw descriptor table (or target buffer).
@@ -557,7 +651,7 @@ impl BindingSelector {
     }
 }
 
-/// Summary of one compute dispatch found in `capture.db` matching `--shader` / `--draw`.
+/// Summary of one dispatch or draw event found in `capture.db` matching `--event` / `--shader` / `--draw`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ComputeDispatchInfo {
     pub draw: u64,
@@ -566,21 +660,127 @@ pub struct ComputeDispatchInfo {
     pub args: String,
     pub cs_hash: String,
     pub cs_name: Option<String>,
+    pub stage: String,
     pub submission: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission_cpu_seq: Option<u64>,
     pub descriptors: Vec<ComputeDescriptorRow>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ComputeDescriptorRow {
+    pub stage: String,
     pub kind: String,
     pub slot: u32,
     pub space: u32,
     pub parameter: u32,
+    pub heap: Option<u64>,
+    pub heap_slot: Option<u32>,
+    pub version: Option<u64>,
     pub resource: Option<u64>,
     pub address: Option<u64>,
     pub size: Option<u64>,
     pub stride: Option<u32>,
+    pub format: Option<u32>,
+    pub dimension: Option<u32>,
     pub flag: Option<String>,
+}
+
+/// Sparse/tiled page coverage for a reserved (`ID3D12Resource` with null `heap_properties`) buffer range.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SparseTileCoverage {
+    pub tile_size: u64,
+    pub first_tile: u32,
+    pub tile_count: u32,
+    pub mapped_tiles: u32,
+    pub unmapped_tiles: u32,
+    pub backing_heaps: Vec<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_tile_mapping: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+/// Resolved shader binding view and byte range at this event (Requirement #1).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolvedView {
+    /// `bound`, `missing_root_arg`, `empty_descriptor_slot`, `other_descriptor_type`,
+    /// `no_heap`, `null_or_unmapped_va`, `unmapped_sparse_tile`, `partially_mapped_sparse_tile`, or `flagged:<flag>`.
+    pub binding_status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_reason: Option<String>,
+    pub stage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameter: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heap: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heap_slot: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub descriptor_version: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flag: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_va: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_width: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stride: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dimension: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sparse_tiles: Option<SparseTileCoverage>,
+}
+
+/// The write or copy that supplied the bytes in the resolved range before execution (Requirement #2).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LastWriterInfo {
+    /// `uav_result`, `copy_buffer_region`, `copy_resource`, `upload_version`,
+    /// `clear_uav`, `unrecorded_gpu_write`, `first_use_initial`, `unmapped_tile`, `none`.
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submission: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_resource: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub byte_range: Option<(u64, u64)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_submission: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+    pub detail: String,
+}
+
+/// Explicitly distinguishes a missing binding or unmapped sparse tile from a legitimately zero-filled asset.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ContentVerdict {
+    /// `missing_binding`, `unmapped_sparse_tile`, `legitimate_zero`, `non_zero`, `bytes_unavailable`.
+    pub verdict: String,
+    pub inspected_bytes: usize,
+    pub nonzero_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_nonzero_offset: Option<usize>,
+    pub summary: String,
 }
 
 /// Byte-by-byte comparison result between shader-visible GPU bytes and CPU alias bytes.
@@ -596,10 +796,15 @@ pub struct ByteComparison {
     pub first_mismatch_detail: Option<String>,
 }
 
-/// Full result of probing one compute dispatch (including optional `locum-mem` placement enrichment).
+/// Full result of probing one compute dispatch or draw event (including view, last-writer, placement, and optional CPU-alias diff).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchProbeResult {
     pub dispatch: ComputeDispatchInfo,
+    pub resolved_view: ResolvedView,
+    pub last_writer: LastWriterInfo,
+    pub content_verdict: ContentVerdict,
+    pub d3d12_placement: String,
+    pub observed_placement: String,
     pub descriptor_source: String,
     pub descriptor_sample_point: String,
     pub descriptor_note: Option<String>,
@@ -622,22 +827,26 @@ pub struct DispatchProbeResult {
     pub cpu_win32_residency: Option<String>,
 }
 
-/// Options for probing compute dispatches in a `capture.db`.
+/// Options for probing dispatches/draws in a `capture.db`.
 #[derive(Clone, Debug)]
 pub struct ProbeQuery {
-    /// Substring/prefix match against `draws.cs` or `shaders.name` (e.g. `7700e4c3`).
+    /// Substring/prefix match against `draws.cs` (or selected `--stage`) or `shaders.name` (e.g. `7700e4c3`).
     pub shader: Option<String>,
     /// Explicit `draws.n` filter.
     pub draw: Option<u64>,
-    /// Which compute binding holds the indexed raw descriptor buffer (or `va:...`).
+    /// Explicit `events.seq` filter (works for both compute dispatches and graphics draws).
+    pub event: Option<u64>,
+    /// Optional shader stage filter (`cs`, `vs`, `hs`, `ds`, `gs`, `ps`, `all`; default `cs` when searching by shader, auto for `--event`/`--draw`).
+    pub stage: Option<String>,
+    /// Which binding holds the target view or indexed raw descriptor buffer (`srv:0`, `uav:1`, `cb:0`, `param:2`, or `va:...`).
     pub binding: BindingSelector,
     /// Layout of the indexed descriptor inside that buffer (`row+0x120` style).
     pub layout: DescriptorLayout,
-    /// Follow the decoded descriptor VA to compare target bytes (`true`), or compare the bound buffer slice directly (`false`).
+    /// Follow the decoded descriptor VA to compare target bytes (`true`), or inspect the bound view directly (`false`).
     pub follow_descriptor: bool,
-    /// Number of bytes to compare at the target GPU VA vs CPU alias (default 4096).
+    /// Number of bytes to inspect/compare at the target GPU VA vs CPU alias (default 4096).
     pub compare_bytes: usize,
-    /// Maximum number of matching dispatches to probe (default 10).
+    /// Maximum number of matching events to probe (0 = unlimited).
     pub limit: usize,
 }
 
@@ -646,6 +855,8 @@ impl Default for ProbeQuery {
         Self {
             shader: None,
             draw: None,
+            event: None,
+            stage: None,
             binding: BindingSelector::default(),
             layout: DescriptorLayout::default(),
             follow_descriptor: true,
@@ -655,7 +866,7 @@ impl Default for ProbeQuery {
     }
 }
 
-/// Runs the dispatch-scoped compute buffer probe against `capture_path` (`capture.db` or folder),
+/// Runs the dispatch/event-scoped buffer probe against `capture_path` (`capture.db` or folder),
 /// using `alias_map` and an optional live CPU reader callback `read_live_cpu(cpu_va, len)`.
 pub fn probe_capture<F>(
     capture_path: &Path,
@@ -689,15 +900,24 @@ where
     let mut merged_aliases = alias_map.clone();
     merged_aliases.extend_from_db(&conn);
 
-    let live_buffers = load_live_buffers(&conn);
+    let (live_buffers, live_heaps) = load_live_buffers_and_heaps(&conn);
     let sidecar_regions = load_sidecar_regions(&conn);
-    let dispatches = find_compute_dispatches(&conn, query.shader.as_deref(), query.draw, query.limit)?;
+    let dispatches = find_matching_events(
+        &conn,
+        query.shader.as_deref(),
+        query.draw,
+        query.event,
+        query.stage.as_deref(),
+        query.limit,
+    )?;
     if dispatches.is_empty() {
         return Err(format!(
-            "no matching compute dispatches found in {} (shader={:?}, draw={:?})",
+            "no matching dispatches/draws found in {} (event={:?}, shader={:?}, draw={:?}, stage={:?})",
             db_path.display(),
+            query.event,
             query.shader,
-            query.draw
+            query.draw,
+            query.stage,
         ));
     }
 
@@ -707,6 +927,7 @@ where
             &conn,
             &blobs,
             &live_buffers,
+            &live_heaps,
             &sidecar_regions,
             &merged_aliases,
             &disp,
@@ -721,6 +942,13 @@ where
         {
             res.gpu_sample_point = live.sample_point.clone();
             res.gpu_unavailable_reason = None;
+            res.content_verdict = classify_content(
+                &res.resolved_view,
+                Some(&gbytes),
+                query.compare_bytes,
+                &res.last_writer,
+                None,
+            );
             let cpu_bytes = live.cpu_bytes_blob.as_deref().and_then(|k| blobs.get(k).ok());
             if let Some(cbytes) = cpu_bytes {
                 res.cpu_sample_point = format!("{} (captured cpu alias)", live.sample_point);
@@ -738,6 +966,7 @@ fn probe_one_dispatch<F>(
     conn: &Connection,
     blobs: &Blobs,
     live_buffers: &[LiveBuffer],
+    live_heaps: &BTreeMap<u64, HeapMeta>,
     sidecar_regions: &[(u64, u64, String, Option<String>)],
     aliases: &AliasMap,
     disp: &ComputeDispatchInfo,
@@ -749,88 +978,173 @@ where
 {
     let desc_byte_offset = query.layout.byte_offset();
 
-    // Step 1: Locate either the direct GPU VA or the bound descriptor buffer holding the raw descriptor.
-    let (desc_source, desc_sample_point, desc_note, decoded, target_va_opt) = if let Some(va) =
-        query.binding.direct_gpu_va
-    {
-        if !query.follow_descriptor {
-            (
-                format!("va:{va:#x}"),
-                "direct".into(),
-                None,
-                None,
-                Some(va.saturating_add(desc_byte_offset)),
-            )
-        } else {
-            let raw_va = va.saturating_add(desc_byte_offset);
-            read_and_decode_at_va(
-                conn,
-                blobs,
-                live_buffers,
-                disp,
-                raw_va,
-                format!("va:{va:#x}+{desc_byte_offset:#x}"),
-                &query.layout,
-            )
-        }
-    } else {
-        match select_binding(&disp.descriptors, &query.binding) {
-            Some(b) => {
-                let base_label = format!("{}:{} space={} param={}", b.kind, b.slot, b.space, b.parameter);
-                let base_va = b.address.or_else(|| {
-                    b.resource.and_then(|rid| {
-                        live_buffers
-                            .iter()
-                            .find(|lb| lb.resource == rid)
-                            .map(|lb| lb.gpu_address)
-                    })
-                });
-                if let Some(va) = base_va {
-                    if !query.follow_descriptor {
-                        (
-                            format!("{base_label}+{desc_byte_offset:#x}"),
-                            "bound-descriptor".into(),
-                            None,
-                            None,
-                            Some(va.saturating_add(desc_byte_offset)),
-                        )
-                    } else {
-                        let raw_va = va.saturating_add(desc_byte_offset);
-                        read_and_decode_at_va(
-                            conn,
-                            blobs,
-                            live_buffers,
-                            disp,
-                            raw_va,
-                            format!("{base_label}+{desc_byte_offset:#x}"),
-                            &query.layout,
-                        )
-                    }
-                } else {
-                    (
-                        base_label,
-                        "unavailable".into(),
-                        Some("selected compute binding has no GPU address / live resource".into()),
-                        None,
-                        None,
-                    )
-                }
-            }
-            None => (
-                "none".into(),
-                "unavailable".into(),
-                Some(format!(
-                    "no matching compute descriptor in d12_draw_descriptors for draw={} ({} cs descriptors present)",
-                    disp.draw,
-                    disp.descriptors.len()
-                )),
-                None,
-                None,
-            ),
-        }
+    // Step 1: Resolve shader binding (root arg -> descriptor -> view) AND optionally follow indexed raw descriptor.
+    let mut view = ResolvedView {
+        binding_status: "missing_root_arg".into(),
+        binding_reason: None,
+        stage: disp.stage.clone(),
+        kind: query.binding.kind.clone(),
+        slot: query.binding.slot,
+        space: query.binding.space,
+        parameter: query.binding.parameter,
+        heap: None,
+        heap_slot: None,
+        descriptor_version: None,
+        flag: None,
+        resource: None,
+        gpu_va: None,
+        byte_offset: None,
+        byte_length: None,
+        resource_width: None,
+        stride: None,
+        format: None,
+        dimension: None,
+        sparse_tiles: None,
     };
 
-    // Step 2: Resolve target GPU VA -> (resource, offset) and read N GPU bytes at this exact dispatch!
+    let (desc_source, desc_sample_point, desc_note, decoded, target_va_opt, view_len_hint) =
+        if let Some(va) = query.binding.direct_gpu_va {
+            view.binding_status = "bound".into();
+            view.gpu_va = Some(va.saturating_add(desc_byte_offset));
+            if !query.follow_descriptor {
+                (
+                    format!("va:{va:#x}"),
+                    "direct".into(),
+                    None,
+                    None,
+                    Some(va.saturating_add(desc_byte_offset)),
+                    None,
+                )
+            } else {
+                let raw_va = va.saturating_add(desc_byte_offset);
+                let (src, sp, note, dec, target) = read_and_decode_at_va(
+                    conn,
+                    blobs,
+                    live_buffers,
+                    disp,
+                    raw_va,
+                    format!("va:{va:#x}+{desc_byte_offset:#x}"),
+                    &query.layout,
+                );
+                let sz = dec.as_ref().and_then(|d| d.decoded_size);
+                (src, sp, note, dec, target, sz)
+            }
+        } else {
+            match select_binding(&disp.descriptors, &query.binding) {
+                Some(b) => {
+                    let base_label = format!(
+                        "{}:{}:{} space={} param={}",
+                        b.stage, b.kind, b.slot, b.space, b.parameter
+                    );
+                    view.stage = b.stage.clone();
+                    view.kind = Some(b.kind.clone());
+                    view.slot = Some(b.slot);
+                    view.space = Some(b.space);
+                    view.parameter = Some(b.parameter);
+                    view.heap = b.heap;
+                    view.heap_slot = b.heap_slot;
+                    view.descriptor_version = b.version;
+                    view.flag = b.flag.clone();
+                    view.stride = b.stride;
+                    view.format = b.format;
+                    view.dimension = b.dimension;
+
+                    let base_va = b.address.or_else(|| {
+                        b.resource.and_then(|rid| {
+                            live_buffers
+                                .iter()
+                                .find(|lb| lb.resource == rid)
+                                .map(|lb| lb.gpu_address)
+                        })
+                    });
+
+                    if let Some(ref flg) = b.flag {
+                        view.binding_status = match flg.as_str() {
+                            "empty" => "empty_descriptor_slot".into(),
+                            "other-type" => "other_descriptor_type".into(),
+                            "no-heap" => "no_heap".into(),
+                            "no-resource" | "null" => "null_or_unmapped_va".into(),
+                            other => format!("flagged:{other}"),
+                        };
+                        let why = format!(
+                            "binding {base_label} flagged '{flg}' (heap={:?}, slot={:?}, version={:?})",
+                            b.heap, b.heap_slot, b.version
+                        );
+                        view.binding_reason = Some(why.clone());
+                        (base_label, "unavailable".into(), Some(why), None, None, b.size)
+                    } else if let Some(va) = base_va {
+                        view.binding_status = "bound".into();
+                        if !query.follow_descriptor {
+                            let eff_va = va.saturating_add(desc_byte_offset);
+                            let eff_size = b.size.map(|s| s.saturating_sub(desc_byte_offset));
+                            view.gpu_va = Some(eff_va);
+                            view.byte_length = eff_size;
+                            (
+                                if desc_byte_offset > 0 {
+                                    format!("{base_label}+{desc_byte_offset:#x}")
+                                } else {
+                                    base_label
+                                },
+                                "bound-descriptor".into(),
+                                None,
+                                None,
+                                Some(eff_va),
+                                eff_size,
+                            )
+                        } else {
+                            let raw_va = va.saturating_add(desc_byte_offset);
+                            let (src, sp, note, dec, target) = read_and_decode_at_va(
+                                conn,
+                                blobs,
+                                live_buffers,
+                                disp,
+                                raw_va,
+                                format!("{base_label}+{desc_byte_offset:#x}"),
+                                &query.layout,
+                            );
+                            let sz = dec.as_ref().and_then(|d| d.decoded_size);
+                            if target.is_none() {
+                                view.binding_status = "null_or_unmapped_va".into();
+                                view.binding_reason = note
+                                    .clone()
+                                    .or_else(|| Some("raw descriptor decoded to null/zero GPU VA".into()));
+                            }
+                            (src, sp, note, dec, target, sz)
+                        }
+                    } else {
+                        view.binding_status = "null_or_unmapped_va".into();
+                        let why = format!(
+                            "binding {base_label} has no GPU address / live resource (resource={:?})",
+                            b.resource
+                        );
+                        view.binding_reason = Some(why.clone());
+                        (base_label, "unavailable".into(), Some(why), None, None, b.size)
+                    }
+                }
+                None => {
+                    let why = diagnose_missing_binding(conn, disp, &query.binding);
+                    view.binding_status = "missing_root_arg".into();
+                    view.binding_reason = Some(why.clone());
+                    ("none".into(), "unavailable".into(), Some(why), None, None, None)
+                }
+            }
+        };
+
+    // Step 2: Resolve target GPU VA -> (resource, offset, byte range, sparse tiles, last-writer, D3D12 placement).
+    let mut last_writer = LastWriterInfo {
+        kind: "none".into(),
+        event: None,
+        submission: None,
+        call: None,
+        source_resource: None,
+        source_offset: None,
+        byte_range: None,
+        upload_submission: None,
+        blob: None,
+        detail: "no resolved target resource".into(),
+    };
+    let mut d3d12_placement = "unknown".to_string();
+
     let (target_resource, target_offset, target_buffer_width, gpu_bytes, gpu_sample_point, gpu_unavail) =
         match target_va_opt {
             None => (
@@ -839,32 +1153,104 @@ where
                 None,
                 None,
                 "unavailable".into(),
-                Some("no target GPU VA decoded from descriptor".into()),
+                view.binding_reason
+                    .clone()
+                    .or_else(|| Some("no target GPU VA resolved from binding/descriptor".into())),
             ),
             Some(va) => match find_buffer(live_buffers, va) {
-                None => (
-                    None,
-                    None,
-                    None,
-                    None,
-                    "unavailable".into(),
-                    Some(format!(
-                        "GPU VA {va:#x} is not inside any live ID3D12Resource buffer"
-                    )),
-                ),
+                None => {
+                    view.binding_status = "null_or_unmapped_va".into();
+                    let why = format!("GPU VA {va:#x} is not inside any live ID3D12Resource buffer");
+                    view.binding_reason = Some(why.clone());
+                    (None, None, None, None, "unavailable".into(), Some(why))
+                }
                 Some((buf, off)) => {
-                    let avail_len = (buf.width.saturating_sub(off) as usize).min(query.compare_bytes);
-                    if avail_len == 0 {
+                    let view_len = view_len_hint
+                        .map(|s| s.min(buf.width.saturating_sub(off)))
+                        .unwrap_or_else(|| buf.width.saturating_sub(off));
+                    let avail_len = (view_len.max(buf.width.saturating_sub(off)) as usize)
+                        .min(buf.width.saturating_sub(off) as usize)
+                        .min(query.compare_bytes);
+                    view.resource = Some(buf.resource);
+                    view.gpu_va = Some(va);
+                    view.byte_offset = Some(off);
+                    view.byte_length = Some(view_len);
+                    view.resource_width = Some(buf.width);
+
+                    // Check sparse/tiled mapping coverage for reserved resources as of this event's submission!
+                    if buf.reserved {
+                        let range_for_tiles = view_len.max(avail_len as u64).max(1);
+                        let sp = inspect_sparse_tiles(conn, buf.resource, off, range_for_tiles, disp);
+                        if sp.mapped_tiles == 0 && sp.diagnostic.is_none() {
+                            view.binding_status = "unmapped_sparse_tile".into();
+                            view.binding_reason = Some(format!(
+                                "reserved resource #{} tiles {}..{} ({} tile(s)) are UNMAPPED at submission {:?} (GPU reads zero){}",
+                                buf.resource,
+                                sp.first_tile,
+                                sp.first_tile + sp.tile_count,
+                                sp.tile_count,
+                                disp.submission,
+                                sp.last_tile_mapping
+                                    .as_deref()
+                                    .map(|m| format!("; last tile op: {m}"))
+                                    .unwrap_or_default(),
+                            ));
+                        } else if sp.unmapped_tiles > 0 && sp.diagnostic.is_none() {
+                            view.binding_status = "partially_mapped_sparse_tile".into();
+                            view.binding_reason = Some(format!(
+                                "reserved resource #{} has {}/{} tiles mapped ({} unmapped) covering [{off:#x}, {:#x})",
+                                buf.resource,
+                                sp.mapped_tiles,
+                                sp.tile_count,
+                                sp.unmapped_tiles,
+                                off.saturating_add(range_for_tiles),
+                            ));
+                        }
+                        view.sparse_tiles = Some(sp);
+                    }
+
+                    d3d12_placement = describe_d3d12_placement(buf, live_heaps, view.sparse_tiles.as_ref());
+
+                    if view.binding_status == "unmapped_sparse_tile" {
+                        last_writer = LastWriterInfo {
+                            kind: "unmapped_tile".into(),
+                            event: None,
+                            submission: disp.submission,
+                            call: view
+                                .sparse_tiles
+                                .as_ref()
+                                .and_then(|s| s.last_tile_mapping.clone()),
+                            source_resource: None,
+                            source_offset: None,
+                            byte_range: Some((off, off.saturating_add(view_len))),
+                            upload_submission: None,
+                            blob: None,
+                            detail: view
+                                .binding_reason
+                                .clone()
+                                .unwrap_or_else(|| "unmapped sparse tiles".into()),
+                        };
+                        (
+                            Some(buf.resource),
+                            Some(off),
+                            Some(buf.width),
+                            None,
+                            "unmapped-sparse-tile".into(),
+                            view.binding_reason.clone(),
+                        )
+                    } else if avail_len == 0 {
+                        let why = format!("offset {off:#x} is at end of resource #{}", buf.resource);
+                        last_writer.detail = why.clone();
                         (
                             Some(buf.resource),
                             Some(off),
                             Some(buf.width),
                             None,
                             "unavailable".into(),
-                            Some(format!("offset {off:#x} is at end of resource #{}", buf.resource)),
+                            Some(why),
                         )
                     } else {
-                        let (bytes, sp, note) = read_buffer_at_dispatch(
+                        let (bytes, sp, note, lw) = read_buffer_with_provenance(
                             conn,
                             blobs,
                             live_buffers,
@@ -873,11 +1259,20 @@ where
                             avail_len as u64,
                             disp,
                         );
+                        last_writer = lw;
                         (Some(buf.resource), Some(off), Some(buf.width), bytes, sp, note)
                     }
                 }
             },
         };
+
+    let content_verdict = classify_content(
+        &view,
+        gpu_bytes.as_deref(),
+        query.compare_bytes,
+        &last_writer,
+        gpu_unavail.as_deref(),
+    );
 
     // Step 3: Resolve CPU alias VA from alias_map / sidecar_visible and read N CPU bytes!
     let (cpu_alias_va, cpu_alias_label) = match target_va_opt {
@@ -950,8 +1345,19 @@ where
         _ => None,
     };
 
+    let observed_placement = if d3d12_placement != "unknown" {
+        format!("d3d12={d3d12_placement} (vidmm=unknown; pass --etl for live VidMm segment)")
+    } else {
+        "unknown".into()
+    };
+
     DispatchProbeResult {
         dispatch: disp.clone(),
+        resolved_view: view,
+        last_writer,
+        content_verdict,
+        d3d12_placement,
+        observed_placement,
         descriptor_source: desc_source,
         descriptor_sample_point: desc_sample_point,
         descriptor_note: desc_note,
@@ -971,6 +1377,275 @@ where
         gpu_label_owner: None,
         cpu_label_owner: None,
         cpu_win32_residency: None,
+    }
+}
+
+fn classify_content(
+    view: &ResolvedView,
+    gpu_bytes: Option<&[u8]>,
+    limit_bytes: usize,
+    last_writer: &LastWriterInfo,
+    unavail: Option<&str>,
+) -> ContentVerdict {
+    if view.binding_status == "unmapped_sparse_tile" {
+        return ContentVerdict {
+            verdict: "unmapped_sparse_tile".into(),
+            inspected_bytes: 0,
+            nonzero_bytes: 0,
+            first_nonzero_offset: None,
+            summary: view.binding_reason.clone().unwrap_or_else(|| {
+                "reserved buffer tiles covering this view are unmapped (GPU reads zero)".into()
+            }),
+        };
+    }
+    if view.binding_status != "bound" && view.binding_status != "partially_mapped_sparse_tile" {
+        return ContentVerdict {
+            verdict: "missing_binding".into(),
+            inspected_bytes: 0,
+            nonzero_bytes: 0,
+            first_nonzero_offset: None,
+            summary: format!(
+                "{}: {}",
+                view.binding_status,
+                view.binding_reason
+                    .as_deref()
+                    .unwrap_or("binding did not resolve to a live resource")
+            ),
+        };
+    }
+    if let Some(bytes) = gpu_bytes {
+        let n = bytes.len().min(limit_bytes);
+        let mut nonzero = 0usize;
+        let mut first_nz = None;
+        for (i, &b) in bytes[..n].iter().enumerate() {
+            if b != 0 {
+                nonzero += 1;
+                if first_nz.is_none() {
+                    first_nz = Some(i);
+                }
+            }
+        }
+        if nonzero == 0 {
+            ContentVerdict {
+                verdict: "legitimate_zero".into(),
+                inspected_bytes: n,
+                nonzero_bytes: 0,
+                first_nonzero_offset: None,
+                summary: format!(
+                    "valid bound view ({n} B inspected) legitimately contains all zeros; supplied by {} ({})",
+                    last_writer.kind, last_writer.detail
+                ),
+            }
+        } else {
+            ContentVerdict {
+                verdict: "non_zero".into(),
+                inspected_bytes: n,
+                nonzero_bytes: nonzero,
+                first_nonzero_offset: first_nz,
+                summary: format!(
+                    "valid bound view has {nonzero}/{n} non-zero bytes (first non-zero at +{:#x}); supplied by {} ({})",
+                    first_nz.unwrap_or(0),
+                    last_writer.kind,
+                    last_writer.detail,
+                ),
+            }
+        }
+    } else {
+        ContentVerdict {
+            verdict: "bytes_unavailable".into(),
+            inspected_bytes: 0,
+            nonzero_bytes: 0,
+            first_nonzero_offset: None,
+            summary: format!(
+                "valid bound view, but bytes are unavailable ({}); last writer: {} ({})",
+                unavail.unwrap_or("not captured"),
+                last_writer.kind,
+                last_writer.detail,
+            ),
+        }
+    }
+}
+
+fn diagnose_missing_binding(conn: &Connection, disp: &ComputeDispatchInfo, sel: &BindingSelector) -> String {
+    let want = if let Some(p) = sel.parameter {
+        format!("param:{p}")
+    } else if let Some(ref k) = sel.kind {
+        format!("{}:{} space={}", k, sel.slot.unwrap_or(0), sel.space.unwrap_or(0))
+    } else {
+        "any buffer binding".into()
+    };
+
+    let has_state: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='d12_draw_state'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if has_state
+        && let Ok((g_root, c_root, root_args_s)) = conn.query_row(
+            "SELECT graphics_root, compute_root, root_args_json FROM d12_draw_state WHERE draw=?1",
+            params![disp.draw as i64],
+            |r| {
+                Ok((
+                    r.get::<_, Option<i64>>(0)?.map(|v| v as u64),
+                    r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        )
+    {
+        let root_id = if disp.stage == "cs" {
+            c_root
+        } else {
+            g_root.or(c_root)
+        };
+        let Some(rid) = root_id else {
+            return format!(
+                "missing binding {want} at draw={} event={}: no root signature bound for stage {}",
+                disp.draw, disp.event, disp.stage
+            );
+        };
+        let args_v: Value = serde_json::from_str(&root_args_s).unwrap_or_default();
+        let stage_args = if disp.stage == "cs" {
+            &args_v["compute"]
+        } else {
+            &args_v["graphics"]
+        };
+        let bound_params: Vec<String> = stage_args
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        if let Some(p) = sel.parameter {
+            let pkey = p.to_string();
+            if !bound_params.contains(&pkey) {
+                return format!(
+                    "missing binding {want} at draw={} event={}: root parameter {p} was never set on root signature #{rid} (bound params: [{}])",
+                    disp.draw,
+                    disp.event,
+                    bound_params.join(", ")
+                );
+            }
+        }
+        return format!(
+            "missing binding {want} at draw={} event={} (root #{rid}, bound params [{}], {} projected descriptors)",
+            disp.draw,
+            disp.event,
+            bound_params.join(", "),
+            disp.descriptors.len()
+        );
+    }
+
+    format!(
+        "no matching descriptor for {want} in d12_draw_descriptors at draw={} event={} ({} descriptors present)",
+        disp.draw,
+        disp.event,
+        disp.descriptors.len()
+    )
+}
+
+fn inspect_sparse_tiles(
+    conn: &Connection,
+    resource: u64,
+    offset: u64,
+    byte_len: u64,
+    disp: &ComputeDispatchInfo,
+) -> SparseTileCoverage {
+    const TILE_SIZE: u64 = 65536;
+    let first_tile = (offset / TILE_SIZE) as u32;
+    let last_tile = (offset.saturating_add(byte_len.saturating_sub(1)) / TILE_SIZE) as u32;
+    let tile_count = last_tile.saturating_sub(first_tile) + 1;
+
+    let mut pages_json: Option<String> = None;
+    let mut last_tile_mapping: Option<String> = None;
+    let mut diagnostic: Option<String> = None;
+
+    // 1. Check latest `d12_tile_mappings` at or before this event's submission `cpu_seq`.
+    let has_tm: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='d12_tile_mappings'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if has_tm {
+        let max_cpu = disp
+            .submission_cpu_seq
+            .and_then(|s| i64::try_from(s).ok())
+            .unwrap_or(i64::MAX);
+        if let Ok((id, queue, cpu_seq, call, pjson, diag)) = conn.query_row(
+            "SELECT id, queue, cpu_seq, call, pages_json, diagnostic FROM d12_tile_mappings \
+             WHERE resource=?1 AND cpu_seq <= ?2 ORDER BY cpu_seq DESC, id DESC LIMIT 1",
+            params![resource as i64, max_cpu],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)? as u64,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                ))
+            },
+        ) {
+            last_tile_mapping = Some(format!("{call} (id={id}, queue=#{queue}, cpu_seq={cpu_seq})"));
+            pages_json = pjson;
+            diagnostic = diag;
+        }
+    }
+
+    // 2. Fallback to initial `d12_tile_pages` captured at frame start / first use.
+    if pages_json.is_none() && diagnostic.is_none() {
+        let has_tp: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='d12_tile_pages'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if has_tp
+            && let Ok((pjson, diag)) = conn.query_row(
+                "SELECT pages_json, diagnostic FROM d12_tile_pages WHERE resource=?1",
+                params![resource as i64],
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+        {
+            pages_json = pjson;
+            diagnostic = diag;
+        } else {
+            diagnostic = Some("no d12_tile_pages / d12_tile_mappings record for reserved resource".into());
+        }
+    }
+
+    let mut mapped_tiles = 0u32;
+    let mut unmapped_tiles = 0u32;
+    let mut heaps = std::collections::BTreeSet::new();
+
+    if let Some(ref pj) = pages_json
+        && let Ok(val) = serde_json::from_str::<Value>(pj)
+        && let Some(pages) = crate::tiles::Pages::from_runs(&val)
+    {
+        for t in first_tile..=last_tile {
+            if let Some(&(heap, _page)) = pages.tiles.get(&t) {
+                mapped_tiles += 1;
+                heaps.insert(heap);
+            } else {
+                unmapped_tiles += 1;
+            }
+        }
+    } else {
+        unmapped_tiles = tile_count;
+    }
+
+    SparseTileCoverage {
+        tile_size: TILE_SIZE,
+        first_tile,
+        tile_count,
+        mapped_tiles,
+        unmapped_tiles,
+        backing_heaps: heaps.into_iter().collect(),
+        last_tile_mapping,
+        diagnostic,
     }
 }
 
@@ -1000,7 +1675,7 @@ fn read_and_decode_at_va(
             None,
         );
     };
-    let (raw_opt, sp, note) = read_buffer_at_dispatch(
+    let (raw_opt, sp, note, _lw) = read_buffer_with_provenance(
         conn,
         blobs,
         live_buffers,
@@ -1019,7 +1694,7 @@ fn read_and_decode_at_va(
     }
 }
 
-/// Reads `[offset, offset + len)` of `buf` as of `disp.event` in strict causal priority order.
+/// Reads `[offset, offset + len)` of `buf` as of `disp.event` (legacy wrapper returning `(bytes, sample_point, note)`).
 pub fn read_buffer_at_dispatch(
     conn: &Connection,
     blobs: &Blobs,
@@ -1029,7 +1704,80 @@ pub fn read_buffer_at_dispatch(
     len: u64,
     disp: &ComputeDispatchInfo,
 ) -> (Option<Vec<u8>>, String, Option<String>) {
-    // 1. Check latest UAV `results` row for this resource strictly before `disp.event`.
+    let (bytes, sp, note, _lw) =
+        read_buffer_with_provenance(conn, blobs, live_buffers, buf, offset, len, disp);
+    (bytes, sp, note)
+}
+
+/// Looks up the latest `d12_upload_versions` run for `(resource, submission <= max_sub)` covering `[offset, offset + len)`.
+fn find_upload_version(
+    conn: &Connection,
+    blobs: &Blobs,
+    resource: u64,
+    max_sub: Option<u64>,
+    offset: u64,
+    len: u64,
+) -> Option<(u64, u64, u64, String, Vec<u8>)> {
+    let has_uv: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='d12_upload_versions'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_uv {
+        return None;
+    }
+    let sub_cap = max_sub.and_then(|s| i64::try_from(s).ok()).unwrap_or(i64::MAX);
+    let mut stmt = conn
+        .prepare(
+            "SELECT submission, offset, content_json FROM d12_upload_versions \
+             WHERE resource=?1 AND submission <= ?2 ORDER BY submission DESC, offset DESC",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(params![resource as i64, sub_cap], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .ok()?;
+    for (sub, run_off, json_s) in rows.flatten() {
+        if let Ok(v) = serde_json::from_str::<Value>(&json_s)
+            && let (Some(sz), Some(key)) = (v["size"].as_u64(), v["blob"].as_str())
+            && offset >= run_off
+            && offset.saturating_add(len) <= run_off.saturating_add(sz)
+            && let Ok(bytes) = blobs.read(key, offset - run_off, Some(len))
+        {
+            return Some((sub, run_off, sz, key.to_string(), bytes));
+        }
+    }
+    None
+}
+
+fn event_submission(conn: &Connection, event: u64) -> Option<u64> {
+    conn.query_row(
+        "SELECT x.submission FROM d12_event_locations l JOIN d12_executions x ON x.id = l.execution WHERE l.event = ?1",
+        params![event as i64],
+        |r| Ok(r.get::<_, i64>(0)? as u64),
+    )
+    .ok()
+}
+
+/// Reads `[offset, offset + len)` of `buf` as of `disp.event`, returning `(bytes, sample_point, note, last_writer)`.
+pub fn read_buffer_with_provenance(
+    conn: &Connection,
+    blobs: &Blobs,
+    live_buffers: &[LiveBuffer],
+    buf: &LiveBuffer,
+    offset: u64,
+    len: u64,
+    disp: &ComputeDispatchInfo,
+) -> (Option<Vec<u8>>, String, Option<String>, LastWriterInfo) {
+    // Track the latest UAV `results` row for this resource strictly before `disp.event`.
+    let mut latest_uav: Option<(u64, String, u64, u64, String, Vec<u8>)> = None;
     let has_results: bool = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='results'",
@@ -1038,80 +1786,104 @@ pub fn read_buffer_at_dispatch(
         )
         .unwrap_or(false);
     if has_results
-        && let Ok((ev, key, res_off, res_bytes)) = conn.query_row(
-            "SELECT event, content, offset, bytes FROM results WHERE resource=?1 AND event < ?2 ORDER BY event DESC LIMIT 1",
-            params![buf.resource as i64, disp.event as i64],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)? as u64,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
-                    r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
-                ))
-            },
+        && let Ok(mut stmt) = conn.prepare(
+            "SELECT r.event, r.content, r.offset, r.bytes, COALESCE(e.call, 'UAV') \
+             FROM results r LEFT JOIN events e ON e.seq = r.event \
+             WHERE r.resource=?1 AND r.event < ?2 ORDER BY r.event DESC",
         )
+        && let Ok(rows) = stmt.query_map(params![buf.resource as i64, disp.event as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u64,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?.map(|v| v as u64),
+                r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                r.get::<_, String>(4)?,
+            ))
+        })
     {
-        let base = res_off.unwrap_or(0);
-        let avail = res_bytes.unwrap_or(buf.width);
-        if offset >= base
-            && offset.saturating_add(len) <= base.saturating_add(avail)
-            && let Ok(bytes) = blobs.read(&key, offset - base, Some(len))
-        {
-            return (
-                Some(bytes),
-                format!("before-dispatch (from UAV result at event {ev})"),
-                None,
-            );
-        }
-    }
-
-    // 2. Check submission-scoped `d12_upload_versions` run covering `[offset, offset + len)`.
-    if let Some(sub) = disp.submission {
-        let has_uv: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='d12_upload_versions'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
-        if has_uv
-            && let Ok(mut stmt) = conn.prepare(
-                "SELECT offset, content_json FROM d12_upload_versions WHERE submission=?1 AND resource=?2 ORDER BY offset DESC",
-            )
-            && let Ok(rows) = stmt.query_map(params![sub as i64, buf.resource as i64], |r| {
-                Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?))
-            })
-        {
-            for (run_off, json_s) in rows.flatten() {
-                if let Ok(v) = serde_json::from_str::<Value>(&json_s)
-                    && let (Some(sz), Some(key)) = (v["size"].as_u64(), v["blob"].as_str())
-                    && offset >= run_off
-                    && offset.saturating_add(len) <= run_off.saturating_add(sz)
-                    && let Ok(bytes) = blobs.read(key, offset - run_off, Some(len))
-                {
-                    return (
-                        Some(bytes),
-                        format!("before-dispatch (submission {sub} upload run)"),
-                        None,
-                    );
-                }
+        for (ev, key, res_off, res_bytes, call) in rows.flatten() {
+            let base = res_off.unwrap_or(0);
+            let avail = res_bytes.unwrap_or(buf.width);
+            if offset >= base
+                && offset.saturating_add(len) <= base.saturating_add(avail)
+                && let Ok(bytes) = blobs.read(&key, offset - base, Some(len))
+            {
+                latest_uav = Some((ev, key, base, avail, call, bytes));
+                break;
             }
         }
     }
 
-    // 3. Check `CopyBufferRegion` / `CopyResource` into this resource before `disp.event`!
+    // Start from `d12_upload_versions` (for upload buffers) or `first-use` initial capture as the pre-event base.
     let mut base_bytes: Option<Vec<u8>> = None;
     let mut sample_point = String::new();
     let mut missing_reason: Option<String> = None;
+    let mut last_writer = LastWriterInfo {
+        kind: "none".into(),
+        event: None,
+        submission: None,
+        call: None,
+        source_resource: None,
+        source_offset: None,
+        byte_range: Some((offset, offset.saturating_add(len))),
+        upload_submission: None,
+        blob: None,
+        detail: "no prior write or initial content captured".into(),
+    };
 
-    if let Some(ref key) = buf.content {
+    if let Some((uv_sub, run_off, run_sz, key, bytes)) =
+        find_upload_version(conn, blobs, buf.resource, disp.submission, offset, len)
+    {
+        base_bytes = Some(bytes);
+        sample_point = format!("before-dispatch (upload run at submission {uv_sub})");
+        last_writer = LastWriterInfo {
+            kind: "upload_version".into(),
+            event: None,
+            submission: Some(uv_sub),
+            call: Some("Map/Unmap upload".into()),
+            source_resource: Some(buf.resource),
+            source_offset: Some(offset),
+            byte_range: Some((run_off, run_off.saturating_add(run_sz))),
+            upload_submission: Some(uv_sub),
+            blob: Some(key),
+            detail: format!(
+                "d12_upload_versions submission={uv_sub} resource=#{} run=[{run_off:#x}, {:#x})",
+                buf.resource,
+                run_off.saturating_add(run_sz)
+            ),
+        };
+    } else if let Some(ref key) = buf.content {
+        let fu_sub: Option<u64> = conn
+            .query_row(
+                "SELECT submission FROM d12_first_use WHERE resource=?1",
+                params![buf.resource as i64],
+                |r| Ok(r.get::<_, i64>(0)? as u64),
+            )
+            .ok();
         match blobs.read(key, offset, Some(len)) {
             Ok(b) => {
+                let src_lbl = buf.content_source.as_deref().unwrap_or("first-use");
                 base_bytes = Some(b);
-                sample_point = format!(
-                    "before-dispatch ({})",
-                    buf.content_source.as_deref().unwrap_or("first-use")
-                );
+                sample_point = format!("before-dispatch ({src_lbl})");
+                last_writer = LastWriterInfo {
+                    kind: "first_use_initial".into(),
+                    event: None,
+                    submission: fu_sub,
+                    call: None,
+                    source_resource: Some(buf.resource),
+                    source_offset: Some(offset),
+                    byte_range: Some((offset, offset.saturating_add(len))),
+                    upload_submission: None,
+                    blob: Some(key.clone()),
+                    detail: format!(
+                        "no in-frame writer before event {}; initial {src_lbl} snapshot of resource #{}{}",
+                        disp.event,
+                        buf.resource,
+                        fu_sub
+                            .map(|s| format!(" (first_use sub={s})"))
+                            .unwrap_or_default()
+                    ),
+                };
             }
             Err(e) => {
                 missing_reason = Some(format!(
@@ -1130,9 +1902,11 @@ pub fn read_buffer_at_dispatch(
         ));
     }
 
-    // Replay any `CopyBufferRegion` / `CopyResource` writes into `buf.resource` strictly before `disp.event`.
+    // Apply in-frame writes (`events` + `event_resources` WHERE `access='write'` AND `seq < disp.event`) in exact chronological order!
     let mut copy_count = 0usize;
     let mut unfollowed_write: Option<String> = None;
+    let uav_ev = latest_uav.as_ref().map(|u| u.0).unwrap_or(0);
+
     if let Ok(mut stmt) = conn.prepare(
         "SELECT e.seq, e.call, e.args FROM events e JOIN event_resources er ON er.event = e.seq \
          WHERE er.resource = ?1 AND er.access = 'write' AND e.seq < ?2 ORDER BY e.seq",
@@ -1144,6 +1918,32 @@ pub fn read_buffer_at_dispatch(
         ))
     }) {
         for (seq, call, args_s) in rows.flatten() {
+            // If this event is our captured UAV `results` event, apply it in chronological order!
+            if seq == uav_ev
+                && let Some((ev, ref key, base, avail, ref ucall, ref ubytes)) = latest_uav
+            {
+                base_bytes = Some(ubytes.clone());
+                unfollowed_write = None;
+                sample_point = format!("before-dispatch (from UAV result at event {ev})");
+                last_writer = LastWriterInfo {
+                    kind: "uav_result".into(),
+                    event: Some(ev),
+                    submission: event_submission(conn, ev),
+                    call: Some(ucall.clone()),
+                    source_resource: Some(buf.resource),
+                    source_offset: Some(offset),
+                    byte_range: Some((base, base.saturating_add(avail))),
+                    upload_submission: None,
+                    blob: Some(key.clone()),
+                    detail: format!(
+                        "{ucall} at event {ev} wrote UAV resource #{} range [{base:#x}, {:#x})",
+                        buf.resource,
+                        base.saturating_add(avail)
+                    ),
+                };
+                continue;
+            }
+
             if call == "CopyBufferRegion" || call == "CopyResource" {
                 let a: Value = serde_json::from_str(&args_s).unwrap_or_default();
                 let res_id = |v: &Value| v["resource"].as_u64().or_else(|| v.as_u64());
@@ -1159,33 +1959,153 @@ pub fn read_buffer_at_dispatch(
                 };
                 let lo = offset.max(dst_off);
                 let hi = offset.saturating_add(len).min(dst_off.saturating_add(copy_len));
-                if lo < hi
-                    && let Some(sid) = src_id
-                    && let Some(src_buf) = live_buffers.iter().find(|b| b.resource == sid)
-                    && let Some(ref skey) = src_buf.content
-                    && let Ok(src_bytes) = blobs.read(skey, src_off + (lo - dst_off), Some(hi - lo))
-                {
-                    let dst = base_bytes.get_or_insert_with(|| vec![0u8; len as usize]);
-                    let d_lo = (lo - offset) as usize;
-                    let d_hi = (d_lo + src_bytes.len()).min(dst.len());
-                    dst[d_lo..d_hi].copy_from_slice(&src_bytes[..d_hi - d_lo]);
-                    copy_count += 1;
+                if lo < hi {
+                    let copy_sub = event_submission(conn, seq).or(disp.submission);
+                    let src_read_off = src_off.saturating_add(lo - dst_off);
+                    let src_read_len = hi - lo;
+                    let mut got_src: Option<(Vec<u8>, Option<u64>, Option<String>)> = None;
+
+                    if let Some(sid) = src_id {
+                        // Prefer source's submission-scoped `d12_upload_versions` (critical for UPLOAD -> DEFAULT copies!)
+                        if let Some((uv_sub, _, _, key, bytes)) =
+                            find_upload_version(conn, blobs, sid, copy_sub, src_read_off, src_read_len)
+                        {
+                            got_src = Some((bytes, Some(uv_sub), Some(key)));
+                        } else if let Some(src_buf) = live_buffers.iter().find(|b| b.resource == sid)
+                            && let Some(ref skey) = src_buf.content
+                            && let Ok(bytes) = blobs.read(skey, src_read_off, Some(src_read_len))
+                        {
+                            got_src = Some((bytes, None, Some(skey.clone())));
+                        }
+                    }
+
+                    let kind = if call == "CopyBufferRegion" {
+                        "copy_buffer_region"
+                    } else {
+                        "copy_resource"
+                    };
+                    if let Some((src_bytes, uv_sub, src_blob)) = got_src {
+                        let dst = base_bytes.get_or_insert_with(|| vec![0u8; len as usize]);
+                        let d_lo = (lo - offset) as usize;
+                        let d_hi = (d_lo + src_bytes.len()).min(dst.len());
+                        dst[d_lo..d_hi].copy_from_slice(&src_bytes[..d_hi - d_lo]);
+                        copy_count += 1;
+                        unfollowed_write = None;
+                        last_writer = LastWriterInfo {
+                            kind: kind.into(),
+                            event: Some(seq),
+                            submission: copy_sub,
+                            call: Some(call.clone()),
+                            source_resource: src_id,
+                            source_offset: Some(src_read_off),
+                            byte_range: Some((lo, hi)),
+                            upload_submission: uv_sub,
+                            blob: src_blob,
+                            detail: format!(
+                                "{call} at event {seq} copied [{src_read_off:#x}, {:#x}) from resource #{:?} into [{lo:#x}, {hi:#x}){}",
+                                src_read_off.saturating_add(src_read_len),
+                                src_id.unwrap_or(0),
+                                uv_sub
+                                    .map(|s| format!(" (from upload sub={s})"))
+                                    .unwrap_or_default(),
+                            ),
+                        };
+                    } else {
+                        let why = format!(
+                            "{call} at event {seq} wrote [{lo:#x}, {hi:#x}) from resource #{:?} whose source bytes were not captured",
+                            src_id.unwrap_or(0)
+                        );
+                        unfollowed_write = Some(why.clone());
+                        last_writer = LastWriterInfo {
+                            kind: kind.into(),
+                            event: Some(seq),
+                            submission: copy_sub,
+                            call: Some(call.clone()),
+                            source_resource: src_id,
+                            source_offset: Some(src_read_off),
+                            byte_range: Some((lo, hi)),
+                            upload_submission: None,
+                            blob: None,
+                            detail: why,
+                        };
+                    }
                 }
-            } else {
-                unfollowed_write = Some(format!(
-                    "written earlier by {call} at event {seq} without a captured results row"
-                ));
+            } else if call.starts_with("ClearUnorderedAccessView") {
+                let copy_sub = event_submission(conn, seq);
+                let why = format!("{call} at event {seq} cleared resource #{}", buf.resource);
+                unfollowed_write = Some(why.clone());
+                last_writer = LastWriterInfo {
+                    kind: "clear_uav".into(),
+                    event: Some(seq),
+                    submission: copy_sub,
+                    call: Some(call.clone()),
+                    source_resource: None,
+                    source_offset: None,
+                    byte_range: Some((offset, offset.saturating_add(len))),
+                    upload_submission: None,
+                    blob: None,
+                    detail: why,
+                };
+            } else if seq > uav_ev {
+                let copy_sub = event_submission(conn, seq);
+                let why = format!("written earlier by {call} at event {seq} without a captured results row");
+                unfollowed_write = Some(why.clone());
+                last_writer = LastWriterInfo {
+                    kind: "unrecorded_gpu_write".into(),
+                    event: Some(seq),
+                    submission: copy_sub,
+                    call: Some(call.clone()),
+                    source_resource: None,
+                    source_offset: None,
+                    byte_range: Some((offset, offset.saturating_add(len))),
+                    upload_submission: None,
+                    blob: None,
+                    detail: why,
+                };
             }
         }
     }
 
-    if copy_count > 0 {
-        sample_point = format!("before-dispatch (composed over {copy_count} copy op(s))");
+    // If `results` had a UAV capture that wasn't listed in `event_resources` (e.g. ExecuteIndirect), still apply it!
+    if let Some((ev, key, base, avail, ucall, ubytes)) = latest_uav
+        && last_writer.event.is_none_or(|prev| ev > prev)
+    {
+        base_bytes = Some(ubytes);
+        unfollowed_write = None;
+        sample_point = format!("before-dispatch (from UAV result at event {ev})");
+        last_writer = LastWriterInfo {
+            kind: "uav_result".into(),
+            event: Some(ev),
+            submission: event_submission(conn, ev),
+            call: Some(ucall.clone()),
+            source_resource: Some(buf.resource),
+            source_offset: Some(offset),
+            byte_range: Some((base, base.saturating_add(avail))),
+            upload_submission: None,
+            blob: Some(key),
+            detail: format!(
+                "{ucall} at event {ev} wrote UAV resource #{} range [{base:#x}, {:#x})",
+                buf.resource,
+                base.saturating_add(avail)
+            ),
+        };
+    }
+
+    if copy_count > 0 && last_writer.kind.starts_with("copy_") {
+        sample_point = format!(
+            "before-dispatch (composed over {copy_count} copy op(s); last at event {})",
+            last_writer.event.unwrap_or(0)
+        );
     }
     if base_bytes.is_some() {
-        (base_bytes, sample_point, unfollowed_write)
+        (base_bytes, sample_point, unfollowed_write, last_writer)
     } else {
-        (None, "unavailable".into(), missing_reason.or(unfollowed_write))
+        (
+            None,
+            "unavailable".into(),
+            missing_reason.or(unfollowed_write),
+            last_writer,
+        )
     }
 }
 
@@ -1246,7 +2166,7 @@ fn select_binding<'a>(
             d.kind == *k && sel.slot.is_none_or(|s| d.slot == s) && sel.space.is_none_or(|sp| d.space == sp)
         });
     }
-    // Auto-select: first valid buffer SRV or UAV bound to CS.
+    // Auto-select: first valid buffer SRV or UAV bound.
     descriptors
         .iter()
         .find(|d| d.flag.is_none() && d.address.is_some() && matches!(d.kind.as_str(), "srv" | "uav"))
@@ -1255,7 +2175,7 @@ fn select_binding<'a>(
 
 type ResourceContentMeta = (Option<String>, Option<String>, Option<String>);
 
-fn load_live_buffers(conn: &Connection) -> Vec<LiveBuffer> {
+fn load_live_buffers_and_heaps(conn: &Connection) -> (Vec<LiveBuffer>, BTreeMap<u64, HeapMeta>) {
     let mut meta: BTreeMap<u64, ResourceContentMeta> = BTreeMap::new();
     if let Ok(mut stmt) =
         conn.prepare("SELECT id, content, content_source, content_note FROM resources WHERE kind='buffer'")
@@ -1272,6 +2192,28 @@ fn load_live_buffers(conn: &Connection) -> Vec<LiveBuffer> {
             meta.insert(id, (c, src, note));
         }
     }
+
+    let mut heaps = BTreeMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, description FROM d12_objects WHERE kind='ID3D12Heap'")
+        && let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)))
+    {
+        for (id, desc_s) in rows.flatten() {
+            if let Ok(v) = serde_json::from_str::<Value>(&desc_s) {
+                let hp = &v["heap_properties"];
+                heaps.insert(
+                    id,
+                    HeapMeta {
+                        id,
+                        bytes: v["bytes"].as_u64().unwrap_or(0),
+                        heap_type: hp["type"].as_u64(),
+                        cpu_page: hp["cpu_page"].as_u64(),
+                        memory_pool: hp["memory_pool"].as_u64(),
+                    },
+                );
+            }
+        }
+    }
+
     let mut out = Vec::new();
     if let Ok(mut stmt) = conn.prepare("SELECT id, description FROM d12_objects WHERE kind='ID3D12Resource'")
         && let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)))
@@ -1283,6 +2225,17 @@ fn load_live_buffers(conn: &Connection) -> Vec<LiveBuffer> {
                     (v["gpu_address"].as_u64().filter(|&a| a != 0), v["width"].as_u64())
             {
                 let (content, content_source, content_note) = meta.remove(&id).unwrap_or_default();
+                let heap = v["heap"].as_u64().filter(|&h| h != 0);
+                let heap_offset = heap.and_then(|_| v["heap_offset"].as_u64());
+                let hp = &v["heap_properties"];
+                let heap_type = hp["type"].as_u64();
+                let cpu_page = hp["cpu_page"].as_u64();
+                let memory_pool = hp["memory_pool"].as_u64();
+                let reserved = v
+                    .as_object()
+                    .and_then(|m| m.get("heap_properties"))
+                    .is_some_and(Value::is_null)
+                    && heap.is_none();
                 out.push(LiveBuffer {
                     resource: id,
                     gpu_address: va,
@@ -1290,11 +2243,17 @@ fn load_live_buffers(conn: &Connection) -> Vec<LiveBuffer> {
                     content,
                     content_source,
                     content_note,
+                    heap,
+                    heap_offset,
+                    heap_type,
+                    cpu_page,
+                    memory_pool,
+                    reserved,
                 });
             }
         }
     }
-    out
+    (out, heaps)
 }
 
 fn load_sidecar_regions(conn: &Connection) -> Vec<(u64, u64, String, Option<String>)> {
@@ -1369,10 +2328,12 @@ fn load_live_probe(conn: &Connection, draw: u64) -> Option<DispatchProbeRecord> 
     .ok()
 }
 
-fn find_compute_dispatches(
+fn find_matching_events(
     conn: &Connection,
     shader_filter: Option<&str>,
     draw_filter: Option<u64>,
+    event_filter: Option<u64>,
+    stage_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<ComputeDispatchInfo>, String> {
     let shader_names: BTreeMap<String, Option<String>> = conn
@@ -1388,7 +2349,7 @@ fn find_compute_dispatches(
         .unwrap_or_default();
 
     let mut stmt = conn
-        .prepare("SELECT n, event, call, args, cs FROM draws WHERE cs IS NOT NULL ORDER BY n")
+        .prepare("SELECT n, event, call, args, vs, hs, ds, gs, ps, cs FROM draws ORDER BY n")
         .map_err(|e| format!("query draws: {e}"))?;
     let rows = stmt
         .query_map([], |r| {
@@ -1397,7 +2358,14 @@ fn find_compute_dispatches(
                 r.get::<_, i64>(1)? as u64,
                 r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
+                [
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, Option<String>>(9)?,
+                ],
             ))
         })
         .map_err(|e| format!("read draws: {e}"))?;
@@ -1417,18 +2385,84 @@ fn find_compute_dispatches(
         )
         .unwrap_or(false);
 
+    let stage_names = ["vs", "hs", "ds", "gs", "ps", "cs"];
+    let want_stage = stage_filter.map(|s| s.trim().to_ascii_lowercase());
     let filter_lc = shader_filter.map(|s| s.trim().to_ascii_lowercase());
     let mut out = Vec::new();
+
     for row in rows.flatten() {
-        let (n, event, call, args, cs_hash) = row;
-        if let Some(want) = draw_filter
-            && n != want
+        let (n, event, call, args, shaders) = row;
+        if let Some(want_ev) = event_filter
+            && event != want_ev
         {
             continue;
         }
-        let cs_name = shader_names.get(&cs_hash).cloned().flatten();
+        if let Some(want_draw) = draw_filter
+            && n != want_draw
+        {
+            continue;
+        }
+
+        // Determine active stage & shader hash for this row.
+        let is_compute = shaders[5].is_some();
+        let (active_stage, active_hash) = if let Some(ref st) = want_stage {
+            if st == "all" {
+                if let Some(ref cs) = shaders[5] {
+                    ("cs".to_string(), cs.clone())
+                } else if let Some((idx, sh)) = shaders
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, s)| s.as_ref().map(|h| (i, h)))
+                {
+                    (stage_names[idx].to_string(), sh.clone())
+                } else {
+                    ("cs".to_string(), String::new())
+                }
+            } else {
+                let idx = stage_names.iter().position(|&s| s == st.as_str());
+                match idx.and_then(|i| shaders[i].as_ref()) {
+                    Some(h) => (st.clone(), h.clone()),
+                    None if event_filter.is_some() || draw_filter.is_some() => (st.clone(), String::new()),
+                    None => continue,
+                }
+            }
+        } else if is_compute {
+            ("cs".to_string(), shaders[5].clone().unwrap_or_default())
+        } else if event_filter.is_some() || draw_filter.is_some() {
+            // Graphics draw explicitly selected by `--event` or `--draw`!
+            if let Some(ref flt) = filter_lc {
+                if let Some((idx, sh)) = shaders.iter().enumerate().find_map(|(i, s)| {
+                    let h = s.as_ref()?;
+                    let nm = shader_names.get(h).and_then(|o| o.as_deref());
+                    if h.to_ascii_lowercase().contains(flt)
+                        || nm.is_some_and(|x| x.to_ascii_lowercase().contains(flt))
+                    {
+                        Some((i, h))
+                    } else {
+                        None
+                    }
+                }) {
+                    (stage_names[idx].to_string(), sh.clone())
+                } else {
+                    continue;
+                }
+            } else if let Some((idx, sh)) = shaders
+                .iter()
+                .enumerate()
+                .find_map(|(i, s)| s.as_ref().map(|h| (i, h)))
+            {
+                (stage_names[idx].to_string(), sh.clone())
+            } else {
+                ("vs".to_string(), String::new())
+            }
+        } else {
+            // Default scan without --event/--draw/--stage targets compute dispatches (preserves original behavior).
+            continue;
+        };
+
+        let cs_name = shader_names.get(&active_hash).cloned().flatten();
         if let Some(ref flt) = filter_lc {
-            let hash_match = cs_hash.to_ascii_lowercase().contains(flt);
+            let hash_match = active_hash.to_ascii_lowercase().contains(flt);
             let name_match = cs_name
                 .as_deref()
                 .is_some_and(|nm| nm.to_ascii_lowercase().contains(flt));
@@ -1436,49 +2470,82 @@ fn find_compute_dispatches(
                 continue;
             }
         }
-        let submission = if has_locs {
+
+        let (submission, submission_cpu_seq) = if has_locs {
             conn.query_row(
-                "SELECT x.submission FROM d12_event_locations l JOIN d12_executions x ON x.id = l.execution WHERE l.event = ?1",
+                "SELECT x.submission, s.cpu_seq FROM d12_event_locations l \
+                 JOIN d12_executions x ON x.id = l.execution \
+                 LEFT JOIN d12_submissions s ON s.id = x.submission \
+                 WHERE l.event = ?1",
                 params![event as i64],
-                |r| Ok(r.get::<_, i64>(0)? as u64),
+                |r| {
+                    Ok((
+                        Some(r.get::<_, i64>(0)? as u64),
+                        r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+                    ))
+                },
             )
-            .ok()
+            .unwrap_or((None, None))
         } else {
-            None
+            (None, None)
         };
+
         let mut descriptors = Vec::new();
-        if has_desc
-            && let Ok(mut ds) = conn.prepare(
-                "SELECT kind, slot, space, parameter, resource, address, size, stride, flag \
-                 FROM d12_draw_descriptors WHERE draw=?1 AND stage='cs' ORDER BY kind, space, slot",
-            )
-            && let Ok(drows) = ds.query_map(params![n as i64], |r| {
-                Ok(ComputeDescriptorRow {
-                    kind: r.get(0)?,
-                    slot: r.get::<_, i64>(1)? as u32,
-                    space: r.get::<_, i64>(2)? as u32,
-                    parameter: r.get::<_, i64>(3)? as u32,
-                    resource: r.get::<_, Option<i64>>(4)?.map(|v| v as u64),
-                    address: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
-                    size: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
-                    stride: r.get::<_, Option<i64>>(7)?.map(|v| v as u32),
-                    flag: r.get(8)?,
-                })
-            })
-        {
-            descriptors.extend(drows.flatten());
+        if has_desc {
+            let load_all_stages =
+                want_stage.as_deref() == Some("all") || (!is_compute && want_stage.is_none());
+            let sql = if load_all_stages {
+                "SELECT stage, kind, slot, space, parameter, heap, heap_slot, version, \
+                 resource, address, size, stride, format, dimension, flag \
+                 FROM d12_draw_descriptors WHERE draw=?1 ORDER BY stage, kind, space, slot"
+            } else {
+                "SELECT stage, kind, slot, space, parameter, heap, heap_slot, version, \
+                 resource, address, size, stride, format, dimension, flag \
+                 FROM d12_draw_descriptors WHERE draw=?1 AND stage=?2 ORDER BY kind, space, slot"
+            };
+            if let Ok(mut ds) = conn.prepare(sql) {
+                let mapper = |r: &rusqlite::Row<'_>| {
+                    Ok(ComputeDescriptorRow {
+                        stage: r.get(0)?,
+                        kind: r.get(1)?,
+                        slot: r.get::<_, i64>(2)? as u32,
+                        space: r.get::<_, i64>(3)? as u32,
+                        parameter: r.get::<_, i64>(4)? as u32,
+                        heap: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                        heap_slot: r.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                        version: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                        resource: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+                        address: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+                        size: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+                        stride: r.get::<_, Option<i64>>(11)?.map(|v| v as u32),
+                        format: r.get::<_, Option<i64>>(12)?.map(|v| v as u32),
+                        dimension: r.get::<_, Option<i64>>(13)?.map(|v| v as u32),
+                        flag: r.get(14)?,
+                    })
+                };
+                if load_all_stages {
+                    if let Ok(drows) = ds.query_map(params![n as i64], mapper) {
+                        descriptors.extend(drows.flatten());
+                    }
+                } else if let Ok(drows) = ds.query_map(params![n as i64, active_stage.as_str()], mapper) {
+                    descriptors.extend(drows.flatten());
+                }
+            }
         }
+
         out.push(ComputeDispatchInfo {
             draw: n,
             event,
             call,
             args,
-            cs_hash,
+            cs_hash: active_hash,
             cs_name,
+            stage: active_stage,
             submission,
+            submission_cpu_seq,
             descriptors,
         });
-        if out.len() >= limit.max(1) {
+        if limit > 0 && out.len() >= limit {
             break;
         }
     }
@@ -1627,6 +2694,8 @@ mod tests {
         let query = ProbeQuery {
             shader: Some("7700e4c3".into()),
             draw: None,
+            event: None,
+            stage: None,
             binding: BindingSelector::parse("srv:0").unwrap(),
             layout: DescriptorLayout {
                 row_stride: 0x200,
@@ -1652,11 +2721,280 @@ mod tests {
         assert_eq!(r.target_resource, Some(11));
         assert_eq!(r.target_offset, Some(0x1000));
         assert_eq!(r.cpu_alias_va, Some(0x7000_1000));
+        assert_eq!(r.resolved_view.binding_status, "bound");
+        assert_eq!(r.content_verdict.verdict, "non_zero");
+        assert_eq!(r.last_writer.kind, "first_use_initial");
         let cmp = r.comparison.as_ref().expect("comparison computed");
         assert_eq!(cmp.status, "differs");
         assert_eq!(cmp.compared_bytes, 4096);
         assert_eq!(cmp.mismatch_count, 1);
         assert_eq!(cmp.first_mismatch_offset, Some(0x10));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn distinguishes_missing_binding_unmapped_sparse_tile_and_legitimate_zero_from_copy_upload() {
+        let dir = std::env::temp_dir().join(format!("locum_probe_batman_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blobs = Blobs::new(dir.join("blobs"));
+
+        // Resource 20: UPLOAD buffer (type=2, L0_SYS) containing legitimate all-zero 4 KiB bytes in upload_versions.
+        let zeros = vec![0u8; 4096];
+        let zero_key = hash::key(&zeros);
+        blobs.put(&zero_key, &zeros).unwrap();
+
+        // Resource 21: DEFAULT buffer (type=1, L1_VRAM) populated by CopyBufferRegion at event 10 from upload #20.
+        // Resource 22: RESERVED sparse buffer (heap_properties: null) with tile 0 mapped to heap #5 and tile 1 UNMAPPED.
+        let mut cap = db::Capture::default();
+        cap.meta("api", "d3d12");
+        cap.meta("blobs", dir.join("blobs").display());
+        cap.shaders.push(db::Shader {
+            hash: "cull0001".into(),
+            stage: "cs",
+            blob: Some("cull0001".into()),
+            size: 64,
+            name: Some("g10_cull_cs".into()),
+        });
+        cap.resources.push(db::Resource {
+            id: 20,
+            kind: "buffer",
+            width: 4096,
+            bytes: 4096,
+            used: true,
+            ..Default::default()
+        });
+        cap.resources.push(db::Resource {
+            id: 21,
+            kind: "buffer",
+            width: 4096,
+            bytes: 4096,
+            used: true,
+            ..Default::default()
+        });
+        cap.resources.push(db::Resource {
+            id: 22,
+            kind: "buffer",
+            width: 131_072,
+            bytes: 131_072,
+            used: true,
+            ..Default::default()
+        });
+        // Event 10: CopyBufferRegion(dst=#21, dst_off=0, src=#20, src_off=0, bytes=4096)
+        cap.events.push(db::Event {
+            seq: 10,
+            kind: "copy",
+            call: "CopyBufferRegion",
+            args: json!([21, 0, 20, 0, 4096]).to_string(),
+            reads: vec![20],
+            writes: vec![21],
+            ..Default::default()
+        });
+        // Event 11 (draw 1): Dispatch reading srv:0 (#21 legit zero), srv:1 (#22 tile 1 unmapped), srv:2 (empty slot), srv:3 (missing)
+        cap.events.push(db::Event {
+            seq: 11,
+            kind: "dispatch",
+            call: "Dispatch",
+            draw: Some(1),
+            args: "[64,1,1]".into(),
+            reads: vec![21, 22],
+            ..Default::default()
+        });
+        cap.draws.push(db::Draw {
+            n: 1,
+            event: 11,
+            call: "Dispatch",
+            args: "[64,1,1]".into(),
+            shaders: [None, None, None, None, None, Some("cull0001".into())],
+            ..Default::default()
+        });
+        // srv:0 -> DEFAULT buffer #21 (offset 0, 4096 B) -> legitimately zero via CopyBufferRegion <- upload #20!
+        cap.draw_descriptors.push(db::DrawDescriptor {
+            draw: 1,
+            stage: "cs",
+            kind: "srv",
+            slot: 0,
+            space: 0,
+            parameter: 0,
+            resource: Some(21),
+            address: Some(0x4000_0000),
+            size: Some(4096),
+            ..Default::default()
+        });
+        // srv:1 -> RESERVED buffer #22 at offset 0x10000 (tile 1, which is UNMAPPED!)
+        cap.draw_descriptors.push(db::DrawDescriptor {
+            draw: 1,
+            stage: "cs",
+            kind: "srv",
+            slot: 1,
+            space: 0,
+            parameter: 0,
+            resource: Some(22),
+            address: Some(0x5001_0000),
+            size: Some(4096),
+            ..Default::default()
+        });
+        // srv:2 -> empty descriptor slot in heap #9 slot 7
+        cap.draw_descriptors.push(db::DrawDescriptor {
+            draw: 1,
+            stage: "cs",
+            kind: "srv",
+            slot: 2,
+            space: 0,
+            parameter: 0,
+            heap: Some(9),
+            heap_slot: Some(7),
+            flag: Some("empty"),
+            ..Default::default()
+        });
+
+        let frame = crate::d3d12::Frame {
+            objects: vec![
+                crate::d3d12::Object {
+                    id: 5,
+                    kind: "ID3D12Heap",
+                    device: 1,
+                    description: json!({
+                        "bytes": 65536,
+                        "heap_properties": {"type": 1, "cpu_page": 1, "memory_pool": 2}
+                    }),
+                },
+                crate::d3d12::Object {
+                    id: 20,
+                    kind: "ID3D12Resource",
+                    device: 1,
+                    description: json!({
+                        "dimension": 1, "width": 4096, "gpu_address": 0x3000_0000u64,
+                        "heap": 0, "heap_offset": 0,
+                        "heap_properties": {"type": 2, "cpu_page": 2, "memory_pool": 1}
+                    }),
+                },
+                crate::d3d12::Object {
+                    id: 21,
+                    kind: "ID3D12Resource",
+                    device: 1,
+                    description: json!({
+                        "dimension": 1, "width": 4096, "gpu_address": 0x4000_0000u64,
+                        "heap": 0, "heap_offset": 0,
+                        "heap_properties": {"type": 1, "cpu_page": 1, "memory_pool": 2}
+                    }),
+                },
+                crate::d3d12::Object {
+                    id: 22,
+                    kind: "ID3D12Resource",
+                    device: 1,
+                    description: json!({
+                        "dimension": 1, "width": 131_072, "gpu_address": 0x5000_0000u64,
+                        "heap": 0, "heap_offset": 0,
+                        "heap_properties": null
+                    }),
+                },
+            ],
+            submissions: vec![crate::d3d12::Submission {
+                id: 1,
+                queue: 100,
+                queue_seq: 1,
+                cpu_seq: 50,
+                lists: Vec::new(),
+                descriptors: Vec::new(),
+                uploads: vec![(20, json!({"offset": 0, "size": 4096, "blob": zero_key}))],
+            }],
+            tile_pages: vec![crate::d3d12::TilePages {
+                resource: 22,
+                cpu_seq: 10,
+                // Only tile 0 mapped to heap #5; tile 1 (0x10000..0x20000) is unmapped!
+                pages: Ok((json!({}), json!([[0, 1, 5, 0]]))),
+            }],
+            ..Default::default()
+        };
+        let proj = crate::d3d12::Projection::new(&frame.objects);
+        cap.d3d12 = Some(frame.finish(&mut db::Capture::default(), proj));
+
+        let db_path = dir.join("capture.db");
+        db::write(&db_path, &cap).unwrap();
+
+        // 1. srv:0 at event 11 -> legitimate_zero supplied by CopyBufferRegion from upload #20, placed in DEFAULT/L1_VRAM.
+        let q0 = ProbeQuery {
+            event: Some(11),
+            binding: BindingSelector::parse("srv:0").unwrap(),
+            follow_descriptor: false,
+            compare_bytes: 4096,
+            ..Default::default()
+        };
+        let r0 = &probe_capture::<fn(u64, usize) -> Result<Vec<u8>, String>>(
+            &db_path,
+            &q0,
+            &AliasMap::default(),
+            None,
+        )
+        .unwrap()[0];
+        assert_eq!(r0.resolved_view.binding_status, "bound");
+        assert_eq!(r0.resolved_view.resource, Some(21));
+        assert_eq!(r0.resolved_view.byte_offset, Some(0));
+        assert_eq!(r0.resolved_view.byte_length, Some(4096));
+        assert_eq!(r0.last_writer.kind, "copy_buffer_region");
+        assert_eq!(r0.last_writer.event, Some(10));
+        assert_eq!(r0.last_writer.source_resource, Some(20));
+        assert_eq!(r0.last_writer.upload_submission, Some(1));
+        assert_eq!(r0.content_verdict.verdict, "legitimate_zero");
+        assert_eq!(r0.d3d12_placement, "committed(DEFAULT/L1_VRAM/CPU_NONE)");
+
+        // 2. srv:1 at event 11 -> unmapped_sparse_tile (reserved #22 tile 1 unmapped).
+        let q1 = ProbeQuery {
+            event: Some(11),
+            binding: BindingSelector::parse("srv:1").unwrap(),
+            follow_descriptor: false,
+            compare_bytes: 4096,
+            ..Default::default()
+        };
+        let r1 = &probe_capture::<fn(u64, usize) -> Result<Vec<u8>, String>>(
+            &db_path,
+            &q1,
+            &AliasMap::default(),
+            None,
+        )
+        .unwrap()[0];
+        assert_eq!(r1.resolved_view.binding_status, "unmapped_sparse_tile");
+        assert_eq!(r1.content_verdict.verdict, "unmapped_sparse_tile");
+        assert_eq!(r1.last_writer.kind, "unmapped_tile");
+        assert_eq!(r1.d3d12_placement, "reserved(unmapped_tiles)");
+        let sp = r1.resolved_view.sparse_tiles.as_ref().unwrap();
+        assert_eq!((sp.first_tile, sp.mapped_tiles, sp.unmapped_tiles), (1, 0, 1));
+
+        // 3. srv:2 at event 11 -> missing_binding (empty_descriptor_slot).
+        let q2 = ProbeQuery {
+            event: Some(11),
+            binding: BindingSelector::parse("srv:2").unwrap(),
+            follow_descriptor: false,
+            ..Default::default()
+        };
+        let r2 = &probe_capture::<fn(u64, usize) -> Result<Vec<u8>, String>>(
+            &db_path,
+            &q2,
+            &AliasMap::default(),
+            None,
+        )
+        .unwrap()[0];
+        assert_eq!(r2.resolved_view.binding_status, "empty_descriptor_slot");
+        assert_eq!(r2.content_verdict.verdict, "missing_binding");
+
+        // 4. srv:3 at event 11 -> missing_binding (missing_root_arg).
+        let q3 = ProbeQuery {
+            event: Some(11),
+            binding: BindingSelector::parse("srv:3").unwrap(),
+            follow_descriptor: false,
+            ..Default::default()
+        };
+        let r3 = &probe_capture::<fn(u64, usize) -> Result<Vec<u8>, String>>(
+            &db_path,
+            &q3,
+            &AliasMap::default(),
+            None,
+        )
+        .unwrap()[0];
+        assert_eq!(r3.resolved_view.binding_status, "missing_root_arg");
+        assert_eq!(r3.content_verdict.verdict, "missing_binding");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
