@@ -15,3 +15,8 @@ git_release_enable = true
 git_release_name = "locum {{ version }}"
 # a draft until dist (release.yml) has attached the binaries and publishes it
 git_release_draft = true
+
+[[package]]
+# locum-cli depends on git-only iridia-* crates, so it is distributed via GitHub Releases (dist) rather than crates.io
+name = "locum-cli"
+publish = false
