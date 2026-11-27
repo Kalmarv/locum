@@ -7,8 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../README.md"
-# New crate: keep publish = false until first manual crates.io publish + trusted-publishing setup (CONTRIBUTING.md).
-publish = false
 keywords = ["direct3d", "d3d12", "memory", "etw", "vidmm"]
 categories = ["development-tools::debugging", "graphics"]
 
