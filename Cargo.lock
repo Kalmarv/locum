@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "locum"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "locum-capture",
  "locum-d3d11",
@@ -753,7 +753,7 @@ dependencies = [
 
 [[package]]
 name = "locum-capture"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "dxbc-reader 0.11.0",
  "dxil-reader 0.11.0",
@@ -770,7 +770,7 @@ dependencies = [
 
 [[package]]
 name = "locum-cli"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "clap",
  "dxcontainer 0.11.0",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "locum-d3d11"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "locum-capture",
  "windows",
@@ -804,7 +804,7 @@ dependencies = [
 
 [[package]]
 name = "locum-mem"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -814,32 +814,32 @@ dependencies = [
 
 [[package]]
 name = "locum-shim-d3d11"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "find-msvc-tools",
 ]
 
 [[package]]
 name = "locum-shim-d3d12"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "find-msvc-tools",
 ]
 
 [[package]]
 name = "locum-shim-dxgi"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "find-msvc-tools",
 ]
 
 [[package]]
 name = "locum-shim-nvapi64"
-version = "0.1.6"
+version = "0.2.0"
 
 [[package]]
 name = "locum-smoke"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "locum-capture",
  "locum-d3d11",
@@ -850,7 +850,7 @@ dependencies = [
 
 [[package]]
 name = "locum-smoke-d3d12"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "locum-capture",
  "rusqlite",

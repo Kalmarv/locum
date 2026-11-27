@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-27)
+
+- New crate `locum-mem` and `locum-cli mem` subcommands for out-of-process, zero-suspend Windows virtual memory,
+  D3DKMT, and `DxgKrnl` ETW diagnostics:
+  - `inspect`, `trace`, `etl`, and `diff`: placement reconciliation, `ALLOC_HIST` / `--alloc-size` lookups, and
+    handle-joined `DEMOTED_ALLOC` / `EVICTED_ALLOC` breakdowns with residency priority and create stacks.
+  - `timeline` and `flight`: QPC GPU/fence wait attribution, VidMm paging/demotion throughput, symbolized CPU stacks,
+    and a 10-second in-memory ETW ring that dumps on device removal (`0x887a0006`/TDR) or a 2 s submit stall.
+  - `etw-caps` and `probe`: non-admin ETW capability probe, and dispatch-scoped compute buffer probing (`dispatch-probe`
+    in `settings.txt`) comparing GPU bytes against CPU aliases.
 
 - Licence: locum is now under the MIT License (was GPL-3.0-or-later), so other projects of any licence can use and
   build on it.
