@@ -29,8 +29,36 @@ pub struct ModuleInfo {
 
 /// Captures the loaded module list of `pid` out-of-process with zero thread suspends.
 pub fn snapshot_process_modules(pid: u32) -> Result<Vec<ModuleInfo>, String> {
-    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) }
-        .map_err(|e| format!("CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid={pid}): {e}"))?;
+    // MSDN: CreateToolhelp32Snapshot(TH32CS_SNAPMODULE) returns ERROR_BAD_LENGTH (24) transiently
+    // when the target is loading/unloading a DLL; retry briefly.
+    let mut snap = None;
+    let mut last_err = None;
+    for _ in 0..8 {
+        match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) } {
+            Ok(h) => {
+                snap = Some(h);
+                break;
+            }
+            Err(e) => {
+                let code = e.code().0 as u32;
+                last_err = Some(e);
+                // HRESULT_FROM_WIN32(ERROR_BAD_LENGTH = 24) == 0x80070018
+                if code == 0x8007_0018 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    let snap = snap.ok_or_else(|| {
+        format!(
+            "CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, pid={pid}): {}",
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".into())
+        )
+    })?;
 
     let mut entry = MODULEENTRY32W {
         dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32,

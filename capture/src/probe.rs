@@ -517,6 +517,7 @@ fn format_heap_props(htype: Option<u64>, cpu_page: Option<u64>, pool: Option<u64
         Some(2) => "UPLOAD",
         Some(3) => "READBACK",
         Some(4) => "CUSTOM",
+        Some(5) => "GPU_UPLOAD",
         _ => "UNKNOWN",
     };
     let mut parts = vec![ty.to_string()];
@@ -553,11 +554,11 @@ fn describe_d3d12_placement(
                     .backing_heaps
                     .iter()
                     .map(|hid| match heaps.get(hid) {
-                        Some(h) => format!(
+                        Some(h) if h.heap_type.is_some() => format!(
                             "heap#{hid}:{}",
                             format_heap_props(h.heap_type, h.cpu_page, h.memory_pool)
                         ),
-                        None => format!("heap#{hid}"),
+                        _ => format!("heap#{hid}"),
                     })
                     .collect();
                 let state = if sp.unmapped_tiles == 0 {
@@ -572,13 +573,18 @@ fn describe_d3d12_placement(
     }
     if let Some(hid) = buf.heap {
         let off = buf.heap_offset.unwrap_or(0);
-        if let Some(h) = heaps.get(&hid) {
-            return format!(
-                "placed(heap#{hid}+{off:#x}, {})",
-                format_heap_props(h.heap_type, h.cpu_page, h.memory_pool)
-            );
-        }
-        return format!("placed(heap#{hid}+{off:#x})");
+        let props = heaps
+            .get(&hid)
+            .filter(|h| h.heap_type.is_some())
+            .map(|h| format_heap_props(h.heap_type, h.cpu_page, h.memory_pool))
+            .or_else(|| {
+                buf.heap_type
+                    .map(|_| format_heap_props(buf.heap_type, buf.cpu_page, buf.memory_pool))
+            });
+        return match props {
+            Some(p) => format!("placed(heap#{hid}+{off:#x}, {p})"),
+            None => format!("placed(heap#{hid}+{off:#x})"),
+        };
     }
     if buf.heap_type.is_some() {
         return format!(
@@ -1179,17 +1185,26 @@ where
 
                     // Check sparse/tiled mapping coverage for reserved resources as of this event's submission!
                     if buf.reserved {
-                        let range_for_tiles = view_len.max(avail_len as u64).max(1);
-                        let sp = inspect_sparse_tiles(conn, buf.resource, off, range_for_tiles, disp);
-                        if sp.mapped_tiles == 0 && sp.diagnostic.is_none() {
+                        let slice_len = (avail_len as u64).max(1);
+                        let view_range = view_len.max(slice_len);
+                        let sp_slice = inspect_sparse_tiles(conn, buf.resource, off, slice_len, disp);
+                        let sp = if view_range > slice_len {
+                            inspect_sparse_tiles(conn, buf.resource, off, view_range, disp)
+                        } else {
+                            sp_slice.clone()
+                        };
+                        if sp_slice.mapped_tiles == 0 && sp_slice.diagnostic.is_none() {
                             view.binding_status = "unmapped_sparse_tile".into();
                             view.binding_reason = Some(format!(
-                                "reserved resource #{} tiles {}..{} ({} tile(s)) are UNMAPPED at submission {:?} (GPU reads zero){}",
+                                "reserved resource #{} inspected tiles {}..{} ({} tile(s) at [{off:#x}, {:#x})) are UNMAPPED at submission {:?} (GPU reads zero; whole view has {}/{} tiles mapped){}",
                                 buf.resource,
-                                sp.first_tile,
-                                sp.first_tile + sp.tile_count,
-                                sp.tile_count,
+                                sp_slice.first_tile,
+                                sp_slice.first_tile + sp_slice.tile_count,
+                                sp_slice.tile_count,
+                                off.saturating_add(slice_len),
                                 disp.submission,
+                                sp.mapped_tiles,
+                                sp.tile_count,
                                 sp.last_tile_mapping
                                     .as_deref()
                                     .map(|m| format!("; last tile op: {m}"))
@@ -1198,12 +1213,15 @@ where
                         } else if sp.unmapped_tiles > 0 && sp.diagnostic.is_none() {
                             view.binding_status = "partially_mapped_sparse_tile".into();
                             view.binding_reason = Some(format!(
-                                "reserved resource #{} has {}/{} tiles mapped ({} unmapped) covering [{off:#x}, {:#x})",
+                                "reserved resource #{} has {}/{} tiles mapped ({} unmapped) covering [{off:#x}, {:#x}); inspected slice [{off:#x}, {:#x}) has {}/{} mapped",
                                 buf.resource,
                                 sp.mapped_tiles,
                                 sp.tile_count,
                                 sp.unmapped_tiles,
-                                off.saturating_add(range_for_tiles),
+                                off.saturating_add(view_range),
+                                off.saturating_add(slice_len),
+                                sp_slice.mapped_tiles,
+                                sp_slice.tile_count,
                             ));
                         }
                         view.sparse_tiles = Some(sp);
