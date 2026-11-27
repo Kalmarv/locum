@@ -1942,8 +1942,8 @@ impl TimelineBuilder {
                     wait_kind: None,
                 });
             }
-            // VidMm Paging & Residency events (skip DC_Start=3 / DC_Stop=4 rundown snapshots!)
-            47 | 71 | 73 | 74 | 242 | 320 | 321 | 338 | 374 => {
+            // VidMm Paging & Residency events (drop id=374 allocation rundown; also skip DC_Start=3 / DC_Stop=4 rundown snapshots)
+            47 | 71 | 73 | 74 | 242 | 320 | 321 | 338 => {
                 if matches!(opcode, 3 | 4) {
                     return;
                 }
@@ -1965,12 +1965,12 @@ impl TimelineBuilder {
                     71 => "AllocFault",
                     47 => "Migrate",
                     242 => "ResetBacking",
-                    320 | 338 | 374 => "MakeResident",
+                    320 | 338 => "MakeResident",
                     321 => "VidMmEvict",
                     _ => "Paging",
                 };
                 let stack = extract_inline_stack(rec);
-                let is_wait = matches!(id, 320 | 338 | 374);
+                let is_wait = matches!(id, 320 | 338);
                 if is_wait {
                     self.record_wait_acc(hdr_tid, "vidmm_make_resident", None, None, true);
                 }

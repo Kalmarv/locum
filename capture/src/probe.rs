@@ -824,6 +824,10 @@ pub struct ResolvedView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub byte_length: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspected_byte_offset: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspected_byte_length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub resource_width: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stride: Option<u32>,
@@ -885,6 +889,18 @@ pub struct ByteComparison {
     pub first_mismatch_detail: Option<String>,
 }
 
+/// Earlier pre-write snapshot bytes (e.g. `first-use` or prior upload/copy) exposed separately
+/// when execution-time bytes are unavailable because a subsequent unrecorded GPU write could overlap the slice.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EarlierSnapshot {
+    pub sample_point: String,
+    pub inspected_bytes: usize,
+    pub nonzero_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_nonzero_offset: Option<usize>,
+    pub hex_preview: String,
+}
+
 /// Full result of probing one compute dispatch or draw event (including view, last-writer, placement, and optional CPU-alias diff).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DispatchProbeResult {
@@ -892,6 +908,8 @@ pub struct DispatchProbeResult {
     pub resolved_view: ResolvedView,
     pub last_writer: LastWriterInfo,
     pub content_verdict: ContentVerdict,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub earlier_snapshot: Option<EarlierSnapshot>,
     pub d3d12_placement: String,
     pub observed_placement: String,
     pub descriptor_source: String,
@@ -1035,11 +1053,13 @@ where
         {
             res.gpu_sample_point = live.sample_point.clone();
             res.gpu_unavailable_reason = None;
+            res.earlier_snapshot = None;
             res.content_verdict = classify_content(
                 &res.resolved_view,
                 Some(&gbytes),
                 query.compare_bytes,
                 &res.last_writer,
+                None,
                 None,
             );
             let cpu_bytes = live.cpu_bytes_blob.as_deref().and_then(|k| blobs.get(k).ok());
@@ -1088,6 +1108,8 @@ where
         gpu_va: None,
         byte_offset: None,
         byte_length: None,
+        inspected_byte_offset: None,
+        inspected_byte_length: None,
         resource_width: None,
         stride: None,
         format: None,
@@ -1237,6 +1259,7 @@ where
         detail: "no resolved target resource".into(),
     };
     let mut d3d12_placement = "unknown".to_string();
+    let mut earlier_snapshot: Option<EarlierSnapshot> = None;
 
     let (target_resource, target_offset, target_buffer_width, gpu_bytes, gpu_sample_point, gpu_unavail) =
         match target_va_opt {
@@ -1268,6 +1291,8 @@ where
                     view.gpu_va = Some(va);
                     view.byte_offset = Some(off);
                     view.byte_length = Some(view_len);
+                    view.inspected_byte_offset = Some(off);
+                    view.inspected_byte_length = Some(avail_len as u64);
                     view.resource_width = Some(buf.width);
 
                     // Check sparse/tiled mapping coverage for reserved resources as of this event's submission!
@@ -1355,7 +1380,7 @@ where
                             Some(why),
                         )
                     } else {
-                        let (bytes, sp, note, lw) = read_buffer_with_provenance(
+                        let read = read_buffer_with_provenance(
                             conn,
                             blobs,
                             live_buffers,
@@ -1364,8 +1389,24 @@ where
                             avail_len as u64,
                             disp,
                         );
-                        last_writer = lw;
-                        (Some(buf.resource), Some(off), Some(buf.width), bytes, sp, note)
+                        last_writer = read.last_writer;
+                        if let Some(ref eb) = read.earlier_snapshot_bytes {
+                            earlier_snapshot = Some(summarize_earlier_snapshot(
+                                eb,
+                                query.compare_bytes,
+                                read.earlier_snapshot_sample_point
+                                    .as_deref()
+                                    .unwrap_or("earlier snapshot"),
+                            ));
+                        }
+                        (
+                            Some(buf.resource),
+                            Some(off),
+                            Some(buf.width),
+                            read.bytes,
+                            read.sample_point,
+                            read.unavailable_reason,
+                        )
                     }
                 }
             },
@@ -1377,6 +1418,7 @@ where
         query.compare_bytes,
         &last_writer,
         gpu_unavail.as_deref(),
+        earlier_snapshot.as_ref(),
     );
 
     // Step 3: Resolve CPU alias VA from alias_map / sidecar_visible and read N CPU bytes!
@@ -1461,6 +1503,7 @@ where
         resolved_view: view,
         last_writer,
         content_verdict,
+        earlier_snapshot,
         d3d12_placement,
         observed_placement,
         descriptor_source: desc_source,
@@ -1485,12 +1528,40 @@ where
     }
 }
 
+fn summarize_earlier_snapshot(bytes: &[u8], limit_bytes: usize, sample_point: &str) -> EarlierSnapshot {
+    let n = bytes.len().min(limit_bytes);
+    let mut nonzero = 0usize;
+    let mut first_nz = None;
+    for (i, &b) in bytes[..n].iter().enumerate() {
+        if b != 0 {
+            nonzero += 1;
+            if first_nz.is_none() {
+                first_nz = Some(i);
+            }
+        }
+    }
+    let hex_preview: String = bytes[..n]
+        .iter()
+        .take(32)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join("");
+    EarlierSnapshot {
+        sample_point: sample_point.to_string(),
+        inspected_bytes: n,
+        nonzero_bytes: nonzero,
+        first_nonzero_offset: first_nz,
+        hex_preview,
+    }
+}
+
 fn classify_content(
     view: &ResolvedView,
     gpu_bytes: Option<&[u8]>,
     limit_bytes: usize,
     last_writer: &LastWriterInfo,
     unavail: Option<&str>,
+    earlier_snapshot: Option<&EarlierSnapshot>,
 ) -> ContentVerdict {
     if view.binding_status == "unmapped_sparse_tile" {
         return ContentVerdict {
@@ -1518,7 +1589,10 @@ fn classify_content(
             ),
         };
     }
-    if let Some(bytes) = gpu_bytes {
+    if let Some(bytes) = gpu_bytes
+        && unavail.is_none()
+        && last_writer.kind != "unrecorded_gpu_write"
+    {
         let n = bytes.len().min(limit_bytes);
         let mut nonzero = 0usize;
         let mut first_nz = None;
@@ -1556,16 +1630,25 @@ fn classify_content(
             }
         }
     } else {
+        let earlier_note = earlier_snapshot
+            .map(|es| {
+                format!(
+                    "; earlier snapshot [{}] had {}/{} non-zero bytes (hex={})",
+                    es.sample_point, es.nonzero_bytes, es.inspected_bytes, es.hex_preview
+                )
+            })
+            .unwrap_or_default();
         ContentVerdict {
             verdict: "bytes_unavailable".into(),
             inspected_bytes: 0,
             nonzero_bytes: 0,
             first_nonzero_offset: None,
             summary: format!(
-                "valid bound view, but bytes are unavailable ({}); last writer: {} ({})",
+                "valid bound view, but execution-time bytes are unavailable ({}); last writer: {} ({}){}",
                 unavail.unwrap_or("not captured"),
                 last_writer.kind,
                 last_writer.detail,
+                earlier_note,
             ),
         }
     }
@@ -1784,8 +1867,24 @@ fn read_and_decode_at_va(
     // Optional 2-level slot-index indirection: read u32 slot index at `raw_va`, then read the
     // guest view at `indirect_heap_va + slot_index * indirect_stride`!
     if let Some(heap_base) = layout.indirect_heap_va {
-        let (slot_opt, sp1, note1, _lw1) =
-            read_buffer_with_provenance(conn, blobs, live_buffers, buf, off, 4, disp);
+        let r1 = read_buffer_with_provenance(conn, blobs, live_buffers, buf, off, 4, disp);
+        let (slot_opt, sp1, note1) = match (r1.bytes, r1.earlier_snapshot_bytes) {
+            (Some(b), _) => (Some(b), r1.sample_point, r1.unavailable_reason),
+            (None, Some(eb)) => (
+                Some(eb),
+                format!(
+                    "{} [UNVERIFIED: {}]",
+                    r1.earlier_snapshot_sample_point
+                        .as_deref()
+                        .unwrap_or("earlier-snapshot"),
+                    r1.unavailable_reason
+                        .as_deref()
+                        .unwrap_or("tainted by earlier unrecorded write")
+                ),
+                r1.unavailable_reason,
+            ),
+            (None, None) => (None, r1.sample_point, r1.unavailable_reason),
+        };
         let Some(slot_bytes) = slot_opt else {
             return (source_label, sp1, note1, None, None);
         };
@@ -1822,8 +1921,24 @@ fn read_and_decode_at_va(
             );
         };
         let view_len = layout.indirect_view_size.max(8) as u64;
-        let (view_opt, sp2, note2, _lw2) =
-            read_buffer_with_provenance(conn, blobs, live_buffers, vbuf, voff, view_len, disp);
+        let r2 = read_buffer_with_provenance(conn, blobs, live_buffers, vbuf, voff, view_len, disp);
+        let (view_opt, sp2, note2) = match (r2.bytes, r2.earlier_snapshot_bytes) {
+            (Some(b), _) => (Some(b), r2.sample_point, r2.unavailable_reason),
+            (None, Some(eb)) => (
+                Some(eb),
+                format!(
+                    "{} [UNVERIFIED: {}]",
+                    r2.earlier_snapshot_sample_point
+                        .as_deref()
+                        .unwrap_or("earlier-snapshot"),
+                    r2.unavailable_reason
+                        .as_deref()
+                        .unwrap_or("tainted by earlier unrecorded write")
+                ),
+                r2.unavailable_reason,
+            ),
+            (None, None) => (None, r2.sample_point, r2.unavailable_reason),
+        };
         return match view_opt {
             Some(vraw) => {
                 let mut dec = decode_raw_descriptor(&vraw, layout, live_buffers);
@@ -1836,7 +1951,7 @@ fn read_and_decode_at_va(
         };
     }
 
-    let (raw_opt, sp, note, _lw) = read_buffer_with_provenance(
+    let r = read_buffer_with_provenance(
         conn,
         blobs,
         live_buffers,
@@ -1845,6 +1960,23 @@ fn read_and_decode_at_va(
         layout.desc_size.max(8) as u64,
         disp,
     );
+    let (raw_opt, sp, note) = match (r.bytes, r.earlier_snapshot_bytes) {
+        (Some(b), _) => (Some(b), r.sample_point, r.unavailable_reason),
+        (None, Some(eb)) => (
+            Some(eb),
+            format!(
+                "{} [UNVERIFIED: {}]",
+                r.earlier_snapshot_sample_point
+                    .as_deref()
+                    .unwrap_or("earlier-snapshot"),
+                r.unavailable_reason
+                    .as_deref()
+                    .unwrap_or("tainted by earlier unrecorded write")
+            ),
+            r.unavailable_reason,
+        ),
+        (None, None) => (None, r.sample_point, r.unavailable_reason),
+    };
     match raw_opt {
         Some(raw) => {
             let dec = decode_raw_descriptor(&raw, layout, live_buffers);
@@ -1853,6 +1985,22 @@ fn read_and_decode_at_va(
         }
         None => (source_label, sp, note, None, None),
     }
+}
+
+/// Result of reading a buffer slice with write-provenance tracking.
+pub struct BufferReadResult {
+    /// Verified bytes at execution time (`None` if missing or invalidated by an overlapping unrecorded write).
+    pub bytes: Option<Vec<u8>>,
+    /// Sample point of `bytes` (or `"unavailable..."`).
+    pub sample_point: String,
+    /// Reason why execution-time bytes are unavailable.
+    pub unavailable_reason: Option<String>,
+    /// Earlier pre-write snapshot bytes preserved separately when a subsequent unrecorded write tainted the slice.
+    pub earlier_snapshot_bytes: Option<Vec<u8>>,
+    /// Sample point of `earlier_snapshot_bytes`.
+    pub earlier_snapshot_sample_point: Option<String>,
+    /// Last writer info.
+    pub last_writer: LastWriterInfo,
 }
 
 /// Reads `[offset, offset + len)` of `buf` as of `disp.event` (legacy wrapper returning `(bytes, sample_point, note)`).
@@ -1865,9 +2013,8 @@ pub fn read_buffer_at_dispatch(
     len: u64,
     disp: &ComputeDispatchInfo,
 ) -> (Option<Vec<u8>>, String, Option<String>) {
-    let (bytes, sp, note, _lw) =
-        read_buffer_with_provenance(conn, blobs, live_buffers, buf, offset, len, disp);
-    (bytes, sp, note)
+    let r = read_buffer_with_provenance(conn, blobs, live_buffers, buf, offset, len, disp);
+    (r.bytes, r.sample_point, r.unavailable_reason)
 }
 
 /// Looks up the latest `d12_upload_versions` run for `(resource, submission <= max_sub)` covering `[offset, offset + len)`.
@@ -1927,7 +2074,8 @@ fn event_submission(conn: &Connection, event: u64) -> Option<u64> {
     .ok()
 }
 
-/// Reads `[offset, offset + len)` of `buf` as of `disp.event`, returning `(bytes, sample_point, note, last_writer)`.
+/// Reads `[offset, offset + len)` of `buf` as of `disp.event`, returning verified execution-time bytes
+/// (or `None` + separate earlier snapshot when invalidated by a potentially overlapping unrecorded write).
 pub fn read_buffer_with_provenance(
     conn: &Connection,
     blobs: &Blobs,
@@ -1936,7 +2084,7 @@ pub fn read_buffer_with_provenance(
     offset: u64,
     len: u64,
     disp: &ComputeDispatchInfo,
-) -> (Option<Vec<u8>>, String, Option<String>, LastWriterInfo) {
+) -> BufferReadResult {
     // Track the latest UAV `results` row for this resource strictly before `disp.event`.
     let mut latest_uav: Option<(u64, String, u64, u64, String, Vec<u8>)> = None;
     let has_results: bool = conn
@@ -2066,7 +2214,22 @@ pub fn read_buffer_with_provenance(
     // Apply in-frame writes (`events` + `event_resources` WHERE `access='write'` AND `seq < disp.event`) in exact chronological order!
     let mut copy_count = 0usize;
     let mut unfollowed_write: Option<String> = None;
+    let mut earlier_snapshot_bytes: Option<Vec<u8>> = None;
+    let mut earlier_snapshot_sample_point: Option<String> = None;
     let uav_ev = latest_uav.as_ref().map(|u| u.0).unwrap_or(0);
+
+    let taint = |why: String,
+                 base_bytes: &mut Option<Vec<u8>>,
+                 sample_point: &str,
+                 earlier_b: &mut Option<Vec<u8>>,
+                 earlier_sp: &mut Option<String>,
+                 unfollowed: &mut Option<String>| {
+        if let Some(b) = base_bytes.take() {
+            *earlier_b = Some(b);
+            *earlier_sp = Some(sample_point.to_string());
+        }
+        *unfollowed = Some(why);
+    };
 
     if let Ok(mut stmt) = conn.prepare(
         "SELECT e.seq, e.call, e.args FROM events e JOIN event_resources er ON er.event = e.seq \
@@ -2085,6 +2248,8 @@ pub fn read_buffer_with_provenance(
             {
                 base_bytes = Some(ubytes.clone());
                 unfollowed_write = None;
+                earlier_snapshot_bytes = None;
+                earlier_snapshot_sample_point = None;
                 sample_point = format!("before-dispatch (from UAV result at event {ev})");
                 last_writer = LastWriterInfo {
                     kind: "uav_result".into(),
@@ -2146,12 +2311,19 @@ pub fn read_buffer_with_provenance(
                         "copy_resource"
                     };
                     if let Some((src_bytes, uv_sub, src_blob)) = got_src {
-                        let dst = base_bytes.get_or_insert_with(|| vec![0u8; len as usize]);
-                        let d_lo = (lo - offset) as usize;
-                        let d_hi = (d_lo + src_bytes.len()).min(dst.len());
-                        dst[d_lo..d_hi].copy_from_slice(&src_bytes[..d_hi - d_lo]);
-                        copy_count += 1;
-                        unfollowed_write = None;
+                        let covers_full = lo == offset && hi == offset.saturating_add(len);
+                        if covers_full || unfollowed_write.is_none() {
+                            let dst = base_bytes.get_or_insert_with(|| vec![0u8; len as usize]);
+                            let d_lo = (lo - offset) as usize;
+                            let d_hi = (d_lo + src_bytes.len()).min(dst.len());
+                            dst[d_lo..d_hi].copy_from_slice(&src_bytes[..d_hi - d_lo]);
+                            copy_count += 1;
+                            if covers_full {
+                                unfollowed_write = None;
+                                earlier_snapshot_bytes = None;
+                                earlier_snapshot_sample_point = None;
+                            }
+                        }
                         last_writer = LastWriterInfo {
                             kind: kind.into(),
                             event: Some(seq),
@@ -2176,7 +2348,14 @@ pub fn read_buffer_with_provenance(
                             "{call} at event {seq} wrote [{lo:#x}, {hi:#x}) from resource #{:?} whose source bytes were not captured",
                             src_id.unwrap_or(0)
                         );
-                        unfollowed_write = Some(why.clone());
+                        taint(
+                            why.clone(),
+                            &mut base_bytes,
+                            &sample_point,
+                            &mut earlier_snapshot_bytes,
+                            &mut earlier_snapshot_sample_point,
+                            &mut unfollowed_write,
+                        );
                         last_writer = LastWriterInfo {
                             kind: kind.into(),
                             event: Some(seq),
@@ -2194,7 +2373,14 @@ pub fn read_buffer_with_provenance(
             } else if call.starts_with("ClearUnorderedAccessView") {
                 let copy_sub = event_submission(conn, seq);
                 let why = format!("{call} at event {seq} cleared resource #{}", buf.resource);
-                unfollowed_write = Some(why.clone());
+                taint(
+                    why.clone(),
+                    &mut base_bytes,
+                    &sample_point,
+                    &mut earlier_snapshot_bytes,
+                    &mut earlier_snapshot_sample_point,
+                    &mut unfollowed_write,
+                );
                 last_writer = LastWriterInfo {
                     kind: "clear_uav".into(),
                     event: Some(seq),
@@ -2218,7 +2404,14 @@ pub fn read_buffer_with_provenance(
                     "written earlier by {call} at event {seq} without a captured results row covering [{offset:#x}, {:#x})",
                     offset.saturating_add(len)
                 );
-                unfollowed_write = Some(why.clone());
+                taint(
+                    why.clone(),
+                    &mut base_bytes,
+                    &sample_point,
+                    &mut earlier_snapshot_bytes,
+                    &mut earlier_snapshot_sample_point,
+                    &mut unfollowed_write,
+                );
                 last_writer = LastWriterInfo {
                     kind: "unrecorded_gpu_write".into(),
                     event: Some(seq),
@@ -2241,6 +2434,8 @@ pub fn read_buffer_with_provenance(
     {
         base_bytes = Some(ubytes);
         unfollowed_write = None;
+        earlier_snapshot_bytes = None;
+        earlier_snapshot_sample_point = None;
         sample_point = format!("before-dispatch (from UAV result at event {ev})");
         last_writer = LastWriterInfo {
             kind: "uav_result".into(),
@@ -2260,21 +2455,39 @@ pub fn read_buffer_with_provenance(
         };
     }
 
-    if copy_count > 0 && last_writer.kind.starts_with("copy_") {
+    if copy_count > 0 && last_writer.kind.starts_with("copy_") && unfollowed_write.is_none() {
         sample_point = format!(
             "before-dispatch (composed over {copy_count} copy op(s); last at event {})",
             last_writer.event.unwrap_or(0)
         );
     }
-    if base_bytes.is_some() {
-        (base_bytes, sample_point, unfollowed_write, last_writer)
-    } else {
-        (
-            None,
-            "unavailable".into(),
-            missing_reason.or(unfollowed_write),
+    if unfollowed_write.is_some() {
+        BufferReadResult {
+            bytes: None,
+            sample_point: "unavailable (tainted by earlier unrecorded write)".into(),
+            unavailable_reason: unfollowed_write,
+            earlier_snapshot_bytes: earlier_snapshot_bytes.or(base_bytes),
+            earlier_snapshot_sample_point,
             last_writer,
-        )
+        }
+    } else if base_bytes.is_some() {
+        BufferReadResult {
+            bytes: base_bytes,
+            sample_point,
+            unavailable_reason: None,
+            earlier_snapshot_bytes: None,
+            earlier_snapshot_sample_point: None,
+            last_writer,
+        }
+    } else {
+        BufferReadResult {
+            bytes: None,
+            sample_point: "unavailable".into(),
+            unavailable_reason: missing_reason,
+            earlier_snapshot_bytes: None,
+            earlier_snapshot_sample_point: None,
+            last_writer,
+        }
     }
 }
 
@@ -3375,6 +3588,164 @@ mod tests {
         assert_eq!(r.target_offset, Some(0x400));
         assert_eq!(r.content_verdict.verdict, "non_zero");
         assert_eq!(r.content_verdict.nonzero_bytes, 256);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unrecorded_overlapping_dispatch_returns_bytes_unavailable_with_earlier_snapshot_while_disjoint_cites_actual_writer()
+     {
+        let dir = std::env::temp_dir().join(format!("locum_probe_taint_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blobs = Blobs::new(dir.join("blobs"));
+
+        // Resource 10 (GPU VA 0x4_0000_0000, 4096 B): first-use has 0x0000_8bf6 at +0x120 and 0x11223344 at +0x500.
+        let mut buf = vec![0u8; 4096];
+        buf[0x120..0x124].copy_from_slice(&0x0000_8bf6u32.to_le_bytes());
+        buf[0x500..0x504].copy_from_slice(&0x1122_3344u32.to_le_bytes());
+        let buf_key = hash::key(&buf);
+        blobs.put(&buf_key, &buf).unwrap();
+
+        let mut cap = db::Capture::default();
+        cap.meta("api", "d3d12");
+        cap.meta("blobs", dir.join("blobs").display());
+        cap.resources.push(db::Resource {
+            id: 10,
+            kind: "buffer",
+            width: 4096,
+            bytes: 4096,
+            used: true,
+            content: Some(buf_key),
+            content_source: Some("first-use"),
+            ..Default::default()
+        });
+        // Earlier Dispatch at event 13094 (draw 270) wrote resource #10 with UAV covering ONLY [0x0, 0x300)
+        // -> overlaps +0x120..+0x124, strictly disjoint from +0x500..+0x504!
+        cap.events.push(db::Event {
+            seq: 13094,
+            kind: "dispatch",
+            call: "Dispatch",
+            draw: Some(270),
+            args: "[1,1,1]".into(),
+            writes: vec![10],
+            ..Default::default()
+        });
+        cap.draws.push(db::Draw {
+            n: 270,
+            event: 13094,
+            call: "Dispatch",
+            args: "[1,1,1]".into(),
+            shaders: [None, None, None, None, None, Some("deadbeef".into())],
+            ..Default::default()
+        });
+        cap.draw_descriptors.push(db::DrawDescriptor {
+            draw: 270,
+            stage: "cs",
+            kind: "uav",
+            slot: 0,
+            space: 0,
+            parameter: 0,
+            resource: Some(10),
+            address: Some(0x4_0000_0000),
+            size: Some(0x300),
+            ..Default::default()
+        });
+
+        // Target Dispatch at event 13106 (draw 271) binds full resource #10 at uav:2.
+        cap.draws.push(db::Draw {
+            n: 271,
+            event: 13106,
+            call: "Dispatch",
+            args: "[1,1,1]".into(),
+            shaders: [None, None, None, None, None, Some("1e38f9df".into())],
+            ..Default::default()
+        });
+        cap.draw_descriptors.push(db::DrawDescriptor {
+            draw: 271,
+            stage: "cs",
+            kind: "uav",
+            slot: 2,
+            space: 0,
+            parameter: 2,
+            resource: Some(10),
+            address: Some(0x4_0000_0000),
+            size: Some(4096),
+            ..Default::default()
+        });
+        let frame = crate::d3d12::Frame {
+            objects: vec![crate::d3d12::Object {
+                id: 10,
+                kind: "ID3D12Resource",
+                device: 1,
+                description: json!({"dimension": 1, "width": 4096, "gpu_address": 0x4_0000_0000u64, "heap_properties": {"type": 1}}),
+            }],
+            ..Default::default()
+        };
+        let proj = crate::d3d12::Projection::new(&frame.objects);
+        cap.d3d12 = Some(frame.finish(&mut db::Capture::default(), proj));
+        let db_path = dir.join("capture.db");
+        db::write(&db_path, &cap).unwrap();
+
+        // Case A: probe 4 bytes at +0x120 (overlapped by Dispatch 13094's UAV [0x0, 0x300))
+        // -> MUST return bytes_unavailable at execution, expose earlier first-use snapshot separately,
+        //    and record inspected [0x120, 0x124) separately from bound view [0x120, 0x1000).
+        let q_overlap = ProbeQuery {
+            event: Some(13106),
+            binding: BindingSelector::parse("uav:2").unwrap(),
+            layout: DescriptorLayout {
+                desc_offset: 0x120,
+                ..Default::default()
+            },
+            follow_descriptor: false,
+            compare_bytes: 4,
+            ..Default::default()
+        };
+        let r_ov = &probe_capture::<fn(u64, usize) -> Result<Vec<u8>, String>>(
+            &db_path,
+            &q_overlap,
+            &AliasMap::default(),
+            None,
+        )
+        .unwrap()[0];
+        assert_eq!(r_ov.content_verdict.verdict, "bytes_unavailable");
+        assert_eq!(r_ov.content_verdict.inspected_bytes, 0);
+        assert_eq!(r_ov.last_writer.kind, "unrecorded_gpu_write");
+        assert_eq!(r_ov.last_writer.event, Some(13094));
+        assert_eq!(r_ov.resolved_view.inspected_byte_offset, Some(0x120));
+        assert_eq!(r_ov.resolved_view.inspected_byte_length, Some(4));
+        assert_eq!(r_ov.resolved_view.byte_offset, Some(0x120));
+        assert_eq!(r_ov.resolved_view.byte_length, Some(4096 - 0x120));
+        let snap = r_ov.earlier_snapshot.as_ref().expect("earlier snapshot exposed");
+        assert_eq!(snap.inspected_bytes, 4);
+        assert_eq!(snap.nonzero_bytes, 2);
+        assert_eq!(snap.hex_preview, "f68b0000");
+
+        // Case B: probe 4 bytes at +0x500 (strictly disjoint from Dispatch 13094's UAV [0x0, 0x300))
+        // -> MUST skip Dispatch 13094, cite actual supplying writer (first_use_initial), and return non_zero!
+        let q_disjoint = ProbeQuery {
+            event: Some(13106),
+            binding: BindingSelector::parse("uav:2").unwrap(),
+            layout: DescriptorLayout {
+                desc_offset: 0x500,
+                ..Default::default()
+            },
+            follow_descriptor: false,
+            compare_bytes: 4,
+            ..Default::default()
+        };
+        let r_dj = &probe_capture::<fn(u64, usize) -> Result<Vec<u8>, String>>(
+            &db_path,
+            &q_disjoint,
+            &AliasMap::default(),
+            None,
+        )
+        .unwrap()[0];
+        assert_eq!(r_dj.content_verdict.verdict, "non_zero");
+        assert_eq!(r_dj.content_verdict.inspected_bytes, 4);
+        assert_eq!(r_dj.content_verdict.nonzero_bytes, 4);
+        assert_eq!(r_dj.last_writer.kind, "first_use_initial");
+        assert!(r_dj.earlier_snapshot.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

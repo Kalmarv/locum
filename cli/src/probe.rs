@@ -297,10 +297,14 @@ pub fn format_probe_text(results: &[DispatchProbeResult], summary_only: bool) ->
             .resource
             .map(|id| format!("#{id}"))
             .unwrap_or_else(|| "none".into());
-        let range_s = match (v.byte_offset, v.byte_length) {
+        let view_range_s = match (v.byte_offset, v.byte_length) {
             (Some(off), Some(len)) => format!("[{off:#x}, {:#x}) ({len} B)", off.saturating_add(len)),
             (Some(off), None) => format!("[{off:#x}, ?)"),
             _ => "-".into(),
+        };
+        let inspected_range_s = match (v.inspected_byte_offset, v.inspected_byte_length) {
+            (Some(off), Some(len)) => format!("[{off:#x}, {:#x}) ({len} B)", off.saturating_add(len)),
+            _ => view_range_s.clone(),
         };
         let writer_at = match (lw.event, lw.submission) {
             (Some(ev), Some(sub)) => format!("{}@ev={ev}/sub={sub}", lw.kind),
@@ -310,14 +314,15 @@ pub fn format_probe_text(results: &[DispatchProbeResult], summary_only: bool) ->
         };
         let _ = writeln!(
             out,
-            "VERDICT event={:<6} draw={:<5} call={:<18} verdict={:<21} binding={:<22} res={:<6} range={:<26} writer={:<28} placement={}",
+            "VERDICT event={:<6} draw={:<5} call={:<18} verdict={:<21} binding={:<22} res={:<6} inspected={:<26} view={:<28} writer={:<28} placement={}",
             r.dispatch.event,
             r.dispatch.draw,
             r.dispatch.call,
             cv.verdict,
             v.binding_status,
             res_s,
-            range_s,
+            inspected_range_s,
+            view_range_s,
             writer_at,
             r.observed_placement,
         );
@@ -359,10 +364,11 @@ pub fn format_probe_text(results: &[DispatchProbeResult], summary_only: bool) ->
         );
         let _ = writeln!(
             out,
-            "     Byte Range       : res={} gpu_va={} range={} buf_width={} stride={} fmt={}",
+            "     Byte Range       : res={} gpu_va={} inspected={} view={} buf_width={} stride={} fmt={}",
             res_s,
             v.gpu_va.map(|a| format!("{a:#x}")).unwrap_or_else(|| "-".into()),
-            range_s,
+            inspected_range_s,
+            view_range_s,
             v.resource_width
                 .map(|w| format!("{w} B"))
                 .unwrap_or_else(|| "-".into()),
@@ -407,6 +413,19 @@ pub fn format_probe_text(results: &[DispatchProbeResult], summary_only: bool) ->
             cv.verdict.to_ascii_uppercase(),
             cv.summary,
         );
+        if let Some(ref es) = r.earlier_snapshot {
+            let _ = writeln!(
+                out,
+                "     Earlier Snapshot : {} ({}/{} non-zero bytes{}, hex={}) [NOT execution-time bytes]",
+                es.sample_point,
+                es.nonzero_bytes,
+                es.inspected_bytes,
+                es.first_nonzero_offset
+                    .map(|o| format!(", first non-zero at +{o:#x}"))
+                    .unwrap_or_default(),
+                es.hex_preview,
+            );
+        }
         let _ = writeln!(
             out,
             "  3. Placement        : {} (vidmm={} | gpu_owner={} | cpu_owner={} | cpu_ws={})",
