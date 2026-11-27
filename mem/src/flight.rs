@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
 use windows::Win32::System::Diagnostics::Etw::{
     CloseTrace, EVENT_RECORD, EVENT_TRACE_LOGFILEW, OpenTraceW, PROCESS_TRACE_MODE_EVENT_RECORD,
-    PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace,
+    PROCESS_TRACE_MODE_RAW_TIMESTAMP, PROCESS_TRACE_MODE_REAL_TIME, PROCESSTRACE_HANDLE, ProcessTrace,
 };
 use windows::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::core::PWSTR;
@@ -113,7 +113,8 @@ pub fn run_flight_recorder(opts: FlightRecorderOptions) -> Result<TimelineReport
         let mut wide_name: Vec<u16> = consumer_name.encode_utf16().chain(std::iter::once(0)).collect();
         let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
         logfile.LoggerName = PWSTR(wide_name.as_mut_ptr());
-        logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+        logfile.Anonymous1.ProcessTraceMode =
+            PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
         logfile.Anonymous2.EventRecordCallback = Some(flight_event_cb);
         logfile.Context = (Arc::as_ptr(&consumer_shared) as *mut SharedRing).cast::<c_void>();
 

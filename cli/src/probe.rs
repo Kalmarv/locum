@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use clap::Args;
 use locum_capture::probe::{
-    AliasMap, BindingSelector, DescriptorLayout, DispatchProbeResult, ProbeQuery, probe_capture,
+    AliasMap, BindingSelector, DescriptorLayout, DispatchProbeResult, ProbeQuery, ShaderHashMap,
+    probe_capture,
 };
 use locum_mem::etw::parse_etl;
 use locum_mem::labels::LabelMap;
@@ -45,7 +46,19 @@ pub struct ProbeDescArgs {
     /// Optional byte offset of the buffer size field inside the raw descriptor.
     #[arg(long)]
     pub size_offset: Option<usize>,
-    /// Explicitly dereference a shader-decoded descriptor inside the bound buffer (auto-enabled when `--row-stride`, `--desc-offset`, `--table-offset`, `--va-offset`, or `--size-offset` is set).
+    /// Optional 2-level indirection heap base GPU VA (reads a u32 slot index at `row+desc_offset`, then decodes the guest view at `heap_va + slot_index * indirect_stride`, e.g. `0x4c610000`).
+    #[arg(long)]
+    pub indirect_heap_va: Option<String>,
+    /// Stride in bytes of entries in `--indirect-heap-va` (default 32).
+    #[arg(long, default_value = "32")]
+    pub indirect_stride: String,
+    /// Size in bytes of the indirect guest view to read and decode (default 16).
+    #[arg(long, default_value_t = 16)]
+    pub indirect_view_size: usize,
+    /// Optional window base GPU VA added to relative offsets decoded from a guest view.
+    #[arg(long)]
+    pub window_base: Option<String>,
+    /// Explicitly dereference a shader-decoded descriptor inside the bound buffer (auto-enabled when `--row-stride`, `--desc-offset`, `--table-offset`, `--va-offset`, `--size-offset`, or `--indirect-heap-va` is set).
     #[arg(long)]
     pub follow: bool,
     /// Do not dereference a descriptor inside the buffer; inspect the bound view directly (default when no descriptor layout offsets are given).
@@ -63,6 +76,9 @@ pub struct ProbeArgs {
     /// Compute or graphics shader hash prefix or debug name substring (e.g. `7700e4c3`).
     #[arg(long)]
     pub shader: Option<String>,
+    /// Optional guest-to-host shader hash map file (`guest_hash<TAB>host_hash` per line) so guest hashes match translated `draws.cs`.
+    #[arg(long)]
+    pub shader_map: Option<PathBuf>,
     /// Shader stage filter (`cs`, `vs`, `hs`, `ds`, `gs`, `ps`, `all`).
     #[arg(long)]
     pub stage: Option<String>,
@@ -114,6 +130,19 @@ pub fn run(args: ProbeArgs) -> Result<(), String> {
     let table_offset = parse_u64_arg("--table-offset", &args.desc.table_offset)?;
     let row_stride = parse_u64_arg("--row-stride", &args.desc.row_stride)?;
     let desc_offset = parse_u64_arg("--desc-offset", &args.desc.desc_offset)?;
+    let indirect_heap_va = args
+        .desc
+        .indirect_heap_va
+        .as_deref()
+        .map(|s| parse_u64_arg("--indirect-heap-va", s))
+        .transpose()?;
+    let indirect_stride = parse_u64_arg("--indirect-stride", &args.desc.indirect_stride)?;
+    let window_base = args
+        .desc
+        .window_base
+        .as_deref()
+        .map(|s| parse_u64_arg("--window-base", s))
+        .transpose()?;
     let layout = DescriptorLayout {
         table_offset,
         row_stride,
@@ -128,12 +157,17 @@ pub fn run(args: ProbeArgs) -> Result<(), String> {
         va_shift: args.desc.va_shift,
         size_offset: args.desc.size_offset,
         size_width: 4,
+        indirect_heap_va,
+        indirect_stride: indirect_stride.max(4),
+        indirect_view_size: args.desc.indirect_view_size.max(8),
+        window_base,
     };
     let has_indexed_layout = table_offset != 0
         || row_stride != 0
         || desc_offset != 0
         || args.desc.va_offset.is_some()
-        || args.desc.size_offset.is_some();
+        || args.desc.size_offset.is_some()
+        || indirect_heap_va.is_some();
     let follow_descriptor = if args.desc.no_follow {
         false
     } else if args.desc.follow {
@@ -141,8 +175,13 @@ pub fn run(args: ProbeArgs) -> Result<(), String> {
     } else {
         has_indexed_layout
     };
+    let shader_aliases = match (args.shader.as_deref(), args.shader_map.as_deref()) {
+        (Some(sh), Some(mp)) => ShaderHashMap::from_file(mp)?.expand(sh),
+        _ => Vec::new(),
+    };
     let query = ProbeQuery {
         shader: args.shader,
+        shader_aliases,
         draw: args.draw,
         event: args.event,
         stage: args.stage,
@@ -395,6 +434,15 @@ pub fn format_probe_text(results: &[DispatchProbeResult], summary_only: bool) ->
                 "  Descriptor Source   : {} [sample_point: {}]",
                 r.descriptor_source, r.descriptor_sample_point
             );
+            if let Some(slot_idx) = dec.slot_index {
+                let _ = writeln!(
+                    out,
+                    "  Indirect Slot Hop   : slot_index={slot_idx:#x} ({slot_idx}) -> view_va={}",
+                    dec.indirect_view_va
+                        .map(|a| format!("{a:#x}"))
+                        .unwrap_or_else(|| "-".into()),
+                );
+            }
             let _ = writeln!(out, "  Raw Descriptor Hex  : {}", dec.raw_hex);
             let words: Vec<String> = dec.words_u32.iter().map(|w| format!("{w:#010x}")).collect();
             let _ = writeln!(out, "  Raw Descriptor u32s : [{}]", words.join(", "));

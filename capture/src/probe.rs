@@ -345,6 +345,15 @@ pub struct DescriptorLayout {
     pub size_offset: Option<usize>,
     /// Width of the size field (4 or 8 bytes; default 4).
     pub size_width: usize,
+    /// Optional 2-level indirection: read a `u32` slot index at `byte_offset()`, then read the
+    /// guest view at `indirect_heap_va + slot_index * indirect_stride` (e.g. `0x4c610000 + 32 * 0x8bf6`).
+    pub indirect_heap_va: Option<u64>,
+    /// Stride in bytes of entries in `indirect_heap_va` (default 32).
+    pub indirect_stride: u64,
+    /// Size in bytes of the indirect guest view to read and decode (default 16).
+    pub indirect_view_size: usize,
+    /// Optional window base GPU VA added when decoding a relative offset inside a guest view.
+    pub window_base: Option<u64>,
 }
 
 impl Default for DescriptorLayout {
@@ -360,6 +369,10 @@ impl Default for DescriptorLayout {
             va_shift: 0,
             size_offset: None,
             size_width: 4,
+            indirect_heap_va: None,
+            indirect_stride: 32,
+            indirect_view_size: 16,
+            window_base: None,
         }
     }
 }
@@ -375,6 +388,10 @@ impl DescriptorLayout {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DecodedDescriptor {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indirect_view_va: Option<u64>,
     pub raw_hex: String,
     pub words_u32: Vec<u32>,
     pub gpu_va: Option<u64>,
@@ -409,20 +426,29 @@ pub fn decode_raw_descriptor(
     if let Some(off) = layout.va_offset {
         if let Some(slice) = raw.get(off..off + 8) {
             let word = u64::from_le_bytes(slice.try_into().unwrap());
-            let va = (word & layout.va_mask).wrapping_shl(layout.va_shift);
+            let mut va = (word & layout.va_mask).wrapping_shl(layout.va_shift);
+            if let Some(wb) = layout.window_base {
+                va = wb.saturating_add(va);
+            }
             let sz = layout.size_offset.and_then(read_size);
             return DecodedDescriptor {
+                slot_index: None,
+                indirect_view_va: None,
                 raw_hex,
                 words_u32,
                 gpu_va: (va != 0).then_some(va),
                 decoded_size: sz,
                 decode_note: format!(
-                    "explicit u64 at +{off:#x} (mask={:#x}, shift={})",
-                    layout.va_mask, layout.va_shift
+                    "explicit u64 at +{off:#x} (mask={:#x}, shift={}, window_base={:?})",
+                    layout.va_mask,
+                    layout.va_shift,
+                    layout.window_base.map(|w| format!("{w:#x}"))
                 ),
             };
         }
         return DecodedDescriptor {
+            slot_index: None,
+            indirect_view_va: None,
             raw_hex,
             words_u32,
             gpu_va: None,
@@ -431,15 +457,22 @@ pub fn decode_raw_descriptor(
         };
     }
 
-    // Auto-scan mode: try each 4-byte-aligned 64-bit word (raw, 48-bit masked, and << 8) against live GPU buffers.
+    // Auto-scan mode: try each 4-byte-aligned 64-bit word (raw, 48-bit masked, << 8, and window_base-relative) against live GPU buffers.
     let mut off = 0usize;
     while off + 8 <= raw.len() {
         let word = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap());
-        let candidates = [
+        let mut candidates = vec![
             (word, "raw u64"),
             (word & 0x0000_FFFF_FFFF_FFFF, "48-bit VA"),
             ((word & 0x0000_00FF_FFFF_FFFF) << 8, "40-bit<<8 VA"),
         ];
+        if let Some(wb) = layout.window_base {
+            candidates.push((wb.saturating_add(word & 0xFFFF_FFFF), "window_base+u32"));
+            candidates.push((
+                wb.saturating_add((word & 0xFFFF_FFFF) << 8),
+                "window_base+(u32<<8)",
+            ));
+        }
         for (cand, mode) in candidates {
             if cand != 0 && find_buffer(live_buffers, cand).is_some() {
                 let sz = layout.size_offset.and_then(read_size).or_else(|| {
@@ -448,6 +481,8 @@ pub fn decode_raw_descriptor(
                         .filter(|&v| v > 0)
                 });
                 return DecodedDescriptor {
+                    slot_index: None,
+                    indirect_view_va: None,
                     raw_hex,
                     words_u32,
                     gpu_va: Some(cand),
@@ -463,13 +498,61 @@ pub fn decode_raw_descriptor(
     let fallback_va = raw
         .get(0..8)
         .map(|s| u64::from_le_bytes(s.try_into().unwrap()))
-        .filter(|&v| v != 0);
+        .filter(|&v| v != 0)
+        .map(|v| layout.window_base.map_or(v, |wb| wb.saturating_add(v)));
     DecodedDescriptor {
+        slot_index: None,
+        indirect_view_va: None,
         raw_hex,
         words_u32,
         gpu_va: fallback_va,
         decoded_size: layout.size_offset.and_then(read_size),
         decode_note: "no word matched a live D3D12 buffer; fell back to u64 at +0x0".into(),
+    }
+}
+
+/// Guest shader hash -> translated host D3D12 `draws.cs` hash mapping (`--shader-map`).
+#[derive(Clone, Debug, Default)]
+pub struct ShaderHashMap {
+    pairs: Vec<(String, String)>,
+}
+
+impl ShaderHashMap {
+    pub fn from_file(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("reading shader map {}: {e}", path.display()))?;
+        Ok(Self::parse(&text))
+    }
+
+    /// Parses lines of `guest_hash<TAB/space>host_hash[...]` (comments `#` and blank lines ignored).
+    pub fn parse(text: &str) -> Self {
+        let mut pairs = Vec::new();
+        for raw in text.lines() {
+            let line = raw.split('#').next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() >= 2 {
+                pairs.push((cols[0].to_ascii_lowercase(), cols[1].to_ascii_lowercase()));
+            }
+        }
+        Self { pairs }
+    }
+
+    /// Expands `query` (e.g. guest hash `7700e4c3`) into all matching host/guest hashes.
+    pub fn expand(&self, query: &str) -> Vec<String> {
+        let q = query.trim().to_ascii_lowercase();
+        let mut out = vec![q.clone()];
+        for (a, b) in &self.pairs {
+            if (a.contains(&q) || q.contains(a)) && !out.contains(b) {
+                out.push(b.clone());
+            }
+            if (b.contains(&q) || q.contains(b)) && !out.contains(a) {
+                out.push(a.clone());
+            }
+        }
+        out
     }
 }
 
@@ -838,6 +921,8 @@ pub struct DispatchProbeResult {
 pub struct ProbeQuery {
     /// Substring/prefix match against `draws.cs` (or selected `--stage`) or `shaders.name` (e.g. `7700e4c3`).
     pub shader: Option<String>,
+    /// Additional shader hash aliases expanded from `--shader-map` (e.g. guest `7700e4c3` -> translated `draws.cs`).
+    pub shader_aliases: Vec<String>,
     /// Explicit `draws.n` filter.
     pub draw: Option<u64>,
     /// Explicit `events.seq` filter (works for both compute dispatches and graphics draws).
@@ -860,6 +945,7 @@ impl Default for ProbeQuery {
     fn default() -> Self {
         Self {
             shader: None,
+            shader_aliases: Vec::new(),
             draw: None,
             event: None,
             stage: None,
@@ -911,6 +997,7 @@ where
     let dispatches = find_matching_events(
         &conn,
         query.shader.as_deref(),
+        &query.shader_aliases,
         query.draw,
         query.event,
         query.stage.as_deref(),
@@ -1693,6 +1780,62 @@ fn read_and_decode_at_va(
             None,
         );
     };
+
+    // Optional 2-level slot-index indirection: read u32 slot index at `raw_va`, then read the
+    // guest view at `indirect_heap_va + slot_index * indirect_stride`!
+    if let Some(heap_base) = layout.indirect_heap_va {
+        let (slot_opt, sp1, note1, _lw1) =
+            read_buffer_with_provenance(conn, blobs, live_buffers, buf, off, 4, disp);
+        let Some(slot_bytes) = slot_opt else {
+            return (source_label, sp1, note1, None, None);
+        };
+        if slot_bytes.len() < 4 {
+            return (
+                source_label,
+                sp1,
+                Some("slot index read returned fewer than 4 bytes".into()),
+                None,
+                None,
+            );
+        }
+        let slot_idx = u32::from_le_bytes(slot_bytes[0..4].try_into().unwrap());
+        let view_va = heap_base.saturating_add((slot_idx as u64).saturating_mul(layout.indirect_stride));
+        let hop_label = format!("{source_label} -> slot={slot_idx:#x} -> view_va={view_va:#x}");
+        let Some((vbuf, voff)) = find_buffer(live_buffers, view_va) else {
+            return (
+                hop_label,
+                sp1,
+                Some(format!(
+                    "indirect guest view address {view_va:#x} (heap {heap_base:#x} + {slot_idx:#x}*{}) is not inside any live ID3D12Resource buffer",
+                    layout.indirect_stride
+                )),
+                Some(DecodedDescriptor {
+                    slot_index: Some(slot_idx),
+                    indirect_view_va: Some(view_va),
+                    raw_hex: format!("{slot_idx:08x}"),
+                    words_u32: vec![slot_idx],
+                    gpu_va: None,
+                    decoded_size: None,
+                    decode_note: "indirect view address outside live buffers".into(),
+                }),
+                None,
+            );
+        };
+        let view_len = layout.indirect_view_size.max(8) as u64;
+        let (view_opt, sp2, note2, _lw2) =
+            read_buffer_with_provenance(conn, blobs, live_buffers, vbuf, voff, view_len, disp);
+        return match view_opt {
+            Some(vraw) => {
+                let mut dec = decode_raw_descriptor(&vraw, layout, live_buffers);
+                dec.slot_index = Some(slot_idx);
+                dec.indirect_view_va = Some(view_va);
+                let target = dec.gpu_va;
+                (hop_label, sp2, note2.or(note1), Some(dec), target)
+            }
+            None => (hop_label, sp2, note2.or(note1), None, None),
+        };
+    }
+
     let (raw_opt, sp, note, _lw) = read_buffer_with_provenance(
         conn,
         blobs,
@@ -2065,8 +2208,16 @@ pub fn read_buffer_with_provenance(
                     detail: why,
                 };
             } else if seq > uav_ev {
+                // Check whether the writer event's bound UAV views on `buf.resource` are strictly disjoint
+                // from `[buf.gpu_address + offset, buf.gpu_address + offset + len)`!
+                if writer_uav_views_are_disjoint(conn, seq, buf.resource, buf.gpu_address + offset, len) {
+                    continue;
+                }
                 let copy_sub = event_submission(conn, seq);
-                let why = format!("written earlier by {call} at event {seq} without a captured results row");
+                let why = format!(
+                    "written earlier by {call} at event {seq} without a captured results row covering [{offset:#x}, {:#x})",
+                    offset.saturating_add(len)
+                );
                 unfollowed_write = Some(why.clone());
                 last_writer = LastWriterInfo {
                     kind: "unrecorded_gpu_write".into(),
@@ -2346,9 +2497,56 @@ fn load_live_probe(conn: &Connection, draw: u64) -> Option<DispatchProbeRecord> 
     .ok()
 }
 
+/// Returns true only when `writer_event` is a draw/dispatch with explicit UAV descriptor ranges on
+/// `resource` and EVERY such UAV view is strictly disjoint from `[want_va, want_va + want_len)`.
+fn writer_uav_views_are_disjoint(
+    conn: &Connection,
+    writer_event: u64,
+    resource: u64,
+    want_va: u64,
+    want_len: u64,
+) -> bool {
+    let Ok(draw_n) = conn.query_row(
+        "SELECT n FROM draws WHERE event = ?1",
+        params![writer_event as i64],
+        |r| Ok(r.get::<_, i64>(0)? as u64),
+    ) else {
+        return false;
+    };
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT address, size FROM d12_draw_descriptors WHERE draw = ?1 AND resource = ?2 AND kind = 'uav'",
+    ) else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map(params![draw_n as i64, resource as i64], |r| {
+        Ok((
+            r.get::<_, Option<i64>>(0)?.map(|v| v as u64),
+            r.get::<_, Option<i64>>(1)?.map(|v| v as u64),
+        ))
+    }) else {
+        return false;
+    };
+    let want_end = want_va.saturating_add(want_len);
+    let mut saw_any = false;
+    for row in rows.flatten() {
+        saw_any = true;
+        match row {
+            (Some(addr), Some(sz)) if sz > 0 => {
+                let end = addr.saturating_add(sz);
+                if want_va < end && addr < want_end {
+                    return false; // overlaps!
+                }
+            }
+            _ => return false, // unknown or unbounded UAV view -> conservatively overlaps
+        }
+    }
+    saw_any
+}
+
 fn find_matching_events(
     conn: &Connection,
     shader_filter: Option<&str>,
+    shader_aliases: &[String],
     draw_filter: Option<u64>,
     event_filter: Option<u64>,
     stage_filter: Option<&str>,
@@ -2480,7 +2678,11 @@ fn find_matching_events(
 
         let cs_name = shader_names.get(&active_hash).cloned().flatten();
         if let Some(ref flt) = filter_lc {
-            let hash_match = active_hash.to_ascii_lowercase().contains(flt);
+            let active_lc = active_hash.to_ascii_lowercase();
+            let hash_match = active_lc.contains(flt)
+                || shader_aliases
+                    .iter()
+                    .any(|a| !a.is_empty() && active_lc.contains(a));
             let name_match = cs_name
                 .as_deref()
                 .is_some_and(|nm| nm.to_ascii_lowercase().contains(flt));
@@ -2711,6 +2913,7 @@ mod tests {
 
         let query = ProbeQuery {
             shader: Some("7700e4c3".into()),
+            shader_aliases: Vec::new(),
             draw: None,
             event: None,
             stage: None,
@@ -3034,5 +3237,145 @@ mod tests {
             map.gpu_to_cpu(0x200000100, 64),
             Some((0x800000100, Some("uma_win0")))
         );
+    }
+
+    #[test]
+    fn two_level_slot_index_indirection_and_shader_hash_map() {
+        let smap = ShaderHashMap::parse("# guest host\n7700e4c3 1e38f9dfec9d1cea3b296a55bd7e8610\n");
+        let expanded = smap.expand("7700e4c3");
+        assert!(expanded.contains(&"1e38f9dfec9d1cea3b296a55bd7e8610".to_string()));
+
+        let dir = std::env::temp_dir().join(format!("locum_probe_2lvl_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blobs = Blobs::new(dir.join("blobs"));
+
+        // Resource 10 (0x4_0000_0000): table row 2 (stride 336) + 0x120 holds u32 slot index 0x0010.
+        let mut tbl = vec![0u8; 4096];
+        let slot_off = 2 * 336 + 0x120;
+        let slot_idx = 0x10u32;
+        tbl[slot_off..slot_off + 4].copy_from_slice(&slot_idx.to_le_bytes());
+        let tbl_key = hash::key(&tbl);
+        blobs.put(&tbl_key, &tbl).unwrap();
+
+        // Resource 11 (0x4c61_0000): descriptor heap; entry 0x10 * 32 = +0x200 holds 16-byte guest view pointing to 0x6000_0400 (len 256).
+        let mut heap = vec![0u8; 4096];
+        let view_off = (slot_idx as usize) * 32;
+        heap[view_off..view_off + 8].copy_from_slice(&0x6000_0400u64.to_le_bytes());
+        heap[view_off + 8..view_off + 12].copy_from_slice(&256u32.to_le_bytes());
+        let heap_key = hash::key(&heap);
+        blobs.put(&heap_key, &heap).unwrap();
+
+        // Resource 17 (0x6000_0000): target buffer with 0x5A at +0x400.
+        let mut tgt = vec![0u8; 4096];
+        tgt[0x400..0x500].fill(0x5A);
+        let tgt_key = hash::key(&tgt);
+        blobs.put(&tgt_key, &tgt).unwrap();
+
+        let mut cap = db::Capture::default();
+        cap.meta("api", "d3d12");
+        cap.meta("blobs", dir.join("blobs").display());
+        for (id, k) in [(10, tbl_key), (11, heap_key), (17, tgt_key)] {
+            cap.resources.push(db::Resource {
+                id,
+                kind: "buffer",
+                width: 4096,
+                bytes: 4096,
+                used: true,
+                content: Some(k),
+                content_source: Some("first-use"),
+                ..Default::default()
+            });
+        }
+        cap.draws.push(db::Draw {
+            n: 271,
+            event: 13106,
+            call: "Dispatch",
+            args: "[1,1,1]".into(),
+            shaders: [
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("1e38f9dfec9d1cea3b296a55bd7e8610".into()),
+            ],
+            ..Default::default()
+        });
+        cap.draw_descriptors.push(db::DrawDescriptor {
+            draw: 271,
+            stage: "cs",
+            kind: "uav",
+            slot: 2,
+            space: 0,
+            parameter: 2,
+            resource: Some(10),
+            address: Some(0x4_0000_0000),
+            size: Some(4096),
+            ..Default::default()
+        });
+        let frame = crate::d3d12::Frame {
+            objects: vec![
+                crate::d3d12::Object {
+                    id: 10,
+                    kind: "ID3D12Resource",
+                    device: 1,
+                    description: json!({"dimension": 1, "width": 4096, "gpu_address": 0x4_0000_0000u64, "heap_properties": {"type": 1}}),
+                },
+                crate::d3d12::Object {
+                    id: 11,
+                    kind: "ID3D12Resource",
+                    device: 1,
+                    description: json!({"dimension": 1, "width": 4096, "gpu_address": 0x4c61_0000u64, "heap_properties": {"type": 1}}),
+                },
+                crate::d3d12::Object {
+                    id: 17,
+                    kind: "ID3D12Resource",
+                    device: 1,
+                    description: json!({"dimension": 1, "width": 4096, "gpu_address": 0x6000_0000u64, "heap_properties": {"type": 1}}),
+                },
+            ],
+            ..Default::default()
+        };
+        let proj = crate::d3d12::Projection::new(&frame.objects);
+        cap.d3d12 = Some(frame.finish(&mut db::Capture::default(), proj));
+        let db_path = dir.join("capture.db");
+        db::write(&db_path, &cap).unwrap();
+
+        let query = ProbeQuery {
+            shader: Some("7700e4c3".into()),
+            shader_aliases: expanded,
+            binding: BindingSelector::parse("uav:2").unwrap(),
+            layout: DescriptorLayout {
+                row_stride: 336,
+                row_index: 2,
+                desc_offset: 0x120,
+                indirect_heap_va: Some(0x4c61_0000),
+                indirect_stride: 32,
+                indirect_view_size: 16,
+                ..Default::default()
+            },
+            follow_descriptor: true,
+            compare_bytes: 256,
+            ..Default::default()
+        };
+        let res = probe_capture::<fn(u64, usize) -> Result<Vec<u8>, String>>(
+            &db_path,
+            &query,
+            &AliasMap::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(res.len(), 1);
+        let r = &res[0];
+        let dec = r.decoded.as_ref().unwrap();
+        assert_eq!(dec.slot_index, Some(0x10));
+        assert_eq!(dec.indirect_view_va, Some(0x4c61_0200));
+        assert_eq!(r.target_resource, Some(17));
+        assert_eq!(r.target_offset, Some(0x400));
+        assert_eq!(r.content_verdict.verdict, "non_zero");
+        assert_eq!(r.content_verdict.nonzero_bytes, 256);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

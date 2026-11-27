@@ -164,6 +164,9 @@ pub struct TimelineFilterArgs {
     /// Maximum timeline event lines to print in greppable text mode (0 hides individual `EV` lines).
     #[arg(long, default_value_t = 120)]
     limit: usize,
+    /// Print active DxgKrnl process summary (`PIDS`) and exit without per-event listing (helpful to pick `--pid`).
+    #[arg(long)]
+    list_pids: bool,
     /// Emit structured JSON.
     #[arg(long)]
     json: bool,
@@ -406,6 +409,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
                 tid: args.view.tid,
                 top: args.view.top,
                 limit: args.view.limit,
+                list_pids: args.view.list_pids,
             };
             let rep = if let Some(ref etl_path) = args.etl {
                 let pid = if args.target.pid.is_some()
@@ -465,6 +469,7 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
                 tid: args.view.tid,
                 top: args.view.top,
                 limit: args.view.limit,
+                list_pids: args.view.list_pids,
             };
             let rep = run_flight_recorder(FlightRecorderOptions {
                 pid,

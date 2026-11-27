@@ -422,11 +422,15 @@ impl Symbolizer {
     }
 
     /// Resolves up to `max_frames` addresses into readable frame names.
+    /// When a kernel ETW stack includes both kernel logging frames (`>= 0x8000_0000_0000`) and
+    /// user-mode frames (`< 0x8000_0000_0000`), skips the kernel ETW prefix so user-mode callers
+    /// (`d3d12core` / game module) are shown directly.
     pub fn resolve_stack(&mut self, frames: &[u64], max_frames: usize) -> Vec<String> {
+        let has_user = frames.iter().any(|&a| a != 0 && a < 0x0000_8000_0000_0000);
         frames
             .iter()
             .copied()
-            .filter(|&a| a != 0)
+            .filter(|&a| a != 0 && (!has_user || a < 0x0000_8000_0000_0000))
             .take(max_frames)
             .map(|a| self.resolve(a))
             .collect()

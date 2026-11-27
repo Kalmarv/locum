@@ -9,9 +9,10 @@
 //! - CPU stacks (inline `EVENT_HEADER_EXT_TYPE_STACK_TRACE64` + classic `StackWalk` / `SampledProfile`), symbolized out-of-process via `dbghelp` + `TH32CS_SNAPMODULE` / ETW `ImageLoad`
 //! - Thread wait attribution: full `CSwitch` + `ReadyThread` when permitted (offline WPR/xperf or one-time ACL), and automatic non-admin fallback via DxgKrnl CPU/GPU fence waits + `MakeResident` stalls + CPU stacks.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS};
@@ -20,8 +21,8 @@ use windows::Win32::System::Diagnostics::Etw::{
     EVENT_CONTROL_CODE_CAPTURE_STATE, EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_HEADER_FLAG_32_BIT_HEADER,
     EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FILE_MODE_SEQUENTIAL, EVENT_TRACE_LOGFILEW,
     EVENT_TRACE_PROPERTIES, EVENT_TRACE_SYSTEM_LOGGER_MODE, EnableTraceEx2, OpenTraceW,
-    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESSTRACE_HANDLE, ProcessTrace, StartTraceW, TRACE_EVENT_INFO,
-    TdhGetEventInformation, WNODE_FLAG_TRACED_GUID,
+    PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_RAW_TIMESTAMP, PROCESSTRACE_HANDLE, ProcessTrace,
+    StartTraceW, TRACE_EVENT_INFO, TdhGetEventInformation, WNODE_FLAG_TRACED_GUID,
 };
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::core::{GUID, HSTRING, PWSTR};
@@ -29,6 +30,7 @@ use windows::core::{GUID, HSTRING, PWSTR};
 use crate::THREAD_SUSPENDS;
 use crate::etw::{CLASSIC_PAGEFAULT_GUID, DXGKRNL_PROVIDER, SYSTEM_MEMORY_PROVIDER};
 use crate::symbols::Symbolizer;
+use crate::win32::list_processes;
 
 // ---------------------------------------------------------------------------
 // Provider GUIDs & Keyword Constants
@@ -354,6 +356,9 @@ pub struct TimelineEvent {
 pub struct QueueSummary {
     pub queue_id: String,
     pub context: u64,
+    pub pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
     pub node_ordinal: Option<u32>,
     pub engine_type: Option<u32>,
     pub packets_started: u64,
@@ -372,6 +377,8 @@ pub struct WaitSummary {
     pub tid: u32,
     pub kind: String,
     pub count: u64,
+    /// Number of waits in `count` that had a measured start->stop duration (`0` = count-only event).
+    pub measured_count: u64,
     pub total_ms: f64,
     pub max_ms: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -380,20 +387,45 @@ pub struct WaitSummary {
     pub top_stack: Option<String>,
 }
 
-/// Per-present frame slice on the unified QPC clock.
+/// Per-present frame slice on the unified QPC clock (intervals strictly clipped to `[start_qpc, end_qpc]`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FrameSummary {
     pub frame: u64,
+    pub pid: u32,
     pub start_qpc: i64,
+    pub end_qpc: i64,
     pub t_ms: f64,
     pub duration_ms: f64,
+    /// Clipped union wall-clock GPU busy ms (any queue of `pid` busy; guaranteed `<= duration_ms`).
     pub gpu_busy_ms: f64,
+    /// Clipped wall-clock busy ms of the single busiest queue of `pid` (`<= gpu_busy_ms <= duration_ms`).
+    pub busiest_queue_ms: f64,
+    /// Sum of clipped busy ms across all queues of `pid` (shows multi-queue overlap separately from saturation).
+    pub queue_sum_ms: f64,
+    /// Clipped measured fence wait ms in this frame (`cpu_fence_wait_ms + gpu_fence_wait_ms`).
     pub fence_wait_ms: f64,
+    pub cpu_fence_wait_ms: f64,
+    pub gpu_fence_wait_ms: f64,
     pub os_wait_ms: f64,
     pub paging_events: u64,
     pub virtual_protect_events: u64,
     pub hard_faults: u64,
     pub presents: u64,
+    pub present_event_id: u16,
+}
+
+/// Per-PID DxgKrnl activity summary (powers `--list-pids` and `pid=all` disambiguation).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PidActivitySummary {
+    pub pid: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    pub dxg_events: u64,
+    pub submits: u64,
+    pub presents: u64,
+    pub fence_waits: u64,
+    pub fence_signals: u64,
+    pub paging_events: u64,
 }
 
 /// Top symbolized CPU stack summary.
@@ -419,20 +451,32 @@ pub struct FlightTriggerInfo {
 pub struct TimelineReport {
     pub source: String,
     pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_pid: Option<u32>,
     pub thread_suspends: u64,
+    pub ts_unit: String,
     pub qpc_freq_hz: u64,
     pub start_qpc: i64,
     pub end_qpc: i64,
+    /// Total recording/ETL duration from first raw event to last raw event (ms).
     pub duration_ms: f64,
+    /// First-to-last target-PID event span (ms).
+    pub target_span_ms: f64,
     pub total_raw_events: u64,
     pub target_events: usize,
+    pub ev_truncated: bool,
+    pub dxg_pid_events: u64,
+    pub dxg_ctx_other_pid_events: u64,
     pub stack_samples_captured: u64,
+    pub measured_waits: u64,
     pub wait_attribution_mode: String,
     pub providers_active: Vec<String>,
     pub warnings: Vec<String>,
     pub alerts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub flight_trigger: Option<FlightTriggerInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pids: Vec<PidActivitySummary>,
     pub queues: Vec<QueueSummary>,
     pub waits: Vec<WaitSummary>,
     pub frames: Vec<FrameSummary>,
@@ -448,6 +492,7 @@ pub struct TimelineFormatOptions {
     pub tid: Option<u32>,
     pub top: usize,
     pub limit: usize,
+    pub list_pids: bool,
 }
 
 impl Default for TimelineFormatOptions {
@@ -458,23 +503,29 @@ impl Default for TimelineFormatOptions {
             tid: None,
             top: 20,
             limit: 120,
+            list_pids: false,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Internal Raw Event Decoder (shared by offline `.etl`, live `timeline`, and `flight` ring!)
+// Fast Zero-Clone Event Decoder (with PropertyParamCount dynamic arrays!)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug)]
-struct FieldSpec {
-    offset: usize,
-    size: usize,
+#[derive(Clone, Debug)]
+struct PropPlan {
+    name: String,
+    elem_size: usize,
+    count_prop_idx: Option<usize>,
+    fixed_count: usize,
 }
 
 #[derive(Clone, Debug)]
 struct CachedSchema {
-    fields: HashMap<String, FieldSpec>,
+    props: Vec<PropPlan>,
+    /// Fixed-offset scalar fields before the first dynamic array (O(1) read!).
+    fixed: HashMap<String, (usize, usize)>,
+    has_dynamic: bool,
 }
 
 impl CachedSchema {
@@ -495,20 +546,21 @@ impl CachedSchema {
         if rc != ERROR_SUCCESS.0 {
             return None;
         }
-        let mut fields = HashMap::new();
+        let mut props = Vec::new();
+        let mut fixed = HashMap::new();
+        let mut has_dynamic = false;
         let top_count = unsafe { (*info).TopLevelPropertyCount } as usize;
         let props_ptr = unsafe {
             std::ptr::addr_of!((*info).EventPropertyInfoArray)
                 .cast::<windows::Win32::System::Diagnostics::Etw::EVENT_PROPERTY_INFO>()
         };
         let mut offset = 0usize;
-        for i in 0..top_count {
+        for i in 0..top_count.min(32) {
             let pi = unsafe { &*props_ptr.add(i) };
+            // Stop at struct properties (rare in DxgKrnl hot path).
             if (pi.Flags.0 & 0x1) != 0 {
                 break;
             }
-            let count = unsafe { pi.Anonymous2.count };
-            let is_array = (pi.Flags.0 & 0x4) != 0 || count != 1;
             let in_type = unsafe { pi.Anonymous1.nonStructType.InType };
             let fsize = match in_type {
                 TDH_INTYPE_INT8 | TDH_INTYPE_UINT8 => 1,
@@ -526,25 +578,47 @@ impl CachedSchema {
                 }
             };
             let name = read_utf16_at(&buf, pi.NameOffset as usize);
-            fields.insert(name, FieldSpec { offset, size: fsize });
-            if is_array {
-                // Element 0 of the first array (e.g. ObjectHandleArray / BroadcastContext) is now recorded;
-                // subsequent offsets depend on runtime array length, so stop here.
-                break;
+            let is_param_count = (pi.Flags.0 & 0x4) != 0;
+            let (count_prop_idx, fixed_count) = if is_param_count {
+                let cidx = unsafe { pi.Anonymous2.countPropertyIndex } as usize;
+                if cidx < props.len() {
+                    has_dynamic = true;
+                    (Some(cidx), 0)
+                } else {
+                    break;
+                }
+            } else {
+                let c = unsafe { pi.Anonymous2.count } as usize;
+                if c != 1 {
+                    has_dynamic = true;
+                }
+                (None, c)
+            };
+            if !has_dynamic {
+                fixed.insert(name.clone(), (offset, fsize));
+                offset += fsize;
             }
-            offset += fsize;
+            props.push(PropPlan {
+                name,
+                elem_size: fsize,
+                count_prop_idx,
+                fixed_count,
+            });
         }
-        Some(Self { fields })
+        Some(Self {
+            props,
+            fixed,
+            has_dynamic,
+        })
     }
 
     #[inline]
-    fn get_u64(&self, data: &[u8], name: &str) -> Option<u64> {
-        let f = self.fields.get(name)?;
-        if f.offset + f.size > data.len() {
+    fn read_scalar(data: &[u8], off: usize, size: usize) -> Option<u64> {
+        if off + size > data.len() {
             return None;
         }
-        let s = &data[f.offset..f.offset + f.size];
-        match f.size {
+        let s = &data[off..off + size];
+        match size {
             1 => Some(s[0] as u64),
             2 => Some(u16::from_le_bytes(s.try_into().ok()?) as u64),
             4 => Some(u32::from_le_bytes(s.try_into().ok()?) as u64),
@@ -553,10 +627,67 @@ impl CachedSchema {
         }
     }
 
+    /// Evaluates all properties (including fields following `PropertyParamCount` dynamic arrays!)
+    /// into a stack-allocated `[Option<u64>; 32]` with zero heap allocations.
+    #[inline]
+    fn eval_all(&self, data: &[u8]) -> [Option<u64>; 32] {
+        let mut vals = [None; 32];
+        let mut cursor = 0usize;
+        for (i, p) in self.props.iter().enumerate() {
+            let count = match p.count_prop_idx {
+                Some(ci) => vals[ci].unwrap_or(0) as usize,
+                None => p.fixed_count,
+            };
+            if count > 0 {
+                vals[i] = Self::read_scalar(data, cursor, p.elem_size);
+            }
+            cursor = cursor.saturating_add(count.saturating_mul(p.elem_size));
+            if cursor > data.len() {
+                break;
+            }
+        }
+        vals
+    }
+
+    #[inline]
+    fn get_u64(&self, data: &[u8], name: &str) -> Option<u64> {
+        if let Some(&(off, sz)) = self.fixed.get(name) {
+            return Self::read_scalar(data, off, sz);
+        }
+        if !self.has_dynamic {
+            return None;
+        }
+        let idx = self.props.iter().position(|p| p.name == name)?;
+        self.eval_all(data)[idx]
+    }
+
     #[inline]
     fn get_any_u64(&self, data: &[u8], names: &[&str]) -> Option<u64> {
+        if !self.has_dynamic {
+            for &n in names {
+                if let Some(&(off, sz)) = self.fixed.get(n) {
+                    return Self::read_scalar(data, off, sz);
+                }
+            }
+            return None;
+        }
+        let vals = self.eval_all(data);
         for &n in names {
-            if let Some(v) = self.get_u64(data, n) {
+            if let Some(idx) = self.props.iter().position(|p| p.name == n)
+                && let Some(v) = vals[idx]
+            {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    #[inline]
+    fn get_from_vals(&self, vals: &[Option<u64>; 32], names: &[&str]) -> Option<u64> {
+        for &n in names {
+            if let Some(idx) = self.props.iter().position(|p| p.name == n)
+                && let Some(v) = vals[idx]
+            {
                 return Some(v);
             }
         }
@@ -651,17 +782,36 @@ pub(crate) struct RawTimelineEvent {
     pub wait_kind: Option<String>,
 }
 
-type PendingFenceWait = (i64, u32, u32, Option<String>, u64, Vec<u64>);
-type WaitAccEntry = (u64, f64, f64, HashMap<u32, u64>, HashMap<String, u64>);
+#[derive(Clone, Debug)]
+struct PendingFenceWait {
+    wait_qpc: i64,
+    pid: u32,
+    tid: u32,
+    queue: Option<String>,
+    sync_obj: u64,
+    wait_val: u64,
+    is_cpu: bool,
+    event_handle: u64,
+    raw_stack: Vec<u64>,
+}
+
+/// `(total_count, measured_count, total_ms, max_ms, waker_counts, stack_counts)`
+type WaitAccEntry = (u64, u64, f64, f64, HashMap<u32, u64>, HashMap<String, u64>);
+type InFlightWaitPkt = (i64, u32, u32, u64, u64);
 
 /// Stateful streaming QPC timeline builder used by both offline `.etl` parsing and the live 10s flight ring.
 pub(crate) struct TimelineBuilder {
     pub filter_pid: Option<u32>,
     pub qpc_freq_hz: u64,
-    schemas: HashMap<SchemaKey, Option<CachedSchema>>,
+    pub ts_unit: String,
+    schemas: HashMap<SchemaKey, Option<Arc<CachedSchema>>>,
     pub start_qpc: Option<i64>,
     pub end_qpc: Option<i64>,
+    pub target_start_qpc: Option<i64>,
+    pub target_end_qpc: Option<i64>,
     pub total_raw_events: u64,
+    pub dxg_pid_events: u64,
+    pub dxg_ctx_other_pid_events: u64,
     pub stack_samples_captured: u64,
     pub saw_cswitch: bool,
     pub saw_ready_thread: bool,
@@ -674,18 +824,30 @@ pub(crate) struct TimelineBuilder {
     device_pid: HashMap<u64, u32>,
     context_meta: HashMap<u64, ContextMeta>,
     hwqueue_ctx: HashMap<u64, u64>,
-    /// `(hContext, submit_seq)` -> `(start_qpc, tid, packet_type)`
-    in_flight_queue_pkts: HashMap<(u64, u64), (i64, u32, u64)>,
-    /// `(hContext, submit_seq)` -> `(start_qpc, tid)`
-    in_flight_dma_pkts: HashMap<(u64, u64), (i64, u32)>,
-    /// `sync_obj` -> `(wait_qpc, pid, tid, queue, wait_val, raw_stack)`
-    pending_fence_waits: HashMap<u64, PendingFenceWait>,
+    /// `pDxgSyncObject` / `KMTHandle` -> canonical `VidSchSyncObject` (from DxgKrnl id=1070)
+    sync_alias: HashMap<u64, u64>,
+    /// `(hContext, submit_seq)` -> `(start_qpc, pid, tid, packet_type)` for QueuePacket (178)
+    in_flight_queue_pkts: HashMap<(u64, u64), (i64, u32, u32, u64)>,
+    /// `(hContext, submit_seq)` -> `(start_qpc, pid, tid, sync, val)` for QueuePacket Wait (244)
+    in_flight_wait_pkts: HashMap<(u64, u64), InFlightWaitPkt>,
+    /// `(hContext, submit_seq)` -> `(pid, tid, sync, val)` for QueuePacket Signal (245)
+    in_flight_sig_pkts: HashMap<(u64, u64), (u32, u32, u64, u64)>,
+    /// `(hContext, submit_seq)` -> `(start_qpc, pid, tid)` for DmaPacket (175->176)
+    in_flight_dma_pkts: HashMap<(u64, u64), (i64, u32, u32)>,
+    /// `(hHwQueue, progress_fence)` -> `(start_qpc, pid, tid)` for HAGS DmaPacket (450->451)
+    in_flight_hwq_pkts: HashMap<(u64, u64), (i64, u32, u32)>,
+    /// Pending CPU fence waits keyed by kernel `Event` pointer (`297` -> `300`)
+    pending_cpu_waits_by_event: HashMap<u64, PendingFenceWait>,
+    /// Pending CPU/GPU fence waits keyed by canonical `sync_obj` (`297`/`100`/`295`/`231` -> `300`/`550`/`551`/`294`/`296`/`245+180`)
+    pending_waits_by_sync: HashMap<u64, Vec<PendingFenceWait>>,
     /// `tid` -> `(switch_out_qpc, stack)` for CSwitch wait attribution
     off_cpu_threads: HashMap<u32, (i64, Vec<u64>)>,
     /// `tid` -> `waker_tid` from ReadyThread
     last_waker: HashMap<u32, u32>,
     /// ETW `ImageLoad` modules observed for offline symbolization
     pub etw_images: Vec<(u64, u64, String)>,
+    /// Learned PID -> process name (from live ToolHelp + ETW ImageLoad `.exe`)
+    pid_names: HashMap<u32, String>,
 
     pub current_frame: u64,
     pub last_present_qpc: Option<i64>,
@@ -695,23 +857,48 @@ pub(crate) struct TimelineBuilder {
     pub tdr_or_removal_alert: Option<(i64, String)>,
 
     pub alerts: Vec<String>,
+    pub pid_stats: HashMap<u32, PidActivitySummary>,
     pub queues: BTreeMap<u64, QueueSummary>,
-    pub raw_events: Vec<RawTimelineEvent>,
-    /// Optional ring capacity (`None` = keep up to 200k events; `Some((max_events, ring_qpc_window))` = evict older).
+
+    // Compact full-trace accumulators (used in offline / non-ring mode so 9M+ event ETLs never lose summary accuracy!)
+    full_gpu_spans: Vec<(i64, i64, u32, u64)>,
+    /// `(start_qpc, end_qpc, pid, kind_code)` where `0=cpu_fence, 1=gpu_fence, 2=cswitch`
+    full_wait_spans: Vec<(i64, i64, u32, u8)>,
+    /// `(qpc, pid, event_id)` for canonical Present deduplication
+    full_present_marks: Vec<(i64, u32, u16)>,
+    /// `(qpc, pid, aux_code)` where `0=paging, 1=vprot, 2=hfault`
+    full_aux_marks: Vec<(i64, u32, u8)>,
+    full_wait_acc: BTreeMap<(u32, String), WaitAccEntry>,
+    full_measured_waits: u64,
+
+    pub raw_events: VecDeque<RawTimelineEvent>,
+    /// Optional ring capacity (`None` = keep up to 200k EV events; `Some(ring_qpc_window)` = evict older).
     pub ring_window_qpc: Option<i64>,
     pub max_retained_events: usize,
     pub evicted_events: u64,
+    pub ev_truncated: bool,
 }
 
 impl TimelineBuilder {
     pub fn new(filter_pid: Option<u32>, qpc_freq_hz: u64) -> Self {
+        let mut pid_names = HashMap::new();
+        if let Ok(procs) = list_processes() {
+            for p in procs {
+                pid_names.insert(p.pid, p.exe_name);
+            }
+        }
         Self {
             filter_pid,
             qpc_freq_hz: qpc_freq_hz.max(1),
+            ts_unit: "qpc".into(),
             schemas: HashMap::new(),
             start_qpc: None,
             end_qpc: None,
+            target_start_qpc: None,
+            target_end_qpc: None,
             total_raw_events: 0,
+            dxg_pid_events: 0,
+            dxg_ctx_other_pid_events: 0,
             stack_samples_captured: 0,
             saw_cswitch: false,
             saw_ready_thread: false,
@@ -722,12 +909,18 @@ impl TimelineBuilder {
             device_pid: HashMap::new(),
             context_meta: HashMap::new(),
             hwqueue_ctx: HashMap::new(),
+            sync_alias: HashMap::new(),
             in_flight_queue_pkts: HashMap::new(),
+            in_flight_wait_pkts: HashMap::new(),
+            in_flight_sig_pkts: HashMap::new(),
             in_flight_dma_pkts: HashMap::new(),
-            pending_fence_waits: HashMap::new(),
+            in_flight_hwq_pkts: HashMap::new(),
+            pending_cpu_waits_by_event: HashMap::new(),
+            pending_waits_by_sync: HashMap::new(),
             off_cpu_threads: HashMap::new(),
             last_waker: HashMap::new(),
             etw_images: Vec::new(),
+            pid_names,
             current_frame: 0,
             last_present_qpc: None,
             last_submit_qpc: None,
@@ -735,11 +928,19 @@ impl TimelineBuilder {
             total_target_submits: 0,
             tdr_or_removal_alert: None,
             alerts: Vec::new(),
+            pid_stats: HashMap::new(),
             queues: BTreeMap::new(),
-            raw_events: Vec::new(),
+            full_gpu_spans: Vec::new(),
+            full_wait_spans: Vec::new(),
+            full_present_marks: Vec::new(),
+            full_aux_marks: Vec::new(),
+            full_wait_acc: BTreeMap::new(),
+            full_measured_waits: 0,
+            raw_events: VecDeque::new(),
             ring_window_qpc: None,
             max_retained_events: 200_000,
             evicted_events: 0,
+            ev_truncated: false,
         }
     }
 
@@ -749,6 +950,7 @@ impl TimelineBuilder {
         self
     }
 
+    #[inline]
     fn matches_pid(&self, pid: u32) -> bool {
         match self.filter_pid {
             Some(want) => pid == want,
@@ -756,7 +958,72 @@ impl TimelineBuilder {
         }
     }
 
-    fn schema_for(&mut self, rec: &EVENT_RECORD) -> Option<CachedSchema> {
+    #[inline]
+    fn canonical_sync(&self, sync: u64) -> u64 {
+        if sync == 0 {
+            return 0;
+        }
+        self.sync_alias.get(&sync).copied().unwrap_or(sync)
+    }
+
+    #[inline]
+    fn note_target_qpc(&mut self, qpc: i64) {
+        if qpc > 0 {
+            if self.target_start_qpc.is_none() {
+                self.target_start_qpc = Some(qpc);
+            }
+            self.target_end_qpc = Some(qpc);
+        }
+    }
+
+    #[inline]
+    fn bump_pid(&mut self, pid: u32) -> &mut PidActivitySummary {
+        let name = self.pid_names.get(&pid).cloned();
+        self.pid_stats.entry(pid).or_insert_with(|| PidActivitySummary {
+            pid,
+            process_name: name,
+            ..Default::default()
+        })
+    }
+
+    #[inline]
+    fn record_wait_acc(
+        &mut self,
+        tid: u32,
+        kind: &str,
+        dur_qpc: Option<i64>,
+        waker_tid: Option<u32>,
+        increment_count: bool,
+    ) {
+        if self.ring_window_qpc.is_some() {
+            return;
+        }
+        let e = self
+            .full_wait_acc
+            .entry((tid, kind.to_string()))
+            .or_insert_with(|| (0, 0, 0.0, 0.0, HashMap::new(), HashMap::new()));
+        if increment_count {
+            e.0 += 1;
+        }
+        if let Some(dq) = dur_qpc {
+            let ms = dq as f64 * 1e3 / self.qpc_freq_hz as f64;
+            e.1 += 1;
+            if e.1 > e.0 {
+                e.0 = e.1;
+            }
+            e.2 += ms;
+            if ms > e.3 {
+                e.3 = ms;
+            }
+            self.full_measured_waits += 1;
+        }
+        if let Some(w) = waker_tid {
+            *e.4.entry(w).or_insert(0) += 1;
+        }
+    }
+
+    #[inline]
+    fn schema_for(&mut self, rec: &EVENT_RECORD) -> Option<Arc<CachedSchema>> {
         let key = SchemaKey {
             provider: rec.EventHeader.ProviderId.to_u128(),
             id: rec.EventHeader.EventDescriptor.Id,
@@ -765,7 +1032,7 @@ impl TimelineBuilder {
         };
         self.schemas
             .entry(key)
-            .or_insert_with(|| CachedSchema::from_record(rec))
+            .or_insert_with(|| CachedSchema::from_record(rec).map(Arc::new))
             .clone()
     }
 
@@ -778,16 +1045,28 @@ impl TimelineBuilder {
         format!("ctx={ctx:#x}")
     }
 
-    fn ensure_queue(&mut self, ctx: u64) -> &mut QueueSummary {
+    fn ensure_queue(&mut self, ctx: u64, pid_hint: u32) -> &mut QueueSummary {
         let meta = self.context_meta.get(&ctx).cloned();
+        let pid = meta
+            .as_ref()
+            .map(|m| m.pid)
+            .filter(|&p| p != 0)
+            .unwrap_or(pid_hint);
+        let pname = self.pid_names.get(&pid).cloned();
         let label = self.queue_label(ctx);
         let q = self.queues.entry(ctx).or_insert_with(|| QueueSummary {
             queue_id: label,
             context: ctx,
+            pid,
+            process_name: pname,
             node_ordinal: meta.as_ref().and_then(|m| m.node_ordinal),
             engine_type: meta.as_ref().and_then(|m| m.engine_type),
             ..Default::default()
         });
+        if q.pid == 0 && pid != 0 {
+            q.pid = pid;
+            q.process_name = self.pid_names.get(&pid).cloned();
+        }
         if q.node_ordinal.is_none() {
             q.node_ordinal = meta.as_ref().and_then(|m| m.node_ordinal);
         }
@@ -795,45 +1074,41 @@ impl TimelineBuilder {
     }
 
     fn push_event(&mut self, ev: RawTimelineEvent) {
+        self.note_target_qpc(ev.qpc);
         if !ev.raw_stack.is_empty() {
             self.stack_samples_captured += 1;
         }
-        self.raw_events.push(ev);
         if let Some(win) = self.ring_window_qpc {
+            self.raw_events.push_back(ev);
             if let Some(end) = self.end_qpc {
                 let cutoff = end.saturating_sub(win);
-                let slack = (win / 40).max(1);
-                let over_cap = self.raw_events.len() > self.max_retained_events;
-                let over_time = self
-                    .raw_events
-                    .first()
-                    .is_some_and(|e| e.qpc < cutoff.saturating_sub(slack));
-                if over_cap || over_time {
-                    let mut drop_n = self.raw_events.partition_point(|e| e.qpc < cutoff);
-                    let remaining = self.raw_events.len().saturating_sub(drop_n);
-                    if remaining > self.max_retained_events {
-                        drop_n += remaining - self.max_retained_events;
-                    }
-                    if drop_n > 0 {
-                        self.raw_events.drain(..drop_n);
-                        self.evicted_events += drop_n as u64;
-                    }
+                while self.raw_events.len() > self.max_retained_events
+                    || self.raw_events.front().is_some_and(|e| e.qpc < cutoff)
+                {
+                    self.raw_events.pop_front();
+                    self.evicted_events += 1;
                 }
             }
-        } else if self.raw_events.len() > self.max_retained_events {
-            let drop_n = self.raw_events.len() - self.max_retained_events;
-            self.raw_events.drain(..drop_n);
-            self.evicted_events += drop_n as u64;
+        } else {
+            if self.raw_events.len() >= self.max_retained_events {
+                self.raw_events.pop_front();
+                self.evicted_events += 1;
+                self.ev_truncated = true;
+            }
+            self.raw_events.push_back(ev);
         }
     }
 
     /// Returns the oldest unresolved in-flight GPU packet age in seconds relative to `now_qpc`, if any.
     pub fn oldest_in_flight_secs(&self, now_qpc: i64) -> Option<f64> {
         let mut oldest: Option<i64> = None;
-        for &(start, _, _) in self.in_flight_queue_pkts.values() {
+        for &(start, _, _, _) in self.in_flight_queue_pkts.values() {
             oldest = Some(oldest.map_or(start, |o| o.min(start)));
         }
-        for &(start, _) in self.in_flight_dma_pkts.values() {
+        for &(start, _, _) in self.in_flight_dma_pkts.values() {
+            oldest = Some(oldest.map_or(start, |o| o.min(start)));
+        }
+        for &(start, _, _) in self.in_flight_hwq_pkts.values() {
             oldest = Some(oldest.map_or(start, |o| o.min(start)));
         }
         oldest.map(|o| (now_qpc - o).max(0) as f64 / self.qpc_freq_hz as f64)
@@ -874,6 +1149,88 @@ impl TimelineBuilder {
         }
     }
 
+    fn resolve_waits_for_sync(&mut self, sync: u64, sig_val: u64, qpc: i64, waker_tid: u32) {
+        let canon = self.canonical_sync(sync);
+        if canon == 0 {
+            return;
+        }
+        let Some(mut waiters) = self.pending_waits_by_sync.remove(&canon) else {
+            return;
+        };
+        let mut still_pending = Vec::new();
+        for w in waiters.drain(..) {
+            if w.wait_val == 0 || sig_val == 0 || sig_val >= w.wait_val {
+                if w.event_handle != 0 {
+                    self.pending_cpu_waits_by_event.remove(&w.event_handle);
+                }
+                self.emit_resolved_wait(w, sig_val, qpc, waker_tid);
+            } else {
+                still_pending.push(w);
+            }
+        }
+        if !still_pending.is_empty() {
+            self.pending_waits_by_sync.insert(canon, still_pending);
+        }
+    }
+
+    fn emit_resolved_wait(&mut self, w: PendingFenceWait, sig_val: u64, end_qpc: i64, waker_tid: u32) {
+        let dur_qpc = (end_qpc - w.wait_qpc).max(0);
+        if dur_qpc > (self.qpc_freq_hz as i64).saturating_mul(30) {
+            return;
+        }
+        let kind_name = if w.is_cpu {
+            "dxg_fence_cpu_wait"
+        } else {
+            "dxg_fence_gpu_wait"
+        };
+        let waker = (waker_tid != 0).then_some(waker_tid);
+        if self.ring_window_qpc.is_none() {
+            self.full_wait_spans
+                .push((w.wait_qpc, end_qpc, w.pid, if w.is_cpu { 0 } else { 1 }));
+            // `count` was already incremented when the wait started (`297`/`100`/`295`/`231`);
+            // record the measured duration without double-counting `n`.
+            self.record_wait_acc(w.tid, kind_name, Some(dur_qpc), waker, false);
+        }
+        self.push_event(RawTimelineEvent {
+            qpc: w.wait_qpc,
+            frame: self.current_frame,
+            pid: w.pid,
+            tid: w.tid,
+            kind: TimelineEventKind::FenceWait,
+            queue: w.queue,
+            duration_qpc: Some(dur_qpc),
+            detail: format!(
+                "{} sync={:#x} val={}->{} by_tid={}",
+                if w.is_cpu {
+                    "cpu_wait_done"
+                } else {
+                    "gpu_wait_done"
+                },
+                w.sync_obj,
+                w.wait_val,
+                sig_val,
+                waker_tid
+            ),
+            raw_stack: w.raw_stack,
+            waker_tid: waker,
+            wait_kind: Some(kind_name.into()),
+        });
+    }
+
+    fn note_dxg_pid_match(&mut self, resolved_pid: u32, hdr_pid: u32) {
+        if let Some(want) = self.filter_pid {
+            if resolved_pid == want {
+                if hdr_pid == want {
+                    self.dxg_pid_events += 1;
+                } else {
+                    self.dxg_ctx_other_pid_events += 1;
+                }
+            }
+        } else {
+            self.dxg_pid_events += 1;
+        }
+    }
+
     fn on_dxgkrnl(&mut self, rec: &EVENT_RECORD, qpc: i64) {
         let id = rec.EventHeader.EventDescriptor.Id;
         if !matches!(
@@ -883,12 +1240,12 @@ impl TimelineBuilder {
                 | 71
                 | 73
                 | 74
-                | 92..=95
                 | 100
                 | 101
-                | 168
-                | 171..=173
-                | 175..=180
+                | 171
+                | 175..=176
+                | 178
+                | 180
                 | 184
                 | 230
                 | 231
@@ -896,11 +1253,14 @@ impl TimelineBuilder {
                 | 244
                 | 245
                 | 294..=297
+                | 300
                 | 320
                 | 321
                 | 338
                 | 374
                 | 422..=424
+                | 450
+                | 451
                 | 462
                 | 469
                 | 470
@@ -908,9 +1268,13 @@ impl TimelineBuilder {
                 | 541
                 | 547
                 | 548
+                | 550
+                | 551
+                | 1070
         ) {
             return;
         }
+        let opcode = rec.EventHeader.EventDescriptor.Opcode;
         let data = if rec.UserData.is_null() || rec.UserDataLength == 0 {
             &[][..]
         } else {
@@ -978,8 +1342,22 @@ impl TimelineBuilder {
                     self.hwqueue_ctx.insert(hq, hctx);
                 }
             }
-            // QueuePacket Start (178, 244, 245) / Stop (180)
-            178 | 244 | 245 => {
+            // SyncObject handle alias map (`pSyncObject`, `KMTHandle`, `pDxgSyncObject`)
+            1070 => {
+                let vsync = schema.get_u64(data, "pSyncObject").unwrap_or(0);
+                let dsync = schema.get_u64(data, "pDxgSyncObject").unwrap_or(0);
+                let kmt = schema.get_u64(data, "KMTHandle").unwrap_or(0);
+                if vsync != 0 {
+                    if dsync != 0 {
+                        self.sync_alias.insert(dsync, vsync);
+                    }
+                    if kmt != 0 {
+                        self.sync_alias.insert(kmt, vsync);
+                    }
+                }
+            }
+            // QueuePacket Start (178 = Render/Compute DMA)
+            178 => {
                 let hq = schema.get_u64(data, "hHwQueue").unwrap_or(0);
                 let mut ctx = schema.get_u64(data, "hContext").unwrap_or(0);
                 if ctx == 0 && hq != 0 {
@@ -995,15 +1373,21 @@ impl TimelineBuilder {
                     .map(|m| m.pid)
                     .filter(|&p| p != 0)
                     .unwrap_or(hdr_pid);
+                if pid != 0 {
+                    let ps = self.bump_pid(pid);
+                    ps.dxg_events += 1;
+                    ps.submits += 1;
+                }
                 if !self.matches_pid(pid) {
                     return;
                 }
+                self.note_dxg_pid_match(pid, hdr_pid);
                 self.last_submit_qpc = Some(qpc);
                 self.total_target_submits += 1;
                 if ctx != 0 {
-                    self.ensure_queue(ctx).packets_started += 1;
+                    self.ensure_queue(ctx, pid).packets_started += 1;
                     self.in_flight_queue_pkts
-                        .insert((ctx, seq), (qpc, hdr_tid, ptype));
+                        .insert((ctx, seq), (qpc, pid, hdr_tid, ptype));
                 }
                 let stack = extract_inline_stack(rec);
                 if !stack.is_empty() {
@@ -1023,6 +1407,74 @@ impl TimelineBuilder {
                     });
                 }
             }
+            // QueuePacket Wait Start (244) -> paired with QueuePacket Stop (180) for EXACT GPU fence wait duration!
+            244 => {
+                let vals = schema.eval_all(data);
+                let ctx = schema.get_from_vals(&vals, &["hContext"]).unwrap_or(0);
+                let seq = schema
+                    .get_from_vals(&vals, &["SubmitSequence", "ulSubmitSequence"])
+                    .unwrap_or(0);
+                let sync = schema
+                    .get_from_vals(&vals, &["hSyncObject", "DxgSyncObject", "ObjectArray"])
+                    .unwrap_or(0);
+                let val = schema
+                    .get_from_vals(&vals, &["FenceValue", "MonitoredFenceValue"])
+                    .unwrap_or(0);
+                let pid = self
+                    .context_meta
+                    .get(&ctx)
+                    .map(|m| m.pid)
+                    .filter(|&p| p != 0)
+                    .unwrap_or(hdr_pid);
+                if pid != 0 {
+                    let ps = self.bump_pid(pid);
+                    ps.dxg_events += 1;
+                    ps.fence_waits += 1;
+                }
+                if !self.matches_pid(pid) {
+                    return;
+                }
+                self.note_dxg_pid_match(pid, hdr_pid);
+                if ctx != 0 {
+                    self.ensure_queue(ctx, pid).fence_waits += 1;
+                    self.in_flight_wait_pkts
+                        .insert((ctx, seq), (qpc, pid, hdr_tid, sync, val));
+                }
+            }
+            // QueuePacket Signal Start (245) -> paired with QueuePacket Stop (180) for EXACT GPU fence signal completion!
+            245 => {
+                let vals = schema.eval_all(data);
+                let ctx = schema.get_from_vals(&vals, &["hContext"]).unwrap_or(0);
+                let seq = schema
+                    .get_from_vals(&vals, &["SubmitSequence", "ulSubmitSequence"])
+                    .unwrap_or(0);
+                let sync = schema
+                    .get_from_vals(&vals, &["ObjectArray", "DxgSyncObjectArray", "hSyncObject"])
+                    .unwrap_or(0);
+                let val = schema
+                    .get_from_vals(&vals, &["FenceValue", "MonitoredFenceValue"])
+                    .unwrap_or(0);
+                let pid = self
+                    .context_meta
+                    .get(&ctx)
+                    .map(|m| m.pid)
+                    .filter(|&p| p != 0)
+                    .unwrap_or(hdr_pid);
+                if pid != 0 {
+                    let ps = self.bump_pid(pid);
+                    ps.dxg_events += 1;
+                    ps.fence_signals += 1;
+                }
+                if ctx != 0 && self.matches_pid(pid) {
+                    self.note_dxg_pid_match(pid, hdr_pid);
+                    self.ensure_queue(ctx, pid).fence_signals += 1;
+                }
+                if ctx != 0 {
+                    self.in_flight_sig_pkts
+                        .insert((ctx, seq), (pid, hdr_tid, sync, val));
+                }
+            }
+            // QueuePacket Stop (180): completes 178 (GpuBusy), 244 (GPU FenceWait), OR 245 (GPU FenceSignal)!
             180 => {
                 let hq = schema.get_u64(data, "hHwQueue").unwrap_or(0);
                 let mut ctx = schema.get_u64(data, "hContext").unwrap_or(0);
@@ -1032,21 +1484,70 @@ impl TimelineBuilder {
                 let seq = schema
                     .get_any_u64(data, &["SubmitSequence", "ulSubmitSequence"])
                     .unwrap_or(0);
-                let pid = self
-                    .context_meta
-                    .get(&ctx)
-                    .map(|m| m.pid)
-                    .filter(|&p| p != 0)
-                    .unwrap_or(hdr_pid);
-                if let Some((start_qpc, start_tid, ptype)) = self.in_flight_queue_pkts.remove(&(ctx, seq)) {
+
+                if let Some((start_qpc, pid, start_tid, sync, val)) =
+                    self.in_flight_wait_pkts.remove(&(ctx, seq))
+                {
+                    let dur_qpc = (qpc - start_qpc).max(0);
+                    self.last_complete_qpc = Some(qpc);
+                    if self.ring_window_qpc.is_none() {
+                        self.full_wait_spans.push((start_qpc, qpc, pid, 1));
+                        self.record_wait_acc(start_tid, "dxg_fence_gpu_wait", Some(dur_qpc), None, true);
+                    }
+                    let qname = self.queue_label(ctx);
+                    self.push_event(RawTimelineEvent {
+                        qpc: start_qpc,
+                        frame: self.current_frame,
+                        pid,
+                        tid: start_tid,
+                        kind: TimelineEventKind::FenceWait,
+                        queue: Some(qname),
+                        duration_qpc: Some(dur_qpc),
+                        detail: format!("gpu_wait_pkt sync={sync:#x} val={val} seq={seq}"),
+                        raw_stack: Vec::new(),
+                        waker_tid: None,
+                        wait_kind: Some("dxg_fence_gpu_wait".into()),
+                    });
+                    return;
+                }
+
+                if let Some((pid, sig_tid, sync, val)) = self.in_flight_sig_pkts.remove(&(ctx, seq)) {
+                    self.last_complete_qpc = Some(qpc);
+                    self.resolve_waits_for_sync(sync, val, qpc, sig_tid);
+                    if self.matches_pid(pid) {
+                        let qname = self.queue_label(ctx);
+                        self.push_event(RawTimelineEvent {
+                            qpc,
+                            frame: self.current_frame,
+                            pid,
+                            tid: sig_tid,
+                            kind: TimelineEventKind::FenceSignal,
+                            queue: Some(qname),
+                            duration_qpc: None,
+                            detail: format!("gpu_sig_done sync={sync:#x} val={val} seq={seq}"),
+                            raw_stack: Vec::new(),
+                            waker_tid: None,
+                            wait_kind: None,
+                        });
+                    }
+                    return;
+                }
+
+                if let Some((start_qpc, pid, start_tid, ptype)) =
+                    self.in_flight_queue_pkts.remove(&(ctx, seq))
+                {
                     let dur_qpc = (qpc - start_qpc).max(0);
                     let dur_ms = dur_qpc as f64 * 1e3 / self.qpc_freq_hz as f64;
                     self.last_complete_qpc = Some(qpc);
-                    let q = self.ensure_queue(ctx);
+                    self.note_dxg_pid_match(pid, hdr_pid);
+                    let q = self.ensure_queue(ctx, pid);
                     q.packets_completed += 1;
                     q.busy_ms += dur_ms;
                     if dur_ms > q.max_packet_ms {
                         q.max_packet_ms = dur_ms;
+                    }
+                    if self.ring_window_qpc.is_none() && dur_qpc > 0 {
+                        self.full_gpu_spans.push((start_qpc, qpc, pid, ctx));
                     }
                     let qname = self.queue_label(ctx);
                     self.push_event(RawTimelineEvent {
@@ -1079,10 +1580,11 @@ impl TimelineBuilder {
                 if !self.matches_pid(pid) {
                     return;
                 }
+                self.note_dxg_pid_match(pid, hdr_pid);
                 self.last_submit_qpc = Some(qpc);
                 self.total_target_submits += 1;
                 if ctx != 0 {
-                    self.in_flight_dma_pkts.insert((ctx, seq), (qpc, hdr_tid));
+                    self.in_flight_dma_pkts.insert((ctx, seq), (qpc, pid, hdr_tid));
                 }
             }
             176 => {
@@ -1090,17 +1592,11 @@ impl TimelineBuilder {
                 let seq = schema
                     .get_any_u64(data, &["SubmitSequence", "ulSubmitSequence"])
                     .unwrap_or(0);
-                let pid = self
-                    .context_meta
-                    .get(&ctx)
-                    .map(|m| m.pid)
-                    .filter(|&p| p != 0)
-                    .unwrap_or(hdr_pid);
-                if let Some((start_qpc, start_tid)) = self.in_flight_dma_pkts.remove(&(ctx, seq)) {
+                if let Some((start_qpc, pid, start_tid)) = self.in_flight_dma_pkts.remove(&(ctx, seq)) {
                     let dur_qpc = (qpc - start_qpc).max(0);
                     let dur_ms = dur_qpc as f64 * 1e3 / self.qpc_freq_hz as f64;
                     self.last_complete_qpc = Some(qpc);
-                    let q = self.ensure_queue(ctx);
+                    let q = self.ensure_queue(ctx, pid);
                     if q.packets_completed == 0 {
                         q.packets_started += 1;
                         q.packets_completed += 1;
@@ -1108,6 +1604,9 @@ impl TimelineBuilder {
                         if dur_ms > q.max_packet_ms {
                             q.max_packet_ms = dur_ms;
                         }
+                    }
+                    if self.ring_window_qpc.is_none() && dur_qpc > 0 {
+                        self.full_gpu_spans.push((start_qpc, qpc, pid, ctx));
                     }
                     let qname = self.queue_label(ctx);
                     self.push_event(RawTimelineEvent {
@@ -1125,29 +1624,101 @@ impl TimelineBuilder {
                     });
                 }
             }
+            // HAGS HwQueue DmaPacket Submit (450) -> Complete (451)
+            450 => {
+                let hq = schema.get_u64(data, "hHwQueue").unwrap_or(0);
+                let pf = schema.get_u64(data, "ProgressFenceValue").unwrap_or(0);
+                let ctx = self.hwqueue_ctx.get(&hq).copied().unwrap_or(hq);
+                let pid = self
+                    .context_meta
+                    .get(&ctx)
+                    .map(|m| m.pid)
+                    .filter(|&p| p != 0)
+                    .unwrap_or(hdr_pid);
+                if !self.matches_pid(pid) {
+                    return;
+                }
+                self.note_dxg_pid_match(pid, hdr_pid);
+                self.last_submit_qpc = Some(qpc);
+                self.total_target_submits += 1;
+                if hq != 0 && pf != 0 {
+                    self.in_flight_hwq_pkts.insert((hq, pf), (qpc, pid, hdr_tid));
+                }
+            }
+            451 => {
+                let hq = schema.get_u64(data, "hHwQueue").unwrap_or(0);
+                let pf = schema.get_u64(data, "ProgressFenceValue").unwrap_or(0);
+                if let Some((start_qpc, pid, start_tid)) = self.in_flight_hwq_pkts.remove(&(hq, pf)) {
+                    let ctx = self.hwqueue_ctx.get(&hq).copied().unwrap_or(hq);
+                    let dur_qpc = (qpc - start_qpc).max(0);
+                    let dur_ms = dur_qpc as f64 * 1e3 / self.qpc_freq_hz as f64;
+                    self.last_complete_qpc = Some(qpc);
+                    let q = self.ensure_queue(ctx, pid);
+                    if q.packets_completed == 0 {
+                        q.packets_started += 1;
+                        q.packets_completed += 1;
+                        q.busy_ms += dur_ms;
+                        if dur_ms > q.max_packet_ms {
+                            q.max_packet_ms = dur_ms;
+                        }
+                    }
+                    if self.ring_window_qpc.is_none() && dur_qpc > 0 {
+                        self.full_gpu_spans.push((start_qpc, qpc, pid, ctx));
+                    }
+                    let qname = self.queue_label(ctx);
+                    self.push_event(RawTimelineEvent {
+                        qpc: start_qpc,
+                        frame: self.current_frame,
+                        pid,
+                        tid: start_tid,
+                        kind: TimelineEventKind::GpuBusy,
+                        queue: Some(qname),
+                        duration_qpc: Some(dur_qpc),
+                        detail: format!("hwq_dma pf={pf}"),
+                        raw_stack: Vec::new(),
+                        waker_tid: None,
+                        wait_kind: None,
+                    });
+                }
+            }
             // WaitForSynchronizationObject* (100, 231, 295=FromGpu, 297=FromCpu)
             100 | 231 | 295 | 297 => {
+                let vals = schema.eval_all(data);
                 let ctx = schema
-                    .get_any_u64(data, &["hContext", "BroadcastContext", "hHwQueue"])
+                    .get_from_vals(&vals, &["hContext", "BroadcastContext", "hHwQueue"])
                     .unwrap_or(0);
-                let hdev = schema.get_u64(data, "hDevice").unwrap_or(0);
-                let sync = schema
-                    .get_any_u64(
-                        data,
+                let hdev = schema.get_from_vals(&vals, &["hDevice"]).unwrap_or(0);
+                let raw_sync = schema
+                    .get_from_vals(
+                        &vals,
                         &[
+                            "ObjectArray",
+                            "SyncObjects",
                             "hSyncObject",
                             "ObjectHandle",
                             "ObjectHandleArray",
                             "pSyncObject",
+                            "DxgSyncObjects",
                             "hFence",
                         ],
                     )
                     .unwrap_or(0);
+                let sync = self.canonical_sync(raw_sync);
                 let val = schema
-                    .get_any_u64(
-                        data,
-                        &["FenceValue", "MonitoredFenceValueArray", "Value", "NewFenceValue"],
+                    .get_from_vals(
+                        &vals,
+                        &[
+                            "MonitoredFenceValue",
+                            "FenceValues",
+                            "FenceValue",
+                            "MonitoredFenceValueArray",
+                            "Value",
+                            "NewFenceValue",
+                        ],
                     )
+                    .unwrap_or(0);
+                let ev_handle = schema
+                    .get_from_vals(&vals, &["hAsyncEvent", "Event", "hEvent"])
                     .unwrap_or(0);
                 let pid = self
                     .context_meta
@@ -1156,19 +1727,47 @@ impl TimelineBuilder {
                     .filter(|&p| p != 0)
                     .or_else(|| self.device_pid.get(&hdev).copied().filter(|&p| p != 0))
                     .unwrap_or(hdr_pid);
+                if pid != 0 {
+                    let ps = self.bump_pid(pid);
+                    ps.dxg_events += 1;
+                    ps.fence_waits += 1;
+                }
                 if !self.matches_pid(pid) {
                     return;
                 }
+                self.note_dxg_pid_match(pid, hdr_pid);
                 let qname = (ctx != 0).then(|| self.queue_label(ctx));
                 if ctx != 0 {
-                    self.ensure_queue(ctx).fence_waits += 1;
+                    self.ensure_queue(ctx, pid).fence_waits += 1;
                 }
                 let stack = extract_inline_stack(rec);
-                let is_cpu_wait = id == 297;
-                if sync != 0 {
-                    self.pending_fence_waits
-                        .insert(sync, (qpc, pid, hdr_tid, qname.clone(), val, stack.clone()));
+                let is_cpu_wait = id == 297 || id == 100;
+                let pw = PendingFenceWait {
+                    wait_qpc: qpc,
+                    pid,
+                    tid: hdr_tid,
+                    queue: qname.clone(),
+                    sync_obj: sync,
+                    wait_val: val,
+                    is_cpu: is_cpu_wait,
+                    event_handle: ev_handle,
+                    raw_stack: stack.clone(),
+                };
+                if is_cpu_wait && ev_handle != 0 {
+                    self.pending_cpu_waits_by_event.insert(ev_handle, pw.clone());
                 }
+                if sync != 0 {
+                    let entry = self.pending_waits_by_sync.entry(sync).or_default();
+                    if entry.len() < 16 {
+                        entry.push(pw);
+                    }
+                }
+                let wk = if is_cpu_wait {
+                    "dxg_fence_cpu_wait"
+                } else {
+                    "dxg_fence_gpu_wait"
+                };
+                self.record_wait_acc(hdr_tid, wk, None, None, true);
                 self.push_event(RawTimelineEvent {
                     qpc,
                     frame: self.current_frame,
@@ -1179,27 +1778,49 @@ impl TimelineBuilder {
                     duration_qpc: None,
                     detail: format!(
                         "{} sync={sync:#x} val={val}",
-                        if is_cpu_wait { "cpu_wait" } else { "gpu_wait" }
+                        if is_cpu_wait {
+                            "cpu_wait_start"
+                        } else {
+                            "gpu_wait_start"
+                        }
                     ),
                     raw_stack: stack,
                     waker_tid: None,
-                    wait_kind: Some(if is_cpu_wait {
-                        "dxg_fence_cpu_wait".into()
-                    } else {
-                        "dxg_fence_gpu_wait".into()
-                    }),
+                    wait_kind: Some(wk.into()),
                 });
             }
-            // SignalSynchronizationObject* (101, 230, 294=FromGpu, 296=FromCpu, 462=Immediate)
-            101 | 230 | 294 | 296 | 462 => {
-                let ctx = schema
-                    .get_any_u64(data, &["hContext", "BroadcastContext", "hHwQueue"])
+            // UnwaitCpuWaiter (300): exact stop event for WaitForSynchronizationObjectFromCpu (297)!
+            300 => {
+                let vals = schema.eval_all(data);
+                let ev_handle = schema.get_from_vals(&vals, &["Event"]).unwrap_or(0);
+                let sync1 = schema
+                    .get_from_vals(&vals, &["SyncObjects", "DxgSyncObjects"])
                     .unwrap_or(0);
-                let hdev = schema.get_u64(data, "hDevice").unwrap_or(0);
-                let sync = schema
-                    .get_any_u64(
-                        data,
+                let val = schema.get_from_vals(&vals, &["FenceValues"]).unwrap_or(0);
+                if ev_handle != 0
+                    && let Some(w) = self.pending_cpu_waits_by_event.remove(&ev_handle)
+                {
+                    self.emit_resolved_wait(w, val, qpc, hdr_tid);
+                    return;
+                }
+                if sync1 != 0 {
+                    self.resolve_waits_for_sync(sync1, val, qpc, hdr_tid);
+                }
+            }
+            // SignalSynchronizationObject* (101, 230, 294=FromGpu, 296=FromCpu, 462=Immediate, 550=VidSchiCpu, 551=VidSchGpuImm)
+            101 | 230 | 294 | 296 | 462 | 550 | 551 => {
+                let vals = schema.eval_all(data);
+                let ctx = schema
+                    .get_from_vals(&vals, &["hContext", "BroadcastContext", "hHwQueue"])
+                    .unwrap_or(0);
+                let hdev = schema.get_from_vals(&vals, &["hDevice"]).unwrap_or(0);
+                let raw_sync = schema
+                    .get_from_vals(
+                        &vals,
                         &[
+                            "VidSchSyncObjectArray",
+                            "ObjectArray",
+                            "DxgSyncObjectArray",
                             "hSyncObject",
                             "ObjectHandle",
                             "ObjectHandleArray",
@@ -1208,10 +1829,13 @@ impl TimelineBuilder {
                         ],
                     )
                     .unwrap_or(0);
+                let sync = self.canonical_sync(raw_sync);
                 let val = schema
-                    .get_any_u64(
-                        data,
+                    .get_from_vals(
+                        &vals,
                         &[
+                            "MonitoredFenceValue",
+                            "FenceValues",
                             "FenceValue",
                             "MonitoredFenceValueArray",
                             "FenceValueArray",
@@ -1227,31 +1851,20 @@ impl TimelineBuilder {
                     .filter(|&p| p != 0)
                     .or_else(|| self.device_pid.get(&hdev).copied().filter(|&p| p != 0))
                     .unwrap_or(hdr_pid);
-                if ctx != 0 && self.matches_pid(pid) {
-                    self.ensure_queue(ctx).fence_signals += 1;
+                if sync != 0 {
+                    self.resolve_waits_for_sync(sync, val, qpc, hdr_tid);
                 }
-                // Resolve matching pending wait to compute fence wait latency!
-                if sync != 0
-                    && let Some((w_qpc, w_pid, w_tid, w_queue, w_val, w_stack)) =
-                        self.pending_fence_waits.remove(&sync)
-                {
-                    let dur_qpc = (qpc - w_qpc).max(0);
-                    self.push_event(RawTimelineEvent {
-                        qpc: w_qpc,
-                        frame: self.current_frame,
-                        pid: w_pid,
-                        tid: w_tid,
-                        kind: TimelineEventKind::FenceWait,
-                        queue: w_queue,
-                        duration_qpc: Some(dur_qpc),
-                        detail: format!("resolved sync={sync:#x} val={w_val}->{val} by_tid={hdr_tid}"),
-                        raw_stack: w_stack,
-                        waker_tid: Some(hdr_tid),
-                        wait_kind: Some("dxg_fence_wait_resolved".into()),
-                    });
+                if pid != 0 && pid != 4 {
+                    let ps = self.bump_pid(pid);
+                    ps.dxg_events += 1;
+                    ps.fence_signals += 1;
                 }
                 if !self.matches_pid(pid) {
                     return;
+                }
+                self.note_dxg_pid_match(pid, hdr_pid);
+                if ctx != 0 {
+                    self.ensure_queue(ctx, pid).fence_signals += 1;
                 }
                 let qname = (ctx != 0).then(|| self.queue_label(ctx));
                 let stack = extract_inline_stack(rec);
@@ -1264,16 +1877,20 @@ impl TimelineBuilder {
                     queue: qname,
                     duration_qpc: None,
                     detail: format!(
-                        "{} sync={sync:#x} val={val}",
-                        if id == 296 { "cpu_sig" } else { "gpu_sig" }
+                        "{} id={id} sync={sync:#x} val={val}",
+                        if matches!(id, 296 | 550) {
+                            "cpu_sig"
+                        } else {
+                            "gpu_sig"
+                        }
                     ),
                     raw_stack: stack,
                     waker_tid: None,
                     wait_kind: None,
                 });
             }
-            // Present (184) / PresentHistory (171) / Flip (168) / PresentQueuePacket (469)
-            184 | 171 | 168 | 469 => {
+            // Canonical Present candidates: Present (184), PresentQueuePacket Start (469), PresentHistory Start (171)
+            184 | 469 | 171 => {
                 let ctx = schema.get_u64(data, "hContext").unwrap_or(0);
                 let pid = self
                     .context_meta
@@ -1281,30 +1898,39 @@ impl TimelineBuilder {
                     .map(|m| m.pid)
                     .filter(|&p| p != 0)
                     .unwrap_or(hdr_pid);
+                if pid != 0 {
+                    let ps = self.bump_pid(pid);
+                    ps.dxg_events += 1;
+                    ps.presents += 1;
+                }
                 if !self.matches_pid(pid) {
                     return;
                 }
-                let dur_qpc = self.last_present_qpc.map(|prev| (qpc - prev).max(0));
-                self.last_present_qpc = Some(qpc);
-                self.last_submit_qpc = Some(qpc);
-                self.total_target_submits += 1;
+                self.note_dxg_pid_match(pid, hdr_pid);
                 let status = schema
                     .get_any_u64(data, &["Status", "hResult", "Result"])
                     .unwrap_or(0) as u32;
-                let frame = self.current_frame;
-                if matches!(id, 184 | 171 | 469) {
-                    self.current_frame += 1;
-                }
                 if is_device_removed_status(status) {
                     let msg = format!(
-                        "Device removal status {status:#010x} observed on Present (id={id}, pid={pid}, frame={frame})"
+                        "Device removal status {status:#010x} observed on Present (id={id}, pid={pid})"
                     );
                     self.record_removal(qpc, pid, hdr_tid, msg);
                 }
+                if self.ring_window_qpc.is_none() {
+                    self.full_present_marks.push((qpc, pid, id));
+                }
+                let min_gap = (self.qpc_freq_hz as i64) / 2000;
+                let dur_qpc = self.last_present_qpc.map(|prev| (qpc - prev).max(0));
+                if dur_qpc.is_none_or(|d| d >= min_gap) {
+                    self.last_present_qpc = Some(qpc);
+                    self.current_frame += 1;
+                }
+                self.last_submit_qpc = Some(qpc);
+                self.total_target_submits += 1;
                 let stack = extract_inline_stack(rec);
                 self.push_event(RawTimelineEvent {
                     qpc,
-                    frame,
+                    frame: self.current_frame,
                     pid,
                     tid: hdr_tid,
                     kind: TimelineEventKind::Present,
@@ -1316,10 +1942,22 @@ impl TimelineBuilder {
                     wait_kind: None,
                 });
             }
-            // VidMm Paging & Residency events
+            // VidMm Paging & Residency events (skip DC_Start=3 / DC_Stop=4 rundown snapshots!)
             47 | 71 | 73 | 74 | 242 | 320 | 321 | 338 | 374 => {
+                if matches!(opcode, 3 | 4) {
+                    return;
+                }
+                if hdr_pid != 0 {
+                    let ps = self.bump_pid(hdr_pid);
+                    ps.dxg_events += 1;
+                    ps.paging_events += 1;
+                }
                 if !self.matches_pid(hdr_pid) && self.filter_pid.is_some() {
                     return;
+                }
+                self.note_dxg_pid_match(hdr_pid, hdr_pid);
+                if self.ring_window_qpc.is_none() {
+                    self.full_aux_marks.push((qpc, hdr_pid, 0));
                 }
                 let label = match id {
                     73 => "PageIn",
@@ -1333,6 +1971,9 @@ impl TimelineBuilder {
                 };
                 let stack = extract_inline_stack(rec);
                 let is_wait = matches!(id, 320 | 338 | 374);
+                if is_wait {
+                    self.record_wait_acc(hdr_tid, "vidmm_make_resident", None, None, true);
+                }
                 self.push_event(RawTimelineEvent {
                     qpc,
                     frame: self.current_frame,
@@ -1361,18 +2002,7 @@ impl TimelineBuilder {
                 );
                 self.record_removal(qpc, hdr_pid, hdr_tid, msg);
             }
-            _ => {
-                // Check for device-removal HRESULT/NTSTATUS in Fence/other events
-                if let Some(status) = schema.get_any_u64(data, &["Status", "hResult", "Result"]) {
-                    let s32 = status as u32;
-                    if is_device_removed_status(s32) {
-                        let msg = format!(
-                            "DxgKrnl device-removal status {s32:#010x} (event id={id}, pid={hdr_pid})"
-                        );
-                        self.record_removal(qpc, hdr_pid, hdr_tid, msg);
-                    }
-                }
-            }
+            _ => {}
         }
     }
 
@@ -1405,14 +2035,25 @@ impl TimelineBuilder {
         let opcode = rec.EventHeader.EventDescriptor.Opcode;
         let id = rec.EventHeader.EventDescriptor.Id;
         let stack = extract_inline_stack(rec);
-        let (kind, detail) = if opcode == 98 || id == 98 {
-            (TimelineEventKind::VirtualProtect, format!("VirtualAlloc id={id}"))
+        let (kind, detail, aux_code) = if opcode == 98 || id == 98 {
+            (
+                TimelineEventKind::VirtualProtect,
+                format!("VirtualAlloc id={id}"),
+                1u8,
+            )
         } else {
             (
                 TimelineEventKind::HardFault,
                 format!("HardFault id={id} op={opcode}"),
+                2u8,
             )
         };
+        if self.ring_window_qpc.is_none() {
+            self.full_aux_marks.push((qpc, pid, aux_code));
+            if aux_code == 2 {
+                self.record_wait_acc(tid, "hard_fault", None, None, true);
+            }
+        }
         self.push_event(RawTimelineEvent {
             qpc,
             frame: self.current_frame,
@@ -1424,7 +2065,7 @@ impl TimelineBuilder {
             detail,
             raw_stack: stack,
             waker_tid: None,
-            wait_kind: Some("hard_fault".into()),
+            wait_kind: (aux_code == 2).then(|| "hard_fault".into()),
         });
     }
 
@@ -1436,6 +2077,9 @@ impl TimelineBuilder {
         let tid = rec.EventHeader.ThreadId;
         let id = rec.EventHeader.EventDescriptor.Id;
         let stack = extract_inline_stack(rec);
+        if self.ring_window_qpc.is_none() {
+            self.full_aux_marks.push((qpc, pid, 1));
+        }
         self.push_event(RawTimelineEvent {
             qpc,
             frame: self.current_frame,
@@ -1472,6 +2116,10 @@ impl TimelineBuilder {
                 if self.matches_pid(pid) {
                     let dur_qpc = (qpc - out_qpc).max(0);
                     let waker = self.last_waker.remove(&new_tid);
+                    if self.ring_window_qpc.is_none() {
+                        self.full_wait_spans.push((out_qpc, qpc, pid, 2));
+                        self.record_wait_acc(new_tid, "cswitch_wait", Some(dur_qpc), waker, true);
+                    }
                     self.push_event(RawTimelineEvent {
                         qpc: out_qpc,
                         frame: self.current_frame,
@@ -1590,47 +2238,93 @@ impl TimelineBuilder {
         }
     }
 
-    /// Finalizes the unified QPC timeline, symbolizing all captured stacks out-of-process.
+    /// Finalizes the unified QPC timeline, symbolizing all captured stacks out-of-process,
+    /// clipping per-frame GPU/wait intervals to exact canonical present bounds, and sorting EV lines.
     pub fn finish(
         mut self,
         source: String,
         symbolizer: &mut Symbolizer,
-        warnings: Vec<String>,
+        mut warnings: Vec<String>,
         flight_trigger: Option<FlightTriggerInfo>,
     ) -> TimelineReport {
         for (base, size, path) in &self.etw_images {
             symbolizer.add_etw_image(*base, *size, path);
         }
 
-        let start_qpc = self
-            .raw_events
-            .first()
-            .map(|e| e.qpc)
-            .or(self.start_qpc)
-            .unwrap_or(0);
-        let end_qpc = self
-            .raw_events
-            .last()
-            .map(|e| e.qpc)
-            .or(self.end_qpc)
-            .unwrap_or(start_qpc);
-        let dur_ms = (end_qpc - start_qpc).max(0) as f64 * 1e3 / self.qpc_freq_hz as f64;
+        let is_ring = self.ring_window_qpc.is_some();
+        let start_qpc = if is_ring {
+            self.raw_events
+                .front()
+                .map(|e| e.qpc)
+                .or(self.start_qpc)
+                .unwrap_or(0)
+        } else {
+            self.start_qpc
+                .or_else(|| self.raw_events.front().map(|e| e.qpc))
+                .unwrap_or(0)
+        };
+        let end_qpc = if is_ring {
+            self.raw_events
+                .back()
+                .map(|e| e.qpc)
+                .or(self.end_qpc)
+                .unwrap_or(start_qpc)
+        } else {
+            self.end_qpc
+                .or_else(|| self.raw_events.back().map(|e| e.qpc))
+                .unwrap_or(start_qpc)
+        };
+        let trace_dur_ms = (end_qpc - start_qpc).max(0) as f64 * 1e3 / self.qpc_freq_hz as f64;
+        let target_span_ms = match (self.target_start_qpc, self.target_end_qpc) {
+            (Some(ts), Some(te)) => (te - ts).max(0) as f64 * 1e3 / self.qpc_freq_hz as f64,
+            _ => 0.0,
+        };
         let qpc_to_ms = |ticks: i64| ticks as f64 * 1e3 / self.qpc_freq_hz as f64;
 
-        // Account for unresolved in-flight packets at end of capture.
         for &(ctx, _) in self.in_flight_queue_pkts.keys() {
             if let Some(q) = self.queues.get_mut(&ctx) {
                 q.in_flight_at_end += 1;
             }
         }
 
-        let mut frames_map: BTreeMap<u64, FrameSummary> = BTreeMap::new();
-        let mut frame_gpu_intervals: BTreeMap<u64, Vec<(i64, i64)>> = BTreeMap::new();
-        let mut queue_gpu_intervals: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
-        let mut wait_acc: BTreeMap<(u32, String), WaitAccEntry> = BTreeMap::new();
         let mut stack_acc: HashMap<(String, String), u64> = HashMap::new();
+        let mut wait_acc = if is_ring {
+            BTreeMap::new()
+        } else {
+            std::mem::take(&mut self.full_wait_acc)
+        };
+        let mut measured_waits = if is_ring { 0 } else { self.full_measured_waits };
+        let mut gpu_spans = if is_ring {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.full_gpu_spans)
+        };
+        let mut wait_spans = if is_ring {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.full_wait_spans)
+        };
+        let mut present_marks = if is_ring {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.full_present_marks)
+        };
+        let mut aux_marks = if is_ring {
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.full_aux_marks)
+        };
+        let qname_to_ctx: HashMap<String, u64> = self
+            .queues
+            .values()
+            .map(|q| (q.queue_id.clone(), q.context))
+            .collect();
 
         let mut events = Vec::with_capacity(self.raw_events.len());
+        let had_full_gpu = !gpu_spans.is_empty();
+        let had_full_presents = !present_marks.is_empty();
+        let had_full_waits = !wait_acc.is_empty();
+
         for raw in self.raw_events {
             let t_ms = qpc_to_ms(raw.qpc - start_qpc);
             let duration_ms = raw.duration_qpc.map(qpc_to_ms);
@@ -1649,60 +2343,70 @@ impl TimelineBuilder {
                 Some(joined)
             };
 
-            let fr = frames_map.entry(raw.frame).or_insert_with(|| FrameSummary {
-                frame: raw.frame,
-                start_qpc: raw.qpc,
-                t_ms,
-                ..Default::default()
-            });
-            match raw.kind {
-                TimelineEventKind::GpuBusy => {
-                    if let Some(dq) = raw.duration_qpc
-                        && dq > 0
-                    {
-                        let s = raw.qpc.max(start_qpc);
-                        let e = raw.qpc.saturating_add(dq).min(end_qpc);
-                        if e > s {
-                            frame_gpu_intervals.entry(raw.frame).or_default().push((s, e));
-                            if let Some(ref qname) = raw.queue {
-                                queue_gpu_intervals.entry(qname.clone()).or_default().push((s, e));
-                            }
+            if (is_ring || !had_full_gpu)
+                && raw.kind == TimelineEventKind::GpuBusy
+                && let Some(dq) = raw.duration_qpc
+                && dq > 0
+            {
+                let ctx = raw
+                    .queue
+                    .as_deref()
+                    .and_then(|qn| qname_to_ctx.get(qn).copied())
+                    .unwrap_or(0);
+                gpu_spans.push((raw.qpc, raw.qpc.saturating_add(dq), raw.pid, ctx));
+            }
+            if (is_ring || !had_full_presents) && raw.kind == TimelineEventKind::Present {
+                present_marks.push((raw.qpc, raw.pid, 184));
+            }
+            if is_ring {
+                match raw.kind {
+                    TimelineEventKind::Paging => aux_marks.push((raw.qpc, raw.pid, 0)),
+                    TimelineEventKind::VirtualProtect => aux_marks.push((raw.qpc, raw.pid, 1)),
+                    TimelineEventKind::HardFault => aux_marks.push((raw.qpc, raw.pid, 2)),
+                    TimelineEventKind::FenceWait => {
+                        if let Some(dq) = raw.duration_qpc {
+                            let is_cpu = raw.wait_kind.as_deref() == Some("dxg_fence_cpu_wait");
+                            wait_spans.push((
+                                raw.qpc,
+                                raw.qpc.saturating_add(dq),
+                                raw.pid,
+                                if is_cpu { 0 } else { 1 },
+                            ));
                         }
                     }
-                }
-                TimelineEventKind::FenceWait => {
-                    fr.fence_wait_ms += duration_ms.unwrap_or(0.0);
-                }
-                TimelineEventKind::CSwitchWait => {
-                    fr.os_wait_ms += duration_ms.unwrap_or(0.0);
-                }
-                TimelineEventKind::Paging => fr.paging_events += 1,
-                TimelineEventKind::VirtualProtect => fr.virtual_protect_events += 1,
-                TimelineEventKind::HardFault => fr.hard_faults += 1,
-                TimelineEventKind::Present => {
-                    fr.presents += 1;
-                    if let Some(d) = duration_ms {
-                        fr.duration_ms = d;
+                    TimelineEventKind::CSwitchWait => {
+                        if let Some(dq) = raw.duration_qpc {
+                            wait_spans.push((raw.qpc, raw.qpc.saturating_add(dq), raw.pid, 2));
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
 
             if let Some(ref wk) = raw.wait_kind {
-                let d = duration_ms.unwrap_or(0.0);
-                let e = wait_acc
-                    .entry((raw.tid, wk.clone()))
-                    .or_insert_with(|| (0, 0.0, 0.0, HashMap::new(), HashMap::new()));
-                e.0 += 1;
-                e.1 += d;
-                if d > e.2 {
-                    e.2 = d;
-                }
-                if let Some(w) = raw.waker_tid {
-                    *e.3.entry(w).or_insert(0) += 1;
-                }
-                if let Some(ref s) = stack_line {
-                    *e.4.entry(s.clone()).or_insert(0) += 1;
+                if is_ring || !had_full_waits {
+                    let e = wait_acc
+                        .entry((raw.tid, wk.clone()))
+                        .or_insert_with(|| (0, 0, 0.0, 0.0, HashMap::new(), HashMap::new()));
+                    e.0 += 1;
+                    if let Some(d) = duration_ms {
+                        e.1 += 1;
+                        e.2 += d;
+                        if d > e.3 {
+                            e.3 = d;
+                        }
+                        measured_waits += 1;
+                    }
+                    if let Some(w) = raw.waker_tid {
+                        *e.4.entry(w).or_insert(0) += 1;
+                    }
+                    if let Some(ref s) = stack_line {
+                        *e.5.entry(s.clone()).or_insert(0) += 1;
+                    }
+                } else if let Some(ref s) = stack_line
+                    && let Some(e) = wait_acc.get_mut(&(raw.tid, wk.clone()))
+                {
+                    *e.5.entry(s.clone()).or_insert(0) += 1;
                 }
             }
 
@@ -1720,23 +2424,30 @@ impl TimelineBuilder {
             });
         }
 
-        // Compute merged union wall-clock busy time per queue (bounded 0..100%) and per frame.
-        for (fnum, intervals) in frame_gpu_intervals {
-            if let Some(fr) = frames_map.get_mut(&fnum) {
-                fr.gpu_busy_ms = qpc_to_ms(union_interval_qpc(intervals));
+        events.sort_by_key(|e| e.qpc);
+
+        let mut queue_intervals: HashMap<u64, Vec<(i64, i64)>> = HashMap::new();
+        for &(s, e, _, ctx) in &gpu_spans {
+            let cs = s.max(start_qpc);
+            let ce = e.min(end_qpc);
+            if ce > cs {
+                queue_intervals.entry(ctx).or_default().push((cs, ce));
             }
         }
         let mut queues: Vec<QueueSummary> = self
             .queues
             .into_values()
             .map(|mut q| {
-                if let Some(intervals) = queue_gpu_intervals.remove(&q.queue_id) {
+                if q.process_name.is_none() && q.pid != 0 {
+                    q.process_name = self.pid_names.get(&q.pid).cloned();
+                }
+                if let Some(intervals) = queue_intervals.remove(&q.context) {
                     q.busy_ms = qpc_to_ms(union_interval_qpc(intervals));
                 } else {
-                    q.busy_ms = q.busy_ms.min(dur_ms);
+                    q.busy_ms = q.busy_ms.min(trace_dur_ms);
                 }
-                q.busy_pct = if dur_ms > 0.0 {
-                    ((q.busy_ms / dur_ms) * 100.0).min(100.0)
+                q.busy_pct = if trace_dur_ms > 0.0 {
+                    ((q.busy_ms / trace_dur_ms) * 100.0).min(100.0)
                 } else {
                     0.0
                 };
@@ -1749,24 +2460,79 @@ impl TimelineBuilder {
                 .then_with(|| b.packets_started.cmp(&a.packets_started))
         });
 
+        let mut pids: Vec<PidActivitySummary> = self
+            .pid_stats
+            .into_values()
+            .map(|mut p| {
+                if p.process_name.is_none() {
+                    p.process_name = self.pid_names.get(&p.pid).cloned();
+                }
+                p
+            })
+            .collect();
+        pids.sort_by(|a, b| {
+            let a_has_p = a.presents > 0 && a.pid != 0 && a.pid != 4;
+            let b_has_p = b.presents > 0 && b.pid != 0 && b.pid != 4;
+            b_has_p
+                .cmp(&a_has_p)
+                .then_with(|| b.submits.cmp(&a.submits))
+                .then_with(|| b.presents.cmp(&a.presents))
+                .then_with(|| b.dxg_events.cmp(&a.dxg_events))
+        });
+
+        let frame_pid = self.filter_pid.or_else(|| {
+            pids.iter()
+                .find(|p| p.pid != 0 && p.pid != 4 && p.presents > 0)
+                .or_else(|| pids.iter().find(|p| p.pid != 0 && p.pid != 4 && p.submits > 0))
+                .map(|p| p.pid)
+                .or_else(|| present_marks.first().map(|m| m.1))
+        });
+        if self.filter_pid.is_none()
+            && let Some(fp) = frame_pid
+            && pids.iter().filter(|p| p.presents > 0).count() > 1
+        {
+            let nm = self
+                .pid_names
+                .get(&fp)
+                .map(|n| format!(" ({n})"))
+                .unwrap_or_default();
+            warnings.push(format!(
+                "pid=all had presents from multiple processes; FRAME table scoped to pid={fp}{nm} (pass --pid <PID> or --list-pids to pick another)"
+            ));
+        }
+
+        let frames = build_clipped_frames(
+            frame_pid,
+            start_qpc,
+            end_qpc,
+            self.qpc_freq_hz,
+            &present_marks,
+            &gpu_spans,
+            &wait_spans,
+            &aux_marks,
+        );
+
         let mut waits: Vec<WaitSummary> = wait_acc
             .into_iter()
-            .map(|((tid, kind), (count, total_ms, max_ms, wakers, stacks))| {
-                let top_waker = wakers
-                    .into_iter()
-                    .max_by_key(|&(_, n)| n)
-                    .map(|(w, n)| format!("tid={w} ({n}x)"));
-                let top_stack = stacks.into_iter().max_by_key(|(_, n)| *n).map(|(s, _)| s);
-                WaitSummary {
-                    tid,
-                    kind,
-                    count,
-                    total_ms,
-                    max_ms,
-                    top_waker,
-                    top_stack,
-                }
-            })
+            .map(
+                |((tid, kind), (count, measured_count, total_ms, max_ms, wakers, stacks))| {
+                    let top_waker = wakers
+                        .into_iter()
+                        .max_by_key(|&(_, n)| n)
+                        .map(|(w, n)| format!("tid={w} ({n}x)"));
+                    let top_stack = stacks.into_iter().max_by_key(|(_, n)| *n).map(|(s, _)| s);
+                    WaitSummary {
+                        tid,
+                        kind,
+                        count,
+                        measured_count,
+                        total_ms,
+                        max_ms,
+                        top_waker,
+                        top_stack,
+                    }
+                },
+            )
             .collect();
         waits.sort_by(|a, b| {
             b.total_ms
@@ -1781,7 +2547,6 @@ impl TimelineBuilder {
         top_stacks.sort_by_key(|s| std::cmp::Reverse(s.count));
         top_stacks.truncate(50);
 
-        let frames: Vec<FrameSummary> = frames_map.into_values().collect();
         let mut providers_active = Vec::new();
         if self.saw_dxgkrnl {
             providers_active.push("DxgKrnl".into());
@@ -1810,19 +2575,27 @@ impl TimelineBuilder {
         TimelineReport {
             source,
             pid: self.filter_pid,
+            frame_pid,
             thread_suspends: THREAD_SUSPENDS,
+            ts_unit: self.ts_unit,
             qpc_freq_hz: self.qpc_freq_hz,
             start_qpc,
             end_qpc,
-            duration_ms: dur_ms,
+            duration_ms: trace_dur_ms,
+            target_span_ms,
             total_raw_events: self.total_raw_events,
             target_events: events.len(),
+            ev_truncated: self.ev_truncated,
+            dxg_pid_events: self.dxg_pid_events,
+            dxg_ctx_other_pid_events: self.dxg_ctx_other_pid_events,
             stack_samples_captured: self.stack_samples_captured,
+            measured_waits,
             wait_attribution_mode,
             providers_active,
             warnings,
             alerts: self.alerts,
             flight_trigger,
+            pids,
             queues,
             waits,
             frames,
@@ -1830,6 +2603,180 @@ impl TimelineBuilder {
             events,
         }
     }
+}
+
+/// Builds deduplicated canonical per-present frames for `frame_pid` and clips every GPU/wait interval
+/// strictly to `[frame.start_qpc, frame.end_qpc]` so `gpu_busy_ms <= dur_ms` is mathematically guaranteed!
+#[allow(clippy::too_many_arguments)]
+fn build_clipped_frames(
+    frame_pid: Option<u32>,
+    start_qpc: i64,
+    _end_qpc: i64,
+    qpc_freq_hz: u64,
+    present_marks: &[(i64, u32, u16)],
+    gpu_spans: &[(i64, i64, u32, u64)],
+    wait_spans: &[(i64, i64, u32, u8)],
+    aux_marks: &[(i64, u32, u8)],
+) -> Vec<FrameSummary> {
+    let Some(fpid) = frame_pid else {
+        return Vec::new();
+    };
+    let qpc_to_ms = |ticks: i64| ticks as f64 * 1e3 / qpc_freq_hz.max(1) as f64;
+    let min_gap = (qpc_freq_hz as i64) / 2000; // 0.5 ms dedup threshold for paired Present/PresentHistory
+
+    let mut pid_presents: Vec<(i64, u16)> = present_marks
+        .iter()
+        .filter(|&&(_, p, _)| p == fpid)
+        .map(|&(q, _, id)| (q, id))
+        .collect();
+    if pid_presents.is_empty() {
+        return Vec::new();
+    }
+    let canon_id = if pid_presents.iter().any(|&(_, id)| id == 184) {
+        184u16
+    } else if pid_presents.iter().any(|&(_, id)| id == 469) {
+        469u16
+    } else {
+        pid_presents[0].1
+    };
+    pid_presents.retain(|&(_, id)| id == canon_id);
+    pid_presents.sort_unstable_by_key(|&(q, _)| q);
+
+    let mut dedup: Vec<(i64, u16)> = Vec::with_capacity(pid_presents.len());
+    for (q, id) in pid_presents {
+        if dedup.last().is_none_or(|&(prev, _)| q - prev >= min_gap) {
+            dedup.push((q, id));
+        }
+    }
+
+    let mut windows: Vec<(u64, i64, i64, u16)> = Vec::with_capacity(dedup.len());
+    let mut prev_qpc = start_qpc;
+    for (idx, &(pq, pid_ev)) in dedup.iter().enumerate() {
+        let f_start = if idx == 0 { prev_qpc.min(pq) } else { prev_qpc };
+        let f_end = pq.max(f_start);
+        windows.push((idx as u64, f_start, f_end, pid_ev));
+        prev_qpc = f_end;
+    }
+
+    let mut g_spans: Vec<(i64, i64, u64)> = gpu_spans
+        .iter()
+        .filter(|&&(_, _, p, _)| p == fpid)
+        .map(|&(s, e, _, ctx)| (s, e, ctx))
+        .collect();
+    g_spans.sort_unstable_by_key(|&(s, _, _)| s);
+
+    let mut w_spans: Vec<(i64, i64, u8)> = wait_spans
+        .iter()
+        .filter(|&&(_, _, p, _)| p == fpid)
+        .map(|&(s, e, _, kc)| (s, e, kc))
+        .collect();
+    w_spans.sort_unstable_by_key(|&(s, _, _)| s);
+
+    let mut a_marks: Vec<(i64, u8)> = aux_marks
+        .iter()
+        .filter(|&&(_, p, _)| p == fpid)
+        .map(|&(q, _, code)| (q, code))
+        .collect();
+    a_marks.sort_unstable_by_key(|&(q, _)| q);
+
+    let mut frames = Vec::with_capacity(windows.len());
+    let mut aux_idx = 0usize;
+    let mut gpu_head = 0usize;
+    let mut wait_head = 0usize;
+
+    for (fnum, f_start, f_end, pid_ev) in windows {
+        let dur_ticks = (f_end - f_start).max(0);
+        let dur_ms = qpc_to_ms(dur_ticks);
+
+        while gpu_head < g_spans.len() && g_spans[gpu_head].1 <= f_start {
+            gpu_head += 1;
+        }
+        let mut all_gpu: Vec<(i64, i64)> = Vec::new();
+        let mut by_q: HashMap<u64, Vec<(i64, i64)>> = HashMap::new();
+        for &(s, e, ctx) in &g_spans[gpu_head..] {
+            if s >= f_end {
+                break;
+            }
+            let cs = s.max(f_start);
+            let ce = e.min(f_end);
+            if ce > cs {
+                all_gpu.push((cs, ce));
+                by_q.entry(ctx).or_default().push((cs, ce));
+            }
+        }
+        let gpu_busy_ms = qpc_to_ms(union_interval_qpc(all_gpu)).min(dur_ms);
+        let mut busiest_q_ms = 0.0f64;
+        let mut q_sum_ms = 0.0f64;
+        for ivs in by_q.into_values() {
+            let ms = qpc_to_ms(union_interval_qpc(ivs)).min(dur_ms);
+            q_sum_ms += ms;
+            if ms > busiest_q_ms {
+                busiest_q_ms = ms;
+            }
+        }
+
+        while wait_head < w_spans.len() && w_spans[wait_head].1 <= f_start {
+            wait_head += 1;
+        }
+        let mut cpu_w = Vec::new();
+        let mut gpu_w = Vec::new();
+        let mut os_w = Vec::new();
+        for &(s, e, kc) in &w_spans[wait_head..] {
+            if s >= f_end {
+                break;
+            }
+            let cs = s.max(f_start);
+            let ce = e.min(f_end);
+            if ce > cs {
+                match kc {
+                    0 => cpu_w.push((cs, ce)),
+                    1 => gpu_w.push((cs, ce)),
+                    _ => os_w.push((cs, ce)),
+                }
+            }
+        }
+        let cpu_fence_wait_ms = qpc_to_ms(union_interval_qpc(cpu_w)).min(dur_ms);
+        let gpu_fence_wait_ms = qpc_to_ms(union_interval_qpc(gpu_w)).min(dur_ms);
+        let os_wait_ms = qpc_to_ms(union_interval_qpc(os_w)).min(dur_ms);
+
+        while aux_idx < a_marks.len() && a_marks[aux_idx].0 < f_start {
+            aux_idx += 1;
+        }
+        let mut paging = 0u64;
+        let mut vprot = 0u64;
+        let mut hfault = 0u64;
+        while aux_idx < a_marks.len() && a_marks[aux_idx].0 <= f_end {
+            match a_marks[aux_idx].1 {
+                0 => paging += 1,
+                1 => vprot += 1,
+                _ => hfault += 1,
+            }
+            aux_idx += 1;
+        }
+
+        frames.push(FrameSummary {
+            frame: fnum,
+            pid: fpid,
+            start_qpc: f_start,
+            end_qpc: f_end,
+            t_ms: qpc_to_ms(f_start - start_qpc),
+            duration_ms: dur_ms,
+            gpu_busy_ms,
+            busiest_queue_ms: busiest_q_ms,
+            queue_sum_ms: q_sum_ms,
+            fence_wait_ms: cpu_fence_wait_ms + gpu_fence_wait_ms,
+            cpu_fence_wait_ms,
+            gpu_fence_wait_ms,
+            os_wait_ms,
+            paging_events: paging,
+            virtual_protect_events: vprot,
+            hard_faults: hfault,
+            presents: 1,
+            present_event_id: pid_ev,
+        });
+    }
+
+    frames
 }
 
 fn union_interval_qpc(mut intervals: Vec<(i64, i64)>) -> i64 {
@@ -1918,7 +2865,7 @@ pub fn parse_timeline_etl(
     let mut builder = Box::new(TimelineBuilder::new(filter_pid, qpc_frequency()));
     let mut logfile: EVENT_TRACE_LOGFILEW = unsafe { std::mem::zeroed() };
     logfile.LogFileName = PWSTR(wide_path.as_mut_ptr());
-    logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD;
+    logfile.Anonymous1.ProcessTraceMode = PROCESS_TRACE_MODE_EVENT_RECORD | PROCESS_TRACE_MODE_RAW_TIMESTAMP;
     logfile.Anonymous2.EventRecordCallback = Some(timeline_event_cb);
     logfile.Context = (&mut *builder as *mut TimelineBuilder).cast::<c_void>();
 
@@ -1930,8 +2877,15 @@ pub fn parse_timeline_etl(
             std::io::Error::last_os_error()
         ));
     }
-    if logfile.LogfileHeader.PerfFreq > 0 {
-        builder.qpc_freq_hz = logfile.LogfileHeader.PerfFreq as u64;
+    // ReservedFlags: 1 = QPC, 2 = SystemTime (100 ns FILETIME), 3 = CPU cycle counter.
+    if logfile.LogfileHeader.ReservedFlags == 2 {
+        builder.ts_unit = "ts_100ns".into();
+        builder.qpc_freq_hz = 10_000_000;
+    } else {
+        builder.ts_unit = "qpc".into();
+        if logfile.LogfileHeader.PerfFreq > 0 {
+            builder.qpc_freq_hz = logfile.LogfileHeader.PerfFreq as u64;
+        }
     }
 
     let handles = [handle];
@@ -2054,9 +3008,9 @@ pub(crate) fn build_session_properties(
         (*p).Wnode.BufferSize = total_size as u32;
         (*p).Wnode.Flags = WNODE_FLAG_TRACED_GUID;
         (*p).Wnode.ClientContext = 1; // QPC clock!
-        (*p).BufferSize = 1024;
-        (*p).MinimumBuffers = 16;
-        (*p).MaximumBuffers = 128;
+        (*p).BufferSize = 256;
+        (*p).MinimumBuffers = 8;
+        (*p).MaximumBuffers = 64;
         (*p).MaximumFileSize = max_file_mb;
         (*p).LogFileMode = log_file_mode;
         (*p).FlushTimer = 1;
@@ -2265,16 +3219,37 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
     let mut out = String::new();
 
     let pid_s = rep.pid.map(|p| p.to_string()).unwrap_or_else(|| "all".into());
+    let fpid_s = rep
+        .frame_pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "none".into());
+    let stacks_s = if rep.stack_samples_captured == 0 {
+        "0(no_stack_events)".to_string()
+    } else {
+        rep.stack_samples_captured.to_string()
+    };
+    let waits_s = if rep.measured_waits == 0 && !rep.waits.is_empty() {
+        "0(count-only:no_wait_end_pairs)".to_string()
+    } else {
+        rep.measured_waits.to_string()
+    };
     let _ = writeln!(
         out,
-        "HEADER source={} pid={} dur_ms={:.2} qpc_hz={} raw_events={} target_events={} stacks={} wait_mode={} providers={} thread_suspends={}",
+        "HEADER source={} pid={} frame_pid={} trace_dur_ms={:.2} target_span_ms={:.2} ts_unit={} freq_hz={} raw_events={} target_events={}{} dxg_pid_ev={} dxg_ctx_other_pid={} stacks={} measured_waits={} wait_mode={} providers={} thread_suspends={}",
         rep.source,
         pid_s,
+        fpid_s,
         rep.duration_ms,
+        rep.target_span_ms,
+        rep.ts_unit,
         rep.qpc_freq_hz,
         rep.total_raw_events,
         rep.target_events,
-        rep.stack_samples_captured,
+        if rep.ev_truncated { "(ev_capped)" } else { "" },
+        rep.dxg_pid_events,
+        rep.dxg_ctx_other_pid_events,
+        stacks_s,
+        waits_s,
         rep.wait_attribution_mode,
         rep.providers_active.join(","),
         rep.thread_suspends,
@@ -2297,13 +3272,42 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
         let _ = writeln!(out, "ALERT {a}");
     }
 
-    if !rep.queues.is_empty() {
-        let _ = writeln!(out, "\n== GPU Hardware Queues (QPC busy / signals / waits) ==");
-        for q in rep.queues.iter().take(opts.top) {
+    if !rep.pids.is_empty() && (opts.list_pids || rep.pid.is_none()) {
+        let _ = writeln!(out, "\n== Active Processes (DxgKrnl) ==");
+        for p in rep.pids.iter().take(opts.top.max(12)) {
+            let name = p.process_name.as_deref().unwrap_or("-");
             let _ = writeln!(
                 out,
-                "QUEUE {:<20} pkts={}/{} in_flight={} busy_ms={:>8.2} ({:>5.1}%) max_pkt_ms={:>7.2} sig={} wait={}",
+                "PID {:<6} name={:<24} submits={:<7} presents={:<5} fence_waits={:<7} fence_sigs={:<7} paging={:<7} dxg_ev={}",
+                p.pid,
+                name,
+                p.submits,
+                p.presents,
+                p.fence_waits,
+                p.fence_signals,
+                p.paging_events,
+                p.dxg_events
+            );
+        }
+        if opts.list_pids {
+            return out;
+        }
+    }
+
+    if !rep.queues.is_empty() {
+        let _ = writeln!(out, "\n== GPU Hardware Queues (union busy / signals / waits) ==");
+        for q in rep.queues.iter().take(opts.top) {
+            let pname = q
+                .process_name
+                .as_deref()
+                .map(|n| format!("({n})"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "QUEUE {:<20} pid={:<6}{:<16} pkts={}/{} in_flight={} busy_ms={:>8.2} ({:>5.1}%) max_pkt_ms={:>7.2} sig={} wait={}",
                 q.queue_id,
+                q.pid,
+                pname,
                 q.packets_completed,
                 q.packets_started,
                 q.in_flight_at_end,
@@ -2321,11 +3325,19 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
         for w in rep.waits.iter().take(opts.top) {
             let waker = w.top_waker.as_deref().unwrap_or("-");
             let stack = w.top_stack.as_deref().unwrap_or("-");
-            let _ = writeln!(
-                out,
-                "WAIT tid={:<6} kind={:<24} n={:<5} total_ms={:>8.2} max_ms={:>7.2} waker={:<18} stack={}",
-                w.tid, w.kind, w.count, w.total_ms, w.max_ms, waker, stack
-            );
+            if w.measured_count == 0 {
+                let _ = writeln!(
+                    out,
+                    "WAIT tid={:<6} kind={:<22} n={:<6} total_ms=n/a(count-only) max_ms=n/a     waker={:<18} stack={}",
+                    w.tid, w.kind, w.count, waker, stack
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "WAIT tid={:<6} kind={:<22} n={:<6} measured={:<6} total_ms={:>8.2} max_ms={:>7.2} waker={:<18} stack={}",
+                    w.tid, w.kind, w.count, w.measured_count, w.total_ms, w.max_ms, waker, stack
+                );
+            }
         }
     }
 
@@ -2337,21 +3349,28 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
     }
 
     if !rep.frames.is_empty() {
-        let _ = writeln!(out, "\n== Per-Present Frames (QPC) ==");
+        let _ = writeln!(
+            out,
+            "\n== Per-Present Frames (clipped to frame bounds; union gpu_busy <= dur) =="
+        );
         for f in rep.frames.iter().take(opts.top.max(30)) {
             let _ = writeln!(
                 out,
-                "FRAME f={:<4} t_ms={:>9.2} dur_ms={:>7.2} gpu_busy_ms={:>7.2} fence_wait_ms={:>7.2} os_wait_ms={:>7.2} paging={} vprot={} hfault={} presents={}",
+                "FRAME f={:<4} pid={:<6} ev_id={:<3} t_ms={:>9.2} dur_ms={:>7.2} gpu_busy_ms={:>7.2} busiest_q_ms={:>7.2} q_sum_ms={:>7.2} cpu_wait_ms={:>6.2} gpu_wait_ms={:>6.2} os_wait_ms={:>6.2} paging={} vprot={} hfault={}",
                 f.frame,
+                f.pid,
+                f.present_event_id,
                 f.t_ms,
                 f.duration_ms,
                 f.gpu_busy_ms,
-                f.fence_wait_ms,
+                f.busiest_queue_ms,
+                f.queue_sum_ms,
+                f.cpu_fence_wait_ms,
+                f.gpu_fence_wait_ms,
                 f.os_wait_ms,
                 f.paging_events,
                 f.virtual_protect_events,
                 f.hard_faults,
-                f.presents,
             );
         }
     }
@@ -2366,18 +3385,43 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
         })
         .collect();
     if !filtered.is_empty() && opts.limit > 0 {
+        // Collapse consecutive bursts sharing (kind, tid, detail, top_stack) within 1.0 ms.
+        let mut collapsed: Vec<(&TimelineEvent, usize, f64)> = Vec::new();
+        for &e in &filtered {
+            let top_s = e.stack.first().map(String::as_str);
+            if let Some((prev, cnt, end_t)) = collapsed.last_mut()
+                && prev.kind == e.kind
+                && prev.tid == e.tid
+                && prev.detail == e.detail
+                && prev.duration_ms.is_none()
+                && e.duration_ms.is_none()
+                && prev.stack.first().map(String::as_str) == top_s
+                && (e.t_ms - *end_t).abs() <= 1.0
+            {
+                *cnt += 1;
+                *end_t = e.t_ms;
+            } else {
+                collapsed.push((e, 1, e.t_ms));
+            }
+        }
         let _ = writeln!(
             out,
-            "\n== Unified QPC Timeline Events (showing {} of {} matching) ==",
-            opts.limit.min(filtered.len()),
+            "\n== Unified Timeline Events (showing {} of {} collapsed lines from {} matching) ==",
+            opts.limit.min(collapsed.len()),
+            collapsed.len(),
             filtered.len(),
         );
-        for e in filtered.iter().take(opts.limit) {
+        for &(e, cnt, end_t) in collapsed.iter().take(opts.limit) {
             let dur = e
                 .duration_ms
                 .map(|d| format!(" dur={d:.3}ms"))
                 .unwrap_or_default();
             let q = e.queue.as_deref().map(|q| format!(" {q}")).unwrap_or_default();
+            let burst = if cnt > 1 {
+                format!(" x{cnt} (span={:.3}ms)", (end_t - e.t_ms).max(0.0))
+            } else {
+                String::new()
+            };
             let stk = if e.stack.is_empty() {
                 String::new()
             } else {
@@ -2388,8 +3432,9 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
             };
             let _ = writeln!(
                 out,
-                "EV t=+{:>9.3}ms qpc={} f={:<4} tid={:<6} [{}]{}{} {}{}",
+                "EV t=+{:>9.3}ms {}={} f={:<4} tid={:<6} [{}]{}{} {}{}{}",
                 e.t_ms,
+                rep.ts_unit,
                 e.qpc,
                 e.frame,
                 e.tid,
@@ -2397,6 +3442,7 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                 q,
                 dur,
                 e.detail,
+                burst,
                 stk,
             );
         }
@@ -2423,6 +3469,8 @@ mod tests {
             QueueSummary {
                 queue_id: "ctx=0x1000/n0".into(),
                 context: 0x1000,
+                pid: 42,
+                process_name: Some("xcl.exe".into()),
                 node_ordinal: Some(0),
                 engine_type: Some(0),
                 packets_started: 2,
@@ -2444,7 +3492,7 @@ mod tests {
             queue: Some("ctx=0x1000/n0".into()),
             duration_qpc: Some(50_000),
             detail: "queue_pkt type=0 seq=1".into(),
-            raw_stack: vec![0x7FF6_1000_1234],
+            raw_stack: vec![0xFFFF_F804_CF8F_8208, 0x7FF6_1000_1234],
             waker_tid: None,
             wait_kind: None,
         });
@@ -2456,10 +3504,10 @@ mod tests {
             kind: TimelineEventKind::FenceWait,
             queue: Some("ctx=0x1000/n0".into()),
             duration_qpc: Some(25_000),
-            detail: "resolved sync=0xabc val=1->1 by_tid=1002".into(),
-            raw_stack: vec![0x7FF6_1000_1234],
+            detail: "cpu_wait_done sync=0xabc val=1->1 by_tid=1002".into(),
+            raw_stack: vec![0xFFFF_F804_CF8F_8208, 0x7FF6_1000_1234],
             waker_tid: Some(1002),
-            wait_kind: Some("dxg_fence_wait_resolved".into()),
+            wait_kind: Some("dxg_fence_cpu_wait".into()),
         });
         b.push_event(RawTimelineEvent {
             qpc: 266_700,
@@ -2480,8 +3528,14 @@ mod tests {
         let rep = b.finish("unit.etl".into(), &mut sym, Vec::new(), None);
         assert_eq!(rep.queues.len(), 1);
         assert_eq!(rep.frames.len(), 1);
+        assert!(
+            rep.frames[0].gpu_busy_ms <= rep.frames[0].duration_ms,
+            "clipped frame gpu_busy_ms must never exceed dur_ms"
+        );
         assert_eq!(rep.waits.len(), 1);
+        assert_eq!(rep.waits[0].measured_count, 1);
         assert_eq!(rep.waits[0].top_waker.as_deref(), Some("tid=1002 (1x)"));
+        // Kernel ETW prefix must be skipped in favor of the user-mode frame!
         assert_eq!(rep.events[0].stack, vec!["xcl.exe+0x1234"]);
 
         let text = format_timeline_text(&rep, &TimelineFormatOptions::default());
@@ -2497,7 +3551,6 @@ mod tests {
     fn ring_eviction_keeps_only_last_window_events() {
         let freq = 10_000_000u64;
         let mut b = TimelineBuilder::new(Some(7), freq).with_ring(10.0, 10_000);
-        // Push 1500 events spanning 20 seconds (0..20s).
         for i in 0..1500i64 {
             let qpc = 1_000_000 + i * (20 * freq as i64 / 1500);
             b.end_qpc = Some(qpc);
@@ -2517,7 +3570,7 @@ mod tests {
         }
         assert!(b.evicted_events > 0, "events older than 10s ring must evict");
         let span_secs =
-            (b.raw_events.last().unwrap().qpc - b.raw_events.first().unwrap().qpc) as f64 / freq as f64;
+            (b.raw_events.back().unwrap().qpc - b.raw_events.front().unwrap().qpc) as f64 / freq as f64;
         assert!(
             span_secs <= 10.5,
             "retained ring span should be ~10s, got {span_secs:.2}s"
