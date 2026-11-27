@@ -194,7 +194,7 @@ fn format_residency_priority(prio: u32) -> String {
 
 fn classify_alloc_heap_kind(pref_kind: SegmentKind, flags: u32) -> &'static str {
     if pref_kind.is_local() {
-        if (flags & 0x0000_0001) != 0 || pref_kind == SegmentKind::LocalCpuVisibleVram {
+        if (flags & 0x0000_0001) != 0 {
             "local_cpu_vis(GPU_UPLOAD)"
         } else if (flags & 0x0004_0000) != 0 {
             "local_cpu_vis_on_demand"
@@ -701,6 +701,60 @@ pub struct DemotedAllocDetail {
     pub created_during_trace: bool,
 }
 
+/// One alive VidMm allocation matching an opt-in exact-size lookup (`--alloc-size`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AllocLookupMatch {
+    pub handle: u64,
+    pub pid: u32,
+    pub size_bytes: u64,
+    /// `"resident_local"`, `"demoted"`, `"resident_nonlocal"`, `"evicted"`, `"uncommitted"`, or `"resident_unknown"`.
+    pub residency: String,
+    pub heap_kind: String,
+    pub cpu_visible: bool,
+    pub flags: u32,
+    pub flags_decoded: String,
+    pub priority: u32,
+    pub priority_label: String,
+    pub preferred_seg_id: u32,
+    pub preferred_seg_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_seg_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_seg_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_va_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_va_end: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_va_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_va_end: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_va_span_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_va_span_end: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub gpu_va_mappings: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_stack: Option<String>,
+    pub created_during_trace: bool,
+}
+
+/// Opt-in exact-size allocation lookup result (`--alloc-size <SIZE>`), with no top-N cutoff and explicit zero-match count.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AllocLookupSummary {
+    pub query_size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    pub match_count: usize,
+    pub resident_local_count: usize,
+    pub demoted_count: usize,
+    pub resident_nonlocal_count: usize,
+    pub evicted_count: usize,
+    pub uncommitted_count: usize,
+    pub matches: Vec<AllocLookupMatch>,
+}
+
 /// VidMm paging, residency, demotion, and eviction throughput summary (clipped to active window).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PagingTimelineSummary {
@@ -754,13 +808,16 @@ pub struct PagingTimelineSummary {
     pub active_demoted_allocs: Vec<DemotedAllocDetail>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evicted_or_demoted_heap_sizes: Vec<HeapSizeBucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alloc_lookup: Option<AllocLookupSummary>,
 }
 
-/// Optional present-to-present window slicing (`--between-presents`, `--frame N`).
+/// Optional present-to-present window slicing (`--between-presents`, `--frame N`) and opt-in allocation lookup (`--alloc-size`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TimelineCutOptions {
     pub between_presents: bool,
     pub frame_index: Option<usize>,
+    pub alloc_size_bytes: Option<u64>,
 }
 
 /// Per-PID DxgKrnl activity summary (powers `--list-pids` and `pid=all` disambiguation).
@@ -1187,9 +1244,12 @@ struct AllocMeta {
     priority: u32,
     preferred_seg_id: u32,
     current_seg: Option<u32>,
+    evicted: bool,
     cpu_va: Option<u64>,
     gpu_va_start: Option<u64>,
     gpu_va_end: Option<u64>,
+    gpu_va_min: Option<u64>,
+    gpu_va_max: Option<u64>,
     gpu_va_mappings: u32,
     create_stack: Vec<u64>,
     created_during_trace: bool,
@@ -2185,9 +2245,12 @@ impl TimelineBuilder {
                     priority,
                     preferred_seg_id: pref_id,
                     current_seg: None,
+                    evicted: false,
                     cpu_va: None,
                     gpu_va_start: None,
                     gpu_va_end: None,
+                    gpu_va_min: None,
+                    gpu_va_max: None,
                     gpu_va_mappings: 0,
                     create_stack: Vec::new(),
                     created_during_trace: id == 33,
@@ -2281,12 +2344,20 @@ impl TimelineBuilder {
                     if a.gpu_va_start == Some(start) && a.gpu_va_end == Some(end) && a.gpu_va_mappings <= 1 {
                         a.gpu_va_start = None;
                         a.gpu_va_end = None;
+                        a.gpu_va_min = None;
+                        a.gpu_va_max = None;
                         a.gpu_va_mappings = 0;
                     }
                 } else {
+                    a.gpu_va_min = Some(a.gpu_va_min.map_or(start, |m| m.min(start)));
+                    a.gpu_va_max = Some(a.gpu_va_max.map_or(end, |m| m.max(end)));
                     let span = end - start;
                     match (a.gpu_va_start, a.gpu_va_end) {
-                        (Some(cs), Some(ce)) if cs == start && ce == end => {}
+                        (Some(cs), Some(ce)) if start >= cs && end <= ce => {}
+                        (Some(cs), Some(ce)) if start <= ce && end >= cs => {
+                            a.gpu_va_start = Some(cs.min(start));
+                            a.gpu_va_end = Some(ce.max(end));
+                        }
                         (Some(cs), Some(ce)) => {
                             a.gpu_va_mappings = a.gpu_va_mappings.saturating_add(1);
                             if span > ce.saturating_sub(cs) {
@@ -2316,6 +2387,7 @@ impl TimelineBuilder {
                         pid,
                         size,
                         current_seg: Some(seg_id),
+                        evicted: false,
                         alive: true,
                         ..Default::default()
                     });
@@ -2326,6 +2398,7 @@ impl TimelineBuilder {
                         entry.size = size;
                     }
                     entry.current_seg = Some(seg_id);
+                    entry.evicted = false;
                 }
             }
             // ReserveResource/Start (67): updates allocation's current segment
@@ -2339,6 +2412,7 @@ impl TimelineBuilder {
                     && let Some(a) = self.allocs.get_mut(&gh)
                 {
                     a.current_seg = Some(seg_id);
+                    a.evicted = false;
                 }
             }
             // VidMm per-process budget / usage / demoted commitment counters (366/367/370/371)
@@ -3297,6 +3371,7 @@ impl TimelineBuilder {
                     && let Some(a) = self.allocs.get_mut(&gh)
                 {
                     a.current_seg = Some(dst_seg);
+                    a.evicted = false;
                 }
                 self.note_dxg_pid_match(pid, hdr_pid);
                 if self.ring_window_qpc.is_none() {
@@ -3464,6 +3539,7 @@ impl TimelineBuilder {
                             && let Some(a) = self.allocs.get_mut(&gh)
                         {
                             a.current_seg = Some(s);
+                            a.evicted = false;
                         }
                         let seg_kind = seg_opt
                             .map(|s| self.segment_kind(alloc_adap, s))
@@ -3499,6 +3575,11 @@ impl TimelineBuilder {
                         }
                     }
                     74 => {
+                        if gh != 0
+                            && let Some(a) = self.allocs.get_mut(&gh)
+                        {
+                            a.evicted = true;
+                        }
                         self.push_paging_op(PagingOpRecord {
                             qpc,
                             pid,
@@ -4402,6 +4483,7 @@ impl TimelineBuilder {
             &self.allocs,
             &self.segments,
             symbolizer,
+            cut.alloc_size_bytes,
         );
 
         let mut top_stacks: Vec<StackSummary> = stack_acc
@@ -4550,6 +4632,7 @@ fn build_paging_summary(
     allocs: &HashMap<u64, AllocMeta>,
     segments: &HashMap<(u64, u32), SegmentKind>,
     symbolizer: &mut Symbolizer,
+    alloc_size_bytes: Option<u64>,
 ) -> Option<PagingTimelineSummary> {
     let mut s = PagingTimelineSummary::default();
     let dur_secs = ((end_qpc - start_qpc).max(0) as f64 / qpc_freq_hz.max(1) as f64).max(1e-6);
@@ -4753,6 +4836,78 @@ fn build_paging_summary(
     active_demoted_details.truncate(16);
     s.active_demoted_heap_sizes = group_heap_buckets(active_demoted_heaps);
     s.active_demoted_allocs = active_demoted_details;
+
+    if let Some(wanted_size) = alloc_size_bytes {
+        any_data = true;
+        let mut lookup = AllocLookupSummary {
+            query_size_bytes: wanted_size,
+            pid: target_pid,
+            ..Default::default()
+        };
+        for (&gh, a) in allocs {
+            if !a.alive || a.size != wanted_size {
+                continue;
+            }
+            if target_pid.is_some_and(|p| p != a.pid) {
+                continue;
+            }
+            let pref_kind = if a.preferred_seg_id != 0 {
+                lookup_seg(a.adapter, a.preferred_seg_id)
+            } else {
+                SegmentKind::Unknown
+            };
+            let cur_kind = a.current_seg.map(|c| lookup_seg(a.adapter, c));
+            let residency = if a.evicted {
+                lookup.evicted_count += 1;
+                "evicted"
+            } else if a.current_seg.is_none() {
+                lookup.uncommitted_count += 1;
+                "uncommitted"
+            } else if pref_kind.is_local() && cur_kind.is_some_and(|k| k.is_non_local()) {
+                lookup.demoted_count += 1;
+                "demoted"
+            } else if cur_kind.is_some_and(|k| k.is_local()) {
+                lookup.resident_local_count += 1;
+                "resident_local"
+            } else if cur_kind.is_some_and(|k| k.is_non_local()) {
+                lookup.resident_nonlocal_count += 1;
+                "resident_nonlocal"
+            } else {
+                "resident_unknown"
+            };
+            let create_stack = (!a.create_stack.is_empty())
+                .then(|| symbolizer.format_stack_oneline(&a.create_stack, 8))
+                .filter(|st| !st.is_empty());
+            lookup.matches.push(AllocLookupMatch {
+                handle: gh,
+                pid: a.pid,
+                size_bytes: a.size,
+                residency: residency.into(),
+                heap_kind: classify_alloc_heap_kind(pref_kind, a.flags).into(),
+                cpu_visible: (a.flags & 0x0000_0001) != 0,
+                flags: a.flags,
+                flags_decoded: format_alloc_flags(a.flags),
+                priority: a.priority,
+                priority_label: format_residency_priority(a.priority),
+                preferred_seg_id: a.preferred_seg_id,
+                preferred_seg_kind: pref_kind.as_str().into(),
+                current_seg_id: a.current_seg,
+                current_seg_kind: cur_kind.map(|k| k.as_str().into()),
+                cpu_va_start: a.cpu_va,
+                cpu_va_end: a.cpu_va.map(|v| v.saturating_add(a.size)),
+                gpu_va_start: a.gpu_va_start,
+                gpu_va_end: a.gpu_va_end,
+                gpu_va_span_start: a.gpu_va_min,
+                gpu_va_span_end: a.gpu_va_max,
+                gpu_va_mappings: a.gpu_va_mappings,
+                create_stack,
+                created_during_trace: a.created_during_trace,
+            });
+        }
+        lookup.matches.sort_by_key(|m| m.handle);
+        lookup.match_count = lookup.matches.len();
+        s.alloc_lookup = Some(lookup);
+    }
 
     any_data.then_some(s)
 }
@@ -5740,6 +5895,75 @@ pub fn format_timeline_text(rep: &TimelineReport, opts: &TimelineFormatOptions) 
                 );
             }
         }
+        if let Some(ref lk) = pg.alloc_lookup {
+            let pid_s = lk.pid.map(|p| p.to_string()).unwrap_or_else(|| "all".into());
+            let _ = writeln!(
+                out,
+                "ALLOC_LOOKUP size={} ({}B) pid={} matches={} (resident_local={} demoted={} resident_nonlocal={} evicted={} uncommitted={})",
+                fmt_heap_size_exact(lk.query_size_bytes),
+                lk.query_size_bytes,
+                pid_s,
+                lk.match_count,
+                lk.resident_local_count,
+                lk.demoted_count,
+                lk.resident_nonlocal_count,
+                lk.evicted_count,
+                lk.uncommitted_count,
+            );
+            for m in &lk.matches {
+                let seg_cur = match (m.current_seg_id, m.current_seg_kind.as_deref()) {
+                    (Some(id), Some(k)) => format!("s{id}({k})"),
+                    (Some(id), None) => format!("s{id}(unknown)"),
+                    _ => "none".into(),
+                };
+                let cpu_va = match (m.cpu_va_start, m.cpu_va_end) {
+                    (Some(s), Some(e)) => format!("{s:#x}..{e:#x}"),
+                    (Some(s), None) => format!("{s:#x}"),
+                    _ => "-".into(),
+                };
+                let gpu_va = match (m.gpu_va_start, m.gpu_va_end) {
+                    (Some(s), Some(e)) => {
+                        let span_note = match (m.gpu_va_span_start, m.gpu_va_span_end) {
+                            (Some(ss), Some(se)) if ss != s || se != e => {
+                                Some(format!("span={ss:#x}..{se:#x}"))
+                            }
+                            _ => None,
+                        };
+                        match (span_note, m.gpu_va_mappings > 1) {
+                            (Some(sp), true) => {
+                                format!("{s:#x}..{e:#x}({sp},+{}maps)", m.gpu_va_mappings - 1)
+                            }
+                            (Some(sp), false) => format!("{s:#x}..{e:#x}({sp})"),
+                            (None, true) => format!("{s:#x}..{e:#x}(+{}maps)", m.gpu_va_mappings - 1),
+                            (None, false) => format!("{s:#x}..{e:#x}"),
+                        }
+                    }
+                    _ => "-".into(),
+                };
+                let origin = match m.create_stack.as_deref() {
+                    Some(st) => format!(" create_stack={st}"),
+                    None if m.created_during_trace => " origin=in_trace(no_stack)".into(),
+                    None => " origin=pre_trace".into(),
+                };
+                let _ = writeln!(
+                    out,
+                    "ALLOC_MATCH handle={:#x} size={} residency={} kind={} cpu_vis={} flags={} prio={} seg=s{}({})->{} cpu_va={} gpu_va={}{}",
+                    m.handle,
+                    fmt_heap_size_exact(m.size_bytes),
+                    m.residency,
+                    m.heap_kind,
+                    m.cpu_visible,
+                    m.flags_decoded,
+                    m.priority_label,
+                    m.preferred_seg_id,
+                    m.preferred_seg_kind,
+                    seg_cur,
+                    cpu_va,
+                    gpu_va,
+                    origin,
+                );
+            }
+        }
     }
 
     if !rep.waits.is_empty() {
@@ -6253,9 +6477,12 @@ mod tests {
                 priority: 0x7800_0000,
                 preferred_seg_id: 1,
                 current_seg: Some(2),
+                evicted: false,
                 cpu_va: Some(0x1c_41ea_0000),
                 gpu_va_start: Some(0x13_6000_0000),
                 gpu_va_end: Some(0x13_d000_0000),
+                gpu_va_min: Some(0x13_6000_0000),
+                gpu_va_max: Some(0x13_d000_0000),
                 gpu_va_mappings: 1,
                 create_stack: Vec::new(),
                 created_during_trace: false,
@@ -6332,6 +6559,7 @@ mod tests {
             TimelineCutOptions {
                 between_presents: true,
                 frame_index: Some(0),
+                alloc_size_bytes: None,
             },
         );
 
@@ -6382,5 +6610,219 @@ mod tests {
         assert!(text.contains(
             "DEMOTED_ALLOC handle=0xa1 size=1792MiB kind=local_cpu_vis(GPU_UPLOAD) flags=0x1(CpuVisible) prio=NORMAL(0x78000000) seg=s1(local_vram)->s2(non_local_host) cpu_va=0x1c41ea0000 gpu_va=0x1360000000..0x13d0000000 origin=pre_trace"
         ));
+        assert!(
+            !text.contains("ALLOC_LOOKUP"),
+            "opt-in lookup must stay silent by default"
+        );
+    }
+
+    #[test]
+    fn opt_in_alloc_size_lookup_reports_resident_rebar_distinction_zero_match_and_no_top_n_cutoff() {
+        let mib = 1024u64 * 1024;
+        let sz = 1792 * mib;
+        let mut b = TimelineBuilder::new(Some(77), 10_000_000);
+        b.start_qpc = Some(0);
+        b.end_qpc = Some(10_000_000);
+        // ReBAR GPU layout: seg 2 is LocalCpuVisibleVram (BAR), seg 3 is NonLocalHost.
+        b.segments.insert((0x20, 2), SegmentKind::LocalCpuVisibleVram);
+        b.segments.insert((0x20, 3), SegmentKind::NonLocalHost);
+
+        // 1. Resident MAXIMUM-priority GPU_UPLOAD 1792 MiB heap (Flags=0x1 CpuVisible).
+        b.allocs.insert(
+            0x1001,
+            AllocMeta {
+                pid: 77,
+                adapter: 0x20,
+                size: sz,
+                flags: 0x1,
+                priority: 0xC800_0000,
+                preferred_seg_id: 2,
+                current_seg: Some(2),
+                evicted: false,
+                cpu_va: Some(0x1c_41ea_0000),
+                gpu_va_start: Some(0x13_6000_0000),
+                gpu_va_end: Some(0x13_d000_0000),
+                gpu_va_min: Some(0x13_6000_0000),
+                gpu_va_max: Some(0x13_d000_0000),
+                gpu_va_mappings: 1,
+                create_stack: Vec::new(),
+                created_during_trace: false,
+                alive: true,
+            },
+        );
+        // 2. Resident DEFAULT 1792 MiB heap on the same ReBAR segment (Flags=0x0, NOT CpuVisible).
+        b.allocs.insert(
+            0x1002,
+            AllocMeta {
+                pid: 77,
+                adapter: 0x20,
+                size: sz,
+                flags: 0x0,
+                priority: 0x7800_0000,
+                preferred_seg_id: 2,
+                current_seg: Some(2),
+                evicted: false,
+                cpu_va: None,
+                gpu_va_start: Some(0x14_0000_0000),
+                gpu_va_end: Some(0x14_7000_0000),
+                gpu_va_min: Some(0x14_0000_0000),
+                gpu_va_max: Some(0x14_9000_0000),
+                gpu_va_mappings: 2,
+                create_stack: Vec::new(),
+                created_during_trace: false,
+                alive: true,
+            },
+        );
+        // 3. Evicted 1792 MiB allocation (must still be reported as residency=evicted).
+        b.allocs.insert(
+            0x1003,
+            AllocMeta {
+                pid: 77,
+                adapter: 0x20,
+                size: sz,
+                flags: 0x1,
+                priority: 0x7800_0000,
+                preferred_seg_id: 2,
+                current_seg: Some(2),
+                evicted: true,
+                cpu_va: None,
+                gpu_va_start: None,
+                gpu_va_end: None,
+                gpu_va_min: None,
+                gpu_va_max: None,
+                gpu_va_mappings: 0,
+                create_stack: Vec::new(),
+                created_during_trace: false,
+                alive: true,
+            },
+        );
+        // 4. Other PID and dead allocation of same size must be excluded.
+        b.allocs.insert(
+            0x1004,
+            AllocMeta {
+                pid: 88,
+                adapter: 0x20,
+                size: sz,
+                flags: 0x1,
+                priority: 0xC800_0000,
+                preferred_seg_id: 2,
+                current_seg: Some(2),
+                alive: true,
+                ..Default::default()
+            },
+        );
+        b.allocs.insert(
+            0x1005,
+            AllocMeta {
+                pid: 77,
+                adapter: 0x20,
+                size: sz,
+                flags: 0x1,
+                priority: 0xC800_0000,
+                preferred_seg_id: 2,
+                current_seg: Some(2),
+                alive: false,
+                ..Default::default()
+            },
+        );
+
+        let mut sym = Symbolizer::new(None);
+        let rep = b.finish_with_options(
+            "lookup.etl".into(),
+            &mut sym,
+            Vec::new(),
+            None,
+            TimelineCutOptions {
+                between_presents: false,
+                frame_index: None,
+                alloc_size_bytes: Some(sz),
+            },
+        );
+        let pg = rep.paging.as_ref().expect("paging summary present");
+        let lk = pg.alloc_lookup.as_ref().expect("alloc_lookup present");
+        assert_eq!(lk.match_count, 3);
+        assert_eq!(lk.resident_local_count, 2);
+        assert_eq!(lk.evicted_count, 1);
+        assert_eq!(lk.demoted_count, 0);
+        assert_eq!(lk.matches[0].handle, 0x1001);
+        assert!(lk.matches[0].cpu_visible);
+        assert_eq!(lk.matches[0].heap_kind, "local_cpu_vis(GPU_UPLOAD)");
+        assert_eq!(lk.matches[0].priority_label, "MAXIMUM(0xc8000000)");
+        assert_eq!(lk.matches[0].cpu_va_start, Some(0x1c_41ea_0000));
+        assert_eq!(lk.matches[0].cpu_va_end, Some(0x1c_41ea_0000 + sz));
+        assert_eq!(lk.matches[1].handle, 0x1002);
+        assert!(
+            !lk.matches[1].cpu_visible,
+            "DEFAULT heap on ReBAR seg must have cpu_visible=false"
+        );
+        assert_eq!(lk.matches[1].heap_kind, "local_default(DEFAULT)");
+
+        let text = format_timeline_text(&rep, &TimelineFormatOptions::default());
+        assert!(text.contains(
+            "ALLOC_LOOKUP size=1792MiB (1879048192B) pid=77 matches=3 (resident_local=2 demoted=0 resident_nonlocal=0 evicted=1 uncommitted=0)"
+        ));
+        assert!(text.contains(
+            "ALLOC_MATCH handle=0x1001 size=1792MiB residency=resident_local kind=local_cpu_vis(GPU_UPLOAD) cpu_vis=true flags=0x1(CpuVisible) prio=MAXIMUM(0xc8000000) seg=s2(local_bar_vram)->s2(local_bar_vram) cpu_va=0x1c41ea0000..0x1cb1ea0000 gpu_va=0x1360000000..0x13d0000000 origin=pre_trace"
+        ));
+        assert!(text.contains(
+            "ALLOC_MATCH handle=0x1002 size=1792MiB residency=resident_local kind=local_default(DEFAULT) cpu_vis=false flags=0x0 prio=NORMAL(0x78000000) seg=s2(local_bar_vram)->s2(local_bar_vram) cpu_va=- gpu_va=0x1400000000..0x1470000000(span=0x1400000000..0x1490000000,+1maps) origin=pre_trace"
+        ));
+
+        // Explicit zero-match count when no allocations match the requested size.
+        let mut b_zero = TimelineBuilder::new(Some(77), 10_000_000);
+        b_zero.start_qpc = Some(0);
+        b_zero.end_qpc = Some(10_000_000);
+        let rep_zero = b_zero.finish_with_options(
+            "zero.etl".into(),
+            &mut sym,
+            Vec::new(),
+            None,
+            TimelineCutOptions {
+                between_presents: false,
+                frame_index: None,
+                alloc_size_bytes: Some(sz),
+            },
+        );
+        let text_zero = format_timeline_text(&rep_zero, &TimelineFormatOptions::default());
+        assert!(text_zero.contains(
+            "ALLOC_LOOKUP size=1792MiB (1879048192B) pid=77 matches=0 (resident_local=0 demoted=0 resident_nonlocal=0 evicted=0 uncommitted=0)"
+        ));
+
+        // No top-N cutoff: 25 matching 64 MiB allocations all appear in matches and text output.
+        let mut b_many = TimelineBuilder::new(Some(77), 10_000_000);
+        b_many.start_qpc = Some(0);
+        b_many.end_qpc = Some(10_000_000);
+        b_many
+            .segments
+            .insert((0x20, 2), SegmentKind::LocalCpuVisibleVram);
+        for i in 0..25u64 {
+            b_many.allocs.insert(
+                0x2000 + i,
+                AllocMeta {
+                    pid: 77,
+                    adapter: 0x20,
+                    size: 64 * mib,
+                    flags: 0x0,
+                    priority: 0x7800_0000,
+                    preferred_seg_id: 2,
+                    current_seg: Some(2),
+                    alive: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let rep_many = b_many.finish_with_options(
+            "many.etl".into(),
+            &mut sym,
+            Vec::new(),
+            None,
+            TimelineCutOptions {
+                between_presents: false,
+                frame_index: None,
+                alloc_size_bytes: Some(64 * mib),
+            },
+        );
+        let text_many = format_timeline_text(&rep_many, &TimelineFormatOptions::default());
+        assert_eq!(text_many.matches("ALLOC_MATCH ").count(), 25);
     }
 }

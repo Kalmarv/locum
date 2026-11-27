@@ -200,6 +200,9 @@ pub struct TimelineArgs {
     /// Isolate one 0-based complete present-to-present frame `[present[N], present[N+1]]` (implies `--between-presents`).
     #[arg(long)]
     frame: Option<usize>,
+    /// Opt-in exact-size VidMm allocation lookup for the target PID (e.g. `1792MiB`): prints every alive match (resident, demoted, evicted, or uncommitted) with handle, CpuVisible flag, rundown priority, segment/residency, and CPU/GPU VA ranges, with no top-N cutoff and an explicit zero-match count.
+    #[arg(long, value_name = "SIZE")]
+    alloc_size: Option<String>,
     #[command(flatten)]
     view: TimelineFilterArgs,
 }
@@ -423,9 +426,11 @@ pub fn run(cmd: MemCommand) -> Result<(), String> {
                 limit: args.view.limit,
                 list_pids: args.view.list_pids,
             };
+            let alloc_size_bytes = args.alloc_size.as_deref().map(parse_byte_size).transpose()?;
             let cut = TimelineCutOptions {
                 between_presents: args.between_presents || args.frame.is_some(),
                 frame_index: args.frame,
+                alloc_size_bytes,
             };
             let rep = if let Some(ref etl_path) = args.etl {
                 let pid = if args.target.pid.is_some()
