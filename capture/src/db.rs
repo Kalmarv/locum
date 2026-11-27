@@ -426,6 +426,8 @@ pub struct Capture {
     pub gaps: Vec<Gap>,
     /// What a tool beside the application said of its memory (see [`crate::sidecar`]).
     pub sidecar: Option<crate::sidecar::Captured>,
+    /// Optional live dispatch-scoped compute buffer probes (`d12_dispatch_probes`).
+    pub dispatch_probes: Vec<crate::probe::DispatchProbeRecord>,
 }
 
 impl Capture {
@@ -713,6 +715,9 @@ pub fn write(path: &Path, capture: &Capture) -> rusqlite::Result<()> {
     }
     if let Some(sidecar) = &capture.sidecar {
         crate::sidecar::write(&tx, sidecar)?;
+    }
+    if !capture.dispatch_probes.is_empty() {
+        crate::probe::write_table(&tx, &capture.dispatch_probes)?;
     }
     tx.commit()?;
     drop(db);

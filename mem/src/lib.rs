@@ -14,8 +14,11 @@
 pub mod capture_join;
 pub mod diff;
 pub mod etw;
+pub mod flight;
 pub mod labels;
 pub mod reconcile;
+pub mod symbols;
+pub mod timeline;
 pub mod win32;
 
 /// Number of target process thread suspends performed by `locum-mem` (guaranteed zero).

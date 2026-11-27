@@ -1500,14 +1500,20 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                     .map_err(|e| e.to_string())
                     .and_then(|()| db::write(&file, &capture).map_err(|e| e.to_string()));
                 match result {
-                    Ok(()) => log!(
-                        "capture written: {} ({} events, {} draws, {} gaps; {:.1} s after the frame)",
-                        file.display(),
-                        capture.events.len(),
-                        capture.draws.len(),
-                        capture.gaps.len(),
-                        t.elapsed().as_secs_f64()
-                    ),
+                    Ok(()) => {
+                        let probes = &crate::settings::settings().dispatch_probes;
+                        if !probes.is_empty() {
+                            record_dispatch_probes(&file, probes);
+                        }
+                        log!(
+                            "capture written: {} ({} events, {} draws, {} gaps; {:.1} s after the frame)",
+                            file.display(),
+                            capture.events.len(),
+                            capture.draws.len(),
+                            capture.gaps.len(),
+                            t.elapsed().as_secs_f64()
+                        );
+                    }
                     Err(e) => log!("capture NOT written to {}: {e}", file.display()),
                 }
             })
@@ -1657,6 +1663,126 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         series.frames,
         super::passes::recorded()
     );
+}
+
+/// Evaluates opt-in `dispatch-probe` settings against `db_path` in-process (reading CPU alias bytes
+/// via `ReadProcessMemory(GetCurrentProcess())`) and persists rows into `d12_dispatch_probes`.
+fn record_dispatch_probes(db_path: &std::path::Path, specs: &[String]) {
+    use locum_capture::probe::{
+        AliasMap, DispatchProbeRecord, append_table, parse_settings_probe, probe_capture,
+    };
+    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    let blobs = &crate::settings::settings().blobs;
+    let mut rows = Vec::new();
+    for spec in specs {
+        let (query, alias_path) = match parse_settings_probe(spec) {
+            Ok(v) => v,
+            Err(e) => {
+                log!("dispatch-probe {spec:?}: {e}");
+                continue;
+            }
+        };
+        let alias_map = match alias_path.as_deref() {
+            Some(p) => match AliasMap::from_file(p) {
+                Ok(m) => m,
+                Err(e) => {
+                    log!("dispatch-probe alias-map {}: {e}", p.display());
+                    AliasMap::default()
+                }
+            },
+            None => AliasMap::default(),
+        };
+        let mut captured_cpu: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        let results = match probe_capture(
+            db_path,
+            &query,
+            &alias_map,
+            Some(|va: u64, len: usize| {
+                let mut buf = vec![0u8; len];
+                let mut read = 0usize;
+                unsafe {
+                    ReadProcessMemory(
+                        GetCurrentProcess(),
+                        va as *const core::ffi::c_void,
+                        buf.as_mut_ptr().cast(),
+                        len,
+                        Some(&mut read),
+                    )
+                }
+                .map_err(|e| format!("ReadProcessMemory({va:#x}): {e}"))?;
+                buf.truncate(read);
+                let key = locum_capture::hash::key(&buf);
+                let _ = blobs.put(&key, &buf);
+                captured_cpu.insert(va, key);
+                Ok(buf)
+            }),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                log!("dispatch-probe {spec:?}: {e}");
+                continue;
+            }
+        };
+        for r in results {
+            let raw_desc = r
+                .decoded
+                .as_ref()
+                .map(|d| {
+                    (0..d.raw_hex.len())
+                        .step_by(2)
+                        .filter_map(|i| u8::from_str_radix(&d.raw_hex[i..i + 2], 16).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let cpu_blob = r.cpu_alias_va.and_then(|va| captured_cpu.get(&va).cloned());
+            let status = r
+                .comparison
+                .as_ref()
+                .map(|c| c.status.clone())
+                .unwrap_or_else(|| {
+                    if r.gpu_unavailable_reason.is_some() {
+                        "gpu-unavailable".into()
+                    } else if r.cpu_unavailable_reason.is_some() {
+                        "cpu-unavailable".into()
+                    } else {
+                        "unavailable".into()
+                    }
+                });
+            rows.push(DispatchProbeRecord {
+                dispatch_draw: r.dispatch.draw,
+                event: r.dispatch.event,
+                shader: r.dispatch.cs_hash,
+                sample_point: r.gpu_sample_point,
+                descriptor_source: r.descriptor_source,
+                raw_descriptor: raw_desc,
+                resolved_gpu_va: r.target_gpu_va,
+                resolved_resource: r.target_resource,
+                resolved_offset: r.target_offset,
+                resolved_size: r.decoded.as_ref().and_then(|d| d.decoded_size),
+                gpu_bytes_blob: None,
+                cpu_alias_va: r.cpu_alias_va,
+                cpu_bytes_blob: cpu_blob,
+                compare_bytes: query.compare_bytes as u64,
+                mismatch_count: r.comparison.as_ref().map(|c| c.mismatch_count as u64),
+                first_mismatch_offset: r
+                    .comparison
+                    .as_ref()
+                    .and_then(|c| c.first_mismatch_offset.map(|o| o as u64)),
+                status,
+                note: r.gpu_unavailable_reason.or(r.cpu_unavailable_reason),
+            });
+        }
+    }
+    if let Err(e) = append_table(db_path, &rows) {
+        log!("dispatch-probe write failed: {e}");
+    } else if !rows.is_empty() {
+        log!(
+            "dispatch-probe: recorded {} row(s) in d12_dispatch_probes",
+            rows.len()
+        );
+    }
 }
 
 /// Arms the capture of the next frame into `root` at once, the first of `frames`, as a request read at a Present

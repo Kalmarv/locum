@@ -52,6 +52,8 @@ pub struct Settings {
     /// frame (32768 by default).
     pub heap_indexed: bool,
     pub heap_indexed_bytes: u64,
+    /// Optional dispatch-scoped compute buffer probes (`dispatch-probe <shader> [binding=srv:0] [row-stride=0x200] [row=0] [desc-offset=0x120] [bytes=4096] [alias-map=PATH]`).
+    pub dispatch_probes: Vec<String>,
 }
 
 pub fn settings() -> &'static Settings {
@@ -71,6 +73,7 @@ pub fn settings() -> &'static Settings {
             sidecar_regions: 4 << 30,
             heap_indexed: true,
             heap_indexed_bytes: 32768 << 20,
+            dispatch_probes: Vec::new(),
         };
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.txt")) {
             for (n, line) in text.lines().enumerate() {
@@ -144,6 +147,7 @@ pub fn settings() -> &'static Settings {
                             n + 1
                         ),
                     },
+                    "dispatch-probe" => s.dispatch_probes.push(value.to_string()),
                     other => log!("settings.txt line {}: unknown setting {other:?}: ignored", n + 1),
                 }
             }

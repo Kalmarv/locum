@@ -15,6 +15,7 @@ pub mod hash;
 pub mod index;
 pub mod layout;
 pub mod maps;
+pub mod probe;
 pub mod rdef;
 pub mod rules;
 pub mod samples;

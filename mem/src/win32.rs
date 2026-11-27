@@ -14,6 +14,7 @@ use windows::Wdk::Graphics::Direct3D::{
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, LUID};
 use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory4};
+use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
@@ -182,6 +183,32 @@ impl Default for InspectOptions {
     fn default() -> Self {
         Self { sample_step: 1 }
     }
+}
+
+/// Reads `len` bytes from `pid` at `va` out-of-process with zero thread suspends.
+pub fn read_process_bytes(pid: u32, va: u64, len: usize) -> Result<Vec<u8>, String> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid) }
+        .map_err(|e| format!("OpenProcess({pid}, QUERY_INFORMATION|VM_READ): {e}"))?;
+    let mut buf = vec![0u8; len];
+    let mut read = 0usize;
+    let res = unsafe {
+        ReadProcessMemory(
+            handle,
+            va as *const c_void,
+            buf.as_mut_ptr().cast::<c_void>(),
+            len,
+            Some(&mut read),
+        )
+    };
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    res.map_err(|e| format!("ReadProcessMemory(pid={pid}, va={va:#x}, len={len}): {e}"))?;
+    buf.truncate(read);
+    Ok(buf)
 }
 
 /// Inspects `pid` out-of-process with zero thread suspends.

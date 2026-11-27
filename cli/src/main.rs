@@ -18,6 +18,7 @@ mod mem;
 mod memory;
 mod open;
 mod pixels;
+mod probe;
 mod replay;
 mod resources;
 mod runtime;
