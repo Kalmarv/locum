@@ -1,6 +1,6 @@
 # locum
 
-[![crates.io](https://img.shields.io/crates/v/locum)](https://crates.io/crates/locum) [![docs.rs](https://img.shields.io/docsrs/locum)](https://docs.rs/locum) [![CI](https://github.com/Kalmarv/locum/actions/workflow/status/Kalmarv/locum/ci.yml?branch=main&label=CI)](https://github.com/Kalmarv/locum/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/locum)](https://crates.io/crates/locum) [![docs.rs](https://img.shields.io/docsrs/locum)](https://docs.rs/locum) [![CI](https://img.shields.io/github/actions/workflow/status/Kalmarv/locum/ci.yml?branch=main&label=CI)](https://github.com/Kalmarv/locum/actions/workflows/ci.yml)
 
 A Windows Direct3D 11 / Direct3D 12 frame capture, replay, and memory diagnostics toolkit.
 
