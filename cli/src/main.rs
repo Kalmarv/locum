@@ -579,6 +579,10 @@ enum Command {
         /// recorded first.
         #[arg(long)]
         times: Option<PathBuf>,
+        /// Fail before applying rules / generating diffs if the unmodified baseline replay does not match the
+        /// capture's saved RT/depth target pixels (or if no saved target exists for this draw).
+        #[arg(long)]
+        strict_self_check: bool,
     },
     /// Replays the whole frame (or one draw's dependency slice with `--draw`) and compares every target the capture
     /// read back.
@@ -1238,6 +1242,7 @@ fn run(cli: Cli) -> Result<(), String> {
             out,
             range: r,
             times,
+            strict_self_check,
         } => {
             if let Some(t) = times {
                 replay::time_to(t);
@@ -1262,6 +1267,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     },
                     out,
                     range: range(&r)?,
+                    strict_self_check,
                 },
             )
         }

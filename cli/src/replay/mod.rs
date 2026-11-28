@@ -1182,6 +1182,60 @@ pub struct Options {
     pub validation: Validation,
     pub out: PathBuf,
     pub range: Range,
+    pub strict_self_check: bool,
+}
+
+/// Outcome of validating the unmodified baseline replay against the capture's saved RT/depth pixels.
+#[derive(Debug, Default)]
+struct SelfCheck {
+    checked: usize,
+    matched: usize,
+    differed: usize,
+    details: Vec<(String, bool, String)>,
+}
+
+impl SelfCheck {
+    fn evaluate(
+        &mut self,
+        name: &str,
+        format: u32,
+        sub: &locum_capture::layout::Sub,
+        game: &[u8],
+        replayed: &[u8],
+    ) {
+        let diff = compare(format, sub, game, replayed);
+        let ok = diff.differ == 0;
+        self.checked += 1;
+        if ok {
+            self.matched += 1;
+        } else {
+            self.differed += 1;
+        }
+        self.details.push((name.to_string(), ok, diff.to_string()));
+    }
+
+    fn verify_strict(&self, draw: i64) -> Result<(), String> {
+        if self.checked == 0 {
+            return Err(format!(
+                "self-check failed: no saved RT/depth targets for draw {draw} in capture"
+            ));
+        }
+        if self.differed > 0 {
+            let bad: Vec<String> = self
+                .details
+                .iter()
+                .filter(|(_, ok, _)| !*ok)
+                .map(|(n, _, d)| format!("{n}: {d}"))
+                .collect();
+            return Err(format!(
+                "self-check failed before diffing ({} of {} saved targets differ): {}",
+                self.differed,
+                self.checked,
+                bad.join("; ")
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// The shader a rule names, by its hash or the start of it, among the capture's shaders of that stage: a hash that
@@ -1225,6 +1279,12 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         })?);
     }
     let mut plan = plan(c, target, o.mode);
+    // Ensure any resources referenced by replay state/API rules (e.g. injected copies, clears, tile remaps) are created.
+    for rule in &parsed {
+        for r in rule.referenced_resources() {
+            plan.resources.insert(r);
+        }
+    }
     if let Some(spec) = &o.buffer_probe {
         let err = "expected --buffer-probe RESOURCE:START..END (decimal byte offsets, end excluded)";
         let (resource, span) = spec.split_once(':').ok_or(err)?;
@@ -1328,13 +1388,8 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     for w in &warnings {
         out!("  warning: {w}");
     }
-    let edited = if parsed.is_empty() {
-        None
-    } else {
-        let (after, _) = execute(c, &plan, &parsed, o.warp, o.validation, &outs)?;
-        Some(after)
-    };
-    // Captured targets after this draw, to compare the replay against.
+    // Pixel self-check: validate unmodified baseline replay against the capture's saved RT/depth targets BEFORE
+    // applying rules or generating diffs.
     let captured: HashMap<String, String> = c
         .rows(
             "SELECT target, blob FROM targets WHERE draw = ?1 AND blob IS NOT NULL",
@@ -1343,6 +1398,64 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         )
         .into_iter()
         .collect();
+    let mut self_check = SelfCheck::default();
+    for output in &outs {
+        let Some(s) = shape(c, output.resource) else {
+            continue;
+        };
+        if s.kind == "buffer" {
+            continue;
+        }
+        let Some((now, x)) = plane_of(&s, &base[&output.resource], output.sub, output.z) else {
+            continue;
+        };
+        let fmt = format::readable(s.format);
+        if let Some(key) = captured.get(&output.name)
+            && let Ok(game) = c.blob(key)
+        {
+            self_check.evaluate(&output.name, fmt, &x, &game, now);
+        }
+    }
+    if self_check.checked == 0 {
+        out!("  self-check: skipped (no saved targets for draw {draw} in capture)");
+    } else if self_check.differed == 0 {
+        out!(
+            "  self-check: PASS ({}/{} saved targets identical to capture)",
+            self_check.matched,
+            self_check.checked
+        );
+    } else {
+        out!(
+            "  self-check: FAIL ({} of {} saved targets differ from capture)",
+            self_check.differed,
+            self_check.checked
+        );
+        for (name, ok, detail) in &self_check.details {
+            if !ok {
+                out!("    self-check {name}: {detail}");
+            }
+        }
+        if !parsed.is_empty() && !o.strict_self_check {
+            out!(
+                "  warning: baseline replay differs from saved capture pixels; rule diff may not isolate the rule \
+                 alone (pass --strict-self-check to abort before diffing)"
+            );
+        }
+    }
+    if o.strict_self_check {
+        self_check.verify_strict(draw)?;
+    }
+    let edited = if parsed.is_empty() {
+        None
+    } else {
+        let (after, rule_warnings) = execute(c, &plan, &parsed, o.warp, o.validation, &outs)?;
+        for w in &rule_warnings {
+            if !warnings.contains(w) {
+                out!("  rule warning: {w}");
+            }
+        }
+        Some(after)
+    };
     for output in &skipped_uavs {
         if let Some(s) = shape(c, output.resource) {
             out!(
@@ -2022,5 +2135,26 @@ mod tests {
         let mine = bytes(&[1, 1 | 1 << 16, 0, 1]);
         let found = sliced(&mine, &game, Some(8), &list, &theirs, 4);
         assert!(matches!(found, Some((8, 0, Length::Halves(1)))));
+    }
+
+    #[test]
+    fn self_check_passes_on_identical_and_fails_on_mismatch() {
+        let sub = locum_capture::layout::texture(28, 2, 2, 1, 1, 1).unwrap()[0];
+        let game = vec![0x11u8; 16];
+        let mut pass = super::SelfCheck::default();
+        pass.evaluate("rt0", 28, &sub, &game, &game);
+        assert_eq!((pass.checked, pass.matched, pass.differed), (1, 1, 0));
+        assert!(pass.verify_strict(42).is_ok());
+
+        let mut modified = game.clone();
+        modified[0] = 0x22;
+        let mut fail = super::SelfCheck::default();
+        fail.evaluate("rt0", 28, &sub, &game, &modified);
+        assert_eq!((fail.checked, fail.matched, fail.differed), (1, 0, 1));
+        let err = fail.verify_strict(42).unwrap_err();
+        assert!(err.contains("self-check failed before diffing"), "{err}");
+
+        let empty = super::SelfCheck::default();
+        assert!(empty.verify_strict(42).is_err());
     }
 }

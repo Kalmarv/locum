@@ -277,6 +277,8 @@ pub struct D3d12 {
     /// Resources the frame uses that the capture holds no description of.
     undescribed: Vec<i64>,
     warnings: BTreeSet<String>,
+    rule_notes: BTreeSet<String>,
+    applied_initial_rules: bool,
     debug: Option<ID3D12InfoQueue>,
     /// Each draw's and dispatch's GPU time, with `--times` (see [`timing`]).
     timing: Option<timing::Timing>,
@@ -486,6 +488,8 @@ impl D3d12 {
                 queries: queries::Queries::default(),
                 undescribed: Vec::new(),
                 warnings: BTreeSet::new(),
+                rule_notes: BTreeSet::new(),
+                applied_initial_rules: false,
                 debug,
                 timing,
             })
@@ -800,7 +804,13 @@ impl D3d12 {
     }
 
     /// Puts in place the descriptors and upload bytes of every submission up to `submission`.
-    fn enter(&mut self, c: &Capture, submission: i64) -> Result<(), String> {
+    fn enter(
+        &mut self,
+        c: &Capture,
+        submission: i64,
+        seq: Option<i64>,
+        rules: &[Rule],
+    ) -> Result<(), String> {
         let order = self.submissions.get_or_insert_with(|| {
             c.rows(
                 "SELECT id, cpu_seq FROM d12_submissions ORDER BY cpu_seq, id",
@@ -824,7 +834,7 @@ impl D3d12 {
             self.applied += 1;
             // The changes to tile mappings made before it, then the first-use contents copied at it, as the frame had
             // them when it ran.
-            self.remap_before(c, cpu_seq)?;
+            self.remap_before(c, cpu_seq, seq, rules)?;
             self.first_uses(s)?;
             if !visible.is_empty() {
                 for (id, heap, slot, kind, resource, counter, desc) in c.rows(
@@ -2166,14 +2176,38 @@ impl D3d12 {
         Ok(())
     }
 
-    fn clear(&mut self, c: &Capture, call: &str, a: &Value) -> Result<(), String> {
+    fn clear(&mut self, c: &Capture, seq: i64, call: &str, a: &Value, rules: &[Rule]) -> Result<(), String> {
         let list = self.list.clone();
+        let skip_for = |resource: i64| {
+            rules.iter().any(|r| {
+                matches!(
+                    r.action,
+                    Action::SkipClear {
+                        resource: target,
+                        event,
+                    } if target.is_none_or(|id| id == resource) && event.is_none_or(|ev| ev == seq)
+                )
+            })
+        };
         match call {
             "ClearRenderTargetView" => {
                 let d = &a[0]["definition"];
                 let resource = d["resource"].as_i64().unwrap_or(0);
-                if !self.resources.contains_key(&resource) {
+                if !self.resources.contains_key(&resource) || skip_for(resource) {
                     return Ok(());
+                }
+                let mut color = floats(&a[1]);
+                for r in rules {
+                    if let Action::ClearColor {
+                        resource: id,
+                        color: cval,
+                        when,
+                    } = r.action
+                        && id == resource
+                        && matches!(when, rules::Timing::Before(ev) if ev.is_none_or(|e| e == seq))
+                    {
+                        color = cval;
+                    }
                 }
                 let handle = self.rtvs.cpu(0);
                 self.view("rtv", resource, 0, &d["description"], handle);
@@ -2184,16 +2218,32 @@ impl D3d12 {
                 }];
                 let r = rects(&a[2]);
                 self.barriers(&needs, false);
-                unsafe {
-                    list.ClearRenderTargetView(handle, &floats(&a[1]), (!r.is_empty()).then_some(&r[..]))
-                };
+                unsafe { list.ClearRenderTargetView(handle, &color, (!r.is_empty()).then_some(&r[..])) };
                 self.barriers(&needs, true);
             }
             "ClearDepthStencilView" => {
                 let d = &a[0]["definition"];
                 let resource = d["resource"].as_i64().unwrap_or(0);
-                if !self.resources.contains_key(&resource) {
+                if !self.resources.contains_key(&resource) || skip_for(resource) {
                     return Ok(());
+                }
+                let mut depth = a[2].as_f64().unwrap_or(0.0) as f32;
+                let mut stencil = u(a, 3) as u8;
+                for r in rules {
+                    if let Action::ClearDepth {
+                        resource: id,
+                        depth: dval,
+                        stencil: sval,
+                        when,
+                    } = r.action
+                        && id == resource
+                        && matches!(when, rules::Timing::Before(ev) if ev.is_none_or(|e| e == seq))
+                    {
+                        depth = dval;
+                        if let Some(s) = sval {
+                            stencil = s;
+                        }
+                    }
                 }
                 let handle = self.dsvs.cpu(0);
                 self.view("dsv", resource, 0, &d["description"], handle);
@@ -2208,8 +2258,8 @@ impl D3d12 {
                     list.ClearDepthStencilView(
                         handle,
                         D3D12_CLEAR_FLAGS(u(a, 1) as i32),
-                        a[2].as_f64().unwrap_or(0.0) as f32,
-                        u(a, 3) as u8,
+                        depth,
+                        stencil,
                         (!r.is_empty()).then_some(&r[..]),
                     )
                 };
@@ -2217,6 +2267,9 @@ impl D3d12 {
             }
             "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat" => {
                 let resource = u(a, 2) as i64;
+                if skip_for(resource) {
+                    return Ok(());
+                }
                 let Ok(target) = self.resource(resource) else {
                     return Ok(());
                 };
@@ -2276,6 +2329,317 @@ impl D3d12 {
                 self.barriers(&needs, true);
             }
             other => self.warn(format!("{other} is not replayed")),
+        }
+        Ok(())
+    }
+
+    /// Emits a D3D12 UAV barrier on `resource` (or a global UAV barrier when `None`).
+    fn emit_uav_barrier(&self, resource: Option<i64>) -> Result<(), String> {
+        let target = match resource {
+            Some(id) => Some(self.resource(id)?),
+            None => None,
+        };
+        let barrier = D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: ManuallyDrop::new(target),
+                }),
+            },
+        };
+        unsafe { self.list.ResourceBarrier(&[barrier]) };
+        Ok(())
+    }
+
+    /// Emits an explicit D3D12 transition barrier sequence on `resource`, flushing first so any prior implicit
+    /// promotion in the open list decays back to `COMMON`, then returning the resource to `COMMON` so replay's
+    /// per-event state invariant remains valid under D3D12 validation.
+    fn emit_transition_barrier(&mut self, resource: i64, before: i32, after: i32) -> Result<(), String> {
+        self.flush()?;
+        let r = self.resource(resource)?;
+        let emit = |from: i32, to: i32| {
+            if from == to {
+                return;
+            }
+            let b = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: borrowed(&r),
+                        Subresource: ALL,
+                        StateBefore: D3D12_RESOURCE_STATES(from),
+                        StateAfter: D3D12_RESOURCE_STATES(to),
+                    }),
+                },
+            };
+            unsafe { self.list.ResourceBarrier(&[b]) };
+        };
+        emit(0, before);
+        emit(before, after);
+        emit(after, 0);
+        Ok(())
+    }
+
+    /// Injects a `ClearRenderTargetView` on texture `resource` (typeless formats mapped to a valid typed RTV format).
+    fn inject_clear_color(&mut self, resource: i64, color: [f32; 4]) -> Result<(), String> {
+        self.first_use_now(resource)?;
+        let m = self.made(resource)?;
+        if m.desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 == 0 {
+            return Err(format!(
+                "clear-color #{resource}: resource has no ALLOW_RENDER_TARGET flag"
+            ));
+        }
+        let r = m.resource.clone();
+        let desc = m.desc;
+        let handle = self.rtvs.cpu(0);
+        let typed = DXGI_FORMAT(locum_capture::format::readable(desc.Format.0 as u32) as i32);
+        let rtv_desc = if typed != desc.Format {
+            let dim = if desc.SampleDesc.Count > 1 {
+                if desc.DepthOrArraySize > 1 {
+                    D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY
+                } else {
+                    D3D12_RTV_DIMENSION_TEXTURE2DMS
+                }
+            } else if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+                D3D12_RTV_DIMENSION_TEXTURE3D
+            } else if desc.DepthOrArraySize > 1 {
+                D3D12_RTV_DIMENSION_TEXTURE2DARRAY
+            } else {
+                D3D12_RTV_DIMENSION_TEXTURE2D
+            };
+            Some(D3D12_RENDER_TARGET_VIEW_DESC {
+                Format: typed,
+                ViewDimension: dim,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+        unsafe {
+            self.device
+                .CreateRenderTargetView(&r, rtv_desc.as_ref().map(|d| d as *const _), handle);
+        }
+        let needs = [self.need_all(resource, 0x4)];
+        self.barriers(&needs, false);
+        unsafe { self.list.ClearRenderTargetView(handle, &color, None) };
+        self.barriers(&needs, true);
+        Ok(())
+    }
+
+    /// Injects a `ClearDepthStencilView` on texture `resource` (typeless depth formats mapped to typed DSV format).
+    fn inject_clear_depth(&mut self, resource: i64, depth: f32, stencil: Option<u8>) -> Result<(), String> {
+        self.first_use_now(resource)?;
+        let m = self.made(resource)?;
+        if m.desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 == 0 {
+            return Err(format!(
+                "clear-depth #{resource}: resource has no ALLOW_DEPTH_STENCIL flag"
+            ));
+        }
+        let r = m.resource.clone();
+        let desc = m.desc;
+        let handle = self.dsvs.cpu(0);
+        let dsv_fmt = match desc.Format {
+            DXGI_FORMAT_R32_TYPELESS => Some(DXGI_FORMAT_D32_FLOAT),
+            DXGI_FORMAT_R16_TYPELESS => Some(DXGI_FORMAT_D16_UNORM),
+            DXGI_FORMAT_R24G8_TYPELESS => Some(DXGI_FORMAT_D24_UNORM_S8_UINT),
+            DXGI_FORMAT_R32G8X24_TYPELESS => Some(DXGI_FORMAT_D32_FLOAT_S8X24_UINT),
+            _ => None,
+        };
+        let dsv_desc = dsv_fmt.map(|fmt| {
+            let dim = if desc.SampleDesc.Count > 1 {
+                if desc.DepthOrArraySize > 1 {
+                    D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY
+                } else {
+                    D3D12_DSV_DIMENSION_TEXTURE2DMS
+                }
+            } else if desc.DepthOrArraySize > 1 {
+                D3D12_DSV_DIMENSION_TEXTURE2DARRAY
+            } else {
+                D3D12_DSV_DIMENSION_TEXTURE2D
+            };
+            D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: fmt,
+                ViewDimension: dim,
+                ..Default::default()
+            }
+        });
+        unsafe {
+            self.device
+                .CreateDepthStencilView(&r, dsv_desc.as_ref().map(|d| d as *const _), handle);
+        }
+        let flags = if stencil.is_some() {
+            D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL
+        } else {
+            D3D12_CLEAR_FLAG_DEPTH
+        };
+        let needs = [self.need_all(resource, 0x10)];
+        self.barriers(&needs, false);
+        unsafe {
+            self.list
+                .ClearDepthStencilView(handle, flags, depth, stencil.unwrap_or(0), None);
+        }
+        self.barriers(&needs, true);
+        Ok(())
+    }
+
+    /// Executes replay-only state/API mutation rules scheduled before (`after == false`) or after (`after == true`)
+    /// event `seq`. `clear_target` suppresses duplicate pre-clear injection when a recorded clear on that resource is
+    /// already being overridden inside [`Self::clear`].
+    fn apply_state_rules(
+        &mut self,
+        c: Option<&Capture>,
+        seq: i64,
+        clear_target: Option<i64>,
+        rules: &[Rule],
+        after: bool,
+    ) -> Result<(), String> {
+        let initial = !self.applied_initial_rules;
+        let matches = |when: rules::Timing| match (after, when) {
+            (false, rules::Timing::Before(Some(ev))) => ev == seq,
+            (false, rules::Timing::Before(None)) => initial,
+            (true, rules::Timing::After(ev)) => ev == seq,
+            _ => false,
+        };
+        let mut ran_any = false;
+        for rule in rules {
+            match rule.action {
+                Action::TileMap {
+                    resource,
+                    tile,
+                    count,
+                    heap,
+                    heap_tile,
+                    when,
+                } if matches(when) => {
+                    if after || ran_any {
+                        self.flush()?;
+                    }
+                    self.rule_tile_map(c, resource, tile, count, heap, heap_tile)?;
+                    ran_any = true;
+                }
+                Action::TileUnmap {
+                    resource,
+                    tile,
+                    count,
+                    when,
+                } if matches(when) => {
+                    if after || ran_any {
+                        self.flush()?;
+                    }
+                    self.rule_tile_unmap(resource, tile, count)?;
+                    ran_any = true;
+                }
+                Action::ClearColor {
+                    resource,
+                    color,
+                    when,
+                } if matches(when) => {
+                    if !after && clear_target == Some(resource) {
+                        continue;
+                    }
+                    self.inject_clear_color(resource, color)?;
+                    ran_any = true;
+                }
+                Action::ClearDepth {
+                    resource,
+                    depth,
+                    stencil,
+                    when,
+                } if matches(when) => {
+                    if !after && clear_target == Some(resource) {
+                        continue;
+                    }
+                    self.inject_clear_depth(resource, depth, stencil)?;
+                    ran_any = true;
+                }
+                Action::Barrier {
+                    resource,
+                    before,
+                    after: to_state,
+                    when,
+                } if matches(when) => {
+                    self.emit_transition_barrier(resource, before, to_state)?;
+                    ran_any = true;
+                }
+                Action::UavBarrier { resource, when } if matches(when) => {
+                    self.emit_uav_barrier(resource)?;
+                    ran_any = true;
+                }
+                Action::SyncFlush { when } if matches(when) => {
+                    self.emit_uav_barrier(None)?;
+                    self.flush()?;
+                    ran_any = true;
+                }
+                Action::SyncWait {
+                    queue,
+                    fence,
+                    value,
+                    when,
+                } if matches(when) => {
+                    self.emit_uav_barrier(None)?;
+                    self.flush()?;
+                    self.fenced += 1;
+                    let v = self.fenced;
+                    unsafe {
+                        self.queue
+                            .Signal(&self.fence, v)
+                            .map_err(|e| format!("sync-wait Signal: {e}"))?;
+                        self.queue
+                            .Wait(&self.fence, v)
+                            .map_err(|e| format!("sync-wait Wait: {e}"))?;
+                    }
+                    self.emit_uav_barrier(None)?;
+                    self.flush()?;
+                    if let (Some(q), Some(f), Some(val)) = (queue, fence, value) {
+                        self.rule_notes.insert(format!(
+                            "sync-wait (queue #{q}, fence #{f}, value {val}) enforced at event {seq}"
+                        ));
+                    }
+                    ran_any = true;
+                }
+                Action::SkipWait { event } if !after && event.is_none_or(|ev| ev == seq) => {
+                    self.rule_notes
+                        .insert(format!("skip-wait recorded at event {seq}"));
+                }
+                Action::CopyBuffer {
+                    dst,
+                    dst_offset,
+                    src,
+                    src_offset,
+                    bytes,
+                    when,
+                } if matches(when) => {
+                    if after || ran_any {
+                        self.flush()?;
+                    }
+                    self.first_use_now(dst)?;
+                    self.first_use_now(src)?;
+                    self.copy_buffer_to_buffer(dst, dst_offset, src, src_offset, bytes)?;
+                    ran_any = true;
+                }
+                Action::CopyResource { dst, src, when } if matches(when) => {
+                    if after || ran_any {
+                        self.flush()?;
+                    }
+                    self.first_use_now(dst)?;
+                    self.first_use_now(src)?;
+                    let (dst_r, src_r) = (self.resource(dst)?, self.resource(src)?);
+                    let needs = [self.need(dst, None, 0x400), self.need(src, None, 0x800)];
+                    self.barriers(&needs, false);
+                    unsafe { self.list.CopyResource(&dst_r, &src_r) };
+                    self.barriers(&needs, true);
+                    ran_any = true;
+                }
+                _ => {}
+            }
+        }
+        if ran_any {
+            self.flush()?;
+        }
+        if !after {
+            self.applied_initial_rules = true;
         }
         Ok(())
     }
@@ -2371,7 +2735,19 @@ impl Backend for D3d12 {
             .and_then(|a| serde_json::from_str(a).ok())
             .unwrap_or_default();
         if let Some(s) = Self::submission_of(c, seq) {
-            self.enter(c, s)?;
+            self.enter(c, s, Some(seq), rules)?;
+        }
+        let clear_target = if kind == "clear" {
+            match call.as_str() {
+                "ClearRenderTargetView" | "ClearDepthStencilView" => a[0]["definition"]["resource"].as_i64(),
+                "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat" => Some(u(&a, 2) as i64),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if !rules.is_empty() {
+            self.apply_state_rules(Some(c), seq, clear_target, rules, false)?;
         }
         match kind.as_str() {
             "draw" | "dispatch" => {
@@ -2390,7 +2766,7 @@ impl Backend for D3d12 {
             "copy" if call == "CopyRaytracingAccelerationStructure" => self.copy_structure(c, &a)?,
             "copy" if call == "EmitRaytracingAccelerationStructurePostbuildInfo" => self.postbuild(c, &a)?,
             "copy" => self.copy(&call, &a)?,
-            "clear" => self.clear(c, &call, &a)?,
+            "clear" => self.clear(c, seq, &call, &a, rules)?,
             "update" if call == "WriteBufferImmediate" => {
                 let writes: Vec<(
                     D3D12_WRITEBUFFERIMMEDIATE_PARAMETER,
@@ -2428,12 +2804,15 @@ impl Backend for D3d12 {
             // keeping them is one valid outcome. A bundle's commands are recorded after it, as its list's events.
             // The game's aliasing barriers and discards of targets in the memory resources share begin their use
             // there; other barriers are replay's own.
-            "barrier" if call == "ResourceBarrier" => self.aliasing(&a),
+            "barrier" if call == "ResourceBarrier" => self.aliasing(seq, &a, rules),
             "discard" => self.discard(&a),
             "state" if call == "BeginQuery" => self.query_begin(&a, list),
             "state" if call == "EndQuery" => self.query_end(&a)?,
             "state" | "barrier" | "submit" | "bundle" => {}
             other => self.warn(format!("events of kind {other} ({call}) are not replayed")),
+        }
+        if !rules.is_empty() {
+            self.apply_state_rules(Some(c), seq, None, rules, true)?;
         }
         let ran = self.flush().and_then(|()| self.collect_queries());
         // Put back the descriptors a rule changed for this event.
@@ -2453,7 +2832,7 @@ impl Backend for D3d12 {
 
     fn reach(&mut self, c: &Capture, seq: i64) -> Result<(), String> {
         match Self::submission_of(c, seq) {
-            Some(s) => self.enter(c, s),
+            Some(s) => self.enter(c, s, Some(seq), &[]),
             None => Ok(()),
         }
     }
@@ -2674,6 +3053,7 @@ impl Backend for D3d12 {
     fn notes(&self) -> Vec<String> {
         let mut notes = self.memory.notes();
         notes.extend(self.queries.notes());
+        notes.extend(self.rule_notes.iter().cloned());
         notes
     }
 }
@@ -3630,6 +4010,188 @@ mod tests {
         assert!(zero.iter().all(|&b| b == 0));
         let _ = blobs.close();
         let _ = std::fs::remove_dir_all(&dir);
+        drop(heap);
+    }
+
+    /// Replay state/API rules (copy-buffer, copy-resource, barrier, uav-barrier, sync-flush, sync-wait,
+    /// clear-color, clear-depth, tile-map, tile-unmap) execute cleanly on WARP and mutate GPU state as expected.
+    #[test]
+    fn state_and_api_rules_mutate_gpu_state_on_warp() {
+        let mut d = D3d12::new(true, super::super::Validation::Layer).unwrap();
+        let tile = locum_capture::tiles::TILE_BYTES;
+        let buf_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        d.adopt(
+            1,
+            committed(&d.device, &buf_desc),
+            Heap::Default,
+            0,
+            layout::buffer_of(256),
+        )
+        .unwrap();
+        d.adopt(
+            2,
+            committed(&d.device, &buf_desc),
+            Heap::Default,
+            0,
+            layout::buffer_of(256),
+        )
+        .unwrap();
+        d.adopt(
+            3,
+            committed(&d.device, &buf_desc),
+            Heap::Default,
+            0,
+            layout::buffer_of(256),
+        )
+        .unwrap();
+        let src_bytes = pattern(256);
+        d.put(1, &src_bytes).unwrap();
+        d.put(2, &vec![0u8; 256]).unwrap();
+        d.put(3, &vec![0u8; 256]).unwrap();
+
+        // Render target texture (#4) and depth texture (#5).
+        let rt_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+            ..Default::default()
+        };
+        let rt_subs = layout::texture(DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 4, 4, 1, 1, 1).unwrap();
+        d.adopt(
+            4,
+            committed(&d.device, &rt_desc),
+            Heap::Default,
+            DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+            rt_subs,
+        )
+        .unwrap();
+
+        let dsv_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+            ..Default::default()
+        };
+        let dsv_subs = layout::texture(DXGI_FORMAT_R32_TYPELESS.0 as u32, 4, 4, 1, 1, 1).unwrap();
+        d.adopt(
+            5,
+            committed(&d.device, &dsv_desc),
+            Heap::Default,
+            DXGI_FORMAT_R32_TYPELESS.0 as u32,
+            dsv_subs,
+        )
+        .unwrap();
+
+        // Reserved buffer (#6, 2 tiles) + backing heap (#70, 2 tiles).
+        let res_desc = D3D12_RESOURCE_DESC {
+            Width: 2 * tile,
+            ..buf_desc
+        };
+        let mut res_r: Option<ID3D12Resource> = None;
+        unsafe {
+            d.device
+                .CreateReservedResource(&res_desc, COMMON, None, &mut res_r)
+        }
+        .unwrap();
+        let res_r = res_r.unwrap();
+        let mut heap: Option<ID3D12Heap> = None;
+        unsafe {
+            d.device.CreateHeap(
+                &D3D12_HEAP_DESC {
+                    SizeInBytes: 2 * tile,
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    ..Default::default()
+                },
+                &mut heap,
+            )
+        }
+        .unwrap();
+        let heap = heap.unwrap();
+        d.memory.insert_test_heap(70, heap.clone());
+        let tiled = locum_capture::tiles::d3d12(&res_r).unwrap();
+        d.memory.mapped.insert(
+            6,
+            staging::Mapped {
+                layout: tiled,
+                tiles: BTreeSet::new(),
+            },
+        );
+        d.adopt(6, res_r, Heap::Default, 0, layout::buffer_of(2 * tile))
+            .unwrap();
+
+        let (rules, errors) = rules::parse_all(
+            "\
+            copy-buffer #2 64 #1 16 128 before 100
+            barrier #2 uav srv before 100
+            uav-barrier #2 before 100
+            sync-flush before 100
+            sync-wait 81 61887 1710 before 100
+            copy-resource #3 #2 after 100
+            clear-color #4 1 0 0.5 1 after 100
+            clear-depth #5 0.25 after 100
+            tile-map #6 0 1 #70 0 before 100
+            tile-unmap #6 0 1 after 200
+            ",
+            std::path::Path::new("."),
+            &rules::hex,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+
+        d.apply_state_rules(None, 100, None, &rules, false).unwrap();
+        d.apply_state_rules(None, 100, None, &rules, true).unwrap();
+        d.flush().unwrap();
+
+        // Check copy-buffer and copy-resource results.
+        let b2 = d.read(2).unwrap();
+        assert_eq!(&b2[64..192], &src_bytes[16..144]);
+        assert!(b2[..64].iter().all(|&x| x == 0));
+        assert_eq!(d.read(3).unwrap(), b2);
+
+        // Check clear-color result on RGBA8 RT (#4): [255, 0, 128, 255].
+        let rt = d.read(4).unwrap();
+        assert_eq!(&rt[0..4], &[255, 0, 128, 255]);
+
+        // Check clear-depth result on R32_TYPELESS DSV (#5): 0.25f32.
+        let dsv = d.read(5).unwrap();
+        let depth_val = f32::from_le_bytes(dsv[0..4].try_into().unwrap());
+        assert!((depth_val - 0.25).abs() < 1e-6, "got {depth_val}");
+
+        // Check tile-map made tile 0 writable/readable, then tile-unmap returns it to zeros.
+        let mut full_tiles = vec![0u8; (2 * tile) as usize];
+        let tile_pat = pattern(256);
+        full_tiles[..256].copy_from_slice(&tile_pat);
+        d.put(6, &full_tiles).unwrap();
+        assert_eq!(d.read_bytes(6, 0, 256).unwrap(), tile_pat);
+        d.apply_state_rules(None, 200, None, &rules, true).unwrap();
+        d.flush().unwrap();
+        assert!(d.read_bytes(6, 0, 256).unwrap().iter().all(|&b| b == 0));
+        assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
         drop(heap);
     }
 }

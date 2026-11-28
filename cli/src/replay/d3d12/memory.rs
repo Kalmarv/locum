@@ -929,7 +929,13 @@ impl D3d12 {
     }
 
     /// Runs the frame's changes to tile mappings the CPU made before `cpu_seq`, in order.
-    pub(super) fn remap_before(&mut self, c: &Capture, cpu_seq: i64) -> Result<(), String> {
+    pub(super) fn remap_before(
+        &mut self,
+        c: &Capture,
+        cpu_seq: i64,
+        seq: Option<i64>,
+        rules: &[locum_capture::rules::Rule],
+    ) -> Result<(), String> {
         let followed = c.has_table("d12_tile_mappings");
         let mappings = self.memory.mappings.get_or_insert_with(|| {
             if !followed {
@@ -967,6 +973,19 @@ impl D3d12 {
                 m.args.clone(),
                 m.pages.clone(),
             );
+            let skip = rules.iter().any(|r| {
+                matches!(
+                    r.action,
+                    locum_capture::rules::Action::SkipTileRemap {
+                        resource: target_res,
+                        event: target_ev,
+                    } if target_res.is_none_or(|id| id == resource)
+                        && target_ev.is_none_or(|ev| Some(ev) == seq)
+                )
+            });
+            if skip {
+                continue;
+            }
             let shared = |id: i64| self.memory.shared.contains(&id) && self.resources.contains_key(&id);
             if !shared(resource) || source.is_some_and(|s| !shared(s)) {
                 // A resource the plan does not make needs none of its changes; one made committed cannot take them.
@@ -1001,6 +1020,137 @@ impl D3d12 {
             }
             self.memory.remaps += 1;
         }
+        Ok(())
+    }
+
+    /// Replay state rule: maps `count` contiguous buffer tiles of reserved `resource` starting at `tile`
+    /// onto `heap` starting at `heap_tile`.
+    pub(super) fn rule_tile_map(
+        &mut self,
+        c: Option<&Capture>,
+        resource: i64,
+        tile: u32,
+        count: u32,
+        heap: i64,
+        heap_tile: u32,
+    ) -> Result<(), String> {
+        let r = self.resource(resource)?;
+        if let Some(&limit) = self.memory.clamped_tiles.get(&resource)
+            && tile.saturating_add(count) > limit
+        {
+            return Err(format!(
+                "tile-map #{resource} {tile}+{count} exceeds clamped limit {limit}"
+            ));
+        }
+        let (h, relocation) = if let Some(cached) = self.memory.heaps.get(&heap) {
+            cached.clone()?
+        } else {
+            let cap = c.ok_or_else(|| format!("tile-map: heap #{heap} is not loaded"))?;
+            self.game_heap(cap, heap)?
+        };
+        let mut starts = Vec::new();
+        let mut sizes = Vec::new();
+        let mut offsets = Vec::new();
+        let mut counts = Vec::new();
+        let mut updated_tiles = Vec::with_capacity(count as usize);
+        if !relocation.moved() || count == 1 {
+            let rel_start = relocation.tile(heap_tile);
+            starts.push(D3D12_TILED_RESOURCE_COORDINATE {
+                X: tile,
+                ..Default::default()
+            });
+            sizes.push(D3D12_TILE_REGION_SIZE {
+                NumTiles: count,
+                UseBox: false.into(),
+                ..Default::default()
+            });
+            offsets.push(rel_start);
+            counts.push(count);
+            for k in 0..count {
+                updated_tiles.push((tile + k, (heap, rel_start + k)));
+            }
+        } else {
+            for k in 0..count {
+                let rel_t = relocation.tile(heap_tile + k);
+                starts.push(D3D12_TILED_RESOURCE_COORDINATE {
+                    X: tile + k,
+                    ..Default::default()
+                });
+                sizes.push(D3D12_TILE_REGION_SIZE {
+                    NumTiles: 1,
+                    UseBox: false.into(),
+                    ..Default::default()
+                });
+                offsets.push(rel_t);
+                counts.push(1);
+                updated_tiles.push((tile + k, (heap, rel_t)));
+            }
+        }
+        unsafe {
+            self.queue.UpdateTileMappings(
+                &r,
+                starts.len() as u32,
+                Some(starts.as_ptr()),
+                Some(sizes.as_ptr()),
+                &h,
+                offsets.len() as u32,
+                None,
+                Some(offsets.as_ptr()),
+                Some(counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+        let map = self.memory.tile_map.entry(resource).or_default();
+        for (t, target) in updated_tiles {
+            map.insert(t, target);
+        }
+        if let Some(m) = self.memory.mapped.get_mut(&resource) {
+            for k in 0..count {
+                m.tiles.insert(tile + k);
+            }
+        }
+        self.memory.remaps += 1;
+        Ok(())
+    }
+
+    /// Replay state rule: unmaps (maps to NULL) `count` tiles of reserved `resource` starting at `tile`.
+    pub(super) fn rule_tile_unmap(&mut self, resource: i64, tile: u32, count: u32) -> Result<(), String> {
+        let r = self.resource(resource)?;
+        let start = D3D12_TILED_RESOURCE_COORDINATE {
+            X: tile,
+            ..Default::default()
+        };
+        let sz = D3D12_TILE_REGION_SIZE {
+            NumTiles: count,
+            UseBox: false.into(),
+            ..Default::default()
+        };
+        let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        unsafe {
+            self.queue.UpdateTileMappings(
+                &r,
+                1,
+                Some(&start),
+                Some(&sz),
+                None,
+                1,
+                Some(&flag),
+                None,
+                Some(&count),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+        if let Some(map) = self.memory.tile_map.get_mut(&resource) {
+            for k in 0..count {
+                map.remove(&(tile + k));
+            }
+        }
+        if let Some(m) = self.memory.mapped.get_mut(&resource) {
+            for k in 0..count {
+                m.tiles.remove(&(tile + k));
+            }
+        }
+        self.memory.remaps += 1;
         Ok(())
     }
 
@@ -1162,7 +1312,21 @@ impl D3d12 {
     }
 
     /// The game's aliasing barriers among the resources made in its memory.
-    pub(super) fn aliasing(&mut self, a: &Value) {
+    pub(super) fn aliasing(&mut self, seq: i64, a: &Value, rules: &[locum_capture::rules::Rule]) {
+        let skip_res = |id: i64| {
+            rules.iter().any(|r| {
+                matches!(
+                    r.action,
+                    locum_capture::rules::Action::SkipAliasing {
+                        resource,
+                        event,
+                    } if resource.is_none_or(|rid| rid == id) && event.is_none_or(|ev| ev == seq)
+                )
+            })
+        };
+        if skip_res(0) {
+            return;
+        }
         let shared = |id: i64| {
             self.memory
                 .shared
@@ -1177,10 +1341,12 @@ impl D3d12 {
             .filter(|b| b["type"].as_i64() == Some(D3D12_RESOURCE_BARRIER_TYPE_ALIASING.0 as i64))
             .filter_map(|b| {
                 let p = &b["payload"];
-                let (before, after) = (
-                    shared(p["before"].as_i64().unwrap_or(0)),
-                    shared(p["after"].as_i64().unwrap_or(0)),
-                );
+                let before_id = p["before"].as_i64().unwrap_or(0);
+                let after_id = p["after"].as_i64().unwrap_or(0);
+                if (before_id != 0 && skip_res(before_id)) || (after_id != 0 && skip_res(after_id)) {
+                    return None;
+                }
+                let (before, after) = (shared(before_id), shared(after_id));
                 (before.is_some() || after.is_some()).then(|| D3D12_RESOURCE_BARRIER {
                     Type: D3D12_RESOURCE_BARRIER_TYPE_ALIASING,
                     Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

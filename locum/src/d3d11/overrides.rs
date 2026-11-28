@@ -111,6 +111,14 @@ fn load(text: &str, dir: &std::path::Path) -> Vec<Rule> {
     }
     parsed
         .into_iter()
+        .filter(|rule| {
+            if rule.is_state_rule() {
+                log!("overrides.txt: {:?} is replay-only: ignored", rule.text);
+                false
+            } else {
+                true
+            }
+        })
         .map(|rule| Rule {
             stage: STAGES[rule.stage],
             rule,
