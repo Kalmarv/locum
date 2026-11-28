@@ -546,67 +546,7 @@ enum Command {
     /// Replays a draw offline (with what it depends on), optionally with rules changing it, and writes what it drew.
     /// With rules, writes the draw's targets as recorded (`.recorded`) and with the rules (`.rules`), and where they
     /// differ (`.diff.png`).
-    Replay {
-        capture: String,
-        /// The draw's number, `last`, or `presented` (the last draw into the presented backbuffer).
-        draw: String,
-        /// Read a buffer range immediately before and after this draw (RESOURCE:START..END in bytes).
-        /// Rules apply only to this draw. Writes before.bin and after.bin in the output directory.
-        #[arg(long)]
-        buffer_probe: Option<String>,
-        /// Read back any resource (including bindless UAV textures) or buffer byte range after this draw:
-        /// `RES` or `RES:START..END`. May be given multiple times.
-        #[arg(long)]
-        readback: Vec<String>,
-        /// Read back any resource or buffer byte range immediately before this draw: `RES` or `RES:START..END`.
-        /// May be given multiple times.
-        #[arg(long)]
-        readback_before: Vec<String>,
-        /// Restrict slice/frame replay to events with `seq >= FROM_EVENT` (earlier events are omitted).
-        #[arg(long)]
-        from_event: Option<i64>,
-        /// Restrict planned events to command list `ONLY_LIST` (plus the target draw).
-        #[arg(long)]
-        only_list: Option<i64>,
-        /// Fill pattern for uncaptured non-reserved resources: `zero` (default) or `0xXXXXXXXX` (32-bit word).
-        #[arg(long, default_value = "zero")]
-        missing_fill: String,
-        /// Log every replayed event that reads a resource whose initial contents were missing in the capture.
-        #[arg(long)]
-        log_missing_reads: bool,
-        /// A/B pixel diff against another replay output directory or reference PNG file.
-        #[arg(long)]
-        compare_to: Option<PathBuf>,
-        /// A rule as in overrides.txt (`constant ps b3 c0 1 0 0 1`, `skip vs=<hash>`, ...); may be given many times.
-        #[arg(long)]
-        rule: Vec<String>,
-        /// A file of rules.
-        #[arg(long)]
-        rules: Option<PathBuf>,
-        /// slice (the draw and what it depends on), frame (everything up to it), or draw (it alone).
-        #[arg(long, default_value = "slice")]
-        mode: String,
-        /// Run on WARP, the software rasterizer, instead of the GPU.
-        #[arg(long)]
-        warp: bool,
-        /// Enable the D3D11 or D3D12 debug layer (D3D12: with GPU-based validation, whose patched shaders can round
-        /// otherwise than the game's); errors are reported.
-        #[arg(long)]
-        debug: bool,
-        #[arg(short, long, default_value = "replay")]
-        out: PathBuf,
-        #[arg(long, default_value = "auto")]
-        range: String,
-        /// Direct3D 12: append each replayed draw's and dispatch's GPU time to this file, a tab-separated row each
-        /// (event, draw, call, arguments, program, microseconds). With rules, both replays are timed, the one as
-        /// recorded first.
-        #[arg(long)]
-        times: Option<PathBuf>,
-        /// Fail before applying rules / generating diffs if the unmodified baseline replay does not match the
-        /// capture's saved RT/depth target pixels (or if no saved target exists for this draw).
-        #[arg(long)]
-        strict_self_check: bool,
-    },
+    Replay(Box<ReplayArgs>),
     /// Replays the whole frame (or one draw's dependency slice with `--draw`) and compares every target the capture
     /// read back.
     Verify {
@@ -801,6 +741,104 @@ enum Command {
         #[arg(short, long, conflicts_with = "check")]
         out: Option<PathBuf>,
     },
+    /// Bindless descriptor heap slots referenced by draws/dispatches (`d12_bindless_usage`).
+    Bindless(Box<BindlessArgs>),
+    /// Inspect or import structured event annotations (`d12_annotations`, e.g. XCL D3D12.X / barrier / placement logs).
+    Annotations(Box<AnnotationsArgs>),
+}
+
+#[derive(clap::Args)]
+struct ReplayArgs {
+    capture: String,
+    /// The draw's number, `last`, or `presented` (the last draw into the presented backbuffer).
+    draw: String,
+    /// Read a buffer range immediately before and after this draw (RESOURCE:START..END in bytes).
+    /// Rules apply only to this draw. Writes before.bin and after.bin in the output directory.
+    #[arg(long)]
+    buffer_probe: Option<String>,
+    /// Read back any resource (including bindless UAV textures) or buffer byte range after this draw:
+    /// `RES` or `RES:START..END`. May be given multiple times.
+    #[arg(long)]
+    readback: Vec<String>,
+    /// Read back any resource or buffer byte range immediately before this draw: `RES` or `RES:START..END`.
+    /// May be given multiple times.
+    #[arg(long)]
+    readback_before: Vec<String>,
+    /// Restrict slice/frame replay to events with `seq >= FROM_EVENT` (earlier events are omitted).
+    #[arg(long)]
+    from_event: Option<i64>,
+    /// Restrict planned events to command list `ONLY_LIST` (plus the target draw).
+    #[arg(long)]
+    only_list: Option<i64>,
+    /// Fill pattern for uncaptured non-reserved resources: `zero` (default) or `0xXXXXXXXX` (32-bit word).
+    #[arg(long, default_value = "zero")]
+    missing_fill: String,
+    /// Log every replayed event that reads a resource whose initial contents were missing in the capture.
+    #[arg(long)]
+    log_missing_reads: bool,
+    /// A/B pixel diff against another replay output directory or reference PNG file.
+    #[arg(long)]
+    compare_to: Option<PathBuf>,
+    /// A rule as in overrides.txt (`constant ps b3 c0 1 0 0 1`, `skip vs=<hash>`, ...); may be given many times.
+    #[arg(long)]
+    rule: Vec<String>,
+    /// A file of rules.
+    #[arg(long)]
+    rules: Option<PathBuf>,
+    /// slice (the draw and what it depends on), frame (everything up to it), or draw (it alone).
+    #[arg(long, default_value = "slice")]
+    mode: String,
+    /// Run on WARP, the software rasterizer, instead of the GPU.
+    #[arg(long)]
+    warp: bool,
+    /// Enable the D3D11 or D3D12 debug layer (D3D12: with GPU-based validation, whose patched shaders can round
+    /// otherwise than the game's); errors are reported.
+    #[arg(long)]
+    debug: bool,
+    #[arg(short, long, default_value = "replay")]
+    out: PathBuf,
+    #[arg(long, default_value = "auto")]
+    range: String,
+    /// Direct3D 12: append each replayed draw's and dispatch's GPU time to this file, a tab-separated row each
+    /// (event, draw, call, arguments, program, microseconds). With rules, both replays are timed, the one as
+    /// recorded first.
+    #[arg(long)]
+    times: Option<PathBuf>,
+    /// Fail before applying rules / generating diffs if the unmodified baseline replay does not match the
+    /// capture's saved RT/depth target pixels (or if no saved target exists for this draw).
+    #[arg(long)]
+    strict_self_check: bool,
+}
+
+#[derive(clap::Args)]
+struct BindlessArgs {
+    capture: String,
+    /// Filter to a specific draw number.
+    #[arg(long)]
+    draw: Option<i64>,
+    /// Filter to a specific resource id.
+    #[arg(long)]
+    resource: Option<i64>,
+    /// Output as JSON lines.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(clap::Args)]
+struct AnnotationsArgs {
+    capture: String,
+    /// Filter to a specific event sequence number.
+    #[arg(long)]
+    seq: Option<i64>,
+    /// Filter to annotations whose category contains this substring.
+    #[arg(long)]
+    category: Option<String>,
+    /// Import a JSONL annotation sidecar file into this capture's `d12_annotations` table.
+    #[arg(long)]
+    import: Option<PathBuf>,
+    /// Output as JSON lines.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Subcommand)]
@@ -1253,27 +1291,28 @@ fn run(cli: Cli) -> Result<(), String> {
             pixels::changes(&open(&capture)?, &target, sub, rect)
         }
         Command::Blob { capture, key, out } => export::blob(&open(&capture)?, &key, &out),
-        Command::Replay {
-            capture,
-            draw,
-            buffer_probe,
-            readback,
-            readback_before,
-            from_event,
-            only_list,
-            missing_fill,
-            log_missing_reads,
-            compare_to,
-            rule,
-            rules,
-            mode,
-            warp,
-            debug,
-            out,
-            range: r,
-            times,
-            strict_self_check,
-        } => {
+        Command::Replay(a) => {
+            let ReplayArgs {
+                capture,
+                draw,
+                buffer_probe,
+                readback,
+                readback_before,
+                from_event,
+                only_list,
+                missing_fill,
+                log_missing_reads,
+                compare_to,
+                rule,
+                rules,
+                mode,
+                warp,
+                debug,
+                out,
+                range: r,
+                times,
+                strict_self_check,
+            } = *a;
             if let Some(t) = times {
                 replay::time_to(t);
             }
@@ -1457,6 +1496,117 @@ fn run(cli: Cli) -> Result<(), String> {
         } => {
             upgrade::copy(&open(&capture)?, &out)?;
             upgrade::upgrade(&open(&out.to_string_lossy())?, false)
+        }
+        Command::Bindless(a) => {
+            let BindlessArgs {
+                capture,
+                draw,
+                resource,
+                json,
+            } = *a;
+            let c = open(&capture)?;
+            if !c.has_table("d12_bindless_usage") {
+                return Err("capture has no d12_bindless_usage table".into());
+            }
+            type BindlessRow = (i64, i64, i64, i64, String, i64, String, String);
+            let rows: Vec<BindlessRow> = c.rows(
+                "SELECT draw, event, heap, slot, kind, resource, access, source FROM d12_bindless_usage \
+                 WHERE (?1 IS NULL OR draw = ?1) AND (?2 IS NULL OR resource = ?2) \
+                 ORDER BY draw, heap, slot",
+                (draw, resource),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            );
+            for (d, ev, heap, slot, kind, res, access, src) in rows {
+                if json {
+                    out!(
+                        "{}",
+                        serde_json::json!({
+                            "draw": d,
+                            "event": ev,
+                            "heap": heap,
+                            "slot": slot,
+                            "kind": kind,
+                            "resource": res,
+                            "access": access,
+                            "source": src
+                        })
+                    );
+                } else {
+                    out!("draw {d}\tevent {ev}\theap #{heap}[{slot}]\t{kind}\t#{res}\t{access}\t{src}");
+                }
+            }
+            Ok(())
+        }
+        Command::Annotations(a) => {
+            let AnnotationsArgs {
+                capture,
+                seq,
+                category,
+                import,
+                json,
+            } = *a;
+            let c = open(&capture)?;
+            if let Some(path) = import {
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let rows = locum_capture::d3d12::parse_annotations_jsonl(&text);
+                let count = rows.len();
+                locum_capture::d3d12::append_annotations(&c.path, &rows)
+                    .map_err(|e| format!("append_annotations: {e}"))?;
+                out!("imported {count} annotation(s) into {}", c.path.display());
+                return Ok(());
+            }
+            if !c.has_table("d12_annotations") {
+                return Err("capture has no d12_annotations table".into());
+            }
+            type AnnotationRow = (i64, Option<i64>, Option<i64>, Option<i64>, String, String);
+            let rows: Vec<AnnotationRow> = c.rows(
+                "SELECT id, seq, list, submission, category, payload_json FROM d12_annotations \
+                 WHERE (?1 IS NULL OR seq = ?1) \
+                 ORDER BY coalesce(seq, 0), id",
+                [seq],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            );
+            for (id, ev, list, sub, cat, payload) in rows {
+                if let Some(filter) = &category
+                    && !cat.to_ascii_lowercase().contains(&filter.to_ascii_lowercase())
+                {
+                    continue;
+                }
+                if json {
+                    let payload_val: serde_json::Value =
+                        serde_json::from_str(&payload).unwrap_or(serde_json::Value::String(payload));
+                    out!(
+                        "{}",
+                        serde_json::json!({
+                            "id": id,
+                            "seq": ev,
+                            "list": list,
+                            "submission": sub,
+                            "category": cat,
+                            "payload": payload_val
+                        })
+                    );
+                } else {
+                    out!(
+                        "{id}\tseq={}\tlist={}\tsub={}\t{cat}\t{payload}",
+                        ev.map_or("-".into(), |v| v.to_string()),
+                        list.map_or("-".into(), |v| v.to_string()),
+                        sub.map_or("-".into(), |v| v.to_string()),
+                    );
+                }
+            }
+            Ok(())
         }
     }
 }

@@ -175,9 +175,9 @@ pub fn before(c: &Class, e: &Entry) -> String {
         "IASetPrimitiveTopology" => "[a0.0]",
         "RSSetViewports" => "[viewports(a1,a0)]",
         "RSSetScissorRects" => "[rects(a1,a0)]",
-        "OMSetBlendFactor" => "[slice(a0,4)]",
+        "OMSetBlendFactor" => "[slice(a0,4),float_bits(a0,4)]",
         "OMSetStencilRef" | "SetViewInstanceMask" => "[a0]",
-        "OMSetDepthBounds" => "[a0,a1]",
+        "OMSetDepthBounds" => "[a0,a1,f32_bits(a0),f32_bits(a1)]",
         "SetDescriptorHeaps" => "[slice(a1,a0 as usize).iter().map(|p|id(*p)).collect::<Vec<_>>() ]",
         "SetGraphicsRootDescriptorTable" | "SetComputeRootDescriptorTable" => "[a0,descriptor(a1.ptr,true)]",
         "SetGraphicsRoot32BitConstant" | "SetComputeRoot32BitConstant" => "[a0,a1,a2]",
@@ -197,10 +197,15 @@ pub fn before(c: &Class, e: &Entry) -> String {
         "OMSetRenderTargets" => {
             "[render_targets(a1,a0,a2.as_bool()),a3.as_ref().map(|d|descriptor(d.ptr as u64,false))]"
         }
-        "ClearRenderTargetView" => "[descriptor(a0.ptr as u64,false),slice(a1,4),rects(a3,a2)]",
-        "ClearDepthStencilView" => "[descriptor(a0.ptr as u64,false),a1.0,a2,a3,rects(a5,a4)]",
-        "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat" => {
+        "ClearRenderTargetView" => {
+            "[descriptor(a0.ptr as u64,false),slice(a1,4),rects(a3,a2),float_bits(a1,4)]"
+        }
+        "ClearDepthStencilView" => "[descriptor(a0.ptr as u64,false),a1.0,a2,a3,rects(a5,a4),f32_bits(a2)]",
+        "ClearUnorderedAccessViewUint" => {
             "[descriptor(a0.ptr,true),descriptor(a1.ptr as u64,false),id(a2),slice(a3,4),rects(a5,a4)]"
+        }
+        "ClearUnorderedAccessViewFloat" => {
+            "[descriptor(a0.ptr,true),descriptor(a1.ptr as u64,false),id(a2),slice(a3,4),rects(a5,a4),float_bits(a3,4)]"
         }
         "BeginQuery" | "EndQuery" => "[id(a0),a1.0,a2]",
         "ResolveQueryData" => "[id(a0),a1.0,a2,a3,id(a4),a5]",
@@ -229,7 +234,7 @@ pub fn before(c: &Class, e: &Entry) -> String {
         "DispatchMesh" => "[a0,a1,a2]",
         "Barrier" => "[barrier_groups(a1,a0)]",
         "OMSetFrontAndBackStencilRef" => "[a0,a1]",
-        "RSSetDepthBias" => "[a0,a1,a2]",
+        "RSSetDepthBias" => "[a0,a1,a2,f32_bits(a0),f32_bits(a1),f32_bits(a2)]",
         "IASetIndexBufferStripCutValue" => "[a0.0]",
         "SetProgram" => "[set_program(a0)]",
         "DispatchGraph" => "[dispatch_graph(a0)]",

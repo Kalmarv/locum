@@ -1729,6 +1729,18 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                 for (key, b) in &rays {
                     prepared.add_acceleration_structure(super::rays::record(*key, b));
                 }
+                let ann_path = &crate::settings::settings().annotations;
+                if let Ok(text) = std::fs::read_to_string(ann_path) {
+                    let rows = model::parse_annotations_jsonl(&text);
+                    if !rows.is_empty() {
+                        log!(
+                            "D3D12 annotations: ingested {} row(s) from {}",
+                            rows.len(),
+                            ann_path.display()
+                        );
+                        prepared.add_annotations(rows);
+                    }
+                }
                 prepared.contents(&mut capture, &crate::settings::settings().blobs);
                 capture.d3d12 = Some(prepared);
                 if let Some((from, sidecar)) = crate::sidecar::captured(&crate::settings::settings().blobs) {
@@ -1929,6 +1941,27 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         })
         .collect();
     let objects: Vec<_> = s.objects.values().cloned().collect();
+    // Optional capture-start snapshot of all live reserved resources' initial tile mappings (`snapshot-reserved on`
+    // or whenever `complete-pass` is active), so bindless-only reserved buffers still have initial page tables.
+    let mut initial_tile_pages = Vec::new();
+    let mut initial_paged = HashSet::new();
+    if settings.snapshot_reserved || !selection.is_empty() {
+        let reserved_ids: Vec<u64> = objects
+            .iter()
+            .filter(|o| o.kind.starts_with("ID3D12Resource") && !o.description["heap_properties"].is_object())
+            .map(|o| o.id)
+            .collect();
+        for rid in reserved_ids {
+            if let Ok((layout, pages)) = super::tiles::pages(rid) {
+                initial_tile_pages.push(model::TilePages {
+                    resource: rid,
+                    cpu_seq: arm_cpu_seq,
+                    pages: Ok((layout, pages)),
+                });
+                initial_paged.insert(rid);
+            }
+        }
+    }
     s.armings += 1;
     s.capture = Some(Live {
         number: s.armings,
@@ -1937,6 +1970,7 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         projection: model::Projection::new(&objects),
         frame: model::Frame {
             objects,
+            tile_pages: initial_tile_pages,
             fence_states,
             ..model::Frame::default()
         },
@@ -1944,7 +1978,7 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         results: Default::default(),
         used: HashSet::new(),
         executed: HashSet::new(),
-        paged: HashSet::new(),
+        paged: initial_paged,
         rays: super::rays::latest(),
         room: Room {
             heap: settings.heap_indexed.then_some(settings.heap_indexed_bytes),

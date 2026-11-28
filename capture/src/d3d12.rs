@@ -482,6 +482,31 @@ pub struct TileSnapshot {
     pub diagnostic: Option<String>,
 }
 
+/// Bindless descriptor heap slot referenced by a draw or dispatch (via root constants or descriptor tables
+/// on a directly-indexed root signature).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindlessUsage {
+    pub draw: u64,
+    pub event: u64,
+    pub heap: u64,
+    pub slot: u32,
+    pub kind: String,
+    pub resource: u64,
+    pub access: &'static str,
+    pub source: &'static str,
+}
+
+/// Structured annotation keyed to an event sequence number, command list, or submission (from in-stream
+/// PIX/D3D12 structured markers or an external JSONL sidecar such as XCL's D3D12.X / barrier / placement log).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Annotation {
+    pub seq: Option<u64>,
+    pub list: Option<u64>,
+    pub submission: Option<u64>,
+    pub category: String,
+    pub payload: Value,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     pub objects: Vec<Object>,
@@ -495,6 +520,8 @@ pub struct Frame {
     pub fence_states: Vec<FenceState>,
     pub submission_syncs: Vec<SubmissionSync>,
     pub tile_snapshots: Vec<TileSnapshot>,
+    pub bindless_usage: Vec<BindlessUsage>,
+    pub annotations: Vec<Annotation>,
     pub diagnostics: Vec<String>,
 }
 
@@ -685,6 +712,9 @@ impl Prepared {
     }
     pub fn add_tile_snapshot(&mut self, snapshot: TileSnapshot) {
         self.frame.tile_snapshots.push(snapshot);
+    }
+    pub fn add_annotations(&mut self, rows: Vec<Annotation>) {
+        self.frame.annotations.extend(rows);
     }
     /// The frame's ExecuteIndirect events whose argument records were copied.
     pub fn indirect(&self) -> &[Indirect] {
@@ -1432,6 +1462,10 @@ pub struct Projection {
     indexed: std::collections::BTreeSet<u64>,
     /// The resources those heaps' slots named at a submission of the frame, as the submission found them.
     heap_named: std::collections::BTreeSet<u64>,
+    /// Bindless descriptor heap slots referenced by draws/dispatches on directly-indexed root signatures.
+    bindless_usage: Vec<BindlessUsage>,
+    /// Structured annotations extracted from in-stream SetMarker/BeginEvent payloads.
+    annotations: Vec<Annotation>,
 }
 
 /// Counts of the frame's direct-list executions and their checkpoints.
@@ -1922,6 +1956,33 @@ impl Frame {
                 ],
             )?;
         }
+        for u in self.bindless_usage.iter().chain(&p.bindless_usage) {
+            tx.execute(
+                "INSERT OR IGNORE INTO d12_bindless_usage VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![
+                    integer(u.draw)?,
+                    integer(u.event)?,
+                    integer(u.heap)?,
+                    i64::from(u.slot),
+                    u.kind,
+                    integer(u.resource)?,
+                    u.access,
+                    u.source
+                ],
+            )?;
+        }
+        for a in self.annotations.iter().chain(&p.annotations) {
+            tx.execute(
+                "INSERT INTO d12_annotations(seq,list,submission,category,payload_json) VALUES(?1,?2,?3,?4,?5)",
+                params![
+                    a.seq.map(integer).transpose()?,
+                    a.list.map(integer).transpose()?,
+                    a.submission.map(integer).transpose()?,
+                    a.category,
+                    a.payload.to_string()
+                ],
+            )?;
+        }
         Ok(())
     }
 }
@@ -1947,6 +2008,8 @@ impl Projection {
             pass_ends: PassEnds::default(),
             indexed: std::collections::BTreeSet::new(),
             heap_named: std::collections::BTreeSet::new(),
+            bindless_usage: Vec::new(),
+            annotations: Vec::new(),
         }
     }
 
@@ -2227,6 +2290,11 @@ impl Projection {
             let seq = capture.events.len() as u64 + 1;
             seqs.push(seq);
             state_objects.push(pipeline.state_object);
+            if matches!(command.call, "SetMarker" | "BeginEvent")
+                && let Some(ann) = marker_annotation(&command.args, seq, list.id, submission.id)
+            {
+                self.annotations.push(ann);
+            }
             // The event kinds D3D11 captures use, so both APIs browse alike.
             let kind = match command.call {
                 "DrawInstanced" | "DrawIndexedInstanced" | "DispatchMesh" => "draw",
@@ -2299,6 +2367,7 @@ impl Projection {
                     .iter()
                     .any(|r| self.objects.get(r).is_some_and(directly_indexed))
                 {
+                    let mut direct_heaps = Vec::new();
                     let heaps = pipeline.descriptor_heaps.as_array().into_iter().flatten();
                     for heap in heaps.filter_map(Value::as_u64) {
                         // Type 0: CBV, SRV and UAV; a sampler heap names no resource.
@@ -2308,6 +2377,70 @@ impl Projection {
                             .is_some_and(|d| d["type"].as_u64() == Some(0))
                         {
                             self.indexed.insert(heap);
+                            direct_heaps.push(heap);
+                        }
+                    }
+                    // Track bindless descriptor indices passed via 32-bit root constants or descriptor tables.
+                    let active_args = if kind == "dispatch" {
+                        &pipeline.compute_args
+                    } else {
+                        &pipeline.graphics_args
+                    };
+                    let mut seen_usage = std::collections::HashSet::new();
+                    for arg in active_args.values() {
+                        match arg["kind"].as_str() {
+                            Some("constants") => {
+                                for w in arg["words"]
+                                    .as_array()
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(Value::as_u64)
+                                {
+                                    let slot = w as u32;
+                                    for &heap in &direct_heaps {
+                                        if let Some(d) = self.descriptors.get(&(heap, slot))
+                                            && d.resource != 0
+                                        {
+                                            let access = if d.kind == "uav" { "write" } else { "read" };
+                                            if seen_usage.insert((heap, slot, access)) {
+                                                self.bindless_usage.push(BindlessUsage {
+                                                    draw: n,
+                                                    event: seq,
+                                                    heap,
+                                                    slot,
+                                                    kind: d.kind.to_string(),
+                                                    resource: d.resource,
+                                                    access,
+                                                    source: "root-constant",
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            Some("DescriptorTable") => {
+                                let heap = arg["value"]["heap"].as_u64().unwrap_or(0);
+                                let slot = arg["value"]["slot"].as_u64().unwrap_or(0) as u32;
+                                if direct_heaps.contains(&heap)
+                                    && let Some(d) = self.descriptors.get(&(heap, slot))
+                                    && d.resource != 0
+                                {
+                                    let access = if d.kind == "uav" { "write" } else { "read" };
+                                    if seen_usage.insert((heap, slot, access)) {
+                                        self.bindless_usage.push(BindlessUsage {
+                                            draw: n,
+                                            event: seq,
+                                            heap,
+                                            slot,
+                                            kind: d.kind.to_string(),
+                                            resource: d.resource,
+                                            access,
+                                            source: "descriptor-table",
+                                        });
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -2652,7 +2785,134 @@ CREATE TABLE d12_submission_sync(id INTEGER PRIMARY KEY,submission INTEGER NOT N
  satisfied INTEGER NOT NULL);
 CREATE TABLE d12_tile_snapshots(submission INTEGER NOT NULL,resource INTEGER NOT NULL,cpu_seq INTEGER NOT NULL,
  pages_json TEXT,blob TEXT,diagnostic TEXT,PRIMARY KEY(submission,resource));
+CREATE TABLE d12_bindless_usage(draw INTEGER NOT NULL,event INTEGER NOT NULL,heap INTEGER NOT NULL,
+ slot INTEGER NOT NULL,kind TEXT NOT NULL,resource INTEGER NOT NULL,access TEXT NOT NULL,source TEXT NOT NULL,
+ PRIMARY KEY(draw,heap,slot,access));
+CREATE TABLE d12_annotations(id INTEGER PRIMARY KEY,seq INTEGER,list INTEGER,submission INTEGER,
+ category TEXT NOT NULL,payload_json TEXT NOT NULL);
 "#;
+
+/// Decodes a PIX/D3D12 SetMarker/BeginEvent payload if it carries structured JSON (`{...}`) or an `xcl:`/`locum:`
+/// annotation prefix.
+fn marker_annotation(args: &Value, seq: u64, list: u64, submission: u64) -> Option<Annotation> {
+    let bytes: Vec<u8> = args
+        .get(1)?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_u64().map(|n| n as u8))
+        .collect();
+    if bytes.is_empty() {
+        return None;
+    }
+    let text = if bytes.len() >= 2 && bytes.len().is_multiple_of(2) && bytes[1] == 0 {
+        let u16s: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&w| w != 0)
+            .collect();
+        String::from_utf16_lossy(&u16s)
+    } else {
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    };
+    let trimmed = text.trim();
+    if trimmed.starts_with('{')
+        && let Ok(val) = serde_json::from_str::<Value>(trimmed)
+    {
+        let category = val["category"]
+            .as_str()
+            .or_else(|| val["cat"].as_str())
+            .unwrap_or("marker")
+            .to_string();
+        return Some(Annotation {
+            seq: Some(seq),
+            list: Some(list),
+            submission: Some(submission),
+            category,
+            payload: val,
+        });
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("xcl:")
+        .or_else(|| trimmed.strip_prefix("locum:"))
+    {
+        let rest = rest.trim();
+        let (category, payload) = match rest.split_once(char::is_whitespace) {
+            Some((cat, body)) => {
+                let payload = serde_json::from_str::<Value>(body.trim())
+                    .unwrap_or_else(|_| serde_json::json!({"text": body.trim()}));
+                (cat.to_string(), payload)
+            }
+            None => ("marker".to_string(), serde_json::json!({"text": rest})),
+        };
+        return Some(Annotation {
+            seq: Some(seq),
+            list: Some(list),
+            submission: Some(submission),
+            category,
+            payload,
+        });
+    }
+    None
+}
+
+/// Parses newline-delimited JSON annotations (`annotations.jsonl`) where each line is a JSON object with optional
+/// `seq`, `list`, `submission`, `category` (or `cat`), and `payload` (defaults to the whole object).
+pub fn parse_annotations_jsonl(text: &str) -> Vec<Annotation> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let category = v["category"]
+            .as_str()
+            .or_else(|| v["cat"].as_str())
+            .unwrap_or("sidecar")
+            .to_string();
+        let payload = if !v["payload"].is_null() {
+            v["payload"].clone()
+        } else {
+            v.clone()
+        };
+        out.push(Annotation {
+            seq: v["seq"].as_u64().or_else(|| v["event"].as_u64()),
+            list: v["list"].as_u64(),
+            submission: v["submission"].as_u64(),
+            category,
+            payload,
+        });
+    }
+    out
+}
+
+/// Appends annotations into `d12_annotations` of an existing capture database (creating the table if absent).
+pub fn append_annotations(db_path: &std::path::Path, rows: &[Annotation]) -> rusqlite::Result<()> {
+    let mut conn = rusqlite::Connection::open(db_path)?;
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS d12_annotations(id INTEGER PRIMARY KEY,seq INTEGER,list INTEGER,\
+         submission INTEGER,category TEXT NOT NULL,payload_json TEXT NOT NULL);",
+    )?;
+    for a in rows {
+        tx.execute(
+            "INSERT INTO d12_annotations(seq,list,submission,category,payload_json) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                a.seq.map(integer).transpose()?,
+                a.list.map(integer).transpose()?,
+                a.submission.map(integer).transpose()?,
+                a.category,
+                a.payload.to_string()
+            ],
+        )?;
+    }
+    tx.commit()
+}
 
 fn integer(value: u64) -> rusqlite::Result<i64> {
     i64::try_from(value).map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
@@ -3367,6 +3627,139 @@ mod tests {
             .unwrap();
         assert_eq!(snap, (18, 5, Some("[[0,4,1,0]]".into()), Some("cafe01".into())));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bindless_usage_and_annotations_project_and_round_trip() {
+        let dir = std::env::temp_dir().join(format!("locum-d12-bindless-ann-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("capture.db");
+
+        let objects = vec![
+            Object {
+                id: 100,
+                kind: "ID3D12DescriptorHeap",
+                device: 1,
+                description: json!({"type": 0, "count": 64, "flags": 1}),
+            },
+            Object {
+                id: 200,
+                kind: "ID3D12RootSignature",
+                device: 1,
+                description: json!({"decoded": {"flags": 0x400, "parameters": []}}),
+            },
+        ];
+        let mut list = Recording::new(10, 0, 1, 0, false);
+        let marker_bytes: Vec<u8> = r#"{"cat":"xcl.barrier","group":7}"#.bytes().collect();
+        list.record(Command {
+            call: "SetMarker",
+            args: json!([0, marker_bytes]),
+            bundle: None,
+            diagnostic: None,
+        });
+        list.record(Command {
+            call: "SetDescriptorHeaps",
+            args: json!([[100]]),
+            bundle: None,
+            diagnostic: None,
+        });
+        list.record(Command {
+            call: "SetComputeRootSignature",
+            args: json!([200]),
+            bundle: None,
+            diagnostic: None,
+        });
+        list.record(Command {
+            call: "SetComputeRoot32BitConstant",
+            args: json!([0, 7, 0]),
+            bundle: None,
+            diagnostic: None,
+        });
+        list.record(Command {
+            call: "Dispatch",
+            args: json!([1, 1, 1]),
+            bundle: None,
+            diagnostic: None,
+        });
+        list.close();
+
+        let frame = Frame {
+            objects,
+            submissions: vec![Submission {
+                id: 1,
+                queue: 80,
+                queue_seq: 1,
+                cpu_seq: 1,
+                lists: vec![list.snapshot()],
+                descriptors: vec![Descriptor {
+                    id: 1,
+                    heap: 100,
+                    slot: 7,
+                    kind: "uav",
+                    resource: 999,
+                    counter: 0,
+                    description: json!({}),
+                }],
+                uploads: Vec::new(),
+            }],
+            ..Frame::default()
+        };
+        let mut cap = crate::db::Capture::default();
+        let mut prepared = frame.prepare(&mut cap);
+        let sidecar = parse_annotations_jsonl(
+            "# comment\n{\"seq\":5,\"category\":\"xcl.placement\",\"payload\":{\"res\":999,\"unmapped\":true}}\n",
+        );
+        assert_eq!(sidecar.len(), 1);
+        prepared.add_annotations(sidecar);
+        cap.d3d12 = Some(prepared);
+        crate::db::write(&db_path, &cap).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let usage: (i64, i64, i64, String, i64, String, String) = conn
+            .query_row(
+                "SELECT draw, heap, slot, kind, resource, access, source FROM d12_bindless_usage",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            usage,
+            (
+                1,
+                100,
+                7,
+                "uav".into(),
+                999,
+                "write".into(),
+                "root-constant".into()
+            )
+        );
+        let ann_count: i64 = conn
+            .query_row("SELECT count(*) FROM d12_annotations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ann_count, 2);
+        drop(conn);
+
+        // Offline append_annotations adds rows to existing DB cleanly.
+        let extra = parse_annotations_jsonl("{\"seq\":9,\"cat\":\"xcl.shader\",\"console_hash\":\"abc\"}");
+        append_annotations(&db_path, &extra).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let ann_count2: i64 = conn
+            .query_row("SELECT count(*) FROM d12_annotations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ann_count2, 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

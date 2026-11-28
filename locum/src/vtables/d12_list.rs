@@ -3054,7 +3054,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
             self.data.record(self.real(), "OMSetBlendFactor", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
-                serde_json::json!([slice(a0, 4)])
+                serde_json::json!([slice(a0, 4), float_bits(a0, 4)])
             });
             real::OMSetBlendFactor(self.real(), a0);
         }
@@ -3343,7 +3343,14 @@ unsafe impl List12Methods for crate::d3d12::Object {
             self.data.record(self.real(), "ClearDepthStencilView", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
-                serde_json::json!([descriptor(a0.ptr as u64, false), a1.0, a2, a3, rects(a5, a4)])
+                serde_json::json!([
+                    descriptor(a0.ptr as u64, false),
+                    a1.0,
+                    a2,
+                    a3,
+                    rects(a5, a4),
+                    f32_bits(a2)
+                ])
             });
             real::ClearDepthStencilView(self.real(), a0, a1, a2, a3, a4, a5);
         }
@@ -3359,7 +3366,12 @@ unsafe impl List12Methods for crate::d3d12::Object {
             self.data.record(self.real(), "ClearRenderTargetView", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
-                serde_json::json!([descriptor(a0.ptr as u64, false), slice(a1, 4), rects(a3, a2)])
+                serde_json::json!([
+                    descriptor(a0.ptr as u64, false),
+                    slice(a1, 4),
+                    rects(a3, a2),
+                    float_bits(a1, 4)
+                ])
             });
             real::ClearRenderTargetView(self.real(), a0, a1, a2, a3);
         }
@@ -3407,7 +3419,8 @@ unsafe impl List12Methods for crate::d3d12::Object {
                         descriptor(a1.ptr as u64, false),
                         id(a2),
                         slice(a3, 4),
-                        rects(a5, a4)
+                        rects(a5, a4),
+                        float_bits(a3, 4)
                     ])
                 });
             real::ClearUnorderedAccessViewFloat(self.real(), a0, a1, crate::d3d12::unwrap(a2), a3, a4, a5);
@@ -3618,7 +3631,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
             self.data.record(self.real(), "OMSetDepthBounds", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
-                serde_json::json!([a0, a1])
+                serde_json::json!([a0, a1, f32_bits(a0), f32_bits(a1)])
             });
             real::OMSetDepthBounds(self.real(), a0, a1);
         }
@@ -3902,7 +3915,7 @@ unsafe impl List12Methods for crate::d3d12::Object {
             self.data.record(self.real(), "RSSetDepthBias", || {
                 #[allow(unused_imports)]
                 use crate::d3d12::values::*;
-                serde_json::json!([a0, a1, a2])
+                serde_json::json!([a0, a1, a2, f32_bits(a0), f32_bits(a1), f32_bits(a2)])
             });
             real::RSSetDepthBias(self.real(), a0, a1, a2);
         }

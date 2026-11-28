@@ -203,6 +203,19 @@ pub unsafe fn rects(p: *const RECT, n: u32) -> Value {
             .collect::<Vec<_>>()
     )
 }
+/// Raw IEEE-754 32-bit bit patterns of `n` floats at `p` (preserves NaN, Inf, and -0.0 payloads).
+pub unsafe fn float_bits(p: *const f32, n: usize) -> Value {
+    json!(
+        unsafe { slice(p, n) }
+            .iter()
+            .map(|&f| f.to_bits())
+            .collect::<Vec<u32>>()
+    )
+}
+/// Raw IEEE-754 32-bit bit pattern of a single float.
+pub fn f32_bits(v: f32) -> u32 {
+    v.to_bits()
+}
 pub unsafe fn viewports(p: *const D3D12_VIEWPORT, n: u32) -> Value {
     json!(
         unsafe { slice(p, n as usize) }
@@ -529,4 +542,25 @@ pub unsafe fn dispatch_graph(p: *const D3D12_DISPATCH_GRAPH_DESC) -> Value {
         };
         json!({"mode":d.Mode.0,"input":input})
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn float_bits_preserves_nan_and_negative_zero_payloads() {
+        let vals = [
+            f32::from_bits(0x7fc0_1234),
+            f32::from_bits(0x8000_0000),
+            1.0f32,
+            f32::from_bits(0x7f80_0000),
+        ];
+        let bits = unsafe { float_bits(vals.as_ptr(), 4) };
+        assert_eq!(
+            bits,
+            json!([0x7fc0_1234u32, 0x8000_0000u32, 0x3f80_0000u32, 0x7f80_0000u32])
+        );
+        assert_eq!(f32_bits(vals[0]), 0x7fc0_1234);
+    }
 }

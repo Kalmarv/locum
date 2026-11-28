@@ -65,6 +65,12 @@ pub struct Settings {
     /// Per-output / per-indirect-record readback cap for selected complete passes (`complete-pass-output-mb`,
     /// 1024 MiB by default).
     pub complete_output_bytes: u64,
+    /// Snapshot initial tile mappings of all live reserved resources at capture arming (`snapshot-reserved on|off`;
+    /// also enabled automatically when `complete-pass` is configured).
+    pub snapshot_reserved: bool,
+    /// Optional external JSONL annotation sidecar ingested into `d12_annotations` at capture close
+    /// (`annotations PATH`, default `<locum_dir>/annotations.jsonl`).
+    pub annotations: PathBuf,
 }
 
 pub fn settings() -> &'static Settings {
@@ -88,6 +94,8 @@ pub fn settings() -> &'static Settings {
             complete_passes: Vec::new(),
             indirect_args: false,
             complete_output_bytes: 1024 << 20,
+            snapshot_reserved: false,
+            annotations: dir.join("annotations.jsonl"),
         };
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.txt")) {
             for (n, line) in text.lines().enumerate() {
@@ -178,6 +186,15 @@ pub fn settings() -> &'static Settings {
                             n + 1
                         ),
                     },
+                    "snapshot-reserved" => match value {
+                        "on" => s.snapshot_reserved = true,
+                        "off" => s.snapshot_reserved = false,
+                        other => log!(
+                            "settings.txt line {}: snapshot-reserved {other:?} is not on or off: ignored",
+                            n + 1
+                        ),
+                    },
+                    "annotations" => s.annotations = PathBuf::from(value),
                     other => log!("settings.txt line {}: unknown setting {other:?}: ignored", n + 1),
                 }
             }

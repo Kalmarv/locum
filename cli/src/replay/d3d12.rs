@@ -2075,10 +2075,19 @@ impl D3d12 {
             unsafe {
                 match call.as_str() {
                     "OMSetDepthBounds" => match list.cast::<ID3D12GraphicsCommandList1>() {
-                        Ok(l) => l.OMSetDepthBounds(
-                            a[0].as_f64().unwrap_or(0.0) as f32,
-                            a[1].as_f64().unwrap_or(1.0) as f32,
-                        ),
+                        Ok(l) => {
+                            let min_d = a
+                                .get(2)
+                                .and_then(Value::as_u64)
+                                .map(|b| f32::from_bits(b as u32))
+                                .unwrap_or_else(|| a[0].as_f64().unwrap_or(0.0) as f32);
+                            let max_d = a
+                                .get(3)
+                                .and_then(Value::as_u64)
+                                .map(|b| f32::from_bits(b as u32))
+                                .unwrap_or_else(|| a[1].as_f64().unwrap_or(1.0) as f32);
+                            l.OMSetDepthBounds(min_d, max_d);
+                        }
                         Err(_) => self
                             .warn("the device has no depth bounds test; draws run without the game's bounds"),
                     },
