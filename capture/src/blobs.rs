@@ -159,6 +159,9 @@ pub struct Entry {
     pub size: u64,
 }
 
+/// Coverage of a pieced blob within a requested byte interval: `(covered_bytes, merged_captured_spans)`.
+pub type PieceCoverage = (u64, Vec<(u64, u64)>);
+
 /// What [`Blobs::copy_from`] did: blobs copied (and their bytes), and blobs the store had already.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Copied {
@@ -271,6 +274,56 @@ impl Blobs {
             }
             _ => Ok(None),
         }
+    }
+
+    /// For a pieced blob `key`, returns `(covered_bytes, captured_spans)` within `[offset, offset + len)` where
+    /// `captured_spans` are the merged non-[`ZEROS`] piece byte intervals clipped to `[offset, offset + len)`.
+    /// Returns `Ok(None)` when `key` is a regular (non-pieced) blob or not in the store.
+    pub fn piece_coverage(&self, key: &str, offset: u64, len: u64) -> io::Result<Option<PieceCoverage>> {
+        let Some(pieces) = self.pieces(key)? else {
+            return Ok(None);
+        };
+        let end = offset.saturating_add(len);
+        let mut at = 0u64;
+        let mut covered = 0u64;
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        for (piece_key, piece_len) in pieces {
+            let next = at.saturating_add(piece_len);
+            if piece_key != ZEROS {
+                let lo = offset.max(at);
+                let hi = end.min(next);
+                if lo < hi {
+                    covered = covered.saturating_add(hi - lo);
+                    match spans.last_mut() {
+                        Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                        _ => spans.push((lo, hi)),
+                    }
+                }
+            }
+            at = next;
+        }
+        Ok(Some((covered, spans)))
+    }
+
+    /// For a pieced blob `key`, returns the merged `[start, end)` byte intervals of all non-[`ZEROS`] pieces.
+    /// Returns `Ok(None)` when `key` is not a pieced blob.
+    pub fn non_zero_piece_spans(&self, key: &str) -> io::Result<Option<Vec<(u64, u64)>>> {
+        let Some(pieces) = self.pieces(key)? else {
+            return Ok(None);
+        };
+        let mut at = 0u64;
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        for (piece_key, piece_len) in pieces {
+            let next = at.saturating_add(piece_len);
+            if piece_key != ZEROS && piece_len > 0 {
+                match spans.last_mut() {
+                    Some(last) if at <= last.1 => last.1 = last.1.max(next),
+                    _ => spans.push((at, next)),
+                }
+            }
+            at = next;
+        }
+        Ok(Some(spans))
     }
 
     /// Makes everything appended so far visible to other processes.

@@ -1840,6 +1840,70 @@ fn resolve_draw_root_buffers(
     out
 }
 
+/// Checks whether `range_snaps` (captured `(start, end, blob_key)` rows from `d12_range_snapshots`) completely
+/// covers `[start, end)`. If fully covered, inspects the covering blob slices (capped at 1 MiB) and returns
+/// `Some("captured-nonzero")`, `Some("captured-zero")`, or `Some(uncaptured_label)` on blob read failure.
+/// Returns `None` when `[start, end)` is uncovered or only partially covered.
+fn classify_from_range_snapshots(
+    c: &Capture,
+    range_snaps: &[(u64, u64, String)],
+    start: u64,
+    end: u64,
+    uncaptured_label: &'static str,
+) -> Option<&'static str> {
+    if start >= end || range_snaps.is_empty() {
+        return None;
+    }
+    let mut hits: Vec<(u64, u64, u64, &str)> = Vec::new();
+    for (r0, r1, key) in range_snaps {
+        let lo = start.max(*r0);
+        let hi = end.min(*r1);
+        if lo < hi {
+            hits.push((lo, hi, *r0, key.as_str()));
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_by_key(|&(lo, hi, _, _)| (lo, std::cmp::Reverse(hi)));
+    // Verify merged coverage spans the entire `[start, end)` without gaps.
+    let mut cursor = start;
+    for &(lo, hi, _, _) in &hits {
+        if lo > cursor {
+            return None;
+        }
+        cursor = cursor.max(hi);
+    }
+    if cursor < end {
+        return None;
+    }
+    // Check all covering snapshots (e.g. `start` + `draw` phases): if any covering slice has non-zero bytes,
+    // report `captured-nonzero`.
+    let mut budget = 1u64 << 20;
+    let mut saw_read = false;
+    for (lo, hi, r0, key) in hits {
+        if budget == 0 {
+            break;
+        }
+        let check_len = (hi - lo).min(budget);
+        match c.blobs.read(key, lo - r0, Some(check_len)) {
+            Ok(bytes) => {
+                saw_read = true;
+                if bytes.iter().any(|&b| b != 0) {
+                    return Some("captured-nonzero");
+                }
+                budget = budget.saturating_sub(check_len);
+            }
+            Err(_) => return Some(uncaptured_label),
+        }
+    }
+    Some(if saw_read {
+        "captured-zero"
+    } else {
+        uncaptured_label
+    })
+}
+
 /// Classifies traced `(draw, event, source, resource, start, end)` byte ranges against tile tables and
 /// first-use/upload blobs so replay knows which ranges can be pulled vs flagged as uncaptured/unmapped.
 fn classify_raw_loads(c: &Capture, rows: &[(i64, i64, String, i64, u64, u64)]) -> Vec<TracedRawLoad> {
@@ -1916,25 +1980,63 @@ fn classify_raw_loads(c: &Capture, rows: &[(i64, i64, String, i64, u64, u64)]) -
                     )
                 });
                 let is_range_only = src.as_deref() == Some("range-snapshot");
-                let snap_hit = range_snaps.iter().find(|&&(r0, r1, _)| r0 < end && r1 > start);
-                if let Some(&(r0, r1, ref snap_key)) = snap_hit
-                    && (is_range_only || key.is_none())
-                {
-                    let lo = start.max(r0);
-                    let hi = end.min(r1);
-                    let check_len = (hi - lo).min(1 << 20);
-                    match c.blobs.read(snap_key, lo - r0, Some(check_len)) {
-                        Ok(bytes) if bytes.iter().any(|&b| b != 0) => "captured-nonzero",
-                        Ok(_) => "captured-zero",
-                        Err(_) => "uncaptured",
+                let uncaptured_label = if is_range_only {
+                    "uncaptured-range-snapshot"
+                } else {
+                    "uncaptured"
+                };
+                if is_range_only {
+                    if let Some(st) =
+                        classify_from_range_snapshots(c, range_snaps, start, end, uncaptured_label)
+                    {
+                        st
+                    } else if range_snaps.is_empty()
+                        && let Some(blob_key) = key.as_deref()
+                        && let Ok(Some((covered, _))) = c.blobs.piece_coverage(blob_key, start, end - start)
+                        && covered == end - start
+                    {
+                        let check_len = (end - start).min(1 << 20);
+                        match c.blobs.read(blob_key, start, Some(check_len)) {
+                            Ok(bytes) if bytes.iter().any(|&b| b != 0) => "captured-nonzero",
+                            Ok(_) => "captured-zero",
+                            Err(_) => uncaptured_label,
+                        }
+                    } else {
+                        let uploads = upload_ranges_cache.entry(resource).or_insert_with(|| {
+                            if !c.has_table("d12_upload_versions") {
+                                return Vec::new();
+                            }
+                            c.rows(
+                                "SELECT content_json FROM d12_upload_versions WHERE resource = ?1",
+                                [resource],
+                                |r| r.get::<_, String>(0),
+                            )
+                            .into_iter()
+                            .filter_map(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                            .map(|v| {
+                                let off = v["offset"].as_u64().unwrap_or(0);
+                                let sz = v["size"].as_u64().unwrap_or(0);
+                                (off, off.saturating_add(sz))
+                            })
+                            .collect()
+                        });
+                        if uploads.iter().any(|&(u0, u1)| u0 < end && u1 > start) {
+                            "captured-upload"
+                        } else {
+                            uncaptured_label
+                        }
                     }
-                } else if !is_range_only && let Some(blob_key) = key.as_deref() {
+                } else if let Some(blob_key) = key.as_deref() {
                     let check_len = (end - start).min(1 << 20);
                     match c.blobs.read(blob_key, start, Some(check_len)) {
                         Ok(bytes) if bytes.iter().any(|&b| b != 0) => "captured-nonzero",
                         Ok(_) => "captured-zero",
                         Err(_) => "uncaptured",
                     }
+                } else if let Some(st) =
+                    classify_from_range_snapshots(c, range_snaps, start, end, "uncaptured")
+                {
+                    st
                 } else {
                     let uploads = upload_ranges_cache.entry(resource).or_insert_with(|| {
                         if !c.has_table("d12_upload_versions") {
@@ -2178,7 +2280,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
                         }
                     }
                 }
-                if matches!(r.status, "uncaptured" | "unmapped") {
+                if r.status.starts_with("uncaptured") || r.status == "unmapped" {
                     missing_ranges += 1;
                 }
             }
@@ -2190,7 +2292,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
                 t_trace.elapsed().as_secs_f64()
             );
             for r in &raw_loads {
-                if o.log_missing_reads && matches!(r.status, "uncaptured" | "unmapped") {
+                if o.log_missing_reads && (r.status.starts_with("uncaptured") || r.status == "unmapped") {
                     out!(
                         "  missing-read: draw {} event {} ({}) rawBufferLoad reads {} #{} {:#x}..{:#x} (tiles {}..{})",
                         r.draw,
@@ -3108,6 +3210,47 @@ fn verified(
             if missing.len() > named.len() { " .." } else { "" }
         ));
     }
+    let range_snap_set: HashSet<i64> = c
+        .rows(
+            "SELECT id FROM resources WHERE content_source = 'range-snapshot'",
+            [],
+            |r| r.get(0),
+        )
+        .into_iter()
+        .collect();
+    let mut partial_range: Vec<i64> = if draw.is_some() {
+        plan.resources
+            .iter()
+            .copied()
+            .filter(|id| range_snap_set.contains(id))
+            .collect()
+    } else {
+        c.rows("SELECT id FROM resources WHERE used = 1 ORDER BY id", [], |r| {
+            r.get(0)
+        })
+        .into_iter()
+        .filter(|id| range_snap_set.contains(id))
+        .collect()
+    };
+    partial_range.sort_unstable();
+    if !partial_range.is_empty() {
+        let named: Vec<String> = partial_range.iter().take(12).map(|id| format!("#{id}")).collect();
+        incomplete.push(format!(
+            "{} resource(s) {} have partial range-snapshot contents only (bytes outside captured ranges are synthesized zeros): {}{}",
+            partial_range.len(),
+            if draw.is_some() {
+                "this slice used"
+            } else {
+                "the frame used"
+            },
+            named.join(" "),
+            if partial_range.len() > named.len() {
+                " .."
+            } else {
+                ""
+            }
+        ));
+    }
     if plan.skipped_empty_heap > 0 {
         out!(
             "note: skipped {} uncaptured heap-only resources (left as null descriptors)",
@@ -3302,5 +3445,157 @@ mod tests {
 
         let empty = super::SelfCheck::default();
         assert!(empty.verify_strict(42).is_err());
+    }
+
+    #[test]
+    fn range_snapshot_synthesized_zeros_classify_uncaptured_and_block_silent_export() {
+        use locum_capture::blobs::{Blobs, ZEROS, pieces_key};
+
+        let dir = std::env::temp_dir().join(format!("locum_range_snap_guard_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blobs_dir = dir.join("blobs");
+        std::fs::create_dir_all(&blobs_dir).unwrap();
+        let blobs = Blobs::new(&blobs_dir);
+
+        // Two captured 64 KiB ranges inside a 1 MiB reserved buffer:
+        // - [0x20000..0x30000): nonzero bytes
+        // - [0x40000..0x50000): genuine zero bytes
+        // Everything else (e.g. [0x10000..0x20000) and [0x60000..0x70000)) is synthesized ZEROS.
+        let nonzero = vec![0xABu8; 0x10000];
+        let real_zero = vec![0u8; 0x10000];
+        let k_nz = locum_capture::hash::key(&nonzero);
+        let k_z = locum_capture::hash::key(&real_zero);
+        blobs.put(&k_nz, &nonzero).unwrap();
+        blobs.put(&k_z, &real_zero).unwrap();
+        let pieces = vec![
+            (ZEROS.to_string(), 0x20000),
+            (k_nz.clone(), 0x10000),
+            (ZEROS.to_string(), 0x10000),
+            (k_z.clone(), 0x10000),
+            (ZEROS.to_string(), 0xB0000),
+        ];
+        let pieced_key = pieces_key(&pieces);
+        blobs.put_pieces(&pieced_key, &pieces).unwrap();
+
+        // Verify Blobs::piece_coverage / non_zero_piece_spans directly.
+        assert_eq!(
+            blobs.piece_coverage(&pieced_key, 0x10000, 0x1000).unwrap(),
+            Some((0, vec![]))
+        );
+        assert_eq!(
+            blobs.piece_coverage(&pieced_key, 0x20000, 0x1000).unwrap(),
+            Some((0x1000, vec![(0x20000, 0x21000)]))
+        );
+        assert_eq!(
+            blobs.piece_coverage(&pieced_key, 0x1f000, 0x2000).unwrap(),
+            Some((0x1000, vec![(0x20000, 0x21000)]))
+        );
+        assert_eq!(
+            blobs.non_zero_piece_spans(&pieced_key).unwrap(),
+            Some(vec![(0x20000, 0x30000), (0x40000, 0x50000)])
+        );
+
+        let db_path = dir.join("capture.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO meta VALUES ('api', 'd3d12');
+             CREATE TABLE resources(
+               id INTEGER PRIMARY KEY, kind TEXT, width INTEGER, height INTEGER, depth INTEGER,
+               mips INTEGER, array INTEGER, format INTEGER, samples INTEGER, bytes INTEGER,
+               stride INTEGER, misc INTEGER, used INTEGER, written INTEGER, content TEXT,
+               content_source TEXT, upload TEXT, upload_stored INTEGER, content_note TEXT
+             );
+             INSERT INTO resources VALUES (
+               24, 'buffer', 1048576, 1, 1, 1, 1, 0, 1, 1048576, 0, 0, 1, 0,
+               '', 'range-snapshot', NULL, 0, 'snapshot-ranges; uncaptured bytes are zero'
+             );
+             CREATE TABLE d12_tile_pages(
+               resource INTEGER PRIMARY KEY, cpu_seq INTEGER, layout_json TEXT, pages_json TEXT, diagnostic TEXT
+             );
+             INSERT INTO d12_tile_pages VALUES (24, 1, '{}', '[[1, 6, 10, 0]]', NULL);
+             CREATE TABLE d12_range_snapshots(
+               id INTEGER PRIMARY KEY AUTOINCREMENT, phase TEXT, submission INTEGER, event INTEGER,
+               draw INTEGER, resource INTEGER, offset INTEGER, bytes INTEGER, blob TEXT, diagnostic TEXT
+             );
+             INSERT INTO d12_range_snapshots(phase, submission, resource, offset, bytes, blob)
+               VALUES ('start', 1, 24, 131072, 65536, '');
+             INSERT INTO d12_range_snapshots(phase, submission, resource, offset, bytes, blob)
+               VALUES ('start', 1, 24, 262144, 65536, '');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta VALUES ('schema_version', ?1)",
+            [locum_capture::db::D3D12_SCHEMA_VERSION.to_string()],
+        )
+        .unwrap();
+        conn.execute("UPDATE resources SET content = ?1 WHERE id = 24", [&pieced_key])
+            .unwrap();
+        conn.execute(
+            "UPDATE d12_range_snapshots SET blob = ?1 WHERE offset = 131072",
+            [&k_nz],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE d12_range_snapshots SET blob = ?1 WHERE offset = 262144",
+            [&k_z],
+        )
+        .unwrap();
+        drop(conn);
+
+        let c = crate::open::open(&db_path.to_string_lossy(), Some(&blobs_dir)).unwrap();
+        let rows = vec![
+            // Inside nonzero snapshot
+            (1, 10, "heap #72[4]".into(), 24, 0x20000, 0x21000),
+            // Inside real-zero snapshot
+            (1, 10, "heap #72[4]".into(), 24, 0x40000, 0x41000),
+            // Mapped tile 1 (0x10000..0x20000), OUTSIDE any range snapshot (synthesized ZEROS)
+            (1, 10, "heap #72[4]".into(), 24, 0x10000, 0x11000),
+            // Partially overlapping snapshot boundary (0x1f000..0x21000)
+            (1, 10, "heap #72[4]".into(), 24, 0x1f000, 0x21000),
+            // Unmapped tile 0 (0x0..0x1000)
+            (1, 10, "heap #72[4]".into(), 24, 0x0, 0x1000),
+        ];
+        let classified = super::classify_raw_loads(&c, &rows);
+        assert_eq!(classified[0].status, "captured-nonzero");
+        assert_eq!(classified[1].status, "captured-zero");
+        assert_eq!(classified[2].status, "uncaptured-range-snapshot");
+        assert_eq!(classified[3].status, "uncaptured-range-snapshot");
+        assert_eq!(classified[4].status, "unmapped");
+
+        // Export inside captured range succeeds with real bytes.
+        let out_ok = dir.join("ok.bin");
+        let pic = crate::export::Picture {
+            range: locum_capture::texels::Range::Tonemap,
+            channel: None,
+            rect: None,
+            crop: false,
+            alpha: false,
+        };
+        let w_ok = crate::export::Which {
+            sub: None,
+            mip: 0,
+            slice: 0,
+            z: 0,
+            upload: false,
+            at: None,
+            warp: false,
+            bytes: Some((0x20000, 0x20040)),
+        };
+        crate::export::export(&c, 24, &out_ok, &w_ok, &pic).unwrap();
+        assert_eq!(std::fs::read(&out_ok).unwrap(), vec![0xABu8; 0x40]);
+
+        // Export completely outside captured ranges fails instead of silently writing synthesized zeros.
+        let out_bad = dir.join("bad.bin");
+        let w_bad = crate::export::Which {
+            bytes: Some((0x10000, 0x10040)),
+            ..w_ok
+        };
+        let err = crate::export::export(&c, 24, &out_bad, &w_bad, &pic).unwrap_err();
+        assert!(err.contains("outside captured snapshot-ranges"), "{err}");
+        assert!(!out_bad.exists());
+
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

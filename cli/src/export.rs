@@ -233,16 +233,29 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
                     return Ok(());
                 }
             }
+            if let Some((Some(key), Some(src))) = c.row::<(Option<String>, Option<String>), _>(
+                "SELECT content, content_source FROM resources WHERE id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ) && src == "range-snapshot"
+                && let Ok(Some((covered, _))) = c.blobs.piece_coverage(&key, from, len)
+                && covered < len
+            {
+                told!(
+                    out_path,
+                    "warning: #{id} {from:#x}..{to:#x} has no draw/pre-submission range snapshot at event {event} and only {covered}/{len} bytes in start snapshot-ranges (uncaptured bytes start as synthesized zeros before replay)"
+                );
+            }
         } else {
             let column = if which.upload { "upload" } else { "content" };
-            let key: String = c
+            let (key, source): (Option<String>, Option<String>) = c
                 .row(
-                    &format!("SELECT {column} FROM resources WHERE id = ?1"),
+                    &format!("SELECT {column}, content_source FROM resources WHERE id = ?1"),
                     [id],
-                    |r| r.get::<_, Option<String>>(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .flatten()
-                .ok_or_else(|| format!("#{id} has no {column} in this capture"))?;
+                .unwrap_or((None, None));
+            let key = key.ok_or_else(|| format!("#{id} has no {column} in this capture"))?;
             let blob_size = c
                 .blobs
                 .size(&key)
@@ -251,6 +264,52 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
                 return Err(format!(
                     "contents ({key}) have {blob_size} bytes, {total} expected for {s}"
                 ));
+            }
+            if !which.upload
+                && source.as_deref() == Some("range-snapshot")
+                && let Some((covered, overlap)) = c
+                    .blobs
+                    .piece_coverage(&key, from, len)
+                    .map_err(|e| format!("blob {key} piece coverage: {e}"))?
+            {
+                if covered == 0 {
+                    let spans = c
+                        .blobs
+                        .non_zero_piece_spans(&key)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let listed: Vec<String> = spans
+                        .iter()
+                        .take(8)
+                        .map(|&(a, b)| format!("{a:#x}..{b:#x}"))
+                        .collect();
+                    let suffix = if spans.len() > 8 {
+                        format!(", ... ({} total)", spans.len())
+                    } else {
+                        String::new()
+                    };
+                    return Err(format!(
+                        "#{id} {from:#x}..{to:#x} is outside captured snapshot-ranges (synthesized zeros only; captured ranges: {}{suffix})",
+                        if listed.is_empty() {
+                            "none".to_string()
+                        } else {
+                            listed.join(", ")
+                        }
+                    ));
+                }
+                if covered < len {
+                    let ov: Vec<String> = overlap
+                        .iter()
+                        .take(8)
+                        .map(|&(a, b)| format!("{a:#x}..{b:#x}"))
+                        .collect();
+                    told!(
+                        out_path,
+                        "warning: #{id} {from:#x}..{to:#x} is only {covered}/{len} bytes covered by snapshot-ranges (uncaptured bytes are synthesized zeros; captured overlap: {})",
+                        ov.join(", ")
+                    );
+                }
             }
             let slice = c
                 .blobs
@@ -290,14 +349,20 @@ pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Pi
         }
         None => {
             let column = if which.upload { "upload" } else { "content" };
-            let key: String = c
+            let (key, source): (Option<String>, Option<String>) = c
                 .row(
-                    &format!("SELECT {column} FROM resources WHERE id = ?1"),
+                    &format!("SELECT {column}, content_source FROM resources WHERE id = ?1"),
                     [id],
-                    |r| r.get::<_, Option<String>>(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .flatten()
-                .ok_or_else(|| format!("#{id} has no {column} in this capture"))?;
+                .unwrap_or((None, None));
+            let key = key.ok_or_else(|| format!("#{id} has no {column} in this capture"))?;
+            if !which.upload && source.as_deref() == Some("range-snapshot") {
+                told!(
+                    out_path,
+                    "warning: #{id} has content_source='range-snapshot': only captured ranges hold real bytes; uncaptured bytes are synthesized zeros"
+                );
+            }
             (c.blob(&key)?, key)
         }
     };

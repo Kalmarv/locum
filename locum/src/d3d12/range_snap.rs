@@ -416,7 +416,7 @@ pub fn parse_traced_text(text: &str) -> ParsedTraced {
             let Some(end) = v["end"].as_u64().filter(|&e| e > start) else {
                 continue;
             };
-            let uncaptured = v["status"].as_str().is_none_or(|s| s == "uncaptured");
+            let uncaptured = v["status"].as_str().is_none_or(|s| s.starts_with("uncaptured"));
             let draw = v["draw"].as_u64();
             out.entries.push((res, start, end, uncaptured, draw));
             continue;
@@ -471,7 +471,7 @@ fn parse_raw_load_text_line(line: &str) -> Option<(u64, u64, u64, bool, Option<u
         if start >= end {
             return None;
         }
-        let uncaptured = status == "uncaptured" || !status.starts_with("captured");
+        let uncaptured = status.starts_with("uncaptured") || !status.starts_with("captured");
         return Some((res, start, end, uncaptured, draw));
     }
     // Space-separated fallback (e.g. copy-pasted text with spaces instead of tabs).
@@ -499,7 +499,7 @@ fn parse_raw_load_text_line(line: &str) -> Option<(u64, u64, u64, bool, Option<u
     }
     let uncaptured = toks
         .last()
-        .is_none_or(|s| *s == "uncaptured" || !s.starts_with("captured"));
+        .is_none_or(|s| s.starts_with("uncaptured") || !s.starts_with("captured"));
     Some((res, start, end, uncaptured, draw))
 }
 
@@ -604,7 +604,7 @@ mod tests {
 # comment
 draw 4306\tevent 31200\theap #72[4]\tuav\t#27\twrite\truntime
 raw-load\tdraw 4306\tevent 31200\theap #72[4]\t#27\t0x12561000..0x12562000\ttiles 4694..4695\tuncaptured
-raw-load\tdraw 4306\tevent 31200\theap #72[4]\t#27\t0x12562000..0x12563000\ttiles 4694..4695\tuncaptured
+raw-load\tdraw 4306\tevent 31200\theap #72[4]\t#27\t0x12562000..0x12563000\ttiles 4694..4695\tuncaptured-range-snapshot
 raw-load\tdraw 4306\tevent 31200\theap #72[7]\t#32\t0x71188000..0x71189000\ttiles 28952..28953\tunmapped
 {\"kind\":\"raw_load\",\"draw\":4306,\"event\":31200,\"source\":\"heap #72[7]\",\"resource\":32,\"start\":3086385152,\"end\":3086389248,\"status\":\"uncaptured\"}
 {\"kind\":\"bindless\",\"draw\":4306,\"resource\":24}

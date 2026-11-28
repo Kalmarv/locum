@@ -859,7 +859,7 @@ struct BindlessArgs {
     include_bindless: Vec<String>,
     /// Also trace 4 KiB page ranges read via `dx.op.rawBufferLoad` from `ResourceDescriptorHeap[0..32]` and root
     /// `u0..u7`/`t0..t7`, classifying each range as `captured-nonzero`, `captured-zero`, `captured-upload`,
-    /// `uncaptured`, or `unmapped`.
+    /// `uncaptured`, `uncaptured-range-snapshot`, or `unmapped`.
     #[arg(long)]
     raw_loads: bool,
     /// Persist `--trace` results into the capture's `d12_bindless_usage` table so subsequent `replay` calls

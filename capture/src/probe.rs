@@ -2266,43 +2266,64 @@ pub fn read_buffer_with_provenance(
             ),
         };
     } else if let Some(ref key) = buf.content {
-        let fu_sub: Option<u64> = conn
-            .query_row(
-                "SELECT submission FROM d12_first_use WHERE resource=?1",
-                params![buf.resource as i64],
-                |r| Ok(r.get::<_, i64>(0)? as u64),
-            )
-            .ok();
-        match blobs.read(key, offset, Some(len)) {
-            Ok(b) => {
-                let src_lbl = buf.content_source.as_deref().unwrap_or("first-use");
-                base_bytes = Some(b);
-                sample_point = format!("before-dispatch ({src_lbl})");
-                last_writer = LastWriterInfo {
-                    kind: "first_use_initial".into(),
-                    event: None,
-                    submission: fu_sub,
-                    call: None,
-                    source_resource: Some(buf.resource),
-                    source_offset: Some(offset),
-                    byte_range: Some((offset, offset.saturating_add(len))),
-                    upload_submission: None,
-                    blob: Some(key.clone()),
-                    detail: format!(
-                        "no in-frame writer before event {}; initial {src_lbl} snapshot of resource #{}{}",
-                        disp.event,
-                        buf.resource,
-                        fu_sub
-                            .map(|s| format!(" (first_use sub={s})"))
-                            .unwrap_or_default()
-                    ),
-                };
+        let is_range_snap = buf.content_source.as_deref() == Some("range-snapshot");
+        let range_covered = if is_range_snap {
+            match blobs.piece_coverage(key, offset, len) {
+                Ok(Some((cov, _))) => Some(cov),
+                _ => None,
             }
-            Err(e) => {
-                missing_reason = Some(format!(
-                    "failed to read resource #{} content blob {key}: {e}",
-                    buf.resource
-                ));
+        } else {
+            None
+        };
+        if let Some(cov) = range_covered
+            && cov < len
+        {
+            let detail = format!(
+                "range-snapshot of #{} covers only {cov}/{len} bytes of [{offset:#x}, {:#x}); bytes outside snapshot ranges are synthesized zeros",
+                buf.resource,
+                offset.saturating_add(len)
+            );
+            last_writer.detail = detail.clone();
+            missing_reason = Some(detail);
+        } else {
+            let fu_sub: Option<u64> = conn
+                .query_row(
+                    "SELECT submission FROM d12_first_use WHERE resource=?1",
+                    params![buf.resource as i64],
+                    |r| Ok(r.get::<_, i64>(0)? as u64),
+                )
+                .ok();
+            match blobs.read(key, offset, Some(len)) {
+                Ok(b) => {
+                    let src_lbl = buf.content_source.as_deref().unwrap_or("first-use");
+                    base_bytes = Some(b);
+                    sample_point = format!("before-dispatch ({src_lbl})");
+                    last_writer = LastWriterInfo {
+                        kind: "first_use_initial".into(),
+                        event: None,
+                        submission: fu_sub,
+                        call: None,
+                        source_resource: Some(buf.resource),
+                        source_offset: Some(offset),
+                        byte_range: Some((offset, offset.saturating_add(len))),
+                        upload_submission: None,
+                        blob: Some(key.clone()),
+                        detail: format!(
+                            "no in-frame writer before event {}; initial {src_lbl} snapshot of resource #{}{}",
+                            disp.event,
+                            buf.resource,
+                            fu_sub
+                                .map(|s| format!(" (first_use sub={s})"))
+                                .unwrap_or_default()
+                        ),
+                    };
+                }
+                Err(e) => {
+                    missing_reason = Some(format!(
+                        "failed to read resource #{} content blob {key}: {e}",
+                        buf.resource
+                    ));
+                }
             }
         }
     } else {
