@@ -477,7 +477,7 @@ impl D3d12 {
                 fence,
                 fenced: 0,
                 kept: Vec::new(),
-                limit: if warp { 64 << 20 } else { staging::LIMIT },
+                limit: if warp { 16 << 20 } else { staging::LIMIT },
                 resources: HashMap::new(),
                 heaps: HashMap::new(),
                 visible_heaps: None,
@@ -3107,8 +3107,8 @@ pub(super) fn resource_desc(d: &Value) -> D3D12_RESOURCE_DESC {
 }
 
 impl Backend for D3d12 {
-    fn prepare(&mut self, _c: &Capture, plan: &super::Plan) {
-        self.memory.scope(&plan.resources, &plan.written_before_target);
+    fn prepare(&mut self, c: &Capture, plan: &super::Plan) {
+        self.memory.prepare_plan(c, plan);
     }
 
     fn create(&mut self, c: &Capture, id: i64, contents: Option<&[u8]>) -> Result<(), String> {
@@ -3543,10 +3543,66 @@ impl D3d12 {
             };
             Ok(r.expect("made"))
         };
+        // Helper: if `source` is a pieced blob, compute the set of 64 KiB tiles covering its non-zero pieces.
+        let non_zero_blob_tiles = |src: Option<Result<&[u8], &str>>| -> Option<BTreeSet<u32>> {
+            let Some(Err(key)) = src else {
+                return None;
+            };
+            let list = c.blobs.pieces(key).ok()??;
+            let tile = locum_capture::tiles::TILE_BYTES;
+            let mut out = BTreeSet::new();
+            let mut at = 0u64;
+            for (k, len) in list {
+                if k != locum_capture::blobs::ZEROS && len > 0 {
+                    let first = (at / tile) as u32;
+                    let last = (at.saturating_add(len).saturating_sub(1) / tile) as u32;
+                    for t in first..=last {
+                        out.insert(t);
+                    }
+                }
+                at = at.saturating_add(len);
+            }
+            Some(out)
+        };
+        // Large committed or unshared-placed buffers with uncaptured (or mostly-zero pieced) contents are backed
+        // sparsely as reserved buffers (only touched/non-zero 64 KiB tiles committed), on both WARP and GPU.
+        let can_sparse_non_reserved = buffer
+            && !matches!(placement, memory::Placement::Reserved)
+            && desc.Width >= memory::SPARSE_COMMITTED_BUFFER_BYTES
+            && !self.memory.upload_versioned.contains(&id)
+            && match placement {
+                memory::Placement::Placed { heap: gh, .. } => !self.memory.shared_content_heaps.contains(&gh),
+                _ => true,
+            };
+        let sparse_extra_tiles = if can_sparse_non_reserved && source.is_some() {
+            let nz = non_zero_blob_tiles(source);
+            let total_tiles = desc.Width.div_ceil(locum_capture::tiles::TILE_BYTES);
+            nz.filter(|tiles| (tiles.len() as u64) * 2 < total_tiles)
+        } else {
+            None
+        };
+        let prefer_sparse = can_sparse_non_reserved && (source.is_none() || sparse_extra_tiles.is_some());
+        let sparse_made = if prefer_sparse {
+            match self.make_sparse_buffer(id, &desc, COMMON, sparse_extra_tiles.as_ref()) {
+                Ok(r) => {
+                    heap = Heap::Default;
+                    Some(r)
+                }
+                Err(why) => {
+                    self.warn(format!(
+                        "sparse backing for large buffer #{id} failed ({why}); falling back to normal creation"
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // In the memory the game shared, with the game's own flags, so it takes what it took there.
-        let shared = match placement {
-            memory::Placement::Committed => None,
-            p => match self.make_shared(c, id, p, &desc, state, source.is_some()) {
+        let shared = match (sparse_made, placement) {
+            (Some(r), _) => Some(r),
+            (None, memory::Placement::Committed) => None,
+            (None, p) => match self.make_shared(c, id, p, &desc, state, source.is_some()) {
                 Ok(r) => Some(r),
                 Err(why) => {
                     self.memory.fell_back(why);
@@ -3569,17 +3625,32 @@ impl D3d12 {
                 }
                 match make(&desc) {
                     Ok(r) => r,
-                    Err(e) if buffer && desc.Width > memory::MAX_WARP_BUFFER_BYTES => {
-                        let clamped = D3D12_RESOURCE_DESC {
-                            Width: memory::MAX_WARP_BUFFER_BYTES,
-                            ..desc
-                        };
-                        self.warn(format!(
-                            "committed buffer #{id} ({} bytes) exceeded this device's buffer width limit and was \
-                             clamped to {} bytes",
-                            desc.Width, clamped.Width
-                        ));
-                        make(&clamped).map_err(|e2| format!("{e} (clamped retry: {e2})"))?
+                    Err(e) if buffer && desc.Width >= memory::SPARSE_RESERVED_BUFFER_BYTES => {
+                        // First try sparse reserved backing (touched/non-zero tiles only) before a doomed full-size
+                        // clamped committed retry.
+                        let nz = non_zero_blob_tiles(source);
+                        if let Ok(r) = self.make_sparse_buffer(id, &desc, COMMON, nz.as_ref()) {
+                            heap = Heap::Default;
+                            self.warn(format!(
+                                "buffer #{id} ({} bytes) failed full allocation ({e}) and was backed sparsely as a \
+                                 reserved buffer",
+                                desc.Width
+                            ));
+                            r
+                        } else if desc.Width > memory::MAX_WARP_BUFFER_BYTES {
+                            let clamped = D3D12_RESOURCE_DESC {
+                                Width: memory::MAX_WARP_BUFFER_BYTES,
+                                ..desc
+                            };
+                            self.warn(format!(
+                                "committed buffer #{id} ({} bytes) exceeded this device's buffer width limit and was \
+                                 clamped to {} bytes",
+                                desc.Width, clamped.Width
+                            ));
+                            make(&clamped).map_err(|e2| format!("{e} (clamped retry: {e2})"))?
+                        } else {
+                            return Err(e.to_string());
+                        }
                     }
                     Err(e) => return Err(e.to_string()),
                 }
@@ -4680,5 +4751,161 @@ mod tests {
         assert_eq!(w(&rt12, 3), 0x00000000);
         assert_eq!(rt13, rt12);
         assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
+    }
+
+    /// Tests sparse tile-pool backing of a 4 GiB buffer (only touched tiles backed, both below and above WARP's
+    /// 2 GiB copy limit) and `map all-unmapped` backing 0-tile and partially-mapped reserved textures while leaving
+    /// giant sparse buffers untouched.
+    #[test]
+    fn sparse_large_buffer_and_map_all_unmapped_textures_on_warp() {
+        let mut d = D3d12::new(true, super::super::Validation::Layer).unwrap();
+        let tile = locum_capture::tiles::TILE_BYTES;
+        let gib4: u64 = 1 << 32;
+
+        // 1. 4 GiB buffer (#25) backed sparsely with only tiles 5 (< 2 GiB) and 40000 (> 2 GiB) touched.
+        d.memory.touched_tiles.insert(25, [5, 40000].into());
+        let big_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: gib4,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let r25 = d.make_sparse_buffer(25, &big_desc, COMMON, None).unwrap();
+        d.adopt_with_recorded(25, r25, Heap::Default, 0, layout::buffer_of(gib4), gib4)
+            .unwrap();
+        let low_pat = pattern(512);
+        let high_pat: Vec<u8> = pattern(512).into_iter().map(|b| b ^ 0xA5).collect();
+        let dummy = Capture {
+            db: rusqlite::Connection::open_in_memory().unwrap(),
+            path: std::path::PathBuf::new(),
+            blobs: locum_capture::blobs::Blobs::new("."),
+            names: crate::join::Names::default(),
+        };
+        d.write_bytes(&dummy, 25, 5 * tile, &low_pat).unwrap();
+        d.write_bytes(&dummy, 25, 40000 * tile, &high_pat).unwrap();
+        assert_eq!(d.read_bytes(25, 5 * tile, 512).unwrap(), low_pat);
+        assert_eq!(d.read_bytes(25, 40000 * tile, 512).unwrap(), high_pat);
+        assert!(d.read_bytes(25, 0, 512).unwrap().iter().all(|&b| b == 0));
+
+        // 2. Two reserved 256x256 RGBA8 textures (4 tiles each): #50 with 0 tiles mapped, #51 with tile 0 mapped.
+        let tex_desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let tex_subs = layout::texture(DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32, 256, 256, 1, 1, 1).unwrap();
+        for id in [50i64, 51i64] {
+            let mut tr: Option<ID3D12Resource> = None;
+            unsafe { d.device.CreateReservedResource(&tex_desc, COMMON, None, &mut tr) }.unwrap();
+            let tr = tr.unwrap();
+            let layout = locum_capture::tiles::d3d12(&tr).unwrap();
+            assert_eq!(layout.total, 4);
+            d.memory.reserved_info.insert(
+                id,
+                memory::ReservedInfo {
+                    layout: layout.clone(),
+                    mapped_tiles: BTreeSet::new(),
+                },
+            );
+            d.memory.mapped.insert(
+                id,
+                staging::Mapped {
+                    layout,
+                    tiles: BTreeSet::new(),
+                },
+            );
+            d.adopt(
+                id,
+                tr,
+                Heap::Default,
+                DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
+                tex_subs.clone(),
+            )
+            .unwrap();
+        }
+        // Pre-map tile 0 of #51 and write data to it; `map all-unmapped` must preserve tile 0 while backing tiles 1..4.
+        let mut h51: Option<ID3D12Heap> = None;
+        unsafe {
+            d.device.CreateHeap(
+                &D3D12_HEAP_DESC {
+                    SizeInBytes: tile,
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    Alignment: tile,
+                    Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
+                },
+                &mut h51,
+            )
+        }
+        .unwrap();
+        let h51 = h51.unwrap();
+        let r51 = d.resource(51).unwrap();
+        let coord0 = D3D12_TILED_RESOURCE_COORDINATE::default();
+        let sz1 = D3D12_TILE_REGION_SIZE {
+            NumTiles: 1,
+            ..Default::default()
+        };
+        let off0 = 0u32;
+        let cnt1 = 1u32;
+        unsafe {
+            d.queue.UpdateTileMappings(
+                &r51,
+                1,
+                Some(&coord0),
+                Some(&sz1),
+                &h51,
+                1,
+                None,
+                Some(&off0),
+                Some(&cnt1),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            );
+        }
+        d.memory.mapped.get_mut(&51).unwrap().tiles.insert(0);
+        d.memory
+            .reserved_info
+            .get_mut(&51)
+            .unwrap()
+            .mapped_tiles
+            .insert(0);
+        let init_tex = pattern(layout::total(&tex_subs));
+        d.put(51, &init_tex).unwrap();
+        let before_51 = d.read(51).unwrap();
+        assert_eq!(&before_51[..256], &init_tex[..256]);
+
+        // Apply `map all-unmapped`: backs all 4 tiles of #50 + tiles 1..4 of #51, skips 4 GiB #25!
+        let (rules, errors) = rules::parse_all(
+            "map all-unmapped before 10",
+            std::path::Path::new("."),
+            &rules::hex,
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        d.apply_state_rules(None, 10, None, &rules, false).unwrap();
+        d.flush().unwrap();
+
+        assert_eq!(d.memory.reserved_info[&50].mapped_tiles.len(), 4);
+        assert_eq!(d.memory.reserved_info[&51].mapped_tiles.len(), 4);
+        // #25 stayed sparse (still only its 2 touched tiles!).
+        assert_eq!(d.memory.reserved_info[&25].mapped_tiles.len(), 2);
+        // Tile 0 of #51 kept its original data untouched, and #50 now persists writes across the whole texture.
+        assert_eq!(&d.read(51).unwrap()[..256], &init_tex[..256]);
+        d.put(50, &init_tex).unwrap();
+        assert_eq!(d.read(50).unwrap(), init_tex);
+        assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
+        drop(h51);
     }
 }

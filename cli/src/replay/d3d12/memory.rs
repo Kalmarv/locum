@@ -191,10 +191,29 @@ fn allocation(
 /// `65535 * 64 KiB` (`4 GiB - 64 KiB`). Exact `4 GiB` (`2^32`) returns `E_OUTOFMEMORY` (`0x8007000E`) on WARP.
 pub(super) const MAX_WARP_BUFFER_BYTES: u64 = 65535 * locum_capture::tiles::TILE_BYTES;
 
+/// Uncaptured reserved buffers at or above this size are backed sparsely (only shared-content heaps + tiles
+/// explicitly touched by planned events) instead of eagerly allocating hundreds of private backing heaps.
+pub(super) const SPARSE_RESERVED_BUFFER_BYTES: u64 = 64 << 20;
+
+/// Uncaptured (or mostly-zero pieced) committed/placed buffers at or above this size (when not upload-mapped and
+/// not sharing a heap with another planned resource) are created as sparse reserved buffers with only touched/non-zero
+/// tiles backed.
+pub(super) const SPARSE_COMMITTED_BUFFER_BYTES: u64 = 256 << 20;
+
+/// Number of 64 KiB tiles allocated per chunk heap in the compact sparse tile pool (4 MiB per chunk).
+const SPARSE_POOL_CHUNK_TILES: u32 = 64;
+
 /// On WARP, `CopyBufferRegion` on a reserved buffer fails with `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (`0x887A0020`)
 /// whenever `offset + len >= 2 GiB` (`0x8000_0000`). Writing/reading those tiles through a temporary placed buffer
 /// alias in their backing heap keeps every `CopyBufferRegion` offset below 2 GiB.
 pub(super) const WARP_COPY_LIMIT: u64 = 0x8000_0000;
+
+/// Metadata tracked for every reserved resource (both textures and buffers, whether or not remapped during the frame)
+/// so `map` / `map all-unmapped` can identify and back every unmapped tile accurately.
+pub(super) struct ReservedInfo {
+    pub(super) layout: Layout,
+    pub(super) mapped_tiles: BTreeSet<u32>,
+}
 
 /// One contiguous run of a reserved buffer's mapped tiles inside a backing heap, for placed-buffer aliasing.
 pub(super) struct PlacedRun {
@@ -218,11 +237,32 @@ pub(super) struct Memory {
     /// Planned resources written by events strictly before the target event (so uncaptured reserved buffers
     /// not written before the target need not commit gigabytes of all-zero backing heaps).
     written_before_target: HashSet<i64>,
-    /// Count of uncaptured reserved buffers left unbacked (0 MiB committed, reads return 0 per D3D12 spec).
+    /// Per-buffer 64 KiB tile indices touched by explicit byte ranges of planned events (copies, indirect args,
+    /// VB/IB/SO, root CBVs, non-zero root SRV/UAV offsets, bounded descriptor views, result checkpoints, uploads).
+    pub(super) touched_tiles: HashMap<i64, BTreeSet<u32>>,
+    /// Game heaps already required by planned placed resources (sharing a heap) or captured reserved resources
+    /// (e.g. `#24`'s heaps shared with `#25`/`#26`), so sparse reserved buffers reuse them at zero extra cost.
+    pub(super) shared_content_heaps: HashSet<i64>,
+    /// Planned resources that receive `d12_upload_versions` CPU map writes (never converted to non-mappable reserved).
+    pub(super) upload_versioned: HashSet<i64>,
+    /// Buffer ids backed sparsely (selective tile backing instead of committing all recorded heaps / full buffer).
+    pub(super) sparse_buffers: HashSet<i64>,
+    /// Compact sparse tile pool: maps `(game_heap_id, game_heap_tile)` -> `(pool_heap_id, pool_tile)` so shared
+    /// touched tiles across multiple sparse buffers (e.g. `#25` and `#26`) still alias the same physical tile.
+    sparse_pool_by_key: HashMap<(i64, u32), (i64, u32)>,
+    /// Current chunk heap in the compact sparse tile pool: `(pool_heap_id, next_free_tile)`.
+    sparse_pool_cur: Option<(i64, u32)>,
+    /// All reserved resources (both textures and buffers) with their tile layout and currently mapped tile set.
+    pub(super) reserved_info: HashMap<i64, ReservedInfo>,
+    /// Count of uncaptured reserved buffers backed sparsely (leaving untouched private tiles unmapped).
     unbacked_reserved: usize,
+    /// Count of large committed/placed buffers backed sparsely as reserved buffers.
+    sparse_converted: usize,
+    /// Total 64 KiB tiles backed from the compact sparse tile pool.
+    sparse_tiles_mapped: usize,
     /// Placed resources created in replay heaps: resource id -> (heap id, relocated byte offset, byte size).
     placed_info: HashMap<i64, (i64, u64, u64)>,
-    /// Next synthetic negative heap id for heaps allocated by `map` rules.
+    /// Next synthetic negative heap id for heaps allocated by `map` rules and the sparse tile pool.
     next_rule_heap: i64,
     /// Cached per-heap mapped tile indices from `d12_tile_pages` and `d12_tile_mappings`, built once on first heap.
     heap_tiles: Option<HashMap<i64, BTreeSet<u32>>>,
@@ -262,12 +302,304 @@ pub(super) struct Memory {
     pub(super) not_remapped: usize,
 }
 
+/// Inserts all 64 KiB tiles overlapping byte interval `[start, start + len)` for `resource`, ignoring empty or
+/// invalid intervals and capping non-copy heuristic spans to `max_tiles`.
+fn add_touched_range(
+    out: &mut HashMap<i64, BTreeSet<u32>>,
+    resource: i64,
+    start: u64,
+    len: u64,
+    max_tiles: u32,
+) {
+    if resource <= 0 || len == 0 {
+        return;
+    }
+    let tile = locum_capture::tiles::TILE_BYTES;
+    let first = (start / tile) as u32;
+    let end = start.saturating_add(len).saturating_sub(1);
+    let last = ((end / tile) as u32).min(first.saturating_add(max_tiles.saturating_sub(1)));
+    let set = out.entry(resource).or_default();
+    for t in first..=last {
+        set.insert(t);
+    }
+}
+
 impl Memory {
-    /// Limits page-table scans to the planned resources (and any resources sharing their heaps).
-    pub(super) fn scope(&mut self, resources: &BTreeSet<i64>, written_before_target: &BTreeSet<i64>) {
-        self.planned = Some(resources.iter().copied().collect());
-        self.written_before_target = written_before_target.iter().copied().collect();
+    /// Scopes page-table and heap-span lookups to `plan` and precomputes per-buffer touched tile ranges,
+    /// shared content heaps, and upload-versioned buffers so large uncaptured buffers can be backed sparsely.
+    pub(super) fn prepare_plan(&mut self, c: &Capture, plan: &super::super::Plan) {
+        self.planned = Some(plan.resources.iter().copied().collect());
+        self.written_before_target = plan.written_before_target.iter().copied().collect();
         self.heap_tiles = None;
+        self.touched_tiles.clear();
+        self.shared_content_heaps.clear();
+        self.upload_versioned.clear();
+
+        let planned_events: HashSet<i64> = plan.events.iter().copied().collect();
+        let planned_res = self.planned.as_ref().expect("set above");
+
+        // 1. Scan explicit byte ranges on planned events: CopyBufferRegion, WriteBufferImmediate, ExecuteIndirect,
+        // ResolveQueryData.
+        let mut sig_strides: HashMap<i64, u64> = HashMap::new();
+        for (id, d) in c.rows(
+            "SELECT id, description FROM d12_objects WHERE kind = 'ID3D12CommandSignature'",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            if let Ok(v) = serde_json::from_str::<Value>(&d)
+                && let Some(st) = v["stride"].as_u64()
+            {
+                sig_strides.insert(id, st.max(4));
+            }
+        }
+        for (seq, call, args) in c.rows(
+            "SELECT seq, call, args FROM events WHERE call IN \
+             ('CopyBufferRegion', 'WriteBufferImmediate', 'ExecuteIndirect', 'ResolveQueryData') \
+             AND args IS NOT NULL",
+            [],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
+        ) {
+            if !planned_events.contains(&seq) {
+                continue;
+            }
+            let Ok(a) = serde_json::from_str::<Value>(&args) else {
+                continue;
+            };
+            match call.as_str() {
+                "CopyBufferRegion" => {
+                    let dst = a[0].as_i64().unwrap_or(0);
+                    let dst_off = a[1].as_u64().unwrap_or(0);
+                    let src = a[2].as_i64().unwrap_or(0);
+                    let src_off = a[3].as_u64().unwrap_or(0);
+                    let bytes = a[4].as_u64().unwrap_or(0);
+                    add_touched_range(&mut self.touched_tiles, dst, dst_off, bytes, 4096);
+                    add_touched_range(&mut self.touched_tiles, src, src_off, bytes, 4096);
+                }
+                "WriteBufferImmediate" => {
+                    for p in a[0].as_array().into_iter().flatten() {
+                        let res = p["address"]["resource"].as_i64().unwrap_or(0);
+                        let off = p["address"]["offset"].as_u64().unwrap_or(0);
+                        add_touched_range(&mut self.touched_tiles, res, off, 4, 1);
+                    }
+                }
+                "ExecuteIndirect" => {
+                    let sig = a[0].as_i64().unwrap_or(0);
+                    let max_count = a[1].as_u64().unwrap_or(1).min(65536);
+                    let arg_buf = a[2].as_i64().unwrap_or(0);
+                    let arg_off = a[3].as_u64().unwrap_or(0);
+                    let cnt_buf = a[4].as_i64().unwrap_or(0);
+                    let cnt_off = a[5].as_u64().unwrap_or(0);
+                    let stride = sig_strides.get(&sig).copied().unwrap_or(64);
+                    let bytes = max_count.saturating_mul(stride).min(16 << 20);
+                    add_touched_range(&mut self.touched_tiles, arg_buf, arg_off, bytes, 256);
+                    if cnt_buf > 0 {
+                        add_touched_range(&mut self.touched_tiles, cnt_buf, cnt_off, 4, 1);
+                    }
+                }
+                "ResolveQueryData" => {
+                    let count = a[3].as_u64().unwrap_or(1);
+                    let dst = a[4].as_i64().unwrap_or(0);
+                    let dst_off = a[5].as_u64().unwrap_or(0);
+                    add_touched_range(
+                        &mut self.touched_tiles,
+                        dst,
+                        dst_off,
+                        count.saturating_mul(8),
+                        256,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Scan draw/dispatch state for VB, IB, SO, root CBVs, and non-zero root SRV/UAV offsets.
+        if c.has_table("d12_draw_state") {
+            let rows: Vec<(i64, String)> = if planned_events.len() <= 32 {
+                let mut out = Vec::new();
+                for &ev in &planned_events {
+                    out.extend(c.rows(
+                        "SELECT d.event, s.root_args_json FROM draws d JOIN d12_draw_state s ON s.draw = d.n \
+                         WHERE d.event = ?1",
+                        [ev],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                    ));
+                }
+                out
+            } else {
+                c.rows(
+                    "SELECT d.event, s.root_args_json FROM draws d JOIN d12_draw_state s ON s.draw = d.n",
+                    [],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+            };
+            for (ev, json) in rows {
+                if !planned_events.contains(&ev) {
+                    continue;
+                }
+                let Ok(st) = serde_json::from_str::<Value>(&json) else {
+                    continue;
+                };
+                if let Some(ib) = st["graphics"]["index"].as_object() {
+                    let res = ib.get("buffer").and_then(|b| b["resource"].as_i64()).unwrap_or(0);
+                    let off = ib.get("buffer").and_then(|b| b["offset"].as_u64()).unwrap_or(0);
+                    let bytes = ib.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+                    add_touched_range(&mut self.touched_tiles, res, off, bytes, 1024);
+                }
+                if let Some(vbs) = st["graphics"]["vertex"].as_object() {
+                    for vb in vbs.values() {
+                        let res = vb["buffer"]["resource"].as_i64().unwrap_or(0);
+                        let off = vb["buffer"]["offset"].as_u64().unwrap_or(0);
+                        let bytes = vb["bytes"].as_u64().unwrap_or(0);
+                        add_touched_range(&mut self.touched_tiles, res, off, bytes, 1024);
+                    }
+                }
+                if let Some(sos) = st["graphics"]["stream_output"].as_object() {
+                    for so in sos.values() {
+                        let res = so["buffer"]["resource"].as_i64().unwrap_or(0);
+                        let off = so["buffer"]["offset"].as_u64().unwrap_or(0);
+                        let bytes = so["bytes"].as_u64().unwrap_or(0);
+                        add_touched_range(&mut self.touched_tiles, res, off, bytes, 1024);
+                        let f_res = so["filled"]["resource"].as_i64().unwrap_or(0);
+                        let f_off = so["filled"]["offset"].as_u64().unwrap_or(0);
+                        add_touched_range(&mut self.touched_tiles, f_res, f_off, 4, 1);
+                    }
+                }
+                for key in ["graphics_args", "compute_args"] {
+                    if let Some(args) = st[key].as_object() {
+                        for arg in args.values() {
+                            let kind = arg["kind"].as_str().unwrap_or("");
+                            let val = &arg["value"];
+                            let res = val["resource"].as_i64().unwrap_or(0);
+                            let off = val["offset"].as_u64().unwrap_or(0);
+                            if res <= 0 {
+                                continue;
+                            }
+                            match kind {
+                                "ConstantBufferView" => {
+                                    // Max D3D12 CBV window is 64 KiB (1 tile).
+                                    add_touched_range(&mut self.touched_tiles, res, off, 65536, 2);
+                                }
+                                "ShaderResourceView" | "UnorderedAccessView" if off > 0 => {
+                                    // Non-zero root SRV/UAV offset targets a specific sub-region of the buffer;
+                                    // offset 0 on a 4 GiB global window is a whole-address-space bind.
+                                    add_touched_range(&mut self.touched_tiles, res, off, 65536, 2);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Checkpoint ranges in `results` (if offset/bytes columns exist) and upload versions.
+        let has_result_range = c
+            .rows("SELECT name FROM pragma_table_info('results')", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .iter()
+            .any(|n| n == "offset");
+        if has_result_range {
+            for (ev, res, off, bytes) in c.rows(
+                "SELECT event, resource, offset, bytes FROM results WHERE offset IS NOT NULL AND bytes IS NOT NULL",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)? as u64,
+                        r.get::<_, i64>(3)? as u64,
+                    ))
+                },
+            ) {
+                if planned_events.contains(&ev) {
+                    add_touched_range(&mut self.touched_tiles, res, off, bytes, 1024);
+                }
+            }
+        }
+        if c.has_table("d12_upload_versions") {
+            for (res, json) in c.rows(
+                "SELECT resource, content_json FROM d12_upload_versions",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            ) {
+                if !planned_res.contains(&res) {
+                    continue;
+                }
+                self.upload_versioned.insert(res);
+                if let Ok(j) = serde_json::from_str::<Value>(&json) {
+                    let off = j["offset"].as_u64().unwrap_or(0);
+                    let sz = j["size"].as_u64().unwrap_or(0);
+                    add_touched_range(&mut self.touched_tiles, res, off, sz, 4096);
+                }
+            }
+        }
+
+        // 4. Identify game heaps needed by planned placed resources (shared or non-sparse) and by planned
+        // captured reserved resources (e.g. `#24`'s heaps shared with `#25`/`#26`).
+        let mut placed_by_heap: HashMap<i64, Vec<(i64, bool, bool, u64)>> = HashMap::new();
+        let has_content_set: HashSet<i64> = c
+            .rows("SELECT id FROM resources WHERE content IS NOT NULL", [], |r| {
+                r.get(0)
+            })
+            .into_iter()
+            .collect();
+        for &pid in planned_res {
+            let Some(desc_str) = c.row(
+                "SELECT description FROM d12_objects WHERE id = ?1 AND kind LIKE 'ID3D12Resource%'",
+                [pid],
+                |r| r.get::<_, String>(0),
+            ) else {
+                continue;
+            };
+            let Ok(d) = serde_json::from_str::<Value>(&desc_str) else {
+                continue;
+            };
+            let heap = d["heap"].as_i64().unwrap_or(0);
+            if heap != 0 {
+                let is_buf = d["dimension"].as_i64() == Some(1);
+                let width = d["width"].as_u64().unwrap_or(0);
+                let has_c = has_content_set.contains(&pid);
+                placed_by_heap
+                    .entry(heap)
+                    .or_default()
+                    .push((pid, is_buf, has_c, width));
+            }
+        }
+        for (heap, items) in &placed_by_heap {
+            // A heap with >= 2 planned placed resources, or any texture/small/captured/upload-versioned placed
+            // resource, will be materialized normally and should be reused by any sparse reserved buffer touching it.
+            let keep = items.len() > 1
+                || items.iter().any(|&(pid, is_buf, has_c, width)| {
+                    !is_buf
+                        || has_c
+                        || width < SPARSE_COMMITTED_BUFFER_BYTES
+                        || self.upload_versioned.contains(&pid)
+                });
+            if keep {
+                self.shared_content_heaps.insert(*heap);
+            }
+        }
+        if c.has_table("d12_tile_pages") {
+            let captured_reserved: HashSet<i64> = planned_res
+                .iter()
+                .copied()
+                .filter(|id| has_content_set.contains(id))
+                .collect();
+            for (rid, pages) in page_tables(c, Some(&captured_reserved)) {
+                if !pages.tiles.is_empty() && has_content_set.contains(&rid) {
+                    for &(heap, _) in pages.tiles.values() {
+                        self.shared_content_heaps.insert(heap as i64);
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(test)]
@@ -334,9 +666,17 @@ impl Memory {
         }
         if self.unbacked_reserved > 0 {
             out.push(format!(
-                "{} uncaptured reserved buffers (not written earlier in this plan) were left unbacked to save memory \
-                 (reads return 0; pass `--rule \"map <res>\"` or `map all-unmapped` to allocate backing tiles)",
-                self.unbacked_reserved
+                "{} uncaptured reserved buffers were backed sparsely ({} 64 KiB pool tiles committed for touched \
+                 ranges; untouched private tiles left unmapped and read 0; use `--rule \"map <res> <tile> <count>\"` \
+                 for explicit ranges)",
+                self.unbacked_reserved, self.sparse_tiles_mapped
+            ));
+        }
+        if self.sparse_converted > 0 {
+            out.push(format!(
+                "{} large committed/placed buffers were backed sparsely as reserved buffers ({} 64 KiB pool tiles \
+                 committed for touched/non-zero ranges)",
+                self.sparse_converted, self.sparse_tiles_mapped
             ));
         }
         if self.relocated > 0 {
@@ -820,48 +1160,36 @@ impl D3d12 {
                     mapped_tiles.insert(tile);
                 }
                 let mut current_tiles: BTreeMap<u32, (i64, u32)> = BTreeMap::new();
-                // An uncaptured reserved buffer not written by any earlier event in this plan holds all zeros:
-                // skip allocating private backing heaps (e.g. hundreds of 4 MiB heaps on #25/#26) that hold no
-                // other planned resource, leaving those tiles unmapped (0 bytes committed; reads return 0).
-                let skip_empty_heaps = !has_content
+                // An uncaptured reserved buffer that is either not written before the target OR is large (>= 64 MiB,
+                // e.g. XCL's 4 GiB UMA-window buffers #25/#26) is backed sparsely:
+                // - tiles in heaps already required by placed or captured resources (e.g. #24's shared heaps) map directly
+                //   into those heaps at zero extra cost, preserving exact aliasing;
+                // - tiles covered by explicit touched ranges in the plan are backed 64 KiB at a time from the compact
+                //   sparse tile pool, keyed by `(game_heap, game_tile)` so shared tiles across #25/#26 still alias;
+                // - untouched private tiles stay unmapped (0 bytes committed; D3D12 reads return 0).
+                let sparse_mode = !has_content
                     && is_buffer
-                    && !self.memory.written_before_target.contains(&id)
+                    && (!self.memory.written_before_target.contains(&id)
+                        || make_desc.Width >= SPARSE_RESERVED_BUFFER_BYTES)
                     && !by_heap.is_empty();
                 let mut skipped_any_heap = false;
-                let planned_placed_heaps: HashSet<i64> = if skip_empty_heaps {
-                    if let Some(planned) = &self.memory.planned {
-                        let mut out = HashSet::new();
-                        for &pid in planned {
-                            if pid == id {
-                                continue;
-                            }
-                            if let Some(h) = c
-                                .row(
-                                    "SELECT json_extract(description, '$.heap') FROM d12_objects WHERE id = ?1",
-                                    [pid],
-                                    |r| r.get::<_, Option<i64>>(0),
-                                )
-                                .flatten()
-                                && h != 0
-                            {
-                                out.insert(h);
-                            }
-                        }
-                        out
-                    } else {
-                        HashSet::new()
-                    }
-                } else {
-                    HashSet::new()
-                };
+                let touched_for_id = self.memory.touched_tiles.get(&id).cloned();
+                let mut pool_mappings: Vec<(u32, i64, u32)> = Vec::new();
                 for (heap, runs) in by_heap {
-                    if skip_empty_heaps
-                        && !self.memory.heaps.contains_key(&heap)
-                        && !planned_placed_heaps.contains(&heap)
-                    {
-                        for (start, sz) in runs.starts.iter().zip(&runs.sizes) {
+                    let heap_already_needed = self.memory.heaps.contains_key(&heap)
+                        || self.memory.shared_content_heaps.contains(&heap);
+                    if sparse_mode && !heap_already_needed {
+                        for ((start, sz), off) in runs.starts.iter().zip(&runs.sizes).zip(&runs.offsets) {
                             for k in 0..sz.NumTiles {
-                                mapped_tiles.remove(&(start.X + k));
+                                let res_tile = start.X + k;
+                                if touched_for_id.as_ref().is_some_and(|t| t.contains(&res_tile)) {
+                                    let (pool_heap, pool_tile) =
+                                        self.alloc_sparse_tile(Some((heap, *off + k)))?;
+                                    pool_mappings.push((res_tile, pool_heap, pool_tile));
+                                    current_tiles.insert(res_tile, (pool_heap, pool_tile));
+                                } else {
+                                    mapped_tiles.remove(&res_tile);
+                                }
                             }
                         }
                         skipped_any_heap = true;
@@ -873,7 +1201,33 @@ impl D3d12 {
                         offsets,
                         counts,
                     } = runs;
-                    let (h, relocation) = self.game_heap(c, heap)?;
+                    let (h, relocation) = match self.game_heap(c, heap) {
+                        Ok(pair) => pair,
+                        Err(e) if is_buffer && make_desc.Width >= SPARSE_RESERVED_BUFFER_BYTES => {
+                            // Never let a heap allocation failure on a multi-hundred-MiB reserved buffer fall back
+                            // to an even larger CreateCommittedResource: keep it sparse for touched tiles instead.
+                            self.warn(format!(
+                                "reserved buffer #{id}: backing heap #{heap} could not be made ({e}); falling back \
+                                 to sparse tiles for touched ranges"
+                            ));
+                            for ((start, sz), off) in starts.iter().zip(&sizes).zip(&offsets) {
+                                for k in 0..sz.NumTiles {
+                                    let res_tile = start.X + k;
+                                    if touched_for_id.as_ref().is_some_and(|t| t.contains(&res_tile)) {
+                                        let (pool_heap, pool_tile) =
+                                            self.alloc_sparse_tile(Some((heap, *off + k)))?;
+                                        pool_mappings.push((res_tile, pool_heap, pool_tile));
+                                        current_tiles.insert(res_tile, (pool_heap, pool_tile));
+                                    } else {
+                                        mapped_tiles.remove(&res_tile);
+                                    }
+                                }
+                            }
+                            skipped_any_heap = true;
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
                     // Re-split any run whose heap tiles were separated by relocation.
                     let (mut r_starts, mut r_sizes, mut r_offsets, mut r_counts) =
                         (Vec::new(), Vec::new(), Vec::new(), Vec::new());
@@ -923,13 +1277,24 @@ impl D3d12 {
                         )
                     };
                 }
+                if !pool_mappings.is_empty() {
+                    self.map_pool_runs(resource, &pool_mappings)?;
+                }
                 if skipped_any_heap {
                     self.memory.unbacked_reserved += 1;
+                    self.memory.sparse_buffers.insert(id);
                 }
                 if is_buffer {
                     self.memory.tile_map.insert(id, current_tiles);
                 }
                 self.memory.reserved += 1;
+                self.memory.reserved_info.insert(
+                    id,
+                    ReservedInfo {
+                        layout: layout.clone(),
+                        mapped_tiles: mapped_tiles.clone(),
+                    },
+                );
                 let remapped = c.has_table("d12_tile_mappings")
                     && c.row(
                         "SELECT 1 FROM d12_tile_mappings WHERE resource = ?1 LIMIT 1",
@@ -950,6 +1315,208 @@ impl D3d12 {
         }
         self.memory.shared.insert(id);
         r.ok_or_else(|| "no resource made".into())
+    }
+
+    /// Allocates one 64 KiB physical buffer tile from the compact sparse tile pool. When `key` is `Some((heap, tile))`,
+    /// deduplicates across resources so buffers that shared a game tile still alias the exact same physical tile.
+    fn alloc_sparse_tile(&mut self, key: Option<(i64, u32)>) -> Result<(i64, u32), String> {
+        if let Some(k) = key
+            && let Some(&existing) = self.memory.sparse_pool_by_key.get(&k)
+        {
+            return Ok(existing);
+        }
+        let tile_bytes = locum_capture::tiles::TILE_BYTES;
+        let need_new = match self.memory.sparse_pool_cur {
+            Some((_, next)) => next >= SPARSE_POOL_CHUNK_TILES,
+            None => true,
+        };
+        if need_new {
+            let chunk_bytes = u64::from(SPARSE_POOL_CHUNK_TILES) * tile_bytes;
+            let mut heap: Option<ID3D12Heap> = None;
+            unsafe {
+                self.device.CreateHeap(
+                    &D3D12_HEAP_DESC {
+                        SizeInBytes: chunk_bytes,
+                        Properties: D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        Alignment: tile_bytes,
+                        Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    },
+                    &mut heap,
+                )
+            }
+            .map_err(|e| format!("sparse tile pool CreateHeap({chunk_bytes} bytes): {e}"))?;
+            let heap = heap.ok_or("sparse tile pool: CreateHeap gave no heap")?;
+            self.memory.next_rule_heap -= 1;
+            let heap_id = self.memory.next_rule_heap;
+            super::name(&heap, format!("sparse-pool-{heap_id}"));
+            let rel = std::rc::Rc::new(Relocation::new(&[], chunk_bytes, tile_bytes));
+            self.memory.heaps.insert(heap_id, Ok((heap, rel)));
+            self.memory.sparse_pool_cur = Some((heap_id, 0));
+        }
+        let (heap_id, tile_idx) = self.memory.sparse_pool_cur.as_mut().expect("pool chunk");
+        let allocated = (*heap_id, *tile_idx);
+        *tile_idx += 1;
+        self.memory.sparse_tiles_mapped += 1;
+        if let Some(k) = key {
+            self.memory.sparse_pool_by_key.insert(k, allocated);
+        }
+        Ok(allocated)
+    }
+
+    /// Maps `(resource_tile, pool_heap_id, pool_tile)` entries onto reserved buffer `resource`, coalescing
+    /// contiguous runs per backing heap.
+    fn map_pool_runs(&self, resource: &ID3D12Resource, mappings: &[(u32, i64, u32)]) -> Result<(), String> {
+        let mut by_heap: BTreeMap<i64, Vec<(u32, u32, u32)>> = BTreeMap::new();
+        let mut sorted = mappings.to_vec();
+        sorted.sort_unstable();
+        for (rt, hid, ht) in sorted {
+            let e = by_heap.entry(hid).or_default();
+            if let Some(last) = e.last_mut()
+                && last.0 + last.2 == rt
+                && last.1 + last.2 == ht
+            {
+                last.2 += 1;
+            } else {
+                e.push((rt, ht, 1));
+            }
+        }
+        for (hid, runs) in by_heap {
+            let (h, _) = self
+                .memory
+                .heaps
+                .get(&hid)
+                .ok_or_else(|| format!("sparse pool heap #{hid} missing"))?
+                .clone()?;
+            let starts: Vec<D3D12_TILED_RESOURCE_COORDINATE> = runs
+                .iter()
+                .map(|&(rt, _, _)| D3D12_TILED_RESOURCE_COORDINATE {
+                    X: rt,
+                    ..Default::default()
+                })
+                .collect();
+            let sizes: Vec<D3D12_TILE_REGION_SIZE> = runs
+                .iter()
+                .map(|&(_, _, cnt)| D3D12_TILE_REGION_SIZE {
+                    NumTiles: cnt,
+                    UseBox: false.into(),
+                    ..Default::default()
+                })
+                .collect();
+            let offsets: Vec<u32> = runs.iter().map(|&(_, ht, _)| ht).collect();
+            let counts: Vec<u32> = runs.iter().map(|&(_, _, cnt)| cnt).collect();
+            unsafe {
+                self.queue.UpdateTileMappings(
+                    resource,
+                    starts.len() as u32,
+                    Some(starts.as_ptr()),
+                    Some(sizes.as_ptr()),
+                    &h,
+                    offsets.len() as u32,
+                    None,
+                    Some(offsets.as_ptr()),
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates a large committed/placed buffer as a sparse reserved buffer (`CreateReservedResource`), backing only
+    /// the 64 KiB tiles touched by planned events (plus `extra_tiles`, e.g. non-zero blob intervals) from the compact
+    /// sparse tile pool. Works identically on WARP and GPU.
+    pub(super) fn make_sparse_buffer(
+        &mut self,
+        id: i64,
+        desc: &D3D12_RESOURCE_DESC,
+        state: D3D12_RESOURCE_STATES,
+        extra_tiles: Option<&BTreeSet<u32>>,
+    ) -> Result<ID3D12Resource, String> {
+        let mut clamped = false;
+        let base_desc = D3D12_RESOURCE_DESC {
+            Alignment: 0,
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..*desc
+        };
+        let make_desc = if self.warp && base_desc.Width > MAX_WARP_BUFFER_BYTES {
+            clamped = true;
+            D3D12_RESOURCE_DESC {
+                Width: MAX_WARP_BUFFER_BYTES,
+                ..base_desc
+            }
+        } else {
+            base_desc
+        };
+        let mut r: Option<ID3D12Resource> = None;
+        let created = unsafe {
+            self.device
+                .CreateReservedResource(&make_desc, state, None, &mut r)
+        };
+        if let Err(first_err) = created {
+            if !clamped && base_desc.Width > MAX_WARP_BUFFER_BYTES {
+                let clamped_desc = D3D12_RESOURCE_DESC {
+                    Width: MAX_WARP_BUFFER_BYTES,
+                    ..base_desc
+                };
+                unsafe {
+                    self.device
+                        .CreateReservedResource(&clamped_desc, state, None, &mut r)
+                }
+                .map_err(|e| format!("sparse buffer #{id} CreateReservedResource (clamped): {e}"))?;
+                clamped = true;
+            } else {
+                return Err(format!("sparse buffer #{id} CreateReservedResource: {first_err}"));
+            }
+        }
+        let resource = r.ok_or("sparse buffer: CreateReservedResource gave no resource")?;
+        let layout = locum_capture::tiles::d3d12(&resource)?;
+        if clamped {
+            self.memory.clamped_buffers += 1;
+            self.memory.clamped_tiles.insert(id, layout.total);
+        }
+        let mut want: BTreeSet<u32> = BTreeSet::new();
+        if let Some(t) = self.memory.touched_tiles.get(&id) {
+            for &tile in t {
+                if tile < layout.total {
+                    want.insert(tile);
+                }
+            }
+        }
+        if let Some(extra) = extra_tiles {
+            for &tile in extra {
+                if tile < layout.total {
+                    want.insert(tile);
+                }
+            }
+        }
+        let mut pool_mappings = Vec::with_capacity(want.len());
+        let mut current_tiles: BTreeMap<u32, (i64, u32)> = BTreeMap::new();
+        for &tile in &want {
+            let (pool_heap, pool_tile) = self.alloc_sparse_tile(None)?;
+            pool_mappings.push((tile, pool_heap, pool_tile));
+            current_tiles.insert(tile, (pool_heap, pool_tile));
+        }
+        if !pool_mappings.is_empty() {
+            self.map_pool_runs(&resource, &pool_mappings)?;
+        }
+        self.memory.tile_map.insert(id, current_tiles);
+        self.memory.reserved_info.insert(
+            id,
+            ReservedInfo {
+                layout: layout.clone(),
+                mapped_tiles: want.clone(),
+            },
+        );
+        self.memory
+            .mapped
+            .insert(id, super::staging::Mapped { layout, tiles: want });
+        self.memory.shared.insert(id);
+        self.memory.sparse_buffers.insert(id);
+        self.memory.sparse_converted += 1;
+        Ok(resource)
     }
 
     /// Holds back resource `id`'s first-use contents for the submission they were copied at; false if the capture
@@ -1062,10 +1629,19 @@ impl D3d12 {
                 }
                 continue;
             }
+            if self.memory.sparse_buffers.contains(&resource) {
+                // Keep sparse uncaptured buffers from pulling in untouched 4 MiB game heaps during in-frame remaps.
+                if let Some(h) = a["heap"].as_i64().filter(|h| *h != 0)
+                    && !self.memory.heaps.contains_key(&h)
+                    && !self.memory.shared_content_heaps.contains(&h)
+                {
+                    self.memory.remaps += 1;
+                    continue;
+                }
+            }
             self.remap(c, &call, resource, source, &a)
                 .map_err(|e| format!("{call} of #{resource}: {e}"))?;
             if let Some(pages_str) = pages
-                && self.memory.tile_map.contains_key(&resource)
                 && let Some(parsed) = serde_json::from_str(&pages_str)
                     .ok()
                     .and_then(|v| Pages::from_runs(&v))
@@ -1076,15 +1652,20 @@ impl D3d12 {
                     .get(&resource)
                     .copied()
                     .unwrap_or(u32::MAX);
-                let mut updated = BTreeMap::new();
-                for (&tile, &(heap, at)) in &parsed.tiles {
-                    if tile < limit
-                        && let Some(Ok((_, rel))) = self.memory.heaps.get(&(heap as i64))
-                    {
-                        updated.insert(tile, (heap as i64, rel.tile(at)));
+                if self.memory.tile_map.contains_key(&resource) {
+                    let mut updated = BTreeMap::new();
+                    for (&tile, &(heap, at)) in &parsed.tiles {
+                        if tile < limit
+                            && let Some(Ok((_, rel))) = self.memory.heaps.get(&(heap as i64))
+                        {
+                            updated.insert(tile, (heap as i64, rel.tile(at)));
+                        }
                     }
+                    self.memory.tile_map.insert(resource, updated);
                 }
-                self.memory.tile_map.insert(resource, updated);
+                if let Some(info) = self.memory.reserved_info.get_mut(&resource) {
+                    info.mapped_tiles = parsed.tiles.keys().copied().filter(|&t| t < limit).collect();
+                }
             }
             self.memory.remaps += 1;
         }
@@ -1177,6 +1758,11 @@ impl D3d12 {
                 m.tiles.insert(tile + k);
             }
         }
+        if let Some(info) = self.memory.reserved_info.get_mut(&resource) {
+            for k in 0..count {
+                info.mapped_tiles.insert(tile + k);
+            }
+        }
         self.memory.remaps += 1;
         Ok(())
     }
@@ -1218,12 +1804,18 @@ impl D3d12 {
                 m.tiles.remove(&(tile + k));
             }
         }
+        if let Some(info) = self.memory.reserved_info.get_mut(&resource) {
+            for k in 0..count {
+                info.mapped_tiles.remove(&(tile + k));
+            }
+        }
         self.memory.remaps += 1;
         Ok(())
     }
 
-    /// Replay state rule: backs an unmapped/0-tile reserved resource (or all unmapped reserved resources when
-    /// `resource` is `None`) with freshly allocated default heap tiles so reads/writes persist.
+    /// Replay state rule: backs unmapped tiles of a reserved resource (or every unmapped reserved texture and
+    /// small/medium reserved buffer when `resource` is `None`, i.e. `map all-unmapped`) with freshly allocated
+    /// default heap tiles so reads/writes persist. Existing mapped tiles on partially-mapped resources are preserved.
     pub(super) fn rule_map_unmapped(
         &mut self,
         resource: Option<i64>,
@@ -1232,41 +1824,97 @@ impl D3d12 {
     ) -> Result<(), String> {
         const DEFAULT_MAX_TILES: u32 = 4096; // 256 MiB cap when mapping whole unmapped resources without explicit count
         let tile_bytes = locum_capture::tiles::TILE_BYTES;
+        let mut skipped_large: Vec<i64> = Vec::new();
         let targets: Vec<i64> = match resource {
             Some(id) => vec![id],
-            None => self
-                .memory
-                .tile_map
-                .iter()
-                .filter(|(_, m)| m.is_empty())
-                .map(|(&id, _)| id)
-                .collect(),
+            None => {
+                // Collect every reserved resource (both textures and buffers!) that has at least one unmapped tile.
+                let mut ids: BTreeSet<i64> = self
+                    .memory
+                    .reserved_info
+                    .iter()
+                    .filter(|(_, info)| info.mapped_tiles.len() < info.layout.total as usize)
+                    .map(|(&id, _)| id)
+                    .collect();
+                // Also include any test/rule-registered reserved buffers in `tile_map` or `mapped` not in `reserved_info`.
+                for (&id, m) in &self.memory.mapped {
+                    if m.tiles.len() < m.layout.total as usize {
+                        ids.insert(id);
+                    }
+                }
+                for (&id, tmap) in &self.memory.tile_map {
+                    if tmap.is_empty() {
+                        ids.insert(id);
+                    }
+                }
+                ids.into_iter().collect()
+            }
         };
+        let mut mapped_resources = 0usize;
+        let mut total_mapped_tiles = 0usize;
         for id in targets {
             let m = self.made(id)?;
             let r = m.resource.clone();
             let is_buffer = m.buffer();
-            let total_tiles = if is_buffer {
-                (m.desc.Width / tile_bytes) as u32
+            let width = m.desc.Width;
+            let res_flags = m.desc.Flags.0;
+            if resource.is_none() && is_buffer && width >= SPARSE_RESERVED_BUFFER_BYTES {
+                skipped_large.push(id);
+                continue;
+            }
+            let layout = if let Some(info) = self.memory.reserved_info.get(&id) {
+                info.layout.clone()
+            } else if let Some(mm) = self.memory.mapped.get(&id) {
+                mm.layout.clone()
             } else {
-                locum_capture::tiles::d3d12(&r).map(|l| l.total).unwrap_or(0)
+                locum_capture::tiles::d3d12(&r)?
             };
+            let total_tiles = layout.total;
             if total_tiles == 0 {
                 continue;
             }
-            let start_tile = tile.unwrap_or(0);
-            let want_count = count
-                .unwrap_or_else(|| total_tiles.saturating_sub(start_tile).min(DEFAULT_MAX_TILES))
-                .min(total_tiles.saturating_sub(start_tile));
-            if want_count == 0 {
+            let existing: BTreeSet<u32> = self
+                .memory
+                .reserved_info
+                .get(&id)
+                .map(|i| i.mapped_tiles.clone())
+                .or_else(|| self.memory.mapped.get(&id).map(|mm| mm.tiles.clone()))
+                .or_else(|| {
+                    self.memory
+                        .tile_map
+                        .get(&id)
+                        .map(|tm| tm.keys().copied().collect())
+                })
+                .unwrap_or_default();
+            // For `map all-unmapped` (`resource.is_none()`), map only the currently unmapped tiles so already-mapped
+            // tiles on partially-mapped textures/buffers are preserved intact. For explicit `map #<id> [tile [count]]`,
+            // map the requested range `[start_tile, start_tile + want_count)`.
+            let tiles_to_map: Vec<u32> = if resource.is_none() {
+                (0..total_tiles)
+                    .filter(|t| !existing.contains(t))
+                    .take(DEFAULT_MAX_TILES as usize)
+                    .collect()
+            } else {
+                let start_tile = tile.unwrap_or(0);
+                let want_count = count
+                    .unwrap_or_else(|| total_tiles.saturating_sub(start_tile).min(DEFAULT_MAX_TILES))
+                    .min(total_tiles.saturating_sub(start_tile));
+                (start_tile..start_tile + want_count).collect()
+            };
+            if tiles_to_map.is_empty() {
                 continue;
             }
-            let heap_bytes = u64::from(want_count) * tile_bytes;
+            let heap_bytes = tiles_to_map.len() as u64 * tile_bytes;
             let mut heap: Option<ID3D12Heap> = None;
             let flags = if is_buffer {
                 D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS
+            } else if res_flags
+                & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0)
+                != 0
+            {
+                D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES
             } else {
-                D3D12_HEAP_FLAG_NONE
+                D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES
             };
             unsafe {
                 self.device.CreateHeap(
@@ -1291,42 +1939,61 @@ impl D3d12 {
             self.memory.heaps.insert(heap_id, Ok((heap.clone(), rel)));
 
             if is_buffer {
-                let start = D3D12_TILED_RESOURCE_COORDINATE {
-                    X: start_tile,
-                    ..Default::default()
-                };
-                let sz = D3D12_TILE_REGION_SIZE {
-                    NumTiles: want_count,
-                    UseBox: false.into(),
-                    ..Default::default()
-                };
-                let heap_off = 0u32;
+                // Coalesce contiguous tile indices into minimal UpdateTileMappings ranges.
+                let mut starts = Vec::new();
+                let mut sizes = Vec::new();
+                let mut offsets = Vec::new();
+                let mut counts = Vec::new();
+                for (k, &t) in tiles_to_map.iter().enumerate() {
+                    let heap_off = k as u32;
+                    let can_extend = starts
+                        .last()
+                        .is_some_and(|prev: &D3D12_TILED_RESOURCE_COORDINATE| {
+                            let prev_cnt = sizes.last().map_or(0, |s: &D3D12_TILE_REGION_SIZE| s.NumTiles);
+                            prev.X + prev_cnt == t
+                        });
+                    if can_extend {
+                        sizes.last_mut().expect("size").NumTiles += 1;
+                        *counts.last_mut().expect("count") += 1;
+                    } else {
+                        starts.push(D3D12_TILED_RESOURCE_COORDINATE {
+                            X: t,
+                            ..Default::default()
+                        });
+                        sizes.push(D3D12_TILE_REGION_SIZE {
+                            NumTiles: 1,
+                            UseBox: false.into(),
+                            ..Default::default()
+                        });
+                        offsets.push(heap_off);
+                        counts.push(1);
+                    }
+                }
                 unsafe {
                     self.queue.UpdateTileMappings(
                         &r,
-                        1,
-                        Some(&start),
-                        Some(&sz),
+                        starts.len() as u32,
+                        Some(starts.as_ptr()),
+                        Some(sizes.as_ptr()),
                         &heap,
-                        1,
+                        offsets.len() as u32,
                         None,
-                        Some(&heap_off),
-                        Some(&want_count),
+                        Some(offsets.as_ptr()),
+                        Some(counts.as_ptr()),
                         D3D12_TILE_MAPPING_FLAG_NONE,
                     );
                 }
                 let tmap = self.memory.tile_map.entry(id).or_default();
-                for k in 0..want_count {
-                    tmap.insert(start_tile + k, (heap_id, k));
+                for (k, &t) in tiles_to_map.iter().enumerate() {
+                    tmap.insert(t, (heap_id, k as u32));
                 }
             } else {
-                let layout = locum_capture::tiles::d3d12(&r)?;
-                let mut starts = Vec::with_capacity(want_count as usize);
-                let mut sizes = Vec::with_capacity(want_count as usize);
-                let mut offsets = Vec::with_capacity(want_count as usize);
-                let mut counts = Vec::with_capacity(want_count as usize);
-                for k in 0..want_count {
-                    let [x, y, z, sub] = layout.coordinate(start_tile + k)?;
+                let mut starts = Vec::with_capacity(tiles_to_map.len());
+                let mut sizes = Vec::with_capacity(tiles_to_map.len());
+                let mut offsets = Vec::with_capacity(tiles_to_map.len());
+                let mut counts = Vec::with_capacity(tiles_to_map.len());
+                for (k, &t) in tiles_to_map.iter().enumerate() {
+                    let [x, y, z, sub] = layout.coordinate(t)?;
                     starts.push(D3D12_TILED_RESOURCE_COORDINATE {
                         X: x,
                         Y: y,
@@ -1338,7 +2005,7 @@ impl D3d12 {
                         UseBox: false.into(),
                         ..Default::default()
                     });
-                    offsets.push(k);
+                    offsets.push(k as u32);
                     counts.push(1);
                 }
                 unsafe {
@@ -1357,12 +2024,37 @@ impl D3d12 {
                 }
             }
             if let Some(m) = self.memory.mapped.get_mut(&id) {
-                for k in 0..want_count {
-                    m.tiles.insert(start_tile + k);
+                for &t in &tiles_to_map {
+                    m.tiles.insert(t);
+                }
+            }
+            if let Some(info) = self.memory.reserved_info.get_mut(&id) {
+                for &t in &tiles_to_map {
+                    info.mapped_tiles.insert(t);
                 }
             }
             self.memory.shared.insert(id);
             self.memory.remaps += 1;
+            mapped_resources += 1;
+            total_mapped_tiles += tiles_to_map.len();
+        }
+        if resource.is_none() {
+            let skipped_note = if skipped_large.is_empty() {
+                String::new()
+            } else {
+                let list: Vec<String> = skipped_large.iter().take(8).map(|id| format!("#{id}")).collect();
+                format!(
+                    "; skipped {} large (>= 64 MiB) sparse buffers ({}) — use explicit `map #<id> <tile> <count>` \
+                     for buffer ranges",
+                    skipped_large.len(),
+                    list.join(" ")
+                )
+            };
+            self.rule_notes.insert(format!(
+                "map all-unmapped: backed {total_mapped_tiles} unmapped tiles ({:.2} MiB) across {mapped_resources} \
+                 reserved resources{skipped_note}",
+                (total_mapped_tiles as f64 * tile_bytes as f64) / (1024.0 * 1024.0)
+            ));
         }
         Ok(())
     }
@@ -1473,6 +2165,11 @@ impl D3d12 {
         if let Some(m) = self.memory.mapped.get_mut(&dst) {
             for &(dt, _, _) in &pairs {
                 m.tiles.insert(dt);
+            }
+        }
+        if let Some(info) = self.memory.reserved_info.get_mut(&dst) {
+            for &(dt, _, _) in &pairs {
+                info.mapped_tiles.insert(dt);
             }
         }
         self.memory.shared.insert(dst);
