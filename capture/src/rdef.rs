@@ -291,6 +291,19 @@ pub fn declared(code: &[u8]) -> Option<Vec<Binding>> {
     Some(out)
 }
 
+/// Whether a shader container's `SFI0` feature flags mark direct indexing of the CBV/SRV/UAV descriptor heap
+/// (`SHADER_FEATURE_RESOURCE_DESCRIPTOR_HEAP_INDEXING`, bit 25 / `0x0200_0000`, required for SM 6.6
+/// `ResourceDescriptorHeap`). Returns `None` if `code` is not a readable DXBC/DXIL container.
+pub fn uses_resource_descriptor_heap(code: &[u8]) -> Option<bool> {
+    const RESOURCE_DESCRIPTOR_HEAP_INDEXING: u64 = 1 << 25;
+    let parts = dxil_reader::parts(code).ok()?;
+    let Some(sfi0) = parts.iter().find(|p| &p.kind == b"SFI0") else {
+        return Some(false);
+    };
+    let flags = u64::from_le_bytes(sfi0.data.get(..8)?.try_into().ok()?);
+    Some(flags & RESOURCE_DESCRIPTOR_HEAP_INDEXING != 0)
+}
+
 /// A program's debug name: the file stem of the PDB its DXIL compiler named in the `ILDN` part, so
 /// `...\GXLightAcc_DDirLightShadowed1.ppo.pdb` gives `GXLightAcc_DDirLightShadowed1`. FXC's DXBC has none.
 pub fn debug_name(code: &[u8]) -> Option<String> {
@@ -966,5 +979,26 @@ mod tests {
                 "cb", "srv", "srv", "sampler", "uav", "srv", "srv", "uav", "uav", "srv"
             ]
         );
+    }
+
+    #[test]
+    fn sfi0_reports_resource_descriptor_heap_indexing() {
+        let with_sfi0 = |flags: u64| {
+            let mut d = b"DXBC".to_vec();
+            d.extend([0u8; 16]);
+            d.extend(1u32.to_le_bytes());
+            d.extend((36u32 + 8 + 8).to_le_bytes());
+            d.extend(1u32.to_le_bytes());
+            d.extend(36u32.to_le_bytes());
+            d.extend(b"SFI0");
+            d.extend(8u32.to_le_bytes());
+            d.extend(flags.to_le_bytes());
+            d
+        };
+        assert_eq!(uses_resource_descriptor_heap(&with_sfi0(0)), Some(false));
+        assert_eq!(uses_resource_descriptor_heap(&with_sfi0(1 << 25)), Some(true));
+        assert_eq!(uses_resource_descriptor_heap(&with_sfi0(1 << 26)), Some(false));
+        assert_eq!(uses_resource_descriptor_heap(&cb_copy(false)), Some(false));
+        assert_eq!(uses_resource_descriptor_heap(b"not dxbc"), None);
     }
 }

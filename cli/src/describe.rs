@@ -116,7 +116,12 @@ impl std::fmt::Display for Shape {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind.as_str() {
             "buffer" => {
-                write!(f, "#{} buffer {} bytes", self.id, self.width)?;
+                write!(
+                    f,
+                    "#{} buffer {} bytes",
+                    self.id,
+                    self.bytes.max(u64::from(self.width))
+                )?;
                 if self.stride > 0 {
                     write!(f, " stride {}", self.stride)?;
                 }

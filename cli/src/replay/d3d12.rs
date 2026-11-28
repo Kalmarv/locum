@@ -134,6 +134,8 @@ struct ListCall {
 struct Made {
     resource: ID3D12Resource,
     desc: D3D12_RESOURCE_DESC,
+    /// Original buffer width recorded in the capture (may exceed `desc.Width` when clamped for WARP's 4 GiB - 64 KiB limit).
+    recorded_width: u64,
     heap: Heap,
     /// A texture replay moves between states with barriers (see the module's note).
     tracked: bool,
@@ -231,6 +233,7 @@ struct Need {
 }
 
 pub struct D3d12 {
+    warp: bool,
     device: ID3D12Device2,
     queue: ID3D12CommandQueue,
     allocator: ID3D12CommandAllocator,
@@ -244,6 +247,8 @@ pub struct D3d12 {
     resources: HashMap<i64, Made>,
     /// Mirrors of the game's shader-visible heaps (None for a heap that is not, or could not be made).
     heaps: HashMap<i64, Option<Mirror>>,
+    /// Shader-visible descriptor heap ids in this capture (cached once for fast descriptor loading).
+    visible_heaps: Option<std::collections::HashSet<i64>>,
     rtvs: Mirror,
     dsvs: Mirror,
     /// Room for the CPU handle a UAV clear names.
@@ -278,8 +283,11 @@ pub struct D3d12 {
 }
 
 /// The resources each resource of a Direct3D 12 capture shares memory with (see [`memory`]).
-pub fn aliases(c: &Capture) -> HashMap<i64, BTreeSet<i64>> {
-    memory::aliases(c)
+pub fn aliases(
+    c: &Capture,
+    relevant: Option<&std::collections::HashSet<i64>>,
+) -> HashMap<i64, BTreeSet<i64>> {
+    memory::aliases(c, relevant)
 }
 
 /// The resources of a Direct3D 12 capture that hold acceleration structures.
@@ -313,8 +321,13 @@ pub fn query_touches(c: &Capture) -> Vec<(i64, Vec<i64>, Vec<i64>)> {
 }
 
 /// For planning: what the heaps `events` index directly name (see [`indexed`]).
-pub fn heap_named(c: &Capture, events: &BTreeSet<i64>) -> BTreeSet<i64> {
-    indexed::named(c, events)
+pub fn heap_named(
+    c: &Capture,
+    events: &BTreeSet<i64>,
+    existing: &BTreeSet<i64>,
+    written_in_plan: &BTreeSet<i64>,
+) -> indexed::HeapNamed {
+    indexed::named(c, events, existing, written_in_plan)
 }
 
 fn u(v: &Value, i: usize) -> u64 {
@@ -443,6 +456,7 @@ impl D3d12 {
             };
             let timing = timing::Timing::new(&device, &queue)?;
             Ok(D3d12 {
+                warp,
                 device,
                 queue,
                 allocator,
@@ -453,6 +467,7 @@ impl D3d12 {
                 limit: staging::LIMIT,
                 resources: HashMap::new(),
                 heaps: HashMap::new(),
+                visible_heaps: None,
                 rtvs,
                 dsvs,
                 cpu_views,
@@ -524,8 +539,13 @@ impl D3d12 {
                 .map_err(|e| format!("command list Reset: {e}"))?;
         }
         removed.map_err(|e| {
+            let hint = if self.warp && self.debug.is_none() && e.code().0 as u32 == 0x887A_0005 {
+                " [WARP removed the device without GBV; retry with --debug or without --warp]"
+            } else {
+                ""
+            };
             format!(
-                "the device was removed: {e}{}{}",
+                "the device was removed: {e}{}{}{hint}",
                 self.removal(),
                 self.validation()
             )
@@ -757,6 +777,28 @@ impl D3d12 {
         )
     }
 
+    /// Shader-visible descriptor heap ids in this capture (cached once).
+    fn visible_heap_ids(&mut self, c: &Capture) -> std::collections::HashSet<i64> {
+        self.visible_heaps
+            .get_or_insert_with(|| {
+                c.rows(
+                    "SELECT id, description FROM d12_objects WHERE kind = 'ID3D12DescriptorHeap'",
+                    [],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .into_iter()
+                .filter(|(_, d)| {
+                    serde_json::from_str::<Value>(d)
+                        .ok()
+                        .and_then(|v| v["flags"].as_u64())
+                        .is_some_and(|f| f & 1 != 0)
+                })
+                .map(|(id, _)| id)
+                .collect()
+            })
+            .clone()
+    }
+
     /// Puts in place the descriptors and upload bytes of every submission up to `submission`.
     fn enter(&mut self, c: &Capture, submission: i64) -> Result<(), String> {
         let order = self.submissions.get_or_insert_with(|| {
@@ -769,6 +811,14 @@ impl D3d12 {
         let Some(at) = order.iter().position(|&(s, _)| s == submission) else {
             return Ok(());
         };
+        if self.applied > at {
+            return Ok(());
+        }
+        let visible = self.visible_heap_ids(c);
+        // Coalesce descriptor updates across skipped submissions (self.applied..=at) so each (heap, slot) is written
+        // once with its latest version at `submission`, and skip JSON parsing for unmade resources.
+        type RawDesc = (i64, String, i64, i64, Option<String>);
+        let mut latest_desc: HashMap<(i64, u32), RawDesc> = HashMap::new();
         while self.applied <= at {
             let (s, cpu_seq) = self.submissions.as_ref().expect("ordered")[self.applied];
             self.applied += 1;
@@ -776,16 +826,29 @@ impl D3d12 {
             // them when it ran.
             self.remap_before(c, cpu_seq)?;
             self.first_uses(s)?;
-            let versions: Vec<Version> = c.rows(
-                &format!(
-                    "SELECT {VERSION_COLUMNS} FROM d12_submission_descriptors s JOIN d12_descriptor_versions v \
-                     ON v.id = s.version WHERE s.submission = ?1 ORDER BY v.id"
-                ),
-                [s],
-                version,
-            );
-            for v in &versions {
-                self.descriptor(c, v);
+            if !visible.is_empty() {
+                for (id, heap, slot, kind, resource, counter, desc) in c.rows(
+                    "SELECT v.id, v.heap, v.slot, v.kind, v.resource, v.counter_resource, v.description \
+                     FROM d12_submission_descriptors s JOIN d12_descriptor_versions v \
+                     ON v.id = s.version WHERE s.submission = ?1 ORDER BY v.id",
+                    [s],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)? as u32,
+                            r.get::<_, String>(3)?,
+                            r.get::<_, Option<i64>>(4)?.unwrap_or(0),
+                            r.get::<_, Option<i64>>(5)?.unwrap_or(0),
+                            r.get::<_, Option<String>>(6)?,
+                        ))
+                    },
+                ) {
+                    if !visible.contains(&heap) {
+                        continue;
+                    }
+                    latest_desc.insert((heap, slot), (id, kind, resource, counter, desc));
+                }
             }
             let uploads: Vec<(i64, String)> = c.rows(
                 "SELECT resource, content_json FROM d12_upload_versions WHERE submission = ?1 \
@@ -815,7 +878,99 @@ impl D3d12 {
                 }
             }
         }
+        for ((heap, slot), (id, kind, resource, counter, desc_str)) in latest_desc {
+            // Fast path: an SRV/UAV/CBV pointing to a resource replay did not make becomes a null view without
+            // allocating a full serde_json::Value tree (crucial on 1M-slot bindless heaps).
+            let needs_parse = kind == "sampler"
+                || kind == "empty"
+                || resource == 0
+                || self.resources.contains_key(&resource)
+                || (kind == "srv"
+                    && desc_str
+                        .as_deref()
+                        .is_some_and(|s| s.contains("\"dimension\":11")));
+            if !needs_parse {
+                self.null_descriptor(c, id, heap, slot, &kind, desc_str.as_deref());
+                continue;
+            }
+            let v = Version {
+                id,
+                heap,
+                slot,
+                kind,
+                resource,
+                counter,
+                description: desc_str
+                    .and_then(|d| serde_json::from_str(&d).ok())
+                    .unwrap_or(Value::Null),
+            };
+            self.descriptor(c, &v);
+        }
         Ok(())
+    }
+
+    /// Writes a null descriptor into `(heap, slot)` for a resource replay did not make, avoiding full JSON parsing.
+    fn null_descriptor(
+        &mut self,
+        c: &Capture,
+        id: i64,
+        heap: i64,
+        slot: u32,
+        kind: &str,
+        desc_str: Option<&str>,
+    ) {
+        let Some(m) = self.heap(c, heap) else {
+            return;
+        };
+        if slot >= m.count {
+            let count = m.count;
+            self.warn(format!(
+                "descriptor heap #{heap}: slot {slot} is past its {count} descriptors"
+            ));
+            return;
+        }
+        let handle = m.cpu(slot);
+        let dim = desc_str.and_then(|s| {
+            let rest = s.split_once("\"dimension\":")?.1;
+            let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+            digits.parse::<i32>().ok()
+        });
+        unsafe {
+            match kind {
+                "cb" => {
+                    let d = D3D12_CONSTANT_BUFFER_VIEW_DESC::default();
+                    self.device.CreateConstantBufferView(Some(&d), handle);
+                }
+                "srv" => {
+                    let dim = match dim {
+                        Some(d @ 1..=10) => D3D12_SRV_DIMENSION(d),
+                        _ => D3D12_SRV_DIMENSION_TEXTURE2D,
+                    };
+                    let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                        ViewDimension: dim,
+                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                        ..Default::default()
+                    };
+                    self.device.CreateShaderResourceView(None, Some(&d), handle);
+                }
+                "uav" => {
+                    let dim = match dim {
+                        Some(d @ 1..=8) if d != 6 && d != 7 => D3D12_UAV_DIMENSION(d),
+                        _ => D3D12_UAV_DIMENSION_BUFFER,
+                    };
+                    let d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                        Format: DXGI_FORMAT_R32_UINT,
+                        ViewDimension: dim,
+                        ..Default::default()
+                    };
+                    self.device
+                        .CreateUnorderedAccessView(None, None, Some(&d), handle);
+                }
+                _ => {}
+            }
+        }
+        self.versions.insert((heap, slot), id);
     }
 
     /// Writes bytes into a buffer on an upload or readback heap through its mapping.
@@ -920,9 +1075,29 @@ impl D3d12 {
                         self.device.CreateShaderResourceView(r, None, handle)
                     }
                 }
-                "srv" => self
-                    .device
-                    .CreateShaderResourceView(r.as_ref(), Some(&views::srv(desc)), handle),
+                "srv" => {
+                    let mut d = views::srv(desc);
+                    if let Some(m) = self.resources.get(&resource)
+                        && m.buffer()
+                        && m.desc.Width < m.recorded_width
+                        && d.ViewDimension == D3D12_SRV_DIMENSION_BUFFER
+                    {
+                        let b = &mut d.Anonymous.Buffer;
+                        let stride = if b.StructureByteStride > 0 {
+                            u64::from(b.StructureByteStride)
+                        } else if b.Flags.contains(D3D12_BUFFER_SRV_FLAG_RAW) {
+                            4
+                        } else {
+                            u64::from(
+                                locum_capture::format::layout(d.Format.0 as u32).map_or(4, |l| l.block_bytes),
+                            )
+                        };
+                        let avail = m.desc.Width / stride.max(1);
+                        let max_elems = avail.saturating_sub(b.FirstElement).min(u64::from(u32::MAX)) as u32;
+                        b.NumElements = b.NumElements.min(max_elems);
+                    }
+                    self.device.CreateShaderResourceView(r.as_ref(), Some(&d), handle)
+                }
                 "uav" => {
                     let counter = self.resources.get(&counter).map(|m| m.resource.clone());
                     if default {
@@ -931,22 +1106,42 @@ impl D3d12 {
                                 .CreateUnorderedAccessView(r, counter.as_ref(), None, handle)
                         }
                     } else {
-                        self.device.CreateUnorderedAccessView(
-                            r.as_ref(),
-                            counter.as_ref(),
-                            Some(&views::uav(desc)),
-                            handle,
-                        )
+                        let mut d = views::uav(desc);
+                        if let Some(m) = self.resources.get(&resource)
+                            && m.buffer()
+                            && m.desc.Width < m.recorded_width
+                            && d.ViewDimension == D3D12_UAV_DIMENSION_BUFFER
+                        {
+                            let b = &mut d.Anonymous.Buffer;
+                            let stride = if b.StructureByteStride > 0 {
+                                u64::from(b.StructureByteStride)
+                            } else if b.Flags.contains(D3D12_BUFFER_UAV_FLAG_RAW) {
+                                4
+                            } else {
+                                u64::from(
+                                    locum_capture::format::layout(d.Format.0 as u32)
+                                        .map_or(4, |l| l.block_bytes),
+                                )
+                            };
+                            let avail = m.desc.Width / stride.max(1);
+                            let max_elems =
+                                avail.saturating_sub(b.FirstElement).min(u64::from(u32::MAX)) as u32;
+                            b.NumElements = b.NumElements.min(max_elems);
+                        }
+                        self.device
+                            .CreateUnorderedAccessView(r.as_ref(), counter.as_ref(), Some(&d), handle)
                     }
                 }
                 "cb" => {
                     let d = match views::cbv(desc) {
                         Some((buffer, offset, bytes)) => D3D12_CONSTANT_BUFFER_VIEW_DESC {
                             BufferLocation: self.address(buffer, offset),
-                            SizeInBytes: if self.resources.contains_key(&buffer) {
-                                bytes
-                            } else {
-                                0
+                            SizeInBytes: match self.resources.get(&buffer) {
+                                Some(m) => {
+                                    let avail = m.desc.Width.saturating_sub(offset);
+                                    (u64::from(bytes)).min(avail) as u32
+                                }
+                                None => 0,
                             },
                         },
                         None => D3D12_CONSTANT_BUFFER_VIEW_DESC::default(),
@@ -1901,8 +2096,10 @@ impl D3d12 {
         unsafe {
             match call {
                 "CopyBufferRegion" => {
-                    let (dst, src) = (self.resource(u(a, 0) as i64)?, self.resource(u(a, 2) as i64)?);
-                    list.CopyBufferRegion(&dst, u(a, 1), &src, u(a, 3), u(a, 4));
+                    let (dst_id, dst_off) = (u(a, 0) as i64, u(a, 1));
+                    let (src_id, src_off) = (u(a, 2) as i64, u(a, 3));
+                    let len = u(a, 4);
+                    self.copy_buffer_to_buffer(dst_id, dst_off, src_id, src_off, len)?;
                 }
                 "CopyResource" => {
                     let (d, s) = (u(a, 0) as i64, u(a, 1) as i64);
@@ -2149,133 +2346,16 @@ pub(super) fn resource_desc(d: &Value) -> D3D12_RESOURCE_DESC {
 }
 
 impl Backend for D3d12 {
+    fn prepare(&mut self, _c: &Capture, plan: &super::Plan) {
+        self.memory.scope(&plan.resources);
+    }
+
     fn create(&mut self, c: &Capture, id: i64, contents: Option<&[u8]>) -> Result<(), String> {
-        let d: Option<Value> = c
-            .row(
-                "SELECT description FROM d12_objects WHERE id = ?1 AND kind LIKE 'ID3D12Resource%'",
-                [id],
-                |r| r.get::<_, String>(0),
-            )
-            .and_then(|d| serde_json::from_str(&d).ok());
-        let (Some(s), Some(d)) = (shape(c, id), d) else {
-            self.undescribed.push(id);
-            return Ok(());
-        };
-        let n = |k: &str| d[k].as_u64().unwrap_or(0);
-        let dimension = n("dimension") as i32;
-        let buffer = dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
-        let props = &d["heap_properties"];
-        let mut heap = match props["type"].as_u64() {
-            Some(2) => Heap::Upload,
-            Some(3) => Heap::Readback,
-            Some(4) => Heap::Custom {
-                page: props["cpu_page"].as_i64().unwrap_or(0) as i32,
-                pool: props["memory_pool"].as_i64().unwrap_or(0) as i32,
-            },
-            _ => Heap::Default,
-        };
-        if !buffer && heap.mapped() {
-            self.warn("textures on heaps the CPU maps are made on a default heap");
-            heap = Heap::Default;
-        }
-        let placement = memory::Placement::of(&d);
-        let format = n("format") as u32;
-        let samples = n("sample_count").max(1) as u32;
-        let mut desc = resource_desc(&d);
-        let (properties, state) = match heap {
-            Heap::Default => (
-                D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_DEFAULT,
-                    ..Default::default()
-                },
-                COMMON,
-            ),
-            Heap::Upload => (
-                D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_UPLOAD,
-                    ..Default::default()
-                },
-                D3D12_RESOURCE_STATE_GENERIC_READ,
-            ),
-            Heap::Readback => (
-                D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_READBACK,
-                    ..Default::default()
-                },
-                D3D12_RESOURCE_STATE_COPY_DEST,
-            ),
-            Heap::Custom { page, pool } => (
-                D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_CUSTOM,
-                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY(page),
-                    MemoryPoolPreference: D3D12_MEMORY_POOL(pool),
-                    ..Default::default()
-                },
-                COMMON,
-            ),
-        };
-        let device = self.device.clone();
-        let make = |desc: &D3D12_RESOURCE_DESC| -> windows::core::Result<ID3D12Resource> {
-            let mut r: Option<ID3D12Resource> = None;
-            unsafe {
-                device.CreateCommittedResource(
-                    &properties,
-                    D3D12_HEAP_FLAG_NONE,
-                    desc,
-                    state,
-                    None,
-                    &mut r,
-                )?
-            };
-            Ok(r.expect("made"))
-        };
-        // In the memory the game shared, with the game's own flags, so it takes what it took there.
-        let shared = match placement {
-            memory::Placement::Committed => None,
-            p => match self.make_shared(c, id, p, &desc, state) {
-                Ok(r) => Some(r),
-                Err(why) => {
-                    self.memory.fell_back(why);
-                    None
-                }
-            },
-        };
-        let resource = match shared {
-            Some(r) => r,
-            None => {
-                desc.Alignment = 0;
-                desc.Layout = if buffer {
-                    D3D12_TEXTURE_LAYOUT_ROW_MAJOR
-                } else {
-                    D3D12_TEXTURE_LAYOUT_UNKNOWN
-                };
-                // Textures that can be are made for simultaneous access, so their uses need no barriers.
-                if !buffer && desc.Flags.0 & 0x2 == 0 && samples == 1 {
-                    desc.Flags.0 |= SIMULTANEOUS;
-                }
-                make(&desc).map_err(|e| e.to_string())?
-            }
-        };
-        self.adopt(id, resource, heap, format, s.subs())?;
-        let subs = s.subs();
-        // Captures before samples were read (2026-11-06) hold a multisampled texture's resolve.
-        if samples > 1 && contents.is_some_and(|b| b.len() as u64 == layout::total(&s.resolved_subs())) {
-            self.warn(
-                "multisampled textures start empty (the capture holds their resolve, not their samples)",
-            );
-        }
-        match contents.filter(|b| b.len() as u64 == layout::total(&subs)) {
-            // In shared memory, written when replay reaches the submission they were copied at.
-            Some(_) if self.memory.shared.contains(&id) && self.defer(c, id) => {}
-            Some(bytes) => self.write(c, id, bytes)?,
-            None => {}
-        }
-        if heap.mapped() {
-            self.resources.get_mut(&id).expect("made").from = c
-                .row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))
-                .flatten();
-        }
-        Ok(())
+        self.create_inner(c, id, contents.map(Ok), None)
+    }
+
+    fn create_blob(&mut self, c: &Capture, id: i64, key: Option<&str>) -> Result<(), String> {
+        self.create_inner(c, id, key.map(Err), key)
     }
 
     fn run(&mut self, c: &Capture, seq: i64, rules: &[Rule]) -> Result<(), String> {
@@ -2423,9 +2503,9 @@ impl Backend for D3d12 {
             let (readback, p) = self.staging(D3D12_HEAP_TYPE_READBACK, piece.len)?;
             for copy in &piece.copies {
                 match copy {
-                    staging::Copy::Buffer { at } => unsafe {
-                        self.list.CopyBufferRegion(&readback, 0, &r, *at, piece.len)
-                    },
+                    staging::Copy::Buffer { at } => {
+                        self.copy_from_buffer(&readback, 0, id, *at, piece.len)?;
+                    }
                     staging::Copy::Texture {
                         sub,
                         footprint,
@@ -2489,13 +2569,17 @@ impl Backend for D3d12 {
 
     fn read_bytes(&mut self, id: i64, offset: u64, len: u64) -> Result<Vec<u8>, String> {
         self.first_use_now(id)?;
-        let (r, mapped) = self.bytes_of(id, offset, len)?;
+        let (r, mapped, actual_width) = self.bytes_of(id, offset, len)?;
         let mut data = vec![0u8; len as usize];
+        let avail = actual_width.saturating_sub(offset).min(len);
+        if avail == 0 {
+            return Ok(data);
+        }
         if mapped {
             let mut p = core::ptr::null_mut();
             let range = D3D12_RANGE {
                 Begin: offset as usize,
-                End: (offset + len) as usize,
+                End: (offset + avail) as usize,
             };
             unsafe {
                 r.Map(0, Some(&range), Some(&mut p))
@@ -2503,19 +2587,16 @@ impl Backend for D3d12 {
                 core::ptr::copy_nonoverlapping(
                     p.cast::<u8>().add(offset as usize),
                     data.as_mut_ptr(),
-                    data.len(),
+                    avail as usize,
                 );
                 r.Unmap(0, Some(&D3D12_RANGE::default()));
             }
             return Ok(data);
         }
-        // What a reserved buffer's unmapped tiles hold: zeros.
-        for piece in staging::within(self.pieces(id), offset, offset + len) {
+        // What a reserved buffer's unmapped tiles (or clamped tail) hold: zeros.
+        for piece in staging::within(self.pieces(id), offset, offset + avail) {
             let (readback, p) = self.staging(D3D12_HEAP_TYPE_READBACK, piece.len)?;
-            unsafe {
-                self.list
-                    .CopyBufferRegion(&readback, 0, &r, piece.from, piece.len)
-            };
+            self.copy_from_buffer(&readback, 0, id, piece.from, piece.len)?;
             self.flush()?;
             let staged = unsafe { core::slice::from_raw_parts(p.cast_const(), piece.len as usize) };
             let at = (piece.from - offset) as usize;
@@ -2528,16 +2609,20 @@ impl Backend for D3d12 {
     fn write_bytes(&mut self, _c: &Capture, id: i64, offset: u64, bytes: &[u8]) -> Result<(), String> {
         // The rest of it as the frame began, first.
         self.first_use_now(id)?;
-        let (r, mapped) = self.bytes_of(id, offset, bytes.len() as u64)?;
-        if mapped {
-            return self.map_write(id, offset, bytes);
+        let (_, mapped, actual_width) = self.bytes_of(id, offset, bytes.len() as u64)?;
+        let avail = actual_width.saturating_sub(offset).min(bytes.len() as u64);
+        if avail == 0 {
+            return Ok(());
         }
-        for piece in staging::within(self.pieces(id), offset, offset + bytes.len() as u64) {
+        if mapped {
+            return self.map_write(id, offset, &bytes[..avail as usize]);
+        }
+        for piece in staging::within(self.pieces(id), offset, offset + avail) {
             let (upload, p) = self.staging(D3D12_HEAP_TYPE_UPLOAD, piece.len)?;
             let at = (piece.from - offset) as usize;
             unsafe { core::slice::from_raw_parts_mut(p, piece.len as usize) }
                 .copy_from_slice(&bytes[at..at + piece.len as usize]);
-            unsafe { self.list.CopyBufferRegion(&r, piece.from, &upload, 0, piece.len) };
+            self.copy_to_buffer(id, piece.from, &upload, 0, piece.len)?;
             self.flush()?;
         }
         Ok(())
@@ -2594,8 +2679,185 @@ impl Backend for D3d12 {
 }
 
 impl D3d12 {
-    /// Takes resource `id`, made as `resource` on `heap`, of `format`, whose contents lie in `subs` in the canonical
-    /// layout: where a copy of each subresource lies in a buffer, and its address for a buffer.
+    /// Creates resource `id` from either in-memory `Ok(bytes)` or a streaming blob key `Err(key)`.
+    fn create_inner(
+        &mut self,
+        c: &Capture,
+        id: i64,
+        source: Option<Result<&[u8], &str>>,
+        key_hint: Option<&str>,
+    ) -> Result<(), String> {
+        let d: Option<Value> = c
+            .row(
+                "SELECT description FROM d12_objects WHERE id = ?1 AND kind LIKE 'ID3D12Resource%'",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
+            .and_then(|d| serde_json::from_str(&d).ok());
+        let (Some(s), Some(d)) = (shape(c, id), d) else {
+            self.undescribed.push(id);
+            return Ok(());
+        };
+        let n = |k: &str| d[k].as_u64().unwrap_or(0);
+        let dimension = n("dimension") as i32;
+        let buffer = dimension == D3D12_RESOURCE_DIMENSION_BUFFER.0;
+        let props = &d["heap_properties"];
+        let mut heap = match props["type"].as_u64() {
+            Some(2) => Heap::Upload,
+            Some(3) => Heap::Readback,
+            Some(4) => Heap::Custom {
+                page: props["cpu_page"].as_i64().unwrap_or(0) as i32,
+                pool: props["memory_pool"].as_i64().unwrap_or(0) as i32,
+            },
+            _ => Heap::Default,
+        };
+        if !buffer && heap.mapped() {
+            self.warn("textures on heaps the CPU maps are made on a default heap");
+            heap = Heap::Default;
+        }
+        let placement = memory::Placement::of(&d);
+        let format = n("format") as u32;
+        let samples = n("sample_count").max(1) as u32;
+        let mut desc = resource_desc(&d);
+        let (properties, state) = match heap {
+            Heap::Default => (
+                D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                COMMON,
+            ),
+            Heap::Upload => (
+                D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_UPLOAD,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            ),
+            Heap::Readback => (
+                D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_READBACK,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COPY_DEST,
+            ),
+            Heap::Custom { page, pool } => (
+                D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_CUSTOM,
+                    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY(page),
+                    MemoryPoolPreference: D3D12_MEMORY_POOL(pool),
+                    ..Default::default()
+                },
+                COMMON,
+            ),
+        };
+        let device = self.device.clone();
+        let make = |desc: &D3D12_RESOURCE_DESC| -> windows::core::Result<ID3D12Resource> {
+            let mut r: Option<ID3D12Resource> = None;
+            unsafe {
+                device.CreateCommittedResource(
+                    &properties,
+                    D3D12_HEAP_FLAG_NONE,
+                    desc,
+                    state,
+                    None,
+                    &mut r,
+                )?
+            };
+            Ok(r.expect("made"))
+        };
+        // In the memory the game shared, with the game's own flags, so it takes what it took there.
+        let shared = match placement {
+            memory::Placement::Committed => None,
+            p => match self.make_shared(c, id, p, &desc, state) {
+                Ok(r) => Some(r),
+                Err(why) => {
+                    self.memory.fell_back(why);
+                    None
+                }
+            },
+        };
+        let resource = match shared {
+            Some(r) => r,
+            None => {
+                desc.Alignment = 0;
+                desc.Layout = if buffer {
+                    D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                } else {
+                    D3D12_TEXTURE_LAYOUT_UNKNOWN
+                };
+                // Textures that can be are made for simultaneous access, so their uses need no barriers.
+                if !buffer && desc.Flags.0 & 0x2 == 0 && samples == 1 {
+                    desc.Flags.0 |= SIMULTANEOUS;
+                }
+                match make(&desc) {
+                    Ok(r) => r,
+                    Err(e) if buffer && desc.Width > memory::MAX_WARP_BUFFER_BYTES => {
+                        let clamped = D3D12_RESOURCE_DESC {
+                            Width: memory::MAX_WARP_BUFFER_BYTES,
+                            ..desc
+                        };
+                        self.warn(format!(
+                            "committed buffer #{id} ({} bytes) exceeded this device's buffer width limit and was \
+                             clamped to {} bytes",
+                            desc.Width, clamped.Width
+                        ));
+                        make(&clamped).map_err(|e2| format!("{e} (clamped retry: {e2})"))?
+                    }
+                    Err(e) => return Err(e.to_string()),
+                }
+            }
+        };
+        let recorded_width = n("width");
+        self.adopt_with_recorded(id, resource, heap, format, s.subs(), recorded_width)?;
+        let subs = s.subs();
+        let expected_total = layout::total(&subs);
+        match source {
+            Some(Ok(bytes)) => {
+                // Captures before samples were read (2026-11-06) hold a multisampled texture's resolve.
+                if samples > 1 && bytes.len() as u64 == layout::total(&s.resolved_subs()) {
+                    self.warn(
+                        "multisampled textures start empty (the capture holds their resolve, not their samples)",
+                    );
+                }
+                if bytes.len() as u64 == expected_total {
+                    if self.memory.shared.contains(&id) && self.defer(c, id) {
+                        // Deferred until its first-use submission.
+                    } else {
+                        self.write(c, id, bytes)?;
+                    }
+                }
+            }
+            Some(Err(key)) => {
+                let blob_size = c
+                    .blobs
+                    .size(key)
+                    .ok_or_else(|| format!("blob {key} is not in {}", c.blobs.root().display()))?;
+                if samples > 1 && blob_size == layout::total(&s.resolved_subs()) {
+                    self.warn(
+                        "multisampled textures start empty (the capture holds their resolve, not their samples)",
+                    );
+                }
+                if blob_size == expected_total {
+                    if self.memory.shared.contains(&id) && self.defer(c, id) {
+                        // Deferred until its first-use submission: zero bytes read now!
+                    } else {
+                        self.put_blob_from(&c.blobs, id, key)?;
+                    }
+                }
+            }
+            None => {}
+        }
+        if heap.mapped() {
+            self.resources.get_mut(&id).expect("made").from = key_hint.map(str::to_string).or_else(|| {
+                c.row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))
+                    .flatten()
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn adopt(
         &mut self,
         id: i64,
@@ -2603,6 +2865,21 @@ impl D3d12 {
         heap: Heap,
         format: u32,
         subs: Vec<Sub>,
+    ) -> Result<(), String> {
+        let width = unsafe { resource.GetDesc() }.Width;
+        self.adopt_with_recorded(id, resource, heap, format, subs, width)
+    }
+
+    /// Takes resource `id`, made as `resource` on `heap`, of `format`, whose contents lie in `subs` in the canonical
+    /// layout: where a copy of each subresource lies in a buffer, and its address for a buffer.
+    fn adopt_with_recorded(
+        &mut self,
+        id: i64,
+        resource: ID3D12Resource,
+        heap: Heap,
+        format: u32,
+        subs: Vec<Sub>,
+        recorded_width: u64,
     ) -> Result<(), String> {
         let desc = unsafe { resource.GetDesc() };
         let buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -2685,6 +2962,11 @@ impl D3d12 {
             Made {
                 resource,
                 desc,
+                recorded_width: if buffer {
+                    recorded_width.max(desc.Width)
+                } else {
+                    desc.Width
+                },
                 heap,
                 tracked: !buffer && desc.Flags.0 & SIMULTANEOUS == 0,
                 extent,
@@ -2700,20 +2982,21 @@ impl D3d12 {
         Ok(())
     }
 
-    /// Buffer `id`, and whether the CPU reaches it through a mapping, where bytes `offset..offset + len` are in it.
-    fn bytes_of(&self, id: i64, offset: u64, len: u64) -> Result<(ID3D12Resource, bool), String> {
+    /// Buffer `id`, whether the CPU reaches it through a mapping, and its actual width on this device
+    /// (which may be clamped below `recorded_width` on WARP for 4 GiB buffers).
+    fn bytes_of(&self, id: i64, offset: u64, len: u64) -> Result<(ID3D12Resource, bool, u64), String> {
         let m = self.made(id)?;
         if !m.buffer() {
             return Err(format!("#{id} is not a buffer"));
         }
-        if offset.checked_add(len).is_none_or(|end| end > m.desc.Width) {
+        if offset.checked_add(len).is_none_or(|end| end > m.recorded_width) {
             return Err(format!(
                 "#{id}: bytes {offset}..{} run past its {} bytes",
                 offset.saturating_add(len),
-                m.desc.Width
+                m.recorded_width
             ));
         }
-        Ok((m.resource.clone(), m.heap.mapped()))
+        Ok((m.resource.clone(), m.heap.mapped(), m.desc.Width))
     }
 
     /// The pieces resource `id`'s contents move in (see [`staging`]): a reserved one's mapped tiles only.
@@ -2727,6 +3010,257 @@ impl D3d12 {
         }
     }
 
+    /// Creates a temporary placed buffer alias in `run.heap` at `run.heap_offset` for WARP high-offset copies,
+    /// keeping it alive until the open command list finishes.
+    fn placed_alias(&mut self, run: &memory::PlacedRun) -> Result<ID3D12Resource, String> {
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: run.width,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut r: Option<ID3D12Resource> = None;
+        unsafe {
+            self.device
+                .CreatePlacedResource(&run.heap, run.heap_offset, &desc, COMMON, None, &mut r)
+        }
+        .map_err(|e| {
+            format!(
+                "placed alias at heap offset {} ({} bytes): {e}",
+                run.heap_offset, run.width
+            )
+        })?;
+        let r = r.ok_or("CreatePlacedResource gave no alias")?;
+        self.kept.push(r.clone());
+        Ok(r)
+    }
+
+    /// Records a copy into buffer `dst_id` at `dst_offset`, using placed-heap aliases on WARP whenever
+    /// `dst_offset + len >= 2 GiB` on a reserved buffer.
+    fn copy_to_buffer(
+        &mut self,
+        dst_id: i64,
+        dst_offset: u64,
+        src: &ID3D12Resource,
+        src_offset: u64,
+        len: u64,
+    ) -> Result<(), String> {
+        if self.warp
+            && dst_offset.saturating_add(len) >= memory::WARP_COPY_LIMIT
+            && let Some(runs) = self.placed_alias_runs(dst_id, dst_offset, len)
+        {
+            for run in runs {
+                let alias = self.placed_alias(&run)?;
+                unsafe {
+                    self.list
+                        .CopyBufferRegion(&alias, run.at, src, src_offset + run.slice_offset, run.len)
+                };
+            }
+            return Ok(());
+        }
+        let dst = self.resource(dst_id)?;
+        unsafe { self.list.CopyBufferRegion(&dst, dst_offset, src, src_offset, len) };
+        Ok(())
+    }
+
+    /// Records a copy from buffer `src_id` at `src_offset`, using placed-heap aliases on WARP whenever
+    /// `src_offset + len >= 2 GiB` on a reserved buffer.
+    fn copy_from_buffer(
+        &mut self,
+        dst: &ID3D12Resource,
+        dst_offset: u64,
+        src_id: i64,
+        src_offset: u64,
+        len: u64,
+    ) -> Result<(), String> {
+        if self.warp
+            && src_offset.saturating_add(len) >= memory::WARP_COPY_LIMIT
+            && let Some(runs) = self.placed_alias_runs(src_id, src_offset, len)
+        {
+            for run in runs {
+                let alias = self.placed_alias(&run)?;
+                unsafe {
+                    self.list
+                        .CopyBufferRegion(dst, dst_offset + run.slice_offset, &alias, run.at, run.len)
+                };
+            }
+            return Ok(());
+        }
+        let src = self.resource(src_id)?;
+        unsafe { self.list.CopyBufferRegion(dst, dst_offset, &src, src_offset, len) };
+        Ok(())
+    }
+
+    /// Records an event's `CopyBufferRegion` between two replay buffers, handling WARP's 2 GiB limit on reserved
+    /// buffers on either or both sides.
+    fn copy_buffer_to_buffer(
+        &mut self,
+        dst_id: i64,
+        dst_offset: u64,
+        src_id: i64,
+        src_offset: u64,
+        len: u64,
+    ) -> Result<(), String> {
+        let dst_high = self.warp
+            && dst_offset.saturating_add(len) >= memory::WARP_COPY_LIMIT
+            && self.memory.tile_map.contains_key(&dst_id);
+        let src_high = self.warp
+            && src_offset.saturating_add(len) >= memory::WARP_COPY_LIMIT
+            && self.memory.tile_map.contains_key(&src_id);
+        if !dst_high && !src_high {
+            let (dst, src) = (self.resource(dst_id)?, self.resource(src_id)?);
+            unsafe {
+                self.list
+                    .CopyBufferRegion(&dst, dst_offset, &src, src_offset, len)
+            };
+            return Ok(());
+        }
+        if dst_high && !src_high {
+            let src = self.resource(src_id)?;
+            return self.copy_to_buffer(dst_id, dst_offset, &src, src_offset, len);
+        }
+        if src_high && !dst_high {
+            let dst = self.resource(dst_id)?;
+            return self.copy_from_buffer(&dst, dst_offset, src_id, src_offset, len);
+        }
+        // Both sides are high reserved buffers: relay through a temporary default buffer in chunks.
+        let mut done = 0u64;
+        while done < len {
+            let step = (len - done).min(self.limit);
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: step,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut tmp: Option<ID3D12Resource> = None;
+            unsafe {
+                self.device.CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    COMMON,
+                    None,
+                    &mut tmp,
+                )
+            }
+            .map_err(|e| format!("relay buffer ({step} bytes): {e}"))?;
+            let tmp = tmp.ok_or("no relay buffer")?;
+            self.kept.push(tmp.clone());
+            self.copy_from_buffer(&tmp, 0, src_id, src_offset + done, step)?;
+            self.copy_to_buffer(dst_id, dst_offset + done, &tmp, 0, step)?;
+            done += step;
+        }
+        Ok(())
+    }
+
+    /// Writes resource `id`'s contents directly from blob `key` in `blobs`, streaming buffers piece-by-piece
+    /// (never materializing a 4 GiB Vec in RAM, and skipping `ZEROS` pieces for fresh/unmapped regions).
+    pub(super) fn put_blob_from(
+        &mut self,
+        blobs: &locum_capture::blobs::Blobs,
+        id: i64,
+        key: &str,
+    ) -> Result<(), String> {
+        let m = self.made(id)?;
+        let expected = layout::total(&m.layout);
+        let blob_size = blobs
+            .size(key)
+            .ok_or_else(|| format!("blob {key} is not in {}", blobs.root().display()))?;
+        if blob_size != expected {
+            return Err(format!(
+                "#{id}: {blob_size} bytes do not fit its {expected} bytes of subresources"
+            ));
+        }
+        if !m.buffer() {
+            let bytes = blobs
+                .get(key)
+                .map_err(|e| format!("blob {key} is not in {} ({e})", blobs.root().display()))?;
+            return self.put(id, &bytes);
+        }
+        let pieces = self.pieces(id);
+        if pieces.is_empty() {
+            return Ok(());
+        }
+        // For pieced blobs (e.g. 4 GiB reserved buffers), identify non-zero byte intervals so ZEROS segments never
+        // allocate RAM or staging copies unless a shared heap might have been written before.
+        let non_zero: Option<Vec<(u64, u64)>> = blobs
+            .pieces(key)
+            .map_err(|e| format!("blob {key} pieces: {e}"))?
+            .map(|list| {
+                let mut out = Vec::new();
+                let mut at = 0u64;
+                for (k, len) in list {
+                    if k != locum_capture::blobs::ZEROS && len > 0 {
+                        out.push((at, at + len));
+                    }
+                    at += len;
+                }
+                out
+            });
+        // Split/filter pieces to only non-zero runs when `non_zero` is known.
+        let to_upload: Vec<staging::Piece> = match &non_zero {
+            Some(runs) if !runs.is_empty() => {
+                let mut out = Vec::new();
+                for p in pieces {
+                    let (p0, p1) = (p.from, p.from + p.len);
+                    for &(r0, r1) in runs {
+                        let (lo, hi) = (p0.max(r0), p1.min(r1));
+                        if lo < hi {
+                            out.push(staging::Piece {
+                                from: lo,
+                                len: hi - lo,
+                                copies: vec![staging::Copy::Buffer { at: lo }],
+                            });
+                        }
+                    }
+                }
+                out
+            }
+            Some(_) => Vec::new(), // Entirely ZEROS!
+            None => pieces,
+        };
+        if to_upload.is_empty() {
+            return Ok(());
+        }
+        let mapped_heap = self.made(id)?.heap.mapped();
+        if mapped_heap {
+            for piece in &to_upload {
+                let chunk = blobs
+                    .read(key, piece.from, Some(piece.len))
+                    .map_err(|e| format!("blob {key} at {}..{}: {e}", piece.from, piece.from + piece.len))?;
+                self.map_write(id, piece.from, &chunk)?;
+            }
+            return Ok(());
+        }
+        let last = to_upload.len().saturating_sub(1);
+        for (k, piece) in to_upload.iter().enumerate() {
+            let chunk = blobs
+                .read(key, piece.from, Some(piece.len))
+                .map_err(|e| format!("blob {key} at {}..{}: {e}", piece.from, piece.from + piece.len))?;
+            let (upload, p) = self.staging(D3D12_HEAP_TYPE_UPLOAD, piece.len)?;
+            let staged = unsafe { core::slice::from_raw_parts_mut(p, piece.len as usize) };
+            staged.copy_from_slice(&chunk);
+            self.copy_to_buffer(id, piece.from, &upload, 0, piece.len)?;
+            if k < last {
+                self.flush()
+                    .map_err(|e| format!("upload #{id} {}..{}: {e}", piece.from, piece.from + piece.len))?;
+            }
+        }
+        self.flush().map_err(|e| format!("upload #{id} final: {e}"))
+    }
+
     /// Writes `contents` (canonical layout) into resource `id`.
     fn put(&mut self, id: i64, contents: &[u8]) -> Result<(), String> {
         let m = self.made(id)?;
@@ -2738,7 +3272,8 @@ impl D3d12 {
             ));
         }
         if m.buffer() && m.heap.mapped() {
-            return self.map_write(id, 0, contents);
+            let len = (m.desc.Width as usize).min(contents.len());
+            return self.map_write(id, 0, &contents[..len]);
         }
         let (r, buffer, bytes, tracked) = (m.resource.clone(), m.buffer(), m.copy_bytes, m.tracked);
         // A multisampled texture's samples are copied into images, drawn from there; it lives until the flush
@@ -2774,9 +3309,9 @@ impl D3d12 {
             staged.copy_from_slice(&laid[piece.from as usize..(piece.from + piece.len) as usize]);
             for copy in &piece.copies {
                 match copy {
-                    staging::Copy::Buffer { at } => unsafe {
-                        self.list.CopyBufferRegion(&r, *at, &upload, 0, piece.len)
-                    },
+                    staging::Copy::Buffer { at } => {
+                        self.copy_to_buffer(id, *at, &upload, 0, piece.len)?;
+                    }
                     staging::Copy::Texture {
                         sub, footprint, y, z, ..
                     } => {
@@ -2986,6 +3521,115 @@ mod tests {
                 assert!(got.iter().all(|&b| b == 0), "unmapped tile {t}");
             }
         }
+        drop(heap);
+    }
+
+    /// A 4 GiB (2^32) reserved buffer clamped to WARP's 4 GiB - 64 KiB limit streams a pieced blob with ZEROS
+    /// segments directly into mapped tiles without allocating 4 GiB of RAM.
+    #[test]
+    fn four_gib_reserved_buffer_and_streaming_pieced_blob_on_warp() {
+        let mut d = D3d12::new(true, super::super::Validation::Off).unwrap();
+        let tile = locum_capture::tiles::TILE_BYTES;
+        let gib4: u64 = 1 << 32;
+        let clamped_width = memory::MAX_WARP_BUFFER_BYTES;
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: clamped_width,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut r: Option<ID3D12Resource> = None;
+        unsafe { d.device.CreateReservedResource(&desc, COMMON, None, &mut r) }.unwrap();
+        let r = r.unwrap();
+        let mut heap: Option<ID3D12Heap> = None;
+        unsafe {
+            d.device.CreateHeap(
+                &D3D12_HEAP_DESC {
+                    SizeInBytes: tile * 2,
+                    Properties: D3D12_HEAP_PROPERTIES {
+                        Type: D3D12_HEAP_TYPE_DEFAULT,
+                        ..Default::default()
+                    },
+                    Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS,
+                    ..Default::default()
+                },
+                &mut heap,
+            )
+        }
+        .unwrap();
+        let heap = heap.unwrap();
+        // Map tile 17 (< 2 GiB) -> heap tile 0, and tile 40000 (> 2 GiB, past WARP's CopyBufferRegion limit) -> heap tile 1.
+        let starts = [
+            D3D12_TILED_RESOURCE_COORDINATE {
+                X: 17,
+                ..Default::default()
+            },
+            D3D12_TILED_RESOURCE_COORDINATE {
+                X: 40000,
+                ..Default::default()
+            },
+        ];
+        let heap_offsets = [0u32, 1u32];
+        let counts = [1u32, 1u32];
+        unsafe {
+            d.queue.UpdateTileMappings(
+                &r,
+                2,
+                Some(starts.as_ptr()),
+                None,
+                &heap,
+                2,
+                None,
+                Some(heap_offsets.as_ptr()),
+                Some(counts.as_ptr()),
+                D3D12_TILE_MAPPING_FLAG_NONE,
+            )
+        };
+        let tiled = locum_capture::tiles::d3d12(&r).unwrap();
+        d.memory.mapped.insert(
+            24,
+            staging::Mapped {
+                layout: tiled,
+                tiles: [17, 40000].into(),
+            },
+        );
+        d.memory.insert_test_heap(100, heap.clone());
+        d.memory
+            .tile_map
+            .insert(24, [(17, (100, 0)), (40000, (100, 1))].into());
+        d.adopt_with_recorded(24, r, Heap::Default, 0, layout::buffer_of(gib4), gib4)
+            .unwrap();
+        // Build a 4 GiB pieced blob where tile 17 and tile 40000 have data and the rest is ZEROS.
+        let dir = std::env::temp_dir().join(format!("locum-test-4gib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blobs = locum_capture::blobs::Blobs::new(&dir);
+        let low_bytes = pattern(tile);
+        let high_bytes: Vec<u8> = pattern(tile).into_iter().map(|b| b ^ 0x5A).collect();
+        let low_key = locum_capture::hash::key(&low_bytes);
+        let high_key = locum_capture::hash::key(&high_bytes);
+        blobs.put(&low_key, &low_bytes).unwrap();
+        blobs.put(&high_key, &high_bytes).unwrap();
+        let pieces = vec![
+            (locum_capture::blobs::ZEROS.to_owned(), 17 * tile),
+            (low_key, tile),
+            (locum_capture::blobs::ZEROS.to_owned(), (40000 - 18) * tile),
+            (high_key, tile),
+            (locum_capture::blobs::ZEROS.to_owned(), gib4 - 40001 * tile),
+        ];
+        let key = locum_capture::blobs::pieces_key(&pieces);
+        blobs.put_pieces(&key, &pieces).unwrap();
+        d.put_blob_from(&blobs, 24, &key).unwrap();
+        assert_eq!(d.read_bytes(24, 17 * tile, tile).unwrap(), low_bytes);
+        assert_eq!(d.read_bytes(24, 40000 * tile, tile).unwrap(), high_bytes);
+        let zero = d.read_bytes(24, 0, 256).unwrap();
+        assert!(zero.iter().all(|&b| b == 0));
+        let _ = blobs.close();
+        let _ = std::fs::remove_dir_all(&dir);
         drop(heap);
     }
 }

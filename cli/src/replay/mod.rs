@@ -26,8 +26,16 @@ use crate::out;
 
 /// What a backend for one graphics API does.
 pub trait Backend {
+    /// Called before resource creation with the replay plan so backends can scope caches and shared heaps.
+    fn prepare(&mut self, _c: &Capture, _plan: &Plan) {}
     /// Makes resource `id` as the capture describes it, holding `contents` (the canonical layout) if given.
     fn create(&mut self, c: &Capture, id: i64, contents: Option<&[u8]>) -> Result<(), String>;
+    /// Makes resource `id` from blob `key` in `c.blobs` (or empty if `None`), allowing streaming without
+    /// materializing multi-gigabyte blobs in RAM.
+    fn create_blob(&mut self, c: &Capture, id: i64, key: Option<&str>) -> Result<(), String> {
+        let contents = key.map(|k| c.blob(k)).transpose()?;
+        self.create(c, id, contents.as_deref())
+    }
     /// Runs event `seq` as the capture recorded it, draws and dispatches with `rules` applied.
     fn run(&mut self, c: &Capture, seq: i64, rules: &[Rule]) -> Result<(), String>;
     /// Resource `id`'s contents now, in the canonical layout.
@@ -159,7 +167,18 @@ fn touches(c: &Capture) -> BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)> {
                 }
             }
         }
-        let aliases = d3d12::aliases(c);
+        let mut relevant: HashSet<i64> = out
+            .values()
+            .flat_map(|(r, w)| r.iter().chain(w.iter()))
+            .copied()
+            .filter(|&id| id >= 0)
+            .collect();
+        relevant.extend(c.rows(
+            "SELECT DISTINCT resource FROM bindings WHERE resource IS NOT NULL",
+            [],
+            |r| r.get::<_, i64>(0),
+        ));
+        let aliases = d3d12::aliases(c, Some(&relevant));
         if !aliases.is_empty() {
             for (_, written) in out.values_mut() {
                 let shared: Vec<i64> = written
@@ -195,15 +214,53 @@ pub struct Plan {
     pub resources: BTreeSet<i64>,
     /// The event the replay is read just before, when it runs no event that far.
     pub until: Option<i64>,
+    /// Heap-only resources referenced by a directly-indexed descriptor heap that had no captured contents and were
+    /// not written by any event in this plan, so they were skipped (left as null descriptors).
+    pub skipped_empty_heap: usize,
 }
 
 /// The events to run to replay event `target`, and the resources they touch.
 pub fn plan(c: &Capture, target: i64, mode: Mode) -> Plan {
+    if mode == Mode::Draw {
+        let mut resources: BTreeSet<i64> = BTreeSet::new();
+        let mut written_in_plan: BTreeSet<i64> = BTreeSet::new();
+        for (resource, access) in c.rows(
+            "SELECT resource, access FROM event_resources WHERE event = ?1",
+            [target],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            resources.insert(resource);
+            if access == "write" {
+                written_in_plan.insert(resource);
+            }
+        }
+        if c.meta("api").as_deref() == Some("d3d12") {
+            let structures = d3d12::acceleration_structures(c);
+            if !structures.is_empty() && resources.iter().any(|r| structures.contains(r)) {
+                resources.extend(structures);
+            }
+        }
+        if captured_constants(c) {
+            let cb_only: Vec<i64> = c.rows(
+                "SELECT b.resource FROM bindings b JOIN draws d ON d.n = b.draw \
+                 WHERE d.event = ?1 AND b.resource IS NOT NULL \
+                 GROUP BY b.resource HAVING sum(b.kind <> 'cb') = 0",
+                [target],
+                |r| r.get(0),
+            );
+            for resource in cb_only {
+                if !written_in_plan.contains(&resource) {
+                    resources.remove(&resource);
+                }
+            }
+        }
+        return with_bound(c, vec![target], resources, &written_in_plan);
+    }
     let touches = touches(c);
     let mut events: Vec<i64> = Vec::new();
     let mut resources: BTreeSet<i64> = BTreeSet::new();
     match mode {
-        Mode::Draw => take(&touches, target, &mut events, &mut resources),
+        Mode::Draw => unreachable!(),
         Mode::Frame => {
             for &seq in touches.keys().filter(|&&s| s <= target) {
                 take(&touches, seq, &mut events, &mut resources);
@@ -214,7 +271,13 @@ pub fn plan(c: &Capture, target: i64, mode: Mode) -> Plan {
             walk_back(&touches, target, &mut events, &mut resources);
         }
     }
-    with_bound(c, events, resources)
+    let written_in_plan: BTreeSet<i64> = events
+        .iter()
+        .filter_map(|e| touches.get(e))
+        .flat_map(|(_, w)| w.iter().copied())
+        .filter(|&id| id >= 0)
+        .collect();
+    with_bound(c, events, resources, &written_in_plan)
 }
 
 /// The events to run for resource `id` to hold what it held just before event `before`: every earlier event that
@@ -223,9 +286,15 @@ pub fn plan_before(c: &Capture, id: i64, before: i64) -> Plan {
     let touches = touches(c);
     let (mut events, mut resources) = (Vec::new(), BTreeSet::from([id]));
     walk_back(&touches, before, &mut events, &mut resources);
+    let written_in_plan: BTreeSet<i64> = events
+        .iter()
+        .filter_map(|e| touches.get(e))
+        .flat_map(|(_, w)| w.iter().copied())
+        .filter(|&id| id >= 0)
+        .collect();
     Plan {
         until: Some(before),
-        ..with_bound(c, events, resources)
+        ..with_bound(c, events, resources, &written_in_plan)
     }
 }
 
@@ -252,40 +321,63 @@ fn walk_back(touches: &Touches, before: i64, events: &mut Vec<i64>, resources: &
 }
 
 /// The plan, with every resource the planned draws have bound.
-fn with_bound(c: &Capture, events: Vec<i64>, mut resources: BTreeSet<i64>) -> Plan {
-    // Everything a draw has bound, and the resource of every view an event names, in one query (one per event
-    // scans the bindings once per event: minutes on a game's frame).
-    let mut bound: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+fn with_bound(
+    c: &Capture,
+    events: Vec<i64>,
+    mut resources: BTreeSet<i64>,
+    written_in_plan: &BTreeSet<i64>,
+) -> Plan {
+    // Everything a draw has bound, and the resource of every view an event names.
     let constants = if captured_constants(c) {
         "AND b.kind <> 'cb'"
     } else {
         ""
     };
-    for (event, resource) in c.rows(
-        &format!(
-            "SELECT DISTINCT d.event, b.resource FROM bindings b JOIN draws d ON d.n = b.draw \
-             WHERE b.resource IS NOT NULL {constants}"
-        ),
-        [],
-        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-    ) {
-        bound.entry(event).or_default().push(resource);
-    }
-    for seq in &events {
-        if let Some(b) = bound.get(seq) {
-            resources.extend(b);
+    if events.len() <= 32 && !events.is_empty() {
+        let list: String = events.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        for resource in c.rows(
+            &format!(
+                "SELECT DISTINCT b.resource FROM bindings b JOIN draws d ON d.n = b.draw \
+                 WHERE d.event IN ({list}) AND b.resource IS NOT NULL {constants}"
+            ),
+            [],
+            |r| r.get::<_, i64>(0),
+        ) {
+            resources.insert(resource);
         }
-    }
-    // What a program reads through a heap its root signature indexes directly, which no binding names.
-    if c.meta("api").as_deref() == Some("d3d12") {
-        resources.extend(d3d12::heap_named(c, &events.iter().copied().collect()));
+    } else if !events.is_empty() {
+        let mut bound: BTreeMap<i64, Vec<i64>> = BTreeMap::new();
+        for (event, resource) in c.rows(
+            &format!(
+                "SELECT DISTINCT d.event, b.resource FROM bindings b JOIN draws d ON d.n = b.draw \
+                 WHERE b.resource IS NOT NULL {constants}"
+            ),
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        ) {
+            bound.entry(event).or_default().push(resource);
+        }
+        for seq in &events {
+            if let Some(b) = bound.get(seq) {
+                resources.extend(b);
+            }
+        }
     }
     // Queries are resources only to the planner (negative ids, d3d12::query_touches).
     resources.retain(|&r| r >= 0);
+    // What a program reads through a heap its root signature indexes directly, which no binding names.
+    let mut skipped_empty_heap = 0;
+    if c.meta("api").as_deref() == Some("d3d12") {
+        let event_set: BTreeSet<i64> = events.iter().copied().collect();
+        let named = d3d12::heap_named(c, &event_set, &resources, written_in_plan);
+        resources.extend(named.resources);
+        skipped_empty_heap = named.skipped_empty;
+    }
     Plan {
         events,
         resources,
         until: None,
+        skipped_empty_heap,
     }
 }
 
@@ -318,8 +410,9 @@ struct Output {
 }
 
 fn outputs(c: &Capture, draw: i64) -> Vec<Output> {
+    let mut seen: HashSet<(String, i64, Option<u32>, u32)> = HashSet::new();
     c.rows(
-        "SELECT b.kind, b.slot, b.resource, v.json FROM bindings b LEFT JOIN views v ON v.id = b.view \
+        "SELECT DISTINCT b.kind, b.slot, b.resource, v.json FROM bindings b LEFT JOIN views v ON v.id = b.view \
          WHERE b.draw = ?1 AND b.kind IN ('rtv', 'dsv', 'uav') AND b.resource IS NOT NULL ORDER BY b.kind DESC, b.slot",
         [draw],
         |r| {
@@ -361,6 +454,7 @@ fn outputs(c: &Capture, draw: i64) -> Vec<Output> {
             z: if volume { slice } else { 0 },
         }).collect::<Vec<_>>()
     })
+    .filter(|o| seen.insert((o.name.clone(), o.resource, o.sub, o.z)))
     .collect()
 }
 
@@ -582,6 +676,13 @@ pub fn run(
             "{missing} resources had no contents in the capture and started empty"
         ));
     }
+    if plan.skipped_empty_heap > 0 {
+        warnings.push(format!(
+            "{} heap-indexed resources with no captured contents and no writes in this plan were skipped \
+             (left as null descriptors)",
+            plan.skipped_empty_heap
+        ));
+    }
     if settled > 0 && !rules.is_empty() {
         warnings.push(format!(
             "{settled} outputs of order-dependent draws and dispatches are the game's, so rules do not change them"
@@ -599,20 +700,17 @@ fn made(
     validation: Validation,
 ) -> Result<(Box<dyn Backend>, usize), String> {
     let mut b = backend(c, warp, validation)?;
+    b.prepare(c, plan);
     let lacking = lacking(c);
     let mut missing = 0;
     for &id in &plan.resources {
         let key: Option<String> = c
             .row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))
             .flatten();
-        let contents = match key {
-            Some(k) => Some(c.blob(&k)?),
-            None => {
-                missing += usize::from(lacking.contains(&id));
-                None
-            }
-        };
-        b.create(c, id, contents.as_deref())
+        if key.is_none() {
+            missing += usize::from(lacking.contains(&id));
+        }
+        b.create_blob(c, id, key.as_deref())
             .map_err(|e| format!("resource #{id}: {e}"))?;
     }
     Ok((b, missing))
@@ -1205,9 +1303,23 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
             );
         }
     }
-    let outs = outputs(c, draw);
-    if outs.is_empty() {
+    let all_outs = outputs(c, draw);
+    if all_outs.is_empty() {
         return Err(format!("draw {draw} has no targets or UAVs to show"));
+    }
+    // Giant global heap UAV buffers (e.g. 4 GiB reserved pools) are skipped from full-buffer .bin dumps;
+    // use --buffer-probe RESOURCE:START..END to inspect a range of them.
+    const MAX_UAV_DUMP_BYTES: u64 = 64 << 20;
+    let mut outs = Vec::new();
+    let mut skipped_uavs = Vec::new();
+    for output in all_outs {
+        let too_big =
+            shape(c, output.resource).is_some_and(|s| s.kind == "buffer" && s.bytes > MAX_UAV_DUMP_BYTES);
+        if too_big {
+            skipped_uavs.push(output);
+        } else {
+            outs.push(output);
+        }
     }
     std::fs::create_dir_all(&o.out).map_err(|e| format!("{}: {e}", o.out.display()))?;
     let t = std::time::Instant::now();
@@ -1231,6 +1343,16 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         )
         .into_iter()
         .collect();
+    for output in &skipped_uavs {
+        if let Some(s) = shape(c, output.resource) {
+            out!(
+                "{}: {s} (skipped full buffer dump > {}; use --buffer-probe {}:START..END)",
+                output.name,
+                mib(MAX_UAV_DUMP_BYTES),
+                output.resource
+            );
+        }
+    }
     for output in &outs {
         let s = shape(c, output.resource).ok_or("resource vanished")?;
         let suffix = if edited.is_some() { ".recorded" } else { "" };
@@ -1298,11 +1420,12 @@ pub fn verify(
     warp: bool,
     debug: bool,
     limit: Option<i64>,
+    draw: Option<(i64, Mode)>,
     keep: Option<&Path>,
     report_to: Option<&Path>,
 ) -> Result<(), String> {
     let mut report = Report::default();
-    let result = verified(c, warp, debug, limit, keep, &mut report);
+    let result = verified(c, warp, debug, limit, draw, keep, &mut report);
     report.ok = result.is_ok();
     report.result = match &result {
         Ok(line) | Err(line) => line.clone(),
@@ -1312,12 +1435,22 @@ pub fn verify(
         std::fs::write(path, json).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     let replayed = report.environment.clone();
+    let flags = match draw {
+        Some((n, mode)) => serde_json::json!({
+            "warp": warp,
+            "debug": debug,
+            "limit": limit,
+            "draw": n,
+            "mode": format!("{mode:?}").to_ascii_lowercase(),
+        }),
+        None => serde_json::json!({"warp": warp, "debug": debug, "limit": limit}),
+    };
     let verification = locum_capture::db::Verification {
         time: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
         locum: env!("CARGO_PKG_VERSION").into(),
-        flags: serde_json::json!({"warp": warp, "debug": debug, "limit": limit}),
+        flags,
         environment: replayed,
         ok: result.is_ok(),
         result: match &result {
@@ -1338,37 +1471,49 @@ fn verified(
     warp: bool,
     debug: bool,
     limit: Option<i64>,
+    draw: Option<(i64, Mode)>,
     keep: Option<&Path>,
     report: &mut Report,
 ) -> Result<String, String> {
     if let Some(dir) = keep {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
-    let last: i64 = c
-        .row("SELECT max(seq) FROM events", [], |r| r.get::<_, Option<i64>>(0))
-        .flatten()
-        .ok_or_else(|| {
-            let gaps: Vec<String> = c.rows(
-                "SELECT what, coalesce(detail, ''), count FROM gaps ORDER BY what, detail",
-                [],
-                |r| {
-                    Ok(format!(
-                        "capture gap: {} {} ({}x)",
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?
-                    ))
-                },
-            );
-            if gaps.is_empty() {
-                "the capture has no events".to_string()
-            } else {
-                format!("the capture has no events; {}", gaps.join("; "))
-            }
-        })?;
     let started = std::time::Instant::now();
-    let plan = plan(c, last, Mode::Frame);
+    let plan = match draw {
+        Some((n, mode)) => {
+            let target: i64 = c
+                .row("SELECT event FROM draws WHERE n = ?1", [n], |r| r.get(0))
+                .ok_or_else(|| format!("no draw {n}"))?;
+            plan(c, target, mode)
+        }
+        None => {
+            let last: i64 = c
+                .row("SELECT max(seq) FROM events", [], |r| r.get::<_, Option<i64>>(0))
+                .flatten()
+                .ok_or_else(|| {
+                    let gaps: Vec<String> = c.rows(
+                        "SELECT what, coalesce(detail, ''), count FROM gaps ORDER BY what, detail",
+                        [],
+                        |r| {
+                            Ok(format!(
+                                "capture gap: {} {} ({}x)",
+                                r.get::<_, String>(0)?,
+                                r.get::<_, String>(1)?,
+                                r.get::<_, i64>(2)?
+                            ))
+                        },
+                    );
+                    if gaps.is_empty() {
+                        "the capture has no events".to_string()
+                    } else {
+                        format!("the capture has no events; {}", gaps.join("; "))
+                    }
+                })?;
+            plan(c, last, Mode::Frame)
+        }
+    };
     let planned = started.elapsed();
+    let plan_events: HashSet<i64> = plan.events.iter().copied().collect();
     // Each target is compared after the event it was read after (in captures from before that was recorded, its draw).
     let has_event = c
         .row(
@@ -1390,16 +1535,26 @@ fn verified(
         )
         .is_some_and(|n| n > 0);
     let z = if has_z { "coalesce(t.z, 0)" } else { "0" };
-    let checks: Vec<(i64, i64, String, i64, String, i64, u32)> = c.rows(
+    let mut checks: Vec<(i64, i64, String, i64, String, i64, u32)> = c.rows(
         &format!(
-            "SELECT t.draw, {at} AS at, t.target, t.resource, t.blob, coalesce(t.sub, 0), {z} FROM targets t \
+            "SELECT t.draw, {at} AS at, t.target, t.resource, t.blob, coalesce(t.sub, 0), {z}, d.event FROM targets t \
              JOIN draws d ON d.n = t.draw WHERE t.blob IS NOT NULL AND t.resource IS NOT NULL ORDER BY at"
         ),
         [],
         |r| {
+            let draw_n: i64 = r.get(0)?;
+            let at_ev: i64 = r.get(1)?;
+            let draw_ev: i64 = r.get(7)?;
+            // In scoped `--draw` verify, targets are often read at a trailing barrier event just after the draw
+            // (outside a single-draw/slice event list); compare them right after the draw's own event instead.
+            let check_at = if draw.is_some() && !plan_events.contains(&at_ev) && plan_events.contains(&draw_ev) {
+                draw_ev
+            } else {
+                at_ev
+            };
             Ok((
-                r.get(0)?,
-                r.get(1)?,
+                draw_n,
+                check_at,
                 r.get(2)?,
                 r.get(3)?,
                 r.get(4)?,
@@ -1408,6 +1563,12 @@ fn verified(
             ))
         },
     );
+    if draw.is_some() {
+        checks.retain(|(_, at, _, resource, _, _, _)| {
+            plan_events.contains(at) && plan.resources.contains(resource)
+        });
+        checks.sort_by_key(|c| c.1);
+    }
     out!(
         "replaying {} events over {} resources; {} targets to compare",
         plan.events.len(),
@@ -1660,21 +1821,39 @@ fn verified(
         },
     );
     let lacking = lacking(c);
-    let missing: Vec<i64> = c
-        .rows("SELECT id FROM resources WHERE used = 1 ORDER BY id", [], |r| {
+    let missing: Vec<i64> = if draw.is_some() {
+        plan.resources
+            .iter()
+            .copied()
+            .filter(|id| lacking.contains(id))
+            .collect()
+    } else {
+        c.rows("SELECT id FROM resources WHERE used = 1 ORDER BY id", [], |r| {
             r.get(0)
         })
         .into_iter()
         .filter(|id| lacking.contains(id))
-        .collect();
+        .collect()
+    };
     if !missing.is_empty() {
         let named: Vec<String> = missing.iter().take(12).map(|id| format!("#{id}")).collect();
         incomplete.push(format!(
-            "{} resources the frame used have no contents (`resource` says why): {}{}",
+            "{} resources {} have no contents (`resource` says why): {}{}",
             missing.len(),
+            if draw.is_some() {
+                "this slice used"
+            } else {
+                "the frame used"
+            },
             named.join(" "),
             if missing.len() > named.len() { " .." } else { "" }
         ));
+    }
+    if plan.skipped_empty_heap > 0 {
+        out!(
+            "note: skipped {} uncaptured heap-only resources (left as null descriptors)",
+            plan.skipped_empty_heap
+        );
     }
     incomplete.extend(b.warnings().into_iter().map(|w| format!("replay: {w}")));
     for note in b.notes() {

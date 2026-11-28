@@ -580,7 +580,8 @@ enum Command {
         #[arg(long)]
         times: Option<PathBuf>,
     },
-    /// Replays the whole frame and compares every target the capture read back.
+    /// Replays the whole frame (or one draw's dependency slice with `--draw`) and compares every target the capture
+    /// read back.
     Verify {
         capture: String,
         #[arg(long)]
@@ -592,6 +593,13 @@ enum Command {
         /// Compare at most this many targets.
         #[arg(long)]
         limit: Option<i64>,
+        /// Verify only up to this draw (`N` or `last`) instead of the whole frame.
+        #[arg(long)]
+        draw: Option<String>,
+        /// With `--draw`, what to run: slice (dependencies, default), frame (everything up to the draw) or draw (the
+        /// draw alone).
+        #[arg(long, default_value = "slice", requires = "draw")]
+        mode: String,
         /// Write what differs here: the replay's and the game's bytes of each output and target, and pictures of
         /// the targets and where they differ.
         #[arg(short, long)]
@@ -1262,6 +1270,8 @@ fn run(cli: Cli) -> Result<(), String> {
             warp,
             debug,
             limit,
+            draw,
+            mode,
             out,
             report,
             times,
@@ -1269,14 +1279,17 @@ fn run(cli: Cli) -> Result<(), String> {
             if let Some(t) = times {
                 replay::time_to(t);
             }
-            replay::verify(
-                &open(&capture)?,
-                warp,
-                debug,
-                limit,
-                out.as_deref(),
-                report.as_deref(),
-            )
+            let c = open(&capture)?;
+            let scope = match draw {
+                Some(d) => {
+                    let n = replay::draw_number(&c, &d)?;
+                    let m = replay::Mode::parse(&mode)
+                        .ok_or_else(|| format!("--mode {mode}: slice, frame or draw"))?;
+                    Some((n, m))
+                }
+                None => None,
+            };
+            replay::verify(&c, warp, debug, limit, scope, out.as_deref(), report.as_deref())
         }
         Command::Conform {
             capture,
