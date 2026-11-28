@@ -215,6 +215,15 @@ pub(super) struct Memory {
     pub(super) tile_map: HashMap<i64, BTreeMap<u32, (i64, u32)>>,
     /// Planned resources for scoping page-table and heap-span lookups, when known.
     planned: Option<HashSet<i64>>,
+    /// Planned resources written by events strictly before the target event (so uncaptured reserved buffers
+    /// not written before the target need not commit gigabytes of all-zero backing heaps).
+    written_before_target: HashSet<i64>,
+    /// Count of uncaptured reserved buffers left unbacked (0 MiB committed, reads return 0 per D3D12 spec).
+    unbacked_reserved: usize,
+    /// Placed resources created in replay heaps: resource id -> (heap id, relocated byte offset, byte size).
+    placed_info: HashMap<i64, (i64, u64, u64)>,
+    /// Next synthetic negative heap id for heaps allocated by `map` rules.
+    next_rule_heap: i64,
     /// Cached per-heap mapped tile indices from `d12_tile_pages` and `d12_tile_mappings`, built once on first heap.
     heap_tiles: Option<HashMap<i64, BTreeSet<u32>>>,
     /// Reserved buffers clamped to a smaller tile count for this device (e.g. WARP's 4 GiB - 64 KiB limit):
@@ -255,8 +264,9 @@ pub(super) struct Memory {
 
 impl Memory {
     /// Limits page-table scans to the planned resources (and any resources sharing their heaps).
-    pub(super) fn scope(&mut self, resources: &BTreeSet<i64>) {
+    pub(super) fn scope(&mut self, resources: &BTreeSet<i64>, written_before_target: &BTreeSet<i64>) {
         self.planned = Some(resources.iter().copied().collect());
+        self.written_before_target = written_before_target.iter().copied().collect();
         self.heap_tiles = None;
     }
 
@@ -320,6 +330,13 @@ impl Memory {
                 self.clamped_buffers,
                 MAX_WARP_BUFFER_BYTES,
                 MAX_WARP_BUFFER_BYTES / locum_capture::tiles::TILE_BYTES
+            ));
+        }
+        if self.unbacked_reserved > 0 {
+            out.push(format!(
+                "{} uncaptured reserved buffers (not written earlier in this plan) were left unbacked to save memory \
+                 (reads return 0; pass `--rule \"map <res>\"` or `map all-unmapped` to allocate backing tiles)",
+                self.unbacked_reserved
             ));
         }
         if self.relocated > 0 {
@@ -656,6 +673,7 @@ impl D3d12 {
         placement: Placement,
         desc: &D3D12_RESOURCE_DESC,
         state: D3D12_RESOURCE_STATES,
+        has_content: bool,
     ) -> Result<ID3D12Resource, String> {
         let mut r: Option<ID3D12Resource> = None;
         match placement {
@@ -675,6 +693,7 @@ impl D3d12 {
                         .CreatePlacedResource(&h, at, &desc, state, None, &mut r)
                 }
                 .map_err(|e| format!("CreatePlacedResource refused them: {e}"))?;
+                self.memory.placed_info.insert(id, (heap, at, info.SizeInBytes));
                 self.memory.placed += 1;
             }
             Placement::Reserved => {
@@ -801,7 +820,53 @@ impl D3d12 {
                     mapped_tiles.insert(tile);
                 }
                 let mut current_tiles: BTreeMap<u32, (i64, u32)> = BTreeMap::new();
+                // An uncaptured reserved buffer not written by any earlier event in this plan holds all zeros:
+                // skip allocating private backing heaps (e.g. hundreds of 4 MiB heaps on #25/#26) that hold no
+                // other planned resource, leaving those tiles unmapped (0 bytes committed; reads return 0).
+                let skip_empty_heaps = !has_content
+                    && is_buffer
+                    && !self.memory.written_before_target.contains(&id)
+                    && !by_heap.is_empty();
+                let mut skipped_any_heap = false;
+                let planned_placed_heaps: HashSet<i64> = if skip_empty_heaps {
+                    if let Some(planned) = &self.memory.planned {
+                        let mut out = HashSet::new();
+                        for &pid in planned {
+                            if pid == id {
+                                continue;
+                            }
+                            if let Some(h) = c
+                                .row(
+                                    "SELECT json_extract(description, '$.heap') FROM d12_objects WHERE id = ?1",
+                                    [pid],
+                                    |r| r.get::<_, Option<i64>>(0),
+                                )
+                                .flatten()
+                                && h != 0
+                            {
+                                out.insert(h);
+                            }
+                        }
+                        out
+                    } else {
+                        HashSet::new()
+                    }
+                } else {
+                    HashSet::new()
+                };
                 for (heap, runs) in by_heap {
+                    if skip_empty_heaps
+                        && !self.memory.heaps.contains_key(&heap)
+                        && !planned_placed_heaps.contains(&heap)
+                    {
+                        for (start, sz) in runs.starts.iter().zip(&runs.sizes) {
+                            for k in 0..sz.NumTiles {
+                                mapped_tiles.remove(&(start.X + k));
+                            }
+                        }
+                        skipped_any_heap = true;
+                        continue;
+                    }
                     let HeapRuns {
                         starts,
                         sizes,
@@ -857,6 +922,9 @@ impl D3d12 {
                             D3D12_TILE_MAPPING_FLAG_NONE,
                         )
                     };
+                }
+                if skipped_any_heap {
+                    self.memory.unbacked_reserved += 1;
                 }
                 if is_buffer {
                     self.memory.tile_map.insert(id, current_tiles);
@@ -1150,6 +1218,264 @@ impl D3d12 {
                 m.tiles.remove(&(tile + k));
             }
         }
+        self.memory.remaps += 1;
+        Ok(())
+    }
+
+    /// Replay state rule: backs an unmapped/0-tile reserved resource (or all unmapped reserved resources when
+    /// `resource` is `None`) with freshly allocated default heap tiles so reads/writes persist.
+    pub(super) fn rule_map_unmapped(
+        &mut self,
+        resource: Option<i64>,
+        tile: Option<u32>,
+        count: Option<u32>,
+    ) -> Result<(), String> {
+        const DEFAULT_MAX_TILES: u32 = 4096; // 256 MiB cap when mapping whole unmapped resources without explicit count
+        let tile_bytes = locum_capture::tiles::TILE_BYTES;
+        let targets: Vec<i64> = match resource {
+            Some(id) => vec![id],
+            None => self
+                .memory
+                .tile_map
+                .iter()
+                .filter(|(_, m)| m.is_empty())
+                .map(|(&id, _)| id)
+                .collect(),
+        };
+        for id in targets {
+            let m = self.made(id)?;
+            let r = m.resource.clone();
+            let is_buffer = m.buffer();
+            let total_tiles = if is_buffer {
+                (m.desc.Width / tile_bytes) as u32
+            } else {
+                locum_capture::tiles::d3d12(&r).map(|l| l.total).unwrap_or(0)
+            };
+            if total_tiles == 0 {
+                continue;
+            }
+            let start_tile = tile.unwrap_or(0);
+            let want_count = count
+                .unwrap_or_else(|| total_tiles.saturating_sub(start_tile).min(DEFAULT_MAX_TILES))
+                .min(total_tiles.saturating_sub(start_tile));
+            if want_count == 0 {
+                continue;
+            }
+            let heap_bytes = u64::from(want_count) * tile_bytes;
+            let mut heap: Option<ID3D12Heap> = None;
+            let flags = if is_buffer {
+                D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS
+            } else {
+                D3D12_HEAP_FLAG_NONE
+            };
+            unsafe {
+                self.device.CreateHeap(
+                    &D3D12_HEAP_DESC {
+                        SizeInBytes: heap_bytes,
+                        Properties: D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        Alignment: tile_bytes,
+                        Flags: flags,
+                    },
+                    &mut heap,
+                )
+            }
+            .map_err(|e| format!("map #{id} CreateHeap({heap_bytes} bytes): {e}"))?;
+            let heap = heap.ok_or("map: CreateHeap gave no heap")?;
+            self.memory.next_rule_heap -= 1;
+            let heap_id = self.memory.next_rule_heap;
+            super::name(&heap, format!("rule-map-{heap_id}-for-#{id}"));
+            let rel = std::rc::Rc::new(Relocation::new(&[], heap_bytes, tile_bytes));
+            self.memory.heaps.insert(heap_id, Ok((heap.clone(), rel)));
+
+            if is_buffer {
+                let start = D3D12_TILED_RESOURCE_COORDINATE {
+                    X: start_tile,
+                    ..Default::default()
+                };
+                let sz = D3D12_TILE_REGION_SIZE {
+                    NumTiles: want_count,
+                    UseBox: false.into(),
+                    ..Default::default()
+                };
+                let heap_off = 0u32;
+                unsafe {
+                    self.queue.UpdateTileMappings(
+                        &r,
+                        1,
+                        Some(&start),
+                        Some(&sz),
+                        &heap,
+                        1,
+                        None,
+                        Some(&heap_off),
+                        Some(&want_count),
+                        D3D12_TILE_MAPPING_FLAG_NONE,
+                    );
+                }
+                let tmap = self.memory.tile_map.entry(id).or_default();
+                for k in 0..want_count {
+                    tmap.insert(start_tile + k, (heap_id, k));
+                }
+            } else {
+                let layout = locum_capture::tiles::d3d12(&r)?;
+                let mut starts = Vec::with_capacity(want_count as usize);
+                let mut sizes = Vec::with_capacity(want_count as usize);
+                let mut offsets = Vec::with_capacity(want_count as usize);
+                let mut counts = Vec::with_capacity(want_count as usize);
+                for k in 0..want_count {
+                    let [x, y, z, sub] = layout.coordinate(start_tile + k)?;
+                    starts.push(D3D12_TILED_RESOURCE_COORDINATE {
+                        X: x,
+                        Y: y,
+                        Z: z,
+                        Subresource: sub,
+                    });
+                    sizes.push(D3D12_TILE_REGION_SIZE {
+                        NumTiles: 1,
+                        UseBox: false.into(),
+                        ..Default::default()
+                    });
+                    offsets.push(k);
+                    counts.push(1);
+                }
+                unsafe {
+                    self.queue.UpdateTileMappings(
+                        &r,
+                        starts.len() as u32,
+                        Some(starts.as_ptr()),
+                        Some(sizes.as_ptr()),
+                        &heap,
+                        offsets.len() as u32,
+                        None,
+                        Some(offsets.as_ptr()),
+                        Some(counts.as_ptr()),
+                        D3D12_TILE_MAPPING_FLAG_NONE,
+                    );
+                }
+            }
+            if let Some(m) = self.memory.mapped.get_mut(&id) {
+                for k in 0..want_count {
+                    m.tiles.insert(start_tile + k);
+                }
+            }
+            self.memory.shared.insert(id);
+            self.memory.remaps += 1;
+        }
+        Ok(())
+    }
+
+    /// Replay state rule: maps reserved `dst`'s tiles onto the exact backing heap tiles used by `src`
+    /// (whether `src` is a reserved buffer or a placed resource), so writer/reader pairs share physical pages.
+    pub(super) fn rule_alias_tiles(
+        &mut self,
+        dst: i64,
+        src: i64,
+        dst_tile: u32,
+        src_tile: u32,
+        count: Option<u32>,
+    ) -> Result<(), String> {
+        let dst_r = self.resource(dst)?;
+        let tile_bytes = locum_capture::tiles::TILE_BYTES;
+        // Collect (dst_tile_idx, heap_id, relocated_heap_tile) pairs to apply.
+        let mut pairs: Vec<(u32, i64, u32)> = Vec::new();
+        if let Some(src_map) = self.memory.tile_map.get(&src) {
+            if let Some(cnt) = count {
+                for k in 0..cnt {
+                    if let Some(&(heap_id, heap_tile)) = src_map.get(&(src_tile + k)) {
+                        pairs.push((dst_tile + k, heap_id, heap_tile));
+                    }
+                }
+            } else {
+                for (&st, &(heap_id, heap_tile)) in src_map {
+                    if st >= src_tile {
+                        pairs.push((dst_tile + (st - src_tile), heap_id, heap_tile));
+                    }
+                }
+            }
+        } else if let Some(&(heap_id, placed_offset, placed_bytes)) = self.memory.placed_info.get(&src) {
+            let base_tile = (placed_offset / tile_bytes) as u32;
+            let total_tiles = placed_bytes.div_ceil(tile_bytes) as u32;
+            let cnt = count
+                .unwrap_or_else(|| total_tiles.saturating_sub(src_tile))
+                .min(total_tiles.saturating_sub(src_tile));
+            for k in 0..cnt {
+                pairs.push((dst_tile + k, heap_id, base_tile + src_tile + k));
+            }
+        } else {
+            return Err(format!(
+                "alias #{dst} #{src}: source #{src} is neither a mapped reserved buffer nor a placed resource"
+            ));
+        }
+        if pairs.is_empty() {
+            return Err(format!(
+                "alias #{dst} #{src}: source #{src} has no mapped tiles in range"
+            ));
+        }
+        // Group contiguous runs by backing heap id.
+        let mut by_heap: BTreeMap<i64, Vec<(u32, u32, u32)>> = BTreeMap::new();
+        for &(dt, heap_id, ht) in &pairs {
+            let e = by_heap.entry(heap_id).or_default();
+            if let Some(last) = e.last_mut()
+                && last.0 + last.2 == dt
+                && last.1 + last.2 == ht
+            {
+                last.2 += 1;
+            } else {
+                e.push((dt, ht, 1));
+            }
+        }
+        for (heap_id, runs) in by_heap {
+            let (h, _) = self
+                .memory
+                .heaps
+                .get(&heap_id)
+                .ok_or_else(|| format!("alias #{dst} #{src}: backing heap #{heap_id} not loaded"))?
+                .clone()?;
+            let starts: Vec<D3D12_TILED_RESOURCE_COORDINATE> = runs
+                .iter()
+                .map(|&(dt, _, _)| D3D12_TILED_RESOURCE_COORDINATE {
+                    X: dt,
+                    ..Default::default()
+                })
+                .collect();
+            let sizes: Vec<D3D12_TILE_REGION_SIZE> = runs
+                .iter()
+                .map(|&(_, _, cnt)| D3D12_TILE_REGION_SIZE {
+                    NumTiles: cnt,
+                    UseBox: false.into(),
+                    ..Default::default()
+                })
+                .collect();
+            let offsets: Vec<u32> = runs.iter().map(|&(_, ht, _)| ht).collect();
+            let counts: Vec<u32> = runs.iter().map(|&(_, _, cnt)| cnt).collect();
+            unsafe {
+                self.queue.UpdateTileMappings(
+                    &dst_r,
+                    starts.len() as u32,
+                    Some(starts.as_ptr()),
+                    Some(sizes.as_ptr()),
+                    &h,
+                    offsets.len() as u32,
+                    None,
+                    Some(offsets.as_ptr()),
+                    Some(counts.as_ptr()),
+                    D3D12_TILE_MAPPING_FLAG_NONE,
+                );
+            }
+        }
+        let dst_map = self.memory.tile_map.entry(dst).or_default();
+        for &(dt, heap_id, ht) in &pairs {
+            dst_map.insert(dt, (heap_id, ht));
+        }
+        if let Some(m) = self.memory.mapped.get_mut(&dst) {
+            for &(dt, _, _) in &pairs {
+                m.tiles.insert(dt);
+            }
+        }
+        self.memory.shared.insert(dst);
         self.memory.remaps += 1;
         Ok(())
     }

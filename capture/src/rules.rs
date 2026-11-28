@@ -30,7 +30,7 @@
 //! that order (as in the capture's `draws` table). In the game a hash is the whole hash; replay also takes the start of
 //! one, if it names exactly one shader of that stage in the capture.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The stages by number.
 pub const STAGES: [&str; 6] = ["vs", "hs", "ds", "gs", "ps", "cs"];
@@ -147,6 +147,101 @@ pub enum Action {
         src: i64,
         when: Timing,
     },
+    /// Skips replaying events whose sequence number falls in `start..=end`.
+    SkipEvent {
+        start: i64,
+        end: i64,
+    },
+    /// Backs an unmapped/0-tile reserved resource (or all unmapped reserved resources when `resource` is `None`)
+    /// with freshly allocated heap tiles.
+    MapUnmapped {
+        resource: Option<i64>,
+        tile: Option<u32>,
+        count: Option<u32>,
+        when: Timing,
+    },
+    /// Maps reserved buffer `dst` tiles onto `src`'s backing heap range (whether `src` is placed or reserved)
+    /// so writer/reader pairs share physical GPU pages.
+    AliasTiles {
+        dst: i64,
+        src: i64,
+        dst_tile: u32,
+        src_tile: u32,
+        count: Option<u32>,
+        when: Timing,
+    },
+    /// Overrides a recorded clear (or injects an RTV/DSV clear when `resource` is `Some`) using exact raw u32 bits
+    /// (preserving NaN / integer bit payloads).
+    ClearBits {
+        resource: Option<i64>,
+        bits: [u32; 4],
+        count: u8,
+        when: Timing,
+    },
+    /// Seeds a resource (or specific subresource / depth-stencil plane) from another resource or a raw file.
+    Seed {
+        resource: i64,
+        sub: Option<u32>,
+        plane: Option<SeedPlane>,
+        source: SeedSource,
+        when: Timing,
+    },
+    /// Overrides a shader-visible descriptor slot (`heap`, `slot`) with a null, SRV, UAV, or CBV view.
+    DescriptorOverride {
+        heap: i64,
+        slot: u32,
+        kind: DescKind,
+        resource: i64,
+        offset: u64,
+        size: u64,
+        when: Timing,
+    },
+    /// Overrides a root CBV/SRV/UAV descriptor GPU address at root parameter `parameter`.
+    RootView {
+        parameter: u32,
+        kind: RootKind,
+        resource: i64,
+        offset: u64,
+        when: Timing,
+    },
+    /// Overrides a single 32-bit root constant word at `(parameter, index)`.
+    RootConst {
+        parameter: u32,
+        index: u32,
+        bits: u32,
+        when: Timing,
+    },
+}
+
+/// Optional plane selector for `seed <res>.depth|.stencil`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeedPlane {
+    Depth,
+    Stencil,
+}
+
+/// Data source for `seed <res> from <src_res|file>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SeedSource {
+    Resource(i64),
+    File(PathBuf),
+}
+
+/// View kind for `descriptor <heap> <slot> null|srv|uav|cbv ...`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DescKind {
+    Null,
+    Srv,
+    Uav,
+    Cbv,
+}
+
+/// Root descriptor kind for `root <param> cbv|srv|uav ...`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootKind {
+    Cbv,
+    Srv,
+    Uav,
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +260,14 @@ pub fn stage_named(name: &str) -> Option<usize> {
 
 /// How the hash in `stage=hash` names a shader, given the stage's number and the text after `=`.
 pub type Resolve<'a> = &'a dyn Fn(usize, &str) -> Result<u128, String>;
+
+/// How `draw <N>` in a timing clause or `skip-draw <N>` resolves a draw number to its event sequence number.
+pub type ResolveDraw<'a> = &'a dyn Fn(i64) -> Result<i64, String>;
+
+/// Default draw resolver when no capture is attached (rejects `draw <N>`).
+pub fn no_draws(draw: i64) -> Result<i64, String> {
+    Err(format!("draw {draw} requires a capture to resolve to an event"))
+}
 
 /// The text read as the hash, in hex: for the game, where a rule can name a shader made after it is read.
 pub fn hex(_stage: usize, hash: &str) -> Result<u128, String> {
@@ -237,34 +340,75 @@ fn parse_event(word: Option<&str>) -> Result<i64, String> {
         .ok_or_else(|| format!("{w:?} is not an event sequence number"))
 }
 
+fn parse_event_or_draw<'a>(
+    words: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+    resolve_draw: ResolveDraw,
+) -> Result<i64, String> {
+    if words.peek().copied() == Some("draw") {
+        words.next();
+        let w = words.next().ok_or("expected draw number after `draw`")?;
+        let n = w
+            .parse::<i64>()
+            .ok()
+            .filter(|&n| n >= 0)
+            .ok_or_else(|| format!("{w:?} is not a draw number"))?;
+        return resolve_draw(n);
+    }
+    parse_event(words.next())
+}
+
 fn parse_timing<'a>(
     words: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+    resolve_draw: ResolveDraw,
 ) -> Result<Timing, String> {
     match words.peek().copied() {
         None => Ok(Timing::Before(None)),
         Some("at" | "before") => {
             words.next();
-            Ok(Timing::Before(Some(parse_event(words.next())?)))
+            Ok(Timing::Before(Some(parse_event_or_draw(words, resolve_draw)?)))
         }
         Some("after") => {
             words.next();
-            Ok(Timing::After(parse_event(words.next())?))
+            Ok(Timing::After(parse_event_or_draw(words, resolve_draw)?))
         }
-        Some(other) => Err(format!("expected before|after|at <event>, got {other:?}")),
+        Some(other) => Err(format!("expected before|after|at <event|draw N>, got {other:?}")),
     }
 }
 
 fn parse_optional_at<'a>(
     words: &mut std::iter::Peekable<impl Iterator<Item = &'a str>>,
+    resolve_draw: ResolveDraw,
 ) -> Result<Option<i64>, String> {
     match words.peek().copied() {
         None => Ok(None),
         Some("at" | "before") => {
             words.next();
-            Ok(Some(parse_event(words.next())?))
+            Ok(Some(parse_event_or_draw(words, resolve_draw)?))
         }
-        Some(other) => Err(format!("expected at <event>, got {other:?}")),
+        Some(other) => Err(format!("expected at <event|draw N>, got {other:?}")),
     }
+}
+
+fn parse_seed_target(word: Option<&str>) -> Result<(i64, Option<u32>, Option<SeedPlane>), String> {
+    let w = word.ok_or("expected resource id (optionally .depth, .stencil, or .subN)")?;
+    if let Some((base, suffix)) = w.split_once('.') {
+        let id = parse_id(Some(base), "resource id")?;
+        let lower = suffix.to_ascii_lowercase();
+        if lower == "depth" || lower == "plane0" {
+            return Ok((id, None, Some(SeedPlane::Depth)));
+        }
+        if lower == "stencil" || lower == "plane1" {
+            return Ok((id, None, Some(SeedPlane::Stencil)));
+        }
+        if let Some(sub_str) = lower.strip_prefix("sub") {
+            let sub = sub_str
+                .parse::<u32>()
+                .map_err(|_| format!("{suffix:?} is not a valid subresource suffix"))?;
+            return Ok((id, Some(sub), None));
+        }
+        return Err(format!("unknown seed target suffix {suffix:?}"));
+    }
+    Ok((parse_id(Some(w), "resource id")?, None, None))
 }
 
 /// Parses a D3D12 resource state bitmask by name (pipe-separated allowed), `0x` hex, or decimal integer.
@@ -317,8 +461,18 @@ fn strip_comment(line: &str) -> &str {
     line.trim()
 }
 
-/// One rule; `dir` is where a `shader` rule's file is looked for, and `resolve` names the shaders.
+/// One rule; `dir` is where a `shader` or `seed` rule's file is looked for, and `resolve` names the shaders.
 pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
+    parse_with(line, dir, resolve, &no_draws)
+}
+
+/// One rule, also resolving `draw <N>` timing/skip references via `resolve_draw`.
+pub fn parse_with(
+    line: &str,
+    dir: &Path,
+    resolve: Resolve,
+    resolve_draw: ResolveDraw,
+) -> Result<Rule, String> {
     let (body, conditions) = match line.split_once(" if ") {
         Some((b, c)) => (
             b,
@@ -329,7 +483,11 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
         None => (line, Vec::new()),
     };
     let mut words = body.split_whitespace().peekable();
-    let verb = words.next().ok_or("empty rule")?;
+    let mut verb = words.next().ok_or("empty rule")?;
+    // Allow optional `insert` prefix (`insert clear-color ...`, `insert copy-buffer ...`, `insert clear ...`).
+    if verb == "insert" {
+        verb = words.next().ok_or("expected rule verb after `insert`")?;
+    }
     let mut when = conditions;
     let (stage, action) = match verb {
         "skip" | "solid" | "shader" => {
@@ -377,7 +535,7 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
             }
             let heap = parse_id(words.next(), "heap id")?;
             let heap_tile = parse_u32(words.next(), "heap tile offset")?;
-            let when = parse_timing(&mut words)?;
+            let when = parse_timing(&mut words, resolve_draw)?;
             (
                 0,
                 Action::TileMap {
@@ -397,7 +555,7 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
             if count == 0 {
                 return Err("tile-unmap count must be > 0".into());
             }
-            let when = parse_timing(&mut words)?;
+            let when = parse_timing(&mut words, resolve_draw)?;
             (
                 0,
                 Action::TileUnmap {
@@ -408,12 +566,69 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
                 },
             )
         }
+        "map" => {
+            let target = words.next().ok_or("map needs <res> or all-unmapped")?;
+            let resource = if target == "all-unmapped" {
+                None
+            } else {
+                Some(parse_id(Some(target), "resource id")?)
+            };
+            let (tile, count) = match words.peek().copied() {
+                None | Some("at" | "before" | "after") => (None, None),
+                Some(_) => {
+                    let t = parse_u32(words.next(), "tile index")?;
+                    let c = parse_u32(words.next(), "tile count")?;
+                    if c == 0 {
+                        return Err("map tile count must be > 0".into());
+                    }
+                    (Some(t), Some(c))
+                }
+            };
+            let when = parse_timing(&mut words, resolve_draw)?;
+            (
+                0,
+                Action::MapUnmapped {
+                    resource,
+                    tile,
+                    count,
+                    when,
+                },
+            )
+        }
+        "alias" => {
+            let dst = parse_id(words.next(), "destination resource id")?;
+            let src = parse_id(words.next(), "source resource id")?;
+            let (dst_tile, src_tile, count) = match words.peek().copied() {
+                None | Some("at" | "before" | "after") => (0, 0, None),
+                Some(_) => {
+                    let dt = parse_u32(words.next(), "destination tile")?;
+                    let st = parse_u32(words.next(), "source tile")?;
+                    let c = parse_u32(words.next(), "tile count")?;
+                    if c == 0 {
+                        return Err("alias tile count must be > 0".into());
+                    }
+                    (dt, st, Some(c))
+                }
+            };
+            let when = parse_timing(&mut words, resolve_draw)?;
+            (
+                0,
+                Action::AliasTiles {
+                    dst,
+                    src,
+                    dst_tile,
+                    src_tile,
+                    count,
+                    when,
+                },
+            )
+        }
         "skip-tile-remap" => {
             let resource = match words.peek().copied() {
                 None | Some("at" | "before") => None,
                 Some(_) => Some(parse_id(words.next(), "resource id")?),
             };
-            let event = parse_optional_at(&mut words)?;
+            let event = parse_optional_at(&mut words, resolve_draw)?;
             (0, Action::SkipTileRemap { resource, event })
         }
         "skip-clear" => {
@@ -421,8 +636,33 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
                 None | Some("at" | "before") => None,
                 Some(_) => Some(parse_id(words.next(), "resource id")?),
             };
-            let event = parse_optional_at(&mut words)?;
+            let event = parse_optional_at(&mut words, resolve_draw)?;
             (0, Action::SkipClear { resource, event })
+        }
+        "skip-event" => {
+            let span = words.next().ok_or("skip-event needs <seq> or <start>..<end>")?;
+            let (start, end) = if let Some((a, b)) = span.split_once("..") {
+                let s = parse_event(Some(a))?;
+                let e = parse_event(Some(b))?;
+                if e < s {
+                    return Err(format!("invalid event range {span:?}"));
+                }
+                (s, e)
+            } else {
+                let s = parse_event(Some(span))?;
+                (s, s)
+            };
+            (0, Action::SkipEvent { start, end })
+        }
+        "skip-draw" => {
+            let w = words.next().ok_or("skip-draw needs a draw number")?;
+            let n = w
+                .parse::<i64>()
+                .ok()
+                .filter(|&n| n >= 0)
+                .ok_or_else(|| format!("{w:?} is not a draw number"))?;
+            let seq = resolve_draw(n)?;
+            (0, Action::SkipEvent { start: seq, end: seq })
         }
         "clear-color" => {
             let resource = parse_id(words.next(), "resource id")?;
@@ -431,7 +671,7 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
                 let w = words.next().ok_or("clear-color needs R G B A")?;
                 *v = w.parse().map_err(|_| format!("{w:?} is not a number"))?;
             }
-            let when = parse_timing(&mut words)?;
+            let when = parse_timing(&mut words, resolve_draw)?;
             (
                 0,
                 Action::ClearColor {
@@ -455,7 +695,7 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
                     )
                 }
             };
-            let when = parse_timing(&mut words)?;
+            let when = parse_timing(&mut words, resolve_draw)?;
             (
                 0,
                 Action::ClearDepth {
@@ -466,11 +706,212 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
                 },
             )
         }
+        "clear-bits" => {
+            let resource = Some(parse_id(words.next(), "resource id")?);
+            let mut bits = [0u32; 4];
+            let mut count = 0u8;
+            while count < 4 {
+                match words.peek().copied() {
+                    None | Some("at" | "before" | "after") => break,
+                    Some(w) => {
+                        words.next();
+                        bits[count as usize] = value_bits(w)?;
+                        count += 1;
+                    }
+                }
+            }
+            if count == 0 {
+                return Err("clear-bits needs 1 to 4 raw 32-bit values (0xXXXXXXXX or float)".into());
+            }
+            let when = parse_timing(&mut words, resolve_draw)?;
+            (
+                0,
+                Action::ClearBits {
+                    resource,
+                    bits,
+                    count,
+                    when,
+                },
+            )
+        }
+        "clear" => {
+            // `clear <seq> bits 0x... [0x... ...]` OR `clear <res> R G B A [before|after|at ...]`
+            let first = words
+                .next()
+                .ok_or("clear needs <seq> bits ... or <res> R G B A ...")?;
+            if words.peek().copied() == Some("bits") {
+                words.next();
+                let seq = parse_event(Some(first))?;
+                let mut bits = [0u32; 4];
+                let mut count = 0u8;
+                while count < 4 {
+                    match words.peek().copied() {
+                        None => break,
+                        Some(w) => {
+                            words.next();
+                            bits[count as usize] = value_bits(w)?;
+                            count += 1;
+                        }
+                    }
+                }
+                if count == 0 {
+                    return Err("clear <seq> bits needs 1 to 4 32-bit values".into());
+                }
+                (
+                    0,
+                    Action::ClearBits {
+                        resource: None,
+                        bits,
+                        count,
+                        when: Timing::Before(Some(seq)),
+                    },
+                )
+            } else {
+                let resource = parse_id(Some(first), "resource id")?;
+                let mut color = [0f32; 4];
+                for v in &mut color {
+                    let w = words.next().ok_or("clear <res> needs R G B A")?;
+                    *v = w.parse().map_err(|_| format!("{w:?} is not a number"))?;
+                }
+                let when = parse_timing(&mut words, resolve_draw)?;
+                (
+                    0,
+                    Action::ClearColor {
+                        resource,
+                        color,
+                        when,
+                    },
+                )
+            }
+        }
+        "seed" => {
+            let (resource, sub, plane) = parse_seed_target(words.next())?;
+            if words.next() != Some("from") {
+                return Err("seed syntax: seed <res>[.depth|.stencil|.subN] from <src_res|file> [before|after|at ...]".into());
+            }
+            let src_word = words
+                .next()
+                .ok_or("seed needs a source resource id or file path")?;
+            let source = if src_word.starts_with('#')
+                || ((src_word.starts_with('r') || src_word.starts_with('R'))
+                    && src_word[1..].chars().all(|c| c.is_ascii_digit())
+                    && src_word.len() > 1)
+                || src_word.chars().all(|c| c.is_ascii_digit())
+            {
+                SeedSource::Resource(parse_id(Some(src_word), "source resource id")?)
+            } else {
+                let p = PathBuf::from(src_word);
+                SeedSource::File(if p.is_absolute() { p } else { dir.join(p) })
+            };
+            let when = parse_timing(&mut words, resolve_draw)?;
+            (
+                0,
+                Action::Seed {
+                    resource,
+                    sub,
+                    plane,
+                    source,
+                    when,
+                },
+            )
+        }
+        "descriptor" => {
+            let heap = parse_id(words.next(), "descriptor heap id")?;
+            let slot = parse_u32(words.next(), "descriptor slot")?;
+            let kind = match words.next().ok_or("descriptor needs null|srv|uav|cbv")? {
+                "null" => DescKind::Null,
+                "srv" => DescKind::Srv,
+                "uav" => DescKind::Uav,
+                "cbv" => DescKind::Cbv,
+                other => {
+                    return Err(format!(
+                        "unknown descriptor kind {other:?} (expected null|srv|uav|cbv)"
+                    ));
+                }
+            };
+            let (resource, offset, size) = if kind == DescKind::Null {
+                (0, 0, 0)
+            } else {
+                let res = parse_id(words.next(), "resource id")?;
+                let (off, sz) = match words.peek().copied() {
+                    None | Some("at" | "before" | "after") => (0, 0),
+                    Some(_) => {
+                        let o = parse_u64(words.next(), "byte offset")?;
+                        let s = match words.peek().copied() {
+                            None | Some("at" | "before" | "after") => 0,
+                            Some(_) => parse_u64(words.next(), "byte size")?,
+                        };
+                        (o, s)
+                    }
+                };
+                (res, off, sz)
+            };
+            let when = parse_timing(&mut words, resolve_draw)?;
+            (
+                0,
+                Action::DescriptorOverride {
+                    heap,
+                    slot,
+                    kind,
+                    resource,
+                    offset,
+                    size,
+                    when,
+                },
+            )
+        }
+        "root" => {
+            let parameter = parse_u32(words.next(), "root parameter index")?;
+            match words.next().ok_or("root needs cbv|srv|uav|const")? {
+                "const" => {
+                    let index = parse_u32(words.next(), "32-bit constant index")?;
+                    let bits = value_bits(words.next().ok_or("root const needs a value")?)?;
+                    let when = parse_timing(&mut words, resolve_draw)?;
+                    (
+                        0,
+                        Action::RootConst {
+                            parameter,
+                            index,
+                            bits,
+                            when,
+                        },
+                    )
+                }
+                kind_s @ ("cbv" | "srv" | "uav") => {
+                    let kind = match kind_s {
+                        "cbv" => RootKind::Cbv,
+                        "srv" => RootKind::Srv,
+                        _ => RootKind::Uav,
+                    };
+                    let resource = parse_id(words.next(), "resource id")?;
+                    let offset = match words.peek().copied() {
+                        None | Some("at" | "before" | "after") => 0,
+                        Some(_) => parse_u64(words.next(), "byte offset")?,
+                    };
+                    let when = parse_timing(&mut words, resolve_draw)?;
+                    (
+                        0,
+                        Action::RootView {
+                            parameter,
+                            kind,
+                            resource,
+                            offset,
+                            when,
+                        },
+                    )
+                }
+                other => {
+                    return Err(format!(
+                        "unknown root override {other:?} (expected cbv|srv|uav|const)"
+                    ));
+                }
+            }
+        }
         "barrier" => {
             let resource = parse_id(words.next(), "resource id")?;
             let before = parse_state(words.next())?;
             let after = parse_state(words.next())?;
-            let when = parse_timing(&mut words)?;
+            let when = parse_timing(&mut words, resolve_draw)?;
             (
                 0,
                 Action::Barrier {
@@ -486,7 +927,7 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
                 None | Some("at" | "before" | "after") => None,
                 Some(_) => Some(parse_id(words.next(), "resource id")?),
             };
-            let when = parse_timing(&mut words)?;
+            let when = parse_timing(&mut words, resolve_draw)?;
             (0, Action::UavBarrier { resource, when })
         }
         "skip-aliasing" => {
@@ -494,11 +935,11 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
                 None | Some("at" | "before") => None,
                 Some(_) => Some(parse_id(words.next(), "resource id")?),
             };
-            let event = parse_optional_at(&mut words)?;
+            let event = parse_optional_at(&mut words, resolve_draw)?;
             (0, Action::SkipAliasing { resource, event })
         }
         "sync-flush" => {
-            let when = parse_timing(&mut words)?;
+            let when = parse_timing(&mut words, resolve_draw)?;
             (0, Action::SyncFlush { when })
         }
         "sync-wait" => {
@@ -510,7 +951,7 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
                     Some(parse_u64(words.next(), "fence value")?),
                 ),
             };
-            let when = parse_timing(&mut words)?;
+            let when = parse_timing(&mut words, resolve_draw)?;
             (
                 0,
                 Action::SyncWait {
@@ -522,7 +963,7 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
             )
         }
         "skip-wait" => {
-            let event = parse_optional_at(&mut words)?;
+            let event = parse_optional_at(&mut words, resolve_draw)?;
             (0, Action::SkipWait { event })
         }
         "copy-buffer" => {
@@ -531,7 +972,7 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
             let src = parse_id(words.next(), "source buffer id")?;
             let src_offset = parse_u64(words.next(), "source byte offset")?;
             let bytes = parse_u64(words.next(), "byte length")?;
-            let when = parse_timing(&mut words)?;
+            let when = parse_timing(&mut words, resolve_draw)?;
             (
                 0,
                 Action::CopyBuffer {
@@ -544,10 +985,10 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
                 },
             )
         }
-        "copy-resource" => {
+        "copy-resource" | "copy" => {
             let dst = parse_id(words.next(), "destination resource id")?;
             let src = parse_id(words.next(), "source resource id")?;
-            let when = parse_timing(&mut words)?;
+            let when = parse_timing(&mut words, resolve_draw)?;
             (0, Action::CopyResource { dst, src, when })
         }
         other => return Err(format!("unknown rule {other:?}")),
@@ -565,13 +1006,23 @@ pub fn parse(line: &str, dir: &Path, resolve: Resolve) -> Result<Rule, String> {
 
 /// Every rule in `text`, and for each line that is not one, its number (from 1) and why.
 pub fn parse_all(text: &str, dir: &Path, resolve: Resolve) -> (Vec<Rule>, Vec<(usize, String)>) {
+    parse_all_with(text, dir, resolve, &no_draws)
+}
+
+/// Every rule in `text`, also resolving `draw <N>` references via `resolve_draw`.
+pub fn parse_all_with(
+    text: &str,
+    dir: &Path,
+    resolve: Resolve,
+    resolve_draw: ResolveDraw,
+) -> (Vec<Rule>, Vec<(usize, String)>) {
     let (mut rules, mut errors) = (Vec::new(), Vec::new());
     for (n, line) in text.lines().enumerate() {
         let line = strip_comment(line);
         if line.is_empty() {
             continue;
         }
-        match parse(line, dir, resolve) {
+        match parse_with(line, dir, resolve, resolve_draw) {
             Ok(r) => rules.push(r),
             Err(e) => errors.push((n + 1, e)),
         }
@@ -590,16 +1041,30 @@ impl Rule {
 
     /// Resource ids referenced by a replay state/API rule (so replay ensures they are created).
     pub fn referenced_resources(&self) -> Vec<i64> {
-        match self.action {
+        match &self.action {
             Action::TileMap { resource, .. }
             | Action::TileUnmap { resource, .. }
             | Action::ClearColor { resource, .. }
             | Action::ClearDepth { resource, .. }
-            | Action::Barrier { resource, .. } => vec![resource],
+            | Action::Barrier { resource, .. }
+            | Action::RootView { resource, .. } => vec![*resource],
             Action::UavBarrier {
                 resource: Some(r), ..
-            } => vec![r],
-            Action::CopyBuffer { dst, src, .. } | Action::CopyResource { dst, src, .. } => vec![dst, src],
+            }
+            | Action::MapUnmapped {
+                resource: Some(r), ..
+            }
+            | Action::ClearBits {
+                resource: Some(r), ..
+            } => vec![*r],
+            Action::DescriptorOverride { resource, .. } if *resource > 0 => vec![*resource],
+            Action::CopyBuffer { dst, src, .. }
+            | Action::CopyResource { dst, src, .. }
+            | Action::AliasTiles { dst, src, .. } => vec![*dst, *src],
+            Action::Seed { resource, source, .. } => match source {
+                SeedSource::Resource(src) => vec![*resource, *src],
+                SeedSource::File(_) => vec![*resource],
+            },
             _ => Vec::new(),
         }
     }
@@ -756,5 +1221,121 @@ copy-resource r24 r1548 after 13712
         assert!(rule("tile-map #9 0 0 #17 0").is_err());
         assert!(rule("barrier #18 bogus srv").is_err());
         assert!(rule("copy-buffer #1 0 #2").is_err());
+    }
+
+    #[test]
+    fn extended_tile_clear_seed_descriptor_root_and_draw_rules_parse() {
+        let resolve_draw = |n: i64| -> Result<i64, String> {
+            match n {
+                4682 => Ok(40619),
+                1594 => Ok(13684),
+                _ => Err(format!("no draw {n}")),
+            }
+        };
+        let script = "\
+map all-unmapped before draw 4682
+map #25 0 16 before 40619
+alias #25 #24 0 8 4 before draw 4682
+clear 13690 bits 0x7fc01234 0x00000000 0x3f800000 0xbf800000
+clear-bits #10130 0x7fc0abcd after draw 4682
+insert clear #10130 1 0 0 1 before draw 4682
+insert copy #10130 #10131 after draw 4682
+seed #10132.depth from #10135 before draw 4682
+seed #10132 from dump.bin after 40619
+descriptor #100 7 uav #18 256 4096 before draw 4682
+descriptor #100 8 null before 40619
+root 2 uav #18 512 before draw 4682
+root 3 const 1 0xdeadbeef before draw 4682
+skip-event 13614..13684
+skip-draw 1594
+";
+        let (rules, errors) = parse_all_with(script, &PathBuf::from("."), &hex, &resolve_draw);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(rules.len(), 15);
+        assert_eq!(
+            rules[0].action,
+            Action::MapUnmapped {
+                resource: None,
+                tile: None,
+                count: None,
+                when: Timing::Before(Some(40619))
+            }
+        );
+        assert_eq!(
+            rules[2].action,
+            Action::AliasTiles {
+                dst: 25,
+                src: 24,
+                dst_tile: 0,
+                src_tile: 8,
+                count: Some(4),
+                when: Timing::Before(Some(40619))
+            }
+        );
+        assert_eq!(
+            rules[3].action,
+            Action::ClearBits {
+                resource: None,
+                bits: [0x7fc01234, 0, 0x3f800000, 0xbf800000],
+                count: 4,
+                when: Timing::Before(Some(13690))
+            }
+        );
+        assert_eq!(
+            rules[7].action,
+            Action::Seed {
+                resource: 10132,
+                sub: None,
+                plane: Some(SeedPlane::Depth),
+                source: SeedSource::Resource(10135),
+                when: Timing::Before(Some(40619))
+            }
+        );
+        assert_eq!(rules[7].referenced_resources(), vec![10132, 10135]);
+        assert_eq!(
+            rules[9].action,
+            Action::DescriptorOverride {
+                heap: 100,
+                slot: 7,
+                kind: DescKind::Uav,
+                resource: 18,
+                offset: 256,
+                size: 4096,
+                when: Timing::Before(Some(40619))
+            }
+        );
+        assert_eq!(
+            rules[11].action,
+            Action::RootView {
+                parameter: 2,
+                kind: RootKind::Uav,
+                resource: 18,
+                offset: 512,
+                when: Timing::Before(Some(40619))
+            }
+        );
+        assert_eq!(
+            rules[12].action,
+            Action::RootConst {
+                parameter: 3,
+                index: 1,
+                bits: 0xdeadbeef,
+                when: Timing::Before(Some(40619))
+            }
+        );
+        assert_eq!(
+            rules[13].action,
+            Action::SkipEvent {
+                start: 13614,
+                end: 13684
+            }
+        );
+        assert_eq!(
+            rules[14].action,
+            Action::SkipEvent {
+                start: 13684,
+                end: 13684
+            }
+        );
     }
 }

@@ -548,12 +548,35 @@ enum Command {
     /// differ (`.diff.png`).
     Replay {
         capture: String,
-        /// The draw's number, or `last`.
+        /// The draw's number, `last`, or `presented` (the last draw into the presented backbuffer).
         draw: String,
         /// Read a buffer range immediately before and after this draw (RESOURCE:START..END in bytes).
         /// Rules apply only to this draw. Writes before.bin and after.bin in the output directory.
         #[arg(long)]
         buffer_probe: Option<String>,
+        /// Read back any resource (including bindless UAV textures) or buffer byte range after this draw:
+        /// `RES` or `RES:START..END`. May be given multiple times.
+        #[arg(long)]
+        readback: Vec<String>,
+        /// Read back any resource or buffer byte range immediately before this draw: `RES` or `RES:START..END`.
+        /// May be given multiple times.
+        #[arg(long)]
+        readback_before: Vec<String>,
+        /// Restrict slice/frame replay to events with `seq >= FROM_EVENT` (earlier events are omitted).
+        #[arg(long)]
+        from_event: Option<i64>,
+        /// Restrict planned events to command list `ONLY_LIST` (plus the target draw).
+        #[arg(long)]
+        only_list: Option<i64>,
+        /// Fill pattern for uncaptured non-reserved resources: `zero` (default) or `0xXXXXXXXX` (32-bit word).
+        #[arg(long, default_value = "zero")]
+        missing_fill: String,
+        /// Log every replayed event that reads a resource whose initial contents were missing in the capture.
+        #[arg(long)]
+        log_missing_reads: bool,
+        /// A/B pixel diff against another replay output directory or reference PNG file.
+        #[arg(long)]
+        compare_to: Option<PathBuf>,
         /// A rule as in overrides.txt (`constant ps b3 c0 1 0 0 1`, `skip vs=<hash>`, ...); may be given many times.
         #[arg(long)]
         rule: Vec<String>,
@@ -1234,6 +1257,13 @@ fn run(cli: Cli) -> Result<(), String> {
             capture,
             draw,
             buffer_probe,
+            readback,
+            readback_before,
+            from_event,
+            only_list,
+            missing_fill,
+            log_missing_reads,
+            compare_to,
             rule,
             rules,
             mode,
@@ -1251,12 +1281,20 @@ fn run(cli: Cli) -> Result<(), String> {
             let n = replay::draw_number(&c, &draw)?;
             let mode =
                 replay::Mode::parse(&mode).ok_or_else(|| format!("--mode {mode}: slice, frame or draw"))?;
+            let missing_fill = replay::parse_missing_fill(&missing_fill)?;
             replay::replay(
                 &c,
                 n,
                 &replay::Options {
                     mode,
                     buffer_probe,
+                    readback,
+                    readback_before,
+                    from_event,
+                    only_list,
+                    missing_fill,
+                    log_missing_reads,
+                    compare_to,
                     rules: rule,
                     rules_file: rules,
                     warp,

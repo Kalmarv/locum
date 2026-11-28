@@ -212,6 +212,8 @@ fn touches(c: &Capture) -> BTreeMap<i64, (BTreeSet<i64>, BTreeSet<i64>)> {
 pub struct Plan {
     pub events: Vec<i64>,
     pub resources: BTreeSet<i64>,
+    /// Resources written by events strictly before the target event in `events`.
+    pub written_before_target: BTreeSet<i64>,
     /// The event the replay is read just before, when it runs no event that far.
     pub until: Option<i64>,
     /// Heap-only resources referenced by a directly-indexed descriptor heap that had no captured contents and were
@@ -221,6 +223,17 @@ pub struct Plan {
 
 /// The events to run to replay event `target`, and the resources they touch.
 pub fn plan(c: &Capture, target: i64, mode: Mode) -> Plan {
+    plan_scoped(c, target, mode, None, None)
+}
+
+/// Like [`plan`], optionally restricting planned earlier events to `seq >= from_event` and/or command list `only_list`.
+pub fn plan_scoped(
+    c: &Capture,
+    target: i64,
+    mode: Mode,
+    from_event: Option<i64>,
+    only_list: Option<i64>,
+) -> Plan {
     if mode == Mode::Draw {
         let mut resources: BTreeSet<i64> = BTreeSet::new();
         let mut written_in_plan: BTreeSet<i64> = BTreeSet::new();
@@ -254,9 +267,19 @@ pub fn plan(c: &Capture, target: i64, mode: Mode) -> Plan {
                 }
             }
         }
-        return with_bound(c, vec![target], resources, &written_in_plan);
+        return with_bound(c, vec![target], resources, &written_in_plan, BTreeSet::new());
     }
-    let touches = touches(c);
+    let mut touches = touches(c);
+    if let Some(min_seq) = from_event {
+        touches.retain(|&seq, _| seq >= min_seq || seq == target);
+    }
+    if let Some(list_id) = only_list {
+        let in_list: HashSet<i64> = c
+            .rows("SELECT seq FROM events WHERE list = ?1", [list_id], |r| r.get(0))
+            .into_iter()
+            .collect();
+        touches.retain(|&seq, _| seq == target || in_list.contains(&seq));
+    }
     let mut events: Vec<i64> = Vec::new();
     let mut resources: BTreeSet<i64> = BTreeSet::new();
     match mode {
@@ -277,7 +300,14 @@ pub fn plan(c: &Capture, target: i64, mode: Mode) -> Plan {
         .flat_map(|(_, w)| w.iter().copied())
         .filter(|&id| id >= 0)
         .collect();
-    with_bound(c, events, resources, &written_in_plan)
+    let written_before_target: BTreeSet<i64> = events
+        .iter()
+        .filter(|&&e| e < target)
+        .filter_map(|e| touches.get(e))
+        .flat_map(|(_, w)| w.iter().copied())
+        .filter(|&id| id >= 0)
+        .collect();
+    with_bound(c, events, resources, &written_in_plan, written_before_target)
 }
 
 /// The events to run for resource `id` to hold what it held just before event `before`: every earlier event that
@@ -292,9 +322,10 @@ pub fn plan_before(c: &Capture, id: i64, before: i64) -> Plan {
         .flat_map(|(_, w)| w.iter().copied())
         .filter(|&id| id >= 0)
         .collect();
+    let written_before_target = written_in_plan.clone();
     Plan {
         until: Some(before),
-        ..with_bound(c, events, resources, &written_in_plan)
+        ..with_bound(c, events, resources, &written_in_plan, written_before_target)
     }
 }
 
@@ -326,6 +357,7 @@ fn with_bound(
     events: Vec<i64>,
     mut resources: BTreeSet<i64>,
     written_in_plan: &BTreeSet<i64>,
+    written_before_target: BTreeSet<i64>,
 ) -> Plan {
     // Everything a draw has bound, and the resource of every view an event names.
     let constants = if captured_constants(c) {
@@ -376,6 +408,7 @@ fn with_bound(
     Plan {
         events,
         resources,
+        written_before_target,
         until: None,
         skipped_empty_heap,
     }
@@ -647,14 +680,77 @@ pub fn run(
     rules: &[Rule],
     warp: bool,
     validation: Validation,
+    after: impl FnMut(i64, &mut dyn Backend) -> Result<(), String>,
+    end: impl FnOnce(&mut dyn Backend) -> Result<(), String>,
+) -> Result<Vec<String>, String> {
+    run_configured(c, plan, rules, warp, validation, 0, false, after, end)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_configured(
+    c: &Capture,
+    plan: &Plan,
+    rules: &[Rule],
+    warp: bool,
+    validation: Validation,
+    missing_fill: u32,
+    log_missing_reads: bool,
     mut after: impl FnMut(i64, &mut dyn Backend) -> Result<(), String>,
     end: impl FnOnce(&mut dyn Backend) -> Result<(), String>,
 ) -> Result<Vec<String>, String> {
-    let (mut b, missing) = made(c, plan, warp, validation)?;
+    let MadeBackend {
+        backend: mut b,
+        missing,
+        mut missing_ids,
+    } = made_with_fill(c, plan, warp, validation, missing_fill)?;
+    let missing_touches: HashMap<i64, (Vec<i64>, Vec<i64>)> = if log_missing_reads && !missing_ids.is_empty()
+    {
+        let mut map: HashMap<i64, (Vec<i64>, Vec<i64>)> = HashMap::new();
+        for (ev, res, acc) in c.rows("SELECT event, resource, access FROM event_resources", [], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?))
+        }) {
+            let e = map.entry(ev).or_default();
+            if acc == "write" {
+                e.1.push(res);
+            } else {
+                e.0.push(res);
+            }
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+    let mut missing_read_notes: Vec<String> = Vec::new();
     // Only order-dependent outputs are put back: the game's bytes for any other would undo what a rule changed.
     let written = recorded(c);
     let mut settled = 0;
+    let mut skipped_events = 0usize;
     for &seq in &plan.events {
+        if rules.iter().any(
+            |r| matches!(r.action, rules::Action::SkipEvent { start, end } if seq >= start && seq <= end),
+        ) {
+            skipped_events += 1;
+            continue;
+        }
+        if log_missing_reads && let Some((reads, writes)) = missing_touches.get(&seq) {
+            let bad: Vec<String> = reads
+                .iter()
+                .filter(|r| missing_ids.contains(r))
+                .map(|r| format!("#{r}"))
+                .collect();
+            if !bad.is_empty() {
+                let call: String = c
+                    .row("SELECT call FROM events WHERE seq = ?1", [seq], |r| r.get(0))
+                    .unwrap_or_default();
+                missing_read_notes.push(format!(
+                    "missing-read: event {seq} ({call}) reads uncaptured {}",
+                    bad.join(" ")
+                ));
+            }
+            for w in writes {
+                missing_ids.remove(w);
+            }
+        }
         b.run(c, seq, rules).map_err(|e| format!("event {seq}: {e}"))?;
         settled += settle(c, b.as_mut(), &written, seq, false, None)
             .map_err(|e| format!("event {seq}: {e}"))?
@@ -671,9 +767,20 @@ pub fn run(
     let mut warnings = b.warnings();
     warnings.extend(b.notes());
     warnings.extend(b.validation());
+    warnings.extend(missing_read_notes);
+    if skipped_events > 0 {
+        warnings.push(format!(
+            "{skipped_events} planned events were skipped by skip-event/skip-draw rules"
+        ));
+    }
     if missing > 0 {
         warnings.push(format!(
-            "{missing} resources had no contents in the capture and started empty"
+            "{missing} resources had no contents in the capture and started {}",
+            if missing_fill == 0 {
+                "empty".to_string()
+            } else {
+                format!("filled with {missing_fill:#010x}")
+            }
         ));
     }
     if plan.skipped_empty_heap > 0 {
@@ -693,27 +800,70 @@ pub fn run(
 
 /// A backend holding the plan's resources with their contents as the frame began, and how many of them had no
 /// contents in the capture (tiled resources made of their tile events aside).
+struct MadeBackend {
+    backend: Box<dyn Backend>,
+    missing: usize,
+    missing_ids: HashSet<i64>,
+}
+
 fn made(
     c: &Capture,
     plan: &Plan,
     warp: bool,
     validation: Validation,
 ) -> Result<(Box<dyn Backend>, usize), String> {
+    let m = made_with_fill(c, plan, warp, validation, 0)?;
+    Ok((m.backend, m.missing))
+}
+
+fn made_with_fill(
+    c: &Capture,
+    plan: &Plan,
+    warp: bool,
+    validation: Validation,
+    missing_fill: u32,
+) -> Result<MadeBackend, String> {
     let mut b = backend(c, warp, validation)?;
     b.prepare(c, plan);
     let lacking = lacking(c);
     let mut missing = 0;
+    let mut missing_ids = HashSet::new();
+    const MAX_FILL_BYTES: u64 = 64 << 20;
     for &id in &plan.resources {
         let key: Option<String> = c
             .row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))
             .flatten();
-        if key.is_none() {
-            missing += usize::from(lacking.contains(&id));
+        let is_missing = key.is_none() && lacking.contains(&id);
+        if is_missing {
+            missing += 1;
+            missing_ids.insert(id);
+        }
+        if is_missing
+            && missing_fill != 0
+            && let Some(s) = shape(c, id)
+            && s.bytes > 0
+            && s.bytes <= MAX_FILL_BYTES
+        {
+            let total = locum_capture::layout::total(&s.subs()) as usize;
+            if total > 0 && (total as u64) <= MAX_FILL_BYTES {
+                let word = missing_fill.to_le_bytes();
+                let mut filled = vec![0u8; total];
+                for (i, byte) in filled.iter_mut().enumerate() {
+                    *byte = word[i & 3];
+                }
+                b.create(c, id, Some(&filled))
+                    .map_err(|e| format!("resource #{id}: {e}"))?;
+                continue;
+            }
         }
         b.create_blob(c, id, key.as_deref())
             .map_err(|e| format!("resource #{id}: {e}"))?;
     }
-    Ok((b, missing))
+    Ok(MadeBackend {
+        backend: b,
+        missing,
+        missing_ids,
+    })
 }
 
 /// The resources whose contents as the frame began matter but the capture does not hold. Not those made of the
@@ -1161,7 +1311,7 @@ fn backend(c: &Capture, warp: bool, validation: Validation) -> Result<Box<dyn Ba
     }
 }
 
-/// The draw named on the command line: a number, or `last`.
+/// The draw named on the command line: a number, `last`, or `presented`.
 pub fn draw_number(c: &Capture, arg: &str) -> Result<i64, String> {
     if arg == "last" {
         return c
@@ -1169,13 +1319,173 @@ pub fn draw_number(c: &Capture, arg: &str) -> Result<i64, String> {
             .flatten()
             .ok_or_else(|| "the capture has no draws".into());
     }
+    if arg == "presented" {
+        let presented: i64 = c
+            .meta("presented")
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| "the capture does not record which buffer was presented".to_string())?;
+        if let Some(n) = c.row(
+            "SELECT d.n FROM bindings b JOIN draws d ON d.n = b.draw \
+             WHERE b.kind = 'rtv' AND b.resource = ?1 ORDER BY d.event DESC LIMIT 1",
+            [presented],
+            |r| r.get::<_, i64>(0),
+        ) {
+            return Ok(n);
+        }
+        return c
+            .row(
+                "SELECT d.n FROM event_resources er JOIN draws d ON d.event = er.event \
+                 WHERE er.resource = ?1 AND er.access = 'write' ORDER BY d.event DESC LIMIT 1",
+                [presented],
+                |r| r.get::<_, i64>(0),
+            )
+            .ok_or_else(|| format!("no draw wrote the presented resource #{presented}"));
+    }
     arg.parse()
-        .map_err(|_| format!("{arg:?} is not a draw number or `last`"))
+        .map_err(|_| format!("{arg:?} is not a draw number, `last`, or `presented`"))
+}
+
+/// Parses `--missing-fill`: `zero` or `0xXXXXXXXX` (32-bit word).
+pub fn parse_missing_fill(spec: &str) -> Result<u32, String> {
+    if spec.eq_ignore_ascii_case("zero") || spec == "0" {
+        return Ok(0);
+    }
+    if let Some(hex) = spec.strip_prefix("0x").or_else(|| spec.strip_prefix("0X")) {
+        return u32::from_str_radix(hex, 16)
+            .map_err(|_| format!("--missing-fill {spec:?}: expected `zero` or `0xXXXXXXXX`"));
+    }
+    spec.parse::<u32>()
+        .map_err(|_| format!("--missing-fill {spec:?}: expected `zero` or `0xXXXXXXXX`"))
+}
+
+/// One `--readback` / `--readback-before` target (`RES` or `RES:START..END`).
+#[derive(Clone, Debug)]
+struct ReadbackSpec {
+    resource: i64,
+    range: Option<(u64, u64)>,
+}
+
+fn parse_readback(c: &Capture, spec: &str) -> Result<ReadbackSpec, String> {
+    let err = "expected RES or RES:START..END (decimal byte offsets, end excluded)";
+    if let Some((res_str, span)) = spec.split_once(':') {
+        let res_digits = res_str
+            .strip_prefix('#')
+            .or_else(|| res_str.strip_prefix('r'))
+            .unwrap_or(res_str);
+        let resource: i64 = res_digits.parse().map_err(|_| err)?;
+        let (s, e) = span.split_once("..").ok_or(err)?;
+        let start: u64 = s.parse().map_err(|_| err)?;
+        let end: u64 = e.parse().map_err(|_| err)?;
+        let sh = shape(c, resource).ok_or_else(|| format!("no resource #{resource}"))?;
+        if sh.kind != "buffer" || start >= end || end > sh.bytes {
+            return Err(format!(
+                "invalid byte range {start}..{end} for #{resource} ({sh})"
+            ));
+        }
+        Ok(ReadbackSpec {
+            resource,
+            range: Some((start, end)),
+        })
+    } else {
+        let res_digits = spec
+            .strip_prefix('#')
+            .or_else(|| spec.strip_prefix('r'))
+            .unwrap_or(spec);
+        let resource: i64 = res_digits.parse().map_err(|_| err)?;
+        if shape(c, resource).is_none() {
+            return Err(format!("no resource #{resource}"));
+        }
+        Ok(ReadbackSpec {
+            resource,
+            range: None,
+        })
+    }
+}
+
+/// Reads an RGBA8 PNG file into `(width, height, rgba_bytes)`.
+fn read_png_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut buf = vec![0u8; reader.output_buffer_size().ok_or("png output size overflow")?];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => bytes.to_vec(),
+        png::ColorType::Rgb => bytes
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        png::ColorType::Grayscale => bytes.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        other => {
+            return Err(format!(
+                "{}: unsupported PNG color type {other:?}",
+                path.display()
+            ));
+        }
+    };
+    Ok((info.width, info.height, rgba))
+}
+
+/// Compares two RGBA8 PNG images and writes a magenta-tinted A/B diff PNG.
+fn compare_pngs(ref_path: &Path, cur_path: &Path, diff_path: &Path) -> Result<String, String> {
+    let (rw, rh, ra) = read_png_rgba(ref_path)?;
+    let (cw, ch, ca) = read_png_rgba(cur_path)?;
+    if (rw, rh) != (cw, ch) {
+        return Ok(format!("dimensions differ ({rw}x{rh} vs {cw}x{ch})"));
+    }
+    let total = u64::from(rw) * u64::from(rh);
+    let mut differ = 0u64;
+    let mut max_delta = 0u8;
+    let mut out = Vec::with_capacity(ca.len());
+    for (a, b) in ra.as_chunks::<4>().0.iter().zip(ca.as_chunks::<4>().0.iter()) {
+        if a == b {
+            let grey = ((u16::from(b[0]) + u16::from(b[1]) + u16::from(b[2])) / 12) as u8;
+            out.extend([grey, grey, grey, 255]);
+        } else {
+            differ += 1;
+            for k in 0..4 {
+                max_delta = max_delta.max(a[k].abs_diff(b[k]));
+            }
+            let tint = |c: u8, t: u16| ((u16::from(c) + t) / 2) as u8;
+            out.extend([tint(b[0], 255), tint(b[1], 0), tint(b[2], 255), 255]);
+        }
+    }
+    png(diff_path, cw, ch, &out)?;
+    if differ == 0 {
+        Ok("identical".into())
+    } else {
+        Ok(format!(
+            "{differ} of {total} pixels differ ({:.3}%), max channel delta {max_delta}/255 -> {}",
+            differ as f64 * 100.0 / total.max(1) as f64,
+            diff_path.display()
+        ))
+    }
 }
 
 pub struct Options {
     pub mode: Mode,
     pub buffer_probe: Option<String>,
+    pub readback: Vec<String>,
+    pub readback_before: Vec<String>,
+    pub from_event: Option<i64>,
+    pub only_list: Option<i64>,
+    pub missing_fill: u32,
+    pub log_missing_reads: bool,
+    pub compare_to: Option<PathBuf>,
     pub rules: Vec<String>,
     pub rules_file: Option<PathBuf>,
     pub warp: bool,
@@ -1263,54 +1573,73 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     let target: i64 = c
         .row("SELECT event FROM draws WHERE n = ?1", [draw], |r| r.get(0))
         .ok_or_else(|| format!("no draw {draw}"))?;
+    let resolve_draw = |n: i64| -> Result<i64, String> {
+        c.row("SELECT event FROM draws WHERE n = ?1", [n], |r| r.get(0))
+            .ok_or_else(|| format!("no draw {n} in capture"))
+    };
     let mut parsed = Vec::new();
     if let Some(file) = &o.rules_file {
         let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
         let dir = file.parent().unwrap_or(Path::new("."));
-        let (r, errors) = rules::parse_all(&text, dir, &|stage, hash| shader_named(c, stage, hash));
+        let (r, errors) = rules::parse_all_with(
+            &text,
+            dir,
+            &|stage, hash| shader_named(c, stage, hash),
+            &resolve_draw,
+        );
         if let Some((line, e)) = errors.first() {
             return Err(format!("{} line {line}: {e}", file.display()));
         }
         parsed.extend(r);
     }
     for text in &o.rules {
-        parsed.push(rules::parse(text, Path::new("."), &|stage, hash| {
-            shader_named(c, stage, hash)
-        })?);
+        parsed.push(rules::parse_with(
+            text,
+            Path::new("."),
+            &|stage, hash| shader_named(c, stage, hash),
+            &resolve_draw,
+        )?);
     }
-    let mut plan = plan(c, target, o.mode);
-    // Ensure any resources referenced by replay state/API rules (e.g. injected copies, clears, tile remaps) are created.
+    let readbacks_after: Vec<ReadbackSpec> = o
+        .readback
+        .iter()
+        .map(|s| parse_readback(c, s))
+        .collect::<Result<_, _>>()?;
+    let readbacks_before: Vec<ReadbackSpec> = o
+        .readback_before
+        .iter()
+        .map(|s| parse_readback(c, s))
+        .collect::<Result<_, _>>()?;
+    let mut plan = plan_scoped(c, target, o.mode, o.from_event, o.only_list);
+    // Ensure any resources referenced by replay state/API rules or explicit readbacks are created.
     for rule in &parsed {
         for r in rule.referenced_resources() {
             plan.resources.insert(r);
         }
     }
+    for rb in readbacks_after.iter().chain(&readbacks_before) {
+        plan.resources.insert(rb.resource);
+    }
     if let Some(spec) = &o.buffer_probe {
-        let err = "expected --buffer-probe RESOURCE:START..END (decimal byte offsets, end excluded)";
-        let (resource, span) = spec.split_once(':').ok_or(err)?;
-        let resource: i64 = resource.parse().map_err(|_| err)?;
-        let (start, end) = span.split_once("..").ok_or(err)?;
-        let start: u64 = start.parse().map_err(|_| err)?;
-        let end: u64 = end.parse().map_err(|_| err)?;
-        let shape = shape(c, resource).ok_or_else(|| format!("no resource #{resource}"))?;
-        if shape.kind != "buffer" || start >= end || end > shape.bytes {
-            return Err(format!(
-                "invalid byte range {start}..{end} for #{resource} ({shape})"
-            ));
-        }
-        if !plan.resources.contains(&resource) || plan.events.pop() != Some(target) {
-            return Err(format!(
-                "draw {draw} does not include #{resource} in its replay plan"
-            ));
+        let rb = parse_readback(c, spec)?;
+        let (start, end) = rb
+            .range
+            .ok_or("expected --buffer-probe RESOURCE:START..END (decimal byte offsets, end excluded)")?;
+        let resource = rb.resource;
+        plan.resources.insert(resource);
+        if plan.events.pop() != Some(target) {
+            return Err(format!("draw {draw} event {target} is not at end of replay plan"));
         }
         plan.until = Some(target);
         std::fs::create_dir_all(&o.out).map_err(|e| e.to_string())?;
-        let warnings = run(
+        let warnings = run_configured(
             c,
             &plan,
-            &[],
+            &parsed,
             o.warp,
             o.validation,
+            o.missing_fill,
+            o.log_missing_reads,
             |_, _| Ok(()),
             |b| {
                 let before = b.read_bytes(resource, start, end - start)?;
@@ -1364,11 +1693,11 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         }
     }
     let all_outs = outputs(c, draw);
-    if all_outs.is_empty() {
+    if all_outs.is_empty() && readbacks_after.is_empty() && readbacks_before.is_empty() {
         return Err(format!("draw {draw} has no targets or UAVs to show"));
     }
     // Giant global heap UAV buffers (e.g. 4 GiB reserved pools) are skipped from full-buffer .bin dumps;
-    // use --buffer-probe RESOURCE:START..END to inspect a range of them.
+    // use --buffer-probe RESOURCE:START..END or --readback RESOURCE:START..END to inspect a range of them.
     const MAX_UAV_DUMP_BYTES: u64 = 64 << 20;
     let mut outs = Vec::new();
     let mut skipped_uavs = Vec::new();
@@ -1382,8 +1711,99 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         }
     }
     std::fs::create_dir_all(&o.out).map_err(|e| format!("{}: {e}", o.out.display()))?;
+    // Helper that executes `plan` with `rules`, reading `outs`, `readbacks_before` (right before `target`),
+    // and `readbacks_after` (after `target`).
+    type ReadbackList = Vec<(ReadbackSpec, Vec<u8>)>;
+    type PassOut = (ResourceBytes, ReadbackList, ReadbackList, Vec<String>);
+    let run_pass = |pass_rules: &[Rule]| -> Result<PassOut, String> {
+        let mut results = HashMap::new();
+        let mut pre_reads: Vec<(ReadbackSpec, Vec<u8>)> = Vec::new();
+        let mut post_reads: Vec<(ReadbackSpec, Vec<u8>)> = Vec::new();
+        if readbacks_before.is_empty() {
+            let w = run_configured(
+                c,
+                &plan,
+                pass_rules,
+                o.warp,
+                o.validation,
+                o.missing_fill,
+                o.log_missing_reads,
+                |_, _| Ok(()),
+                |b| {
+                    for out_spec in &outs {
+                        if let std::collections::hash_map::Entry::Vacant(e) = results.entry(out_spec.resource)
+                        {
+                            e.insert(b.read(out_spec.resource)?);
+                        }
+                    }
+                    for rb in &readbacks_after {
+                        let data = match rb.range {
+                            Some((s, e)) => b.read_bytes(rb.resource, s, e - s)?,
+                            None => b.read(rb.resource)?,
+                        };
+                        post_reads.push((rb.clone(), data));
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok((results, pre_reads, post_reads, w))
+        } else {
+            let mut pre_plan = Plan {
+                events: plan.events.clone(),
+                resources: plan.resources.clone(),
+                written_before_target: plan.written_before_target.clone(),
+                until: Some(target),
+                skipped_empty_heap: plan.skipped_empty_heap,
+            };
+            let has_target = pre_plan.events.last() == Some(&target);
+            if has_target {
+                pre_plan.events.pop();
+            }
+            let w = run_configured(
+                c,
+                &pre_plan,
+                pass_rules,
+                o.warp,
+                o.validation,
+                o.missing_fill,
+                o.log_missing_reads,
+                |_, _| Ok(()),
+                |b| {
+                    for rb in &readbacks_before {
+                        let data = match rb.range {
+                            Some((s, e)) => b.read_bytes(rb.resource, s, e - s)?,
+                            None => b.read(rb.resource)?,
+                        };
+                        pre_reads.push((rb.clone(), data));
+                    }
+                    if has_target
+                        && !pass_rules.iter().any(|r| {
+                            matches!(r.action, rules::Action::SkipEvent { start, end } if target >= start && target <= end)
+                        })
+                    {
+                        b.run(c, target, pass_rules)?;
+                    }
+                    for out_spec in &outs {
+                        if let std::collections::hash_map::Entry::Vacant(e) = results.entry(out_spec.resource)
+                        {
+                            e.insert(b.read(out_spec.resource)?);
+                        }
+                    }
+                    for rb in &readbacks_after {
+                        let data = match rb.range {
+                            Some((s, e)) => b.read_bytes(rb.resource, s, e - s)?,
+                            None => b.read(rb.resource)?,
+                        };
+                        post_reads.push((rb.clone(), data));
+                    }
+                    Ok(())
+                },
+            )?;
+            Ok((results, pre_reads, post_reads, w))
+        }
+    };
     let t = std::time::Instant::now();
-    let (base, warnings) = execute(c, &plan, &[], o.warp, o.validation, &outs)?;
+    let (base, base_pre, base_post, warnings) = run_pass(&[])?;
     out!("  replayed in {:.2} s", t.elapsed().as_secs_f64());
     for w in &warnings {
         out!("  warning: {w}");
@@ -1448,13 +1868,13 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     let edited = if parsed.is_empty() {
         None
     } else {
-        let (after, rule_warnings) = execute(c, &plan, &parsed, o.warp, o.validation, &outs)?;
+        let (after, rules_pre, rules_post, rule_warnings) = run_pass(&parsed)?;
         for w in &rule_warnings {
             if !warnings.contains(w) {
                 out!("  rule warning: {w}");
             }
         }
-        Some(after)
+        Some((after, rules_pre, rules_post))
     };
     for output in &skipped_uavs {
         if let Some(s) = shape(c, output.resource) {
@@ -1466,6 +1886,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
             );
         }
     }
+    let mut written_pngs: Vec<(String, PathBuf)> = Vec::new();
     for output in &outs {
         let s = shape(c, output.resource).ok_or("resource vanished")?;
         let suffix = if edited.is_some() { ".recorded" } else { "" };
@@ -1481,6 +1902,9 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         if s.kind == "buffer" {
             continue;
         }
+        if edited.is_none() {
+            written_pngs.push((output.name.clone(), path.clone()));
+        }
         let Some((now, x)) = plane_of(&s, &base[&output.resource], output.sub, output.z) else {
             continue;
         };
@@ -1490,7 +1914,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         {
             out!("  against the game's: {}", compare(fmt, &x, &game, now));
         }
-        if let Some(after) = &edited {
+        if let Some((after, _, _)) = &edited {
             let Some((then, _)) = plane_of(&s, &after[&output.resource], output.sub, output.z) else {
                 continue;
             };
@@ -1502,6 +1926,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
                 output,
                 o.range,
             )?;
+            written_pngs.push((output.name.clone(), p.clone()));
             let d = o.out.join(format!("{}.diff.png", output.name));
             diff_png(&d, fmt, &x, now, then, o.range)?;
             out!(
@@ -1510,6 +1935,123 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
                 p.display(),
                 d.display()
             );
+        }
+    }
+    // Write explicit `--readback-before` and `--readback` outputs (supports bindless UAV textures & buffer ranges).
+    let write_rb_set = |tag: &str,
+                        base_list: &[(ReadbackSpec, Vec<u8>)],
+                        rules_list: Option<&[(ReadbackSpec, Vec<u8>)]>,
+                        pngs: &mut Vec<(String, PathBuf)>|
+     -> Result<(), String> {
+        for (idx, (rb, bytes)) in base_list.iter().enumerate() {
+            let s = shape(c, rb.resource).ok_or("resource vanished")?;
+            let stem = match rb.range {
+                Some((start, end)) => format!("readback-{tag}-r{}-{start}_{end}", rb.resource),
+                None => format!("readback-{tag}-r{}", rb.resource),
+            };
+            let suffix = if rules_list.is_some() { ".recorded" } else { "" };
+            let bin_path = o.out.join(format!("{stem}{suffix}.bin"));
+            std::fs::write(&bin_path, bytes).map_err(|e| format!("{}: {e}", bin_path.display()))?;
+            let mut png_written = None;
+            if rb.range.is_none()
+                && s.kind != "buffer"
+                && let Some((plane, x)) = plane_of(&s, bytes, Some(0), 0)
+                && let Ok(img) = texels::decode(
+                    format::readable(s.format),
+                    x.width,
+                    x.height,
+                    &plane[..x.slice_bytes() as usize],
+                )
+            {
+                let p = o.out.join(format!("{stem}{suffix}.png"));
+                png(&p, x.width, x.height, &img.rgba8(o.range))?;
+                png_written = Some(p);
+            }
+            if let Some(p) = &png_written {
+                out!(
+                    "readback ({tag}) #{}: {s} -> {}, {}",
+                    rb.resource,
+                    bin_path.display(),
+                    p.display()
+                );
+                if rules_list.is_none() {
+                    pngs.push((stem.clone(), p.clone()));
+                }
+            } else {
+                out!(
+                    "readback ({tag}) #{}: {} bytes -> {}",
+                    rb.resource,
+                    bytes.len(),
+                    bin_path.display()
+                );
+            }
+            if let Some((_, rbytes)) = rules_list.and_then(|list| list.get(idx)) {
+                let rbin = o.out.join(format!("{stem}.rules.bin"));
+                std::fs::write(&rbin, rbytes).map_err(|e| format!("{}: {e}", rbin.display()))?;
+                let changed = bytes.iter().zip(rbytes).filter(|(a, b)| a != b).count();
+                out!(
+                    "  readback ({tag}) #{} with rules: {changed} of {} bytes differ -> {}",
+                    rb.resource,
+                    rbytes.len(),
+                    rbin.display()
+                );
+                if rb.range.is_none()
+                    && s.kind != "buffer"
+                    && let (Some((a_p, x)), Some((b_p, _))) =
+                        (plane_of(&s, bytes, Some(0), 0), plane_of(&s, rbytes, Some(0), 0))
+                {
+                    let fmt = format::readable(s.format);
+                    if let Ok(img) = texels::decode(fmt, x.width, x.height, &b_p[..x.slice_bytes() as usize])
+                    {
+                        let rp = o.out.join(format!("{stem}.rules.png"));
+                        let dp = o.out.join(format!("{stem}.diff.png"));
+                        png(&rp, x.width, x.height, &img.rgba8(o.range))?;
+                        diff_png(&dp, fmt, &x, a_p, b_p, o.range)?;
+                        pngs.push((stem.clone(), rp.clone()));
+                        out!(
+                            "  readback ({tag}) #{} image diff: {} -> {}, {}",
+                            rb.resource,
+                            compare(fmt, &x, a_p, b_p),
+                            rp.display(),
+                            dp.display()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    write_rb_set(
+        "before",
+        &base_pre,
+        edited.as_ref().map(|(_, pre, _)| pre.as_slice()),
+        &mut written_pngs,
+    )?;
+    write_rb_set(
+        "after",
+        &base_post,
+        edited.as_ref().map(|(_, _, post)| post.as_slice()),
+        &mut written_pngs,
+    )?;
+    // Optional A/B pixel diff against another replay output directory or reference PNG file (`--compare-to`).
+    if let Some(ref_target) = &o.compare_to {
+        for (name, cur_png) in &written_pngs {
+            let ref_png = if ref_target.is_dir() {
+                let candidates = [
+                    ref_target.join(format!("{name}.rules.png")),
+                    ref_target.join(format!("{name}.png")),
+                    ref_target.join(format!("{name}.recorded.png")),
+                ];
+                let Some(found) = candidates.into_iter().find(|p| p.exists()) else {
+                    continue;
+                };
+                found
+            } else {
+                ref_target.clone()
+            };
+            let diff_path = o.out.join(format!("{name}.ab-diff.png"));
+            let summary = compare_pngs(&ref_png, cur_png, &diff_path)?;
+            out!("  A/B diff ({name} vs {}): {summary}", ref_png.display());
         }
     }
     Ok(())
