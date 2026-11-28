@@ -28,10 +28,15 @@ use crate::out;
 pub trait Backend {
     /// Called before resource creation with the replay plan so backends can scope caches and shared heaps.
     fn prepare(&mut self, _c: &Capture, _plan: &Plan) {}
-    /// Enables runtime GPU/WARP bindless `ResourceDescriptorHeap` slot tracing (D3D12 SM 6.6+).
-    fn enable_bindless_trace(&mut self) {}
+    /// Enables runtime GPU/WARP bindless `ResourceDescriptorHeap` slot tracing (D3D12 SM 6.6+), and when
+    /// `raw_loads` is true also traces 4 KiB page ranges read via `dx.op.rawBufferLoad`.
+    fn enable_bindless_trace(&mut self, _raw_loads: bool) {}
     /// Takes collected runtime bindless hits: `(draw, event, heap, slot, is_write)`.
     fn take_bindless_trace(&mut self) -> Vec<(i64, i64, i64, u32, bool)> {
+        Vec::new()
+    }
+    /// Takes collected runtime `rawBufferLoad` 4 KiB-page hits: `(draw, event, heap, source, byte_start, byte_end)`.
+    fn take_raw_load_trace(&mut self) -> Vec<(i64, i64, i64, crate::dxil::RawLoadSource, u64, u64)> {
         Vec::new()
     }
     /// Makes resource `id` as the capture describes it, holding `contents` (the canonical layout) if given.
@@ -225,6 +230,9 @@ pub struct Plan {
     /// Heap-only resources referenced by a directly-indexed descriptor heap that had no captured contents and were
     /// not written by any event in this plan, so they were skipped (left as null descriptors).
     pub skipped_empty_heap: usize,
+    /// Additional 64 KiB buffer tiles (e.g. discovered by `--trace-raw-loads`) that sparse buffers should back and
+    /// populate from first-use/upload data if present.
+    pub extra_tiles: HashMap<i64, BTreeSet<u32>>,
 }
 
 /// The events to run to replay event `target`, and the resources they touch.
@@ -417,6 +425,7 @@ fn with_bound(
         written_before_target,
         until: None,
         skipped_empty_heap,
+        extra_tiles: HashMap::new(),
     }
 }
 
@@ -1500,7 +1509,23 @@ pub struct Options {
     pub range: Range,
     pub strict_self_check: bool,
     pub trace_bindless: bool,
+    pub trace_raw_loads: bool,
     pub include_bindless: Vec<String>,
+}
+
+/// One resolved 4 KiB-aligned byte range read via `dx.op.rawBufferLoad` during an instrumented trace, classified
+/// against the capture's tile tables and first-use/upload blobs.
+#[derive(Clone, Debug)]
+pub struct TracedRawLoad {
+    pub draw: u64,
+    pub event: u64,
+    pub source: String,
+    pub resource: u64,
+    pub start: u64,
+    pub end: u64,
+    pub tile_start: u32,
+    pub tile_end: u32,
+    pub status: &'static str,
 }
 
 /// Parses inline `--rule` texts and an optional `--rules` file against capture `c` (resolving shader names and
@@ -1540,17 +1565,27 @@ pub fn parse_rules(
     Ok(parsed)
 }
 
+/// Output of a runtime DXIL bindless + optional `rawBufferLoad` address trace pass.
+pub struct TraceOutput {
+    pub bindless: Vec<locum_capture::d3d12::BindlessUsage>,
+    pub raw_loads: Vec<TracedRawLoad>,
+    pub warnings: Vec<String>,
+}
+
 /// Runs a DXIL-instrumented runtime trace of `plan` to discover every `ResourceDescriptorHeap` slot
-/// dynamically accessed by shaders on the GPU/WARP, resolving each `(heap, slot)` at the event's submission
-/// into `(kind, resource)` rows ready for `d12_bindless_usage`. Replay rules (including `seed`, `map`, `alias`,
-/// `clear`, `copy`, `root`, `descriptor`, `skip-event`) are applied during the trace prepass.
-pub fn trace_bindless(
+/// dynamically accessed by shaders on the GPU/WARP, and when `raw_loads` is true also traces 4 KiB page ranges
+/// read via `dx.op.rawBufferLoad` from `ResourceDescriptorHeap[0..32]` and root `u0..u7`/`t0..t7`, classifying
+/// capture coverage (`captured-nonzero`, `captured-zero`, `captured-upload`, `uncaptured`, `unmapped`).
+/// Replay rules (including `seed`, `map`, `alias`, `clear`, `copy`, `root`, `descriptor`, `skip-event`) are
+/// applied during the trace prepass.
+pub fn trace_bindless_with_raw_loads(
     c: &Capture,
     plan: &Plan,
     rules: &[Rule],
     warp: bool,
     validation: Validation,
-) -> Result<(Vec<locum_capture::d3d12::BindlessUsage>, Vec<String>), String> {
+    raw_loads: bool,
+) -> Result<TraceOutput, String> {
     if c.meta("api").as_deref() != Some("d3d12") {
         return Err("bindless runtime tracing is only supported for Direct3D 12 captures".into());
     }
@@ -1566,9 +1601,10 @@ pub fn trace_bindless(
         written_before_target: plan.written_before_target.clone(),
         until: plan.until,
         skipped_empty_heap: plan.skipped_empty_heap,
+        extra_tiles: plan.extra_tiles.clone(),
     };
     let mut b = backend(c, warp, validation)?;
-    b.enable_bindless_trace();
+    b.enable_bindless_trace(raw_loads);
     b.prepare(c, &effective_plan);
     for &id in &effective_plan.resources {
         let key: Option<String> = c
@@ -1586,6 +1622,7 @@ pub fn trace_bindless(
         b.run(c, seq, rules).map_err(|e| format!("event {seq}: {e}"))?;
     }
     let raw_hits = b.take_bindless_trace();
+    let raw_load_hits = b.take_raw_load_trace();
     let mut warnings = b.warnings();
     warnings.extend(b.notes());
     warnings.extend(b.validation());
@@ -1603,7 +1640,9 @@ pub fn trace_bindless(
         .into_iter()
         .collect();
     type RawHit = (i64, i64, i64, u32, bool);
+    type RawLoadEv = (i64, i64, i64, crate::dxil::RawLoadSource, u64, u64);
     let mut by_sub: BTreeMap<usize, Vec<RawHit>> = BTreeMap::new();
+    let mut raw_by_sub: BTreeMap<usize, Vec<RawLoadEv>> = BTreeMap::new();
     let sub_pos: HashMap<i64, usize> = order.iter().enumerate().map(|(i, &s)| (s, i)).collect();
     let mut needed_heaps: HashSet<i64> = HashSet::new();
     for hit in raw_hits {
@@ -1614,40 +1653,71 @@ pub fn trace_bindless(
             by_sub.entry(pos).or_default().push(hit);
         }
     }
-    let max_pos = by_sub.keys().next_back().copied().unwrap_or(0);
-    let mut slots: HashMap<(i64, u32), (String, i64)> = HashMap::new();
+    for hit in raw_load_hits {
+        if matches!(hit.3, crate::dxil::RawLoadSource::HeapSlot(_)) {
+            needed_heaps.insert(hit.2);
+        }
+        if let Some(&sub) = ev_sub.get(&hit.1)
+            && let Some(&pos) = sub_pos.get(&sub)
+        {
+            raw_by_sub.entry(pos).or_default().push(hit);
+        }
+    }
+    let max_pos = by_sub
+        .keys()
+        .chain(raw_by_sub.keys())
+        .next_back()
+        .copied()
+        .unwrap_or(0);
+    // (kind, resource, buffer_first_byte_offset)
+    let mut slots: HashMap<(i64, u32), (String, i64, u64)> = HashMap::new();
     let mut seen: HashSet<(i64, i64, u32, &'static str)> = HashSet::new();
     let mut resolved = Vec::new();
-    if !by_sub.is_empty() {
+    let mut raw_resolved_ranges: Vec<(i64, i64, String, i64, u64, u64)> = Vec::new();
+    // Cache root-binding lookups per draw for RootUav/RootSrv rawBufferLoad resolution.
+    type RootBindings = HashMap<(bool, u32), (i64, u64)>;
+    let mut draw_roots_cache: HashMap<i64, RootBindings> = HashMap::new();
+    let mut root_params_cache: HashMap<i64, serde_json::Value> = HashMap::new();
+    if !by_sub.is_empty() || !raw_by_sub.is_empty() {
         for (pos, &sub) in order.iter().enumerate().take(max_pos + 1) {
-            for (heap, slot, kind, resource) in c.rows(
-                "SELECT v.heap, v.slot, v.kind, v.resource FROM d12_submission_descriptors d \
-                 JOIN d12_descriptor_versions v ON v.id = d.version WHERE d.submission = ?1 ORDER BY v.id",
-                [sub],
-                |r| {
-                    Ok((
-                        r.get::<_, i64>(0)?,
-                        r.get::<_, i64>(1)? as u32,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, Option<i64>>(3)?.unwrap_or(0),
-                    ))
-                },
-            ) {
-                if !needed_heaps.contains(&heap) {
-                    continue;
-                }
-                if kind == "empty" {
-                    slots.remove(&(heap, slot));
-                } else {
-                    slots.insert((heap, slot), (kind, resource));
+            if !needed_heaps.is_empty() {
+                for (heap, slot, kind, resource, desc) in c.rows(
+                    "SELECT v.heap, v.slot, v.kind, v.resource, v.description FROM d12_submission_descriptors d \
+                     JOIN d12_descriptor_versions v ON v.id = d.version WHERE d.submission = ?1 ORDER BY v.id",
+                    [sub],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, i64>(1)? as u32,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                            r.get::<_, Option<String>>(4)?,
+                        ))
+                    },
+                ) {
+                    if !needed_heaps.contains(&heap) {
+                        continue;
+                    }
+                    if kind == "empty" {
+                        slots.remove(&(heap, slot));
+                    } else {
+                        let first_byte = desc
+                            .as_deref()
+                            .filter(|s| s.contains("FirstElement"))
+                            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                            .and_then(|v| v["payload"]["FirstElement"].as_u64())
+                            .unwrap_or(0)
+                            .saturating_mul(4);
+                        slots.insert((heap, slot), (kind, resource, first_byte));
+                    }
                 }
             }
             if let Some(hits) = by_sub.get(&pos) {
                 for &(draw, event, heap, slot, is_write) in hits {
-                    let (kind, resource) = slots
+                    let (kind, resource, _) = slots
                         .get(&(heap, slot))
                         .cloned()
-                        .unwrap_or_else(|| ("unknown".into(), 0));
+                        .unwrap_or_else(|| ("unknown".into(), 0, 0));
                     let access = if is_write || kind == "uav" {
                         "write"
                     } else {
@@ -1667,9 +1737,213 @@ pub fn trace_bindless(
                     }
                 }
             }
+            if let Some(rhits) = raw_by_sub.get(&pos) {
+                for &(draw, event, heap, source, rel_start, rel_end) in rhits {
+                    let (src_label, resource, base_off) = match source {
+                        crate::dxil::RawLoadSource::HeapSlot(slot) => {
+                            let (_, res, first_byte) = slots
+                                .get(&(heap, slot))
+                                .cloned()
+                                .unwrap_or_else(|| (String::new(), 0, 0));
+                            (format!("heap #{heap}[{slot}]"), res, first_byte)
+                        }
+                        crate::dxil::RawLoadSource::RootUav(reg)
+                        | crate::dxil::RawLoadSource::RootSrv(reg) => {
+                            let is_uav = matches!(source, crate::dxil::RawLoadSource::RootUav(_));
+                            let map = draw_roots_cache.entry(draw).or_insert_with(|| {
+                                resolve_draw_root_buffers(c, draw, &mut root_params_cache)
+                            });
+                            let (res, off) = map.get(&(is_uav, reg)).copied().unwrap_or((0, 0));
+                            let label = if is_uav {
+                                format!("root u{reg}")
+                            } else {
+                                format!("root t{reg}")
+                            };
+                            (label, res, off)
+                        }
+                    };
+                    let start = base_off.saturating_add(rel_start);
+                    let end = base_off.saturating_add(rel_end);
+                    raw_resolved_ranges.push((draw, event, src_label, resource, start, end));
+                }
+            }
         }
     }
-    Ok((resolved, warnings))
+
+    let traced_raw = classify_raw_loads(c, &raw_resolved_ranges);
+    Ok(TraceOutput {
+        bindless: resolved,
+        raw_loads: traced_raw,
+        warnings,
+    })
+}
+
+/// Resolves space-0 root UAV (`(true, reg)`) and SRV (`(false, reg)`) `(resource, offset)` bindings for `draw`.
+fn resolve_draw_root_buffers(
+    c: &Capture,
+    draw: i64,
+    root_cache: &mut HashMap<i64, serde_json::Value>,
+) -> HashMap<(bool, u32), (i64, u64)> {
+    let mut out = HashMap::new();
+    let Some((kind, g_root, c_root, state_json)) = c.row(
+        "SELECT e.kind, s.graphics_root, s.compute_root, s.root_args_json \
+         FROM d12_draw_state s JOIN draws d ON d.n = s.draw JOIN events e ON e.seq = d.event WHERE s.draw = ?1",
+        [draw],
+        |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        },
+    ) else {
+        return out;
+    };
+    let compute = kind == "dispatch";
+    let root_id = if compute { c_root } else { g_root };
+    let Ok(state) = serde_json::from_str::<serde_json::Value>(&state_json) else {
+        return out;
+    };
+    let args = &state[if compute { "compute_args" } else { "graphics_args" }];
+    let root_desc = root_cache.entry(root_id).or_insert_with(|| {
+        c.row(
+            "SELECT decoded_json FROM d12_roots WHERE id = ?1",
+            [root_id],
+            |r| r.get::<_, String>(0),
+        )
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+    });
+    for (idx, param) in root_desc["parameters"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        // Root parameter type: 3 = SRV, 4 = UAV.
+        let ty = param["type"].as_u64().unwrap_or(u64::MAX);
+        if ty != 3 && ty != 4 {
+            continue;
+        }
+        let space = param["value"]["RegisterSpace"].as_u64().unwrap_or(0);
+        if space != 0 {
+            continue;
+        }
+        let reg = param["value"]["ShaderRegister"].as_u64().unwrap_or(u64::MAX) as u32;
+        if let Some(arg) = args.get(idx.to_string()) {
+            let res = arg["value"]["resource"].as_i64().unwrap_or(0);
+            let off = arg["value"]["offset"].as_u64().unwrap_or(0);
+            out.insert((ty == 4, reg), (res, off));
+        }
+    }
+    out
+}
+
+/// Classifies traced `(draw, event, source, resource, start, end)` byte ranges against tile tables and
+/// first-use/upload blobs so replay knows which ranges can be pulled vs flagged as uncaptured/unmapped.
+fn classify_raw_loads(c: &Capture, rows: &[(i64, i64, String, i64, u64, u64)]) -> Vec<TracedRawLoad> {
+    const TILE_BYTES: u64 = 65_536;
+    let mut content_cache: HashMap<i64, Option<String>> = HashMap::new();
+    let mut reserved_tiles_cache: HashMap<i64, Option<BTreeSet<u32>>> = HashMap::new();
+    let mut upload_ranges_cache: HashMap<i64, Vec<(u64, u64)>> = HashMap::new();
+    let mut out = Vec::with_capacity(rows.len());
+    for (draw, event, source, resource, start, end) in rows {
+        let resource = *resource;
+        let start = *start;
+        let end = (*end).max(start);
+        let tile_start = (start / TILE_BYTES) as u32;
+        let tile_end = (end.saturating_sub(1) / TILE_BYTES) as u32 + 1;
+        let status = if resource <= 0 {
+            "uncaptured"
+        } else {
+            let mapped_tiles = reserved_tiles_cache.entry(resource).or_insert_with(|| {
+                if !c.has_table("d12_tile_pages") {
+                    return None;
+                }
+                let pj: Option<String> = c
+                    .row(
+                        "SELECT pages_json FROM d12_tile_pages WHERE resource = ?1",
+                        [resource],
+                        |r| r.get(0),
+                    )
+                    .flatten();
+                let pj = pj?;
+                let mut set = BTreeSet::new();
+                if let Ok(serde_json::Value::Array(runs)) = serde_json::from_str::<serde_json::Value>(&pj) {
+                    for run in runs {
+                        if let Some(a) = run.as_array()
+                            && a.len() >= 2
+                            && let (Some(t0), Some(cnt)) = (a[0].as_u64(), a[1].as_u64())
+                        {
+                            for k in 0..cnt {
+                                set.insert((t0 + k) as u32);
+                            }
+                        }
+                    }
+                }
+                Some(set)
+            });
+            let any_mapped = match mapped_tiles {
+                Some(set) => (tile_start..tile_end).any(|t| set.contains(&t)),
+                None => true,
+            };
+            if !any_mapped {
+                "unmapped"
+            } else {
+                let key = content_cache.entry(resource).or_insert_with(|| {
+                    c.row("SELECT content FROM resources WHERE id = ?1", [resource], |r| {
+                        r.get::<_, Option<String>>(0)
+                    })
+                    .flatten()
+                });
+                if let Some(blob_key) = key.as_deref() {
+                    let check_len = (end - start).min(1 << 20);
+                    match c.blobs.read(blob_key, start, Some(check_len)) {
+                        Ok(bytes) if bytes.iter().any(|&b| b != 0) => "captured-nonzero",
+                        Ok(_) => "captured-zero",
+                        Err(_) => "uncaptured",
+                    }
+                } else {
+                    let uploads = upload_ranges_cache.entry(resource).or_insert_with(|| {
+                        if !c.has_table("d12_upload_versions") {
+                            return Vec::new();
+                        }
+                        c.rows(
+                            "SELECT content_json FROM d12_upload_versions WHERE resource = ?1",
+                            [resource],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .into_iter()
+                        .filter_map(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                        .map(|v| {
+                            let off = v["offset"].as_u64().unwrap_or(0);
+                            let sz = v["size"].as_u64().unwrap_or(0);
+                            (off, off.saturating_add(sz))
+                        })
+                        .collect()
+                    });
+                    if uploads.iter().any(|&(u0, u1)| u0 < end && u1 > start) {
+                        "captured-upload"
+                    } else {
+                        "uncaptured"
+                    }
+                }
+            }
+        };
+        out.push(TracedRawLoad {
+            draw: *draw as u64,
+            event: *event as u64,
+            source: source.clone(),
+            resource: resource.max(0) as u64,
+            start,
+            end,
+            tile_start,
+            tile_end,
+            status,
+        });
+    }
+    out
 }
 
 /// Resolves `--include-bindless <SPEC>` items (`res:1,2,3` or `slots:10,20..30`) into resource IDs to force into
@@ -1834,26 +2108,86 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     for rb in readbacks_after.iter().chain(&readbacks_before) {
         plan.resources.insert(rb.resource);
     }
-    if o.trace_bindless {
+    if o.trace_bindless || o.trace_raw_loads {
         let t_trace = std::time::Instant::now();
-        let (traced, trace_warnings) = trace_bindless(c, &plan, &parsed, o.warp, o.validation)?;
+        let TraceOutput {
+            bindless: traced,
+            raw_loads,
+            warnings: trace_warnings,
+        } = trace_bindless_with_raw_loads(c, &plan, &parsed, o.warp, o.validation, o.trace_raw_loads)?;
         let mut added = 0usize;
-        for u in &traced {
-            if u.resource > 0 && plan.resources.insert(u.resource as i64) {
-                added += 1;
+        if o.trace_bindless {
+            for u in &traced {
+                if u.resource > 0 && plan.resources.insert(u.resource as i64) {
+                    added += 1;
+                }
+            }
+            out!(
+                "  bindless trace: {} hit(s) across {} unique slot(s) in {:.2} s -> added {} resource(s) to replay plan",
+                traced.len(),
+                traced
+                    .iter()
+                    .map(|u| (u.heap, u.slot))
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                t_trace.elapsed().as_secs_f64(),
+                added
+            );
+        }
+        if o.trace_raw_loads {
+            let mut tiles_added = 0usize;
+            let mut missing_ranges = 0usize;
+            for r in &raw_loads {
+                if r.resource > 0 {
+                    plan.resources.insert(r.resource as i64);
+                    let entry = plan.extra_tiles.entry(r.resource as i64).or_default();
+                    for t in r.tile_start..r.tile_end {
+                        if entry.insert(t) {
+                            tiles_added += 1;
+                        }
+                    }
+                }
+                if matches!(r.status, "uncaptured" | "unmapped") {
+                    missing_ranges += 1;
+                }
+            }
+            out!(
+                "  raw-load trace: {} range(s) ({} 64 KiB tile(s) materialized for sparse buffers, {} uncaptured/unmapped) in {:.2} s",
+                raw_loads.len(),
+                tiles_added,
+                missing_ranges,
+                t_trace.elapsed().as_secs_f64()
+            );
+            for r in &raw_loads {
+                if o.log_missing_reads && matches!(r.status, "uncaptured" | "unmapped") {
+                    out!(
+                        "  missing-read: draw {} event {} ({}) rawBufferLoad reads {} #{} {:#x}..{:#x} (tiles {}..{})",
+                        r.draw,
+                        r.event,
+                        r.source,
+                        r.status,
+                        r.resource,
+                        r.start,
+                        r.end,
+                        r.tile_start,
+                        r.tile_end
+                    );
+                } else {
+                    out!(
+                        "  raw-load: draw {} event {} {} -> #{} {:#x}..{:#x} (tiles {}..{}) [{}]",
+                        r.draw,
+                        r.event,
+                        r.source,
+                        r.resource,
+                        r.start,
+                        r.end,
+                        r.tile_start,
+                        r.tile_end,
+                        r.status
+                    );
+                }
             }
         }
-        out!(
-            "  bindless trace: {} hit(s) across {} unique slot(s) in {:.2} s -> added {} resource(s) to replay plan",
-            traced.len(),
-            traced
-                .iter()
-                .map(|u| (u.heap, u.slot))
-                .collect::<BTreeSet<_>>()
-                .len(),
-            t_trace.elapsed().as_secs_f64(),
-            added
-        );
         for w in trace_warnings {
             out!("  trace warning: {w}");
         }
@@ -1992,6 +2326,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
                 written_before_target: plan.written_before_target.clone(),
                 until: Some(target),
                 skipped_empty_heap: plan.skipped_empty_heap,
+                extra_tiles: plan.extra_tiles.clone(),
             };
             let has_target = pre_plan.events.last() == Some(&target);
             if has_target {

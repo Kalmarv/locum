@@ -813,6 +813,11 @@ struct ReplayArgs {
     /// and then execute the replay (e.g. with `--rule "map all-unmapped"`).
     #[arg(long)]
     trace_bindless: bool,
+    /// Run a live GPU/WARP DXIL `rawBufferLoad` 4 KiB-page address trace prepass to discover the exact byte ranges
+    /// shaders read from UMA/root/bindless raw buffers (e.g. `#24`, `#9`, `#25`, `#26`), pull their captured
+    /// first-use/upload tiles into sparse buffers, and flag any uncaptured/unmapped ranges (incl. `--log-missing-reads`).
+    #[arg(long)]
+    trace_raw_loads: bool,
     /// Force specific bindless heap resources or slots into the replay plan even if uncaptured:
     /// `res:ID,ID,...` or `slots:S,A..B,...` (may be repeated).
     #[arg(long)]
@@ -851,6 +856,11 @@ struct BindlessArgs {
     /// Force-include extra bindless resources during `--trace` (`res:ID,...` or `slots:A..B`); repeatable.
     #[arg(long)]
     include_bindless: Vec<String>,
+    /// Also trace 4 KiB page ranges read via `dx.op.rawBufferLoad` from `ResourceDescriptorHeap[0..32]` and root
+    /// `u0..u7`/`t0..t7`, classifying each range as `captured-nonzero`, `captured-zero`, `captured-upload`,
+    /// `uncaptured`, or `unmapped`.
+    #[arg(long)]
+    raw_loads: bool,
     /// Persist `--trace` results into the capture's `d12_bindless_usage` table so subsequent `replay` calls
     /// automatically materialize the discovered bindless resources.
     #[arg(long)]
@@ -1358,6 +1368,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 times,
                 strict_self_check,
                 trace_bindless,
+                trace_raw_loads,
                 include_bindless,
             } = *a;
             if let Some(t) = times {
@@ -1393,6 +1404,7 @@ fn run(cli: Cli) -> Result<(), String> {
                     range: range(&r)?,
                     strict_self_check,
                     trace_bindless,
+                    trace_raw_loads,
                     include_bindless,
                 },
             )
@@ -1558,6 +1570,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 rule,
                 rules,
                 include_bindless,
+                raw_loads,
                 write_db,
                 draw,
                 resource,
@@ -1588,7 +1601,18 @@ fn run(cli: Cli) -> Result<(), String> {
                 } else {
                     replay::Validation::Off
                 };
-                let (rows, warnings) = replay::trace_bindless(&c, &plan, &parsed_rules, warp, validation)?;
+                let replay::TraceOutput {
+                    bindless: rows,
+                    raw_loads: traced_raw,
+                    warnings,
+                } = replay::trace_bindless_with_raw_loads(
+                    &c,
+                    &plan,
+                    &parsed_rules,
+                    warp,
+                    validation,
+                    raw_loads,
+                )?;
                 for w in &warnings {
                     eprintln!("warning: {w}");
                 }
@@ -1642,6 +1666,48 @@ fn run(cli: Cli) -> Result<(), String> {
                             u.resource,
                             u.access,
                             u.source
+                        );
+                    }
+                }
+                for r in traced_raw {
+                    if let Some(fd) = draw
+                        && r.draw as i64 != fd
+                    {
+                        continue;
+                    }
+                    if let Some(fr) = resource
+                        && r.resource as i64 != fr
+                    {
+                        continue;
+                    }
+                    if json {
+                        out!(
+                            "{}",
+                            serde_json::json!({
+                                "kind": "raw_load",
+                                "draw": r.draw,
+                                "event": r.event,
+                                "source": r.source,
+                                "resource": r.resource,
+                                "start": r.start,
+                                "end": r.end,
+                                "tile_start": r.tile_start,
+                                "tile_end": r.tile_end,
+                                "status": r.status
+                            })
+                        );
+                    } else {
+                        out!(
+                            "raw-load\tdraw {}\tevent {}\t{}\t#{}\t{:#x}..{:#x}\ttiles {}..{}\t{}",
+                            r.draw,
+                            r.event,
+                            r.source,
+                            r.resource,
+                            r.start,
+                            r.end,
+                            r.tile_start,
+                            r.tile_end,
+                            r.status
                         );
                     }
                 }

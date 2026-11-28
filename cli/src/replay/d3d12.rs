@@ -232,12 +232,13 @@ struct Need {
     state: i32,
 }
 
-/// Runtime GPU/WARP bindless descriptor-slot tracer: instruments SM 6.6+ DXIL `createHandleFromHeap` calls
-/// to atomically set bits in a 2-region `RWByteAddressBuffer` bound at a reserved slot of each mirrored CBV/SRV/UAV
-/// heap, reading back the exact `(draw, event, heap, slot, is_write)` accesses executed on the GPU.
+/// Runtime GPU/WARP bindless descriptor-slot (and optional `rawBufferLoad` 4 KiB-page) tracer: instruments SM 6.6+
+/// DXIL `createHandleFromHeap` (and optionally `rawBufferLoad`) calls to atomically set bits in an
+/// `RWByteAddressBuffer` bound at a reserved slot of each mirrored CBV/SRV/UAV heap.
 struct BindlessHeapLog {
     log_slot: u32,
     max_slots: u32,
+    raw_base: Option<u64>,
     gpu_buf: ID3D12Resource,
     zero_buf: ID3D12Resource,
     readback_buf: ID3D12Resource,
@@ -245,11 +246,16 @@ struct BindlessHeapLog {
     bytes: u64,
 }
 
+type RawLoadHit = (i64, i64, i64, crate::dxil::RawLoadSource, u64, u64);
+type PatchedShaderKey = (String, u32, u32, Option<u32>);
+
 #[derive(Default)]
 struct BindlessTracer {
+    trace_raw_loads: bool,
     heaps: HashMap<i64, BindlessHeapLog>,
-    patched_shaders: HashMap<(String, u32, u32), Option<Vec<u8>>>,
+    patched_shaders: HashMap<PatchedShaderKey, Option<Vec<u8>>>,
     hits: Vec<(i64, i64, i64, u32, bool)>,
+    raw_hits: Vec<RawLoadHit>,
     pending: Option<(i64, i64, i64, u32)>,
 }
 
@@ -1096,7 +1102,9 @@ impl D3d12 {
                     match mirror(&self.device, kind, mirror_count, true) {
                         Ok(m) => {
                             if let Some(log_slot) = trace_slot {
-                                match self.make_bindless_log(log_slot, m.cpu(log_slot)) {
+                                let raw_loads =
+                                    self.bindless_tracer.as_ref().is_some_and(|t| t.trace_raw_loads);
+                                match self.make_bindless_log(log_slot, m.cpu(log_slot), raw_loads) {
                                     Ok(log) => {
                                         if let Some(t) = &mut self.bindless_tracer {
                                             t.heaps.insert(id, log);
@@ -1128,14 +1136,17 @@ impl D3d12 {
         self.heaps[&id].as_ref()
     }
 
-    /// Allocates the 2-region bitmask `RWByteAddressBuffer` (plus reusable zero-upload and readback buffers) for
-    /// runtime bindless slot tracing and binds its raw UAV descriptor at `uav_handle`.
+    /// Allocates the bitmask `RWByteAddressBuffer` (plus reusable zero-upload and readback buffers) for
+    /// runtime bindless slot (and optional `rawBufferLoad` 4 KiB-page) tracing and binds its raw UAV descriptor
+    /// at `uav_handle`.
     fn make_bindless_log(
         &self,
         log_slot: u32,
         uav_handle: D3D12_CPU_DESCRIPTOR_HANDLE,
+        raw_loads: bool,
     ) -> Result<BindlessHeapLog, String> {
-        let bytes = crate::dxil::bindless_log_bytes(log_slot);
+        let (bytes, raw_base_off) = crate::dxil::bindless_log_layout(log_slot, raw_loads);
+        let raw_base = raw_loads.then_some(raw_base_off);
         let mk = |heap_type: D3D12_HEAP_TYPE,
                   flags: D3D12_RESOURCE_FLAGS,
                   state: D3D12_RESOURCE_STATES|
@@ -1217,6 +1228,7 @@ impl D3d12 {
         Ok(BindlessHeapLog {
             log_slot,
             max_slots: log_slot,
+            raw_base,
             gpu_buf,
             zero_buf,
             readback_buf,
@@ -1777,11 +1789,12 @@ impl D3d12 {
             for hid in heap_ids {
                 let _ = self.heap(c, hid);
                 if let Some(log) = self.bindless_tracer.as_ref().and_then(|t| t.heaps.get(&hid)) {
-                    active_trace_heap = Some((hid, log.log_slot, log.max_slots));
+                    active_trace_heap =
+                        Some((hid, log.log_slot, log.max_slots, log.raw_base.map(|b| b as u32)));
                     break;
                 }
             }
-            if let Some((trace_heap, log_slot, max_slots)) = active_trace_heap
+            if let Some((trace_heap, log_slot, max_slots, raw_base)) = active_trace_heap
                 && let Some(pso_desc) = &pso_desc
             {
                 let mut patched_any = false;
@@ -1795,7 +1808,7 @@ impl D3d12 {
                     let Some(key) = val["blob"].as_str() else {
                         continue;
                     };
-                    let cache_key = (key.to_string(), log_slot, max_slots);
+                    let cache_key = (key.to_string(), log_slot, max_slots, raw_base);
                     let cached = self
                         .bindless_tracer
                         .as_ref()
@@ -1805,7 +1818,9 @@ impl D3d12 {
                         Some(v) => v,
                         None => {
                             let res = c.blob(key).and_then(|code| {
-                                crate::dxil::instrument_bindless(&code, log_slot, max_slots)
+                                crate::dxil::instrument_bindless_with_raw_loads(
+                                    &code, log_slot, max_slots, raw_base,
+                                )
                             });
                             let entry = match res {
                                 Ok(opt) => opt,
@@ -1823,7 +1838,10 @@ impl D3d12 {
                         }
                     };
                     if let Some(bytes) = patched {
-                        texts.push(format!("__bindless_trace_{sub_ty}_{log_slot}"));
+                        texts.push(format!(
+                            "__bindless_trace_{sub_ty}_{log_slot}_{}",
+                            raw_base.unwrap_or(0)
+                        ));
                         replaced.push((sub_ty, bytes));
                         patched_any = true;
                     }
@@ -3427,14 +3445,24 @@ impl Backend for D3d12 {
         self.memory.prepare_plan(c, plan);
     }
 
-    fn enable_bindless_trace(&mut self) {
-        self.bindless_tracer = Some(BindlessTracer::default());
+    fn enable_bindless_trace(&mut self, raw_loads: bool) {
+        self.bindless_tracer = Some(BindlessTracer {
+            trace_raw_loads: raw_loads,
+            ..Default::default()
+        });
     }
 
     fn take_bindless_trace(&mut self) -> Vec<(i64, i64, i64, u32, bool)> {
         self.bindless_tracer
             .as_mut()
             .map(|t| std::mem::take(&mut t.hits))
+            .unwrap_or_default()
+    }
+
+    fn take_raw_load_trace(&mut self) -> Vec<RawLoadHit> {
+        self.bindless_tracer
+            .as_mut()
+            .map(|t| std::mem::take(&mut t.raw_hits))
             .unwrap_or_default()
     }
 
@@ -3596,6 +3624,11 @@ impl Backend for D3d12 {
             let slice = unsafe { core::slice::from_raw_parts(log.readback_ptr, log.bytes as usize) };
             for (slot, is_write) in crate::dxil::decode_bindless_log(slice, max_slots) {
                 t.hits.push((draw_n, ev_seq, trace_heap, slot, is_write));
+            }
+            if let Some(raw_base) = log.raw_base {
+                for (source, start, end) in crate::dxil::decode_raw_load_log(slice, raw_base) {
+                    t.raw_hits.push((draw_n, ev_seq, trace_heap, source, start, end));
+                }
             }
         }
         // Put back the descriptors a rule changed for this event.
@@ -5425,7 +5458,7 @@ mod tests {
             d.device
                 .CreateUnorderedAccessView(&d.resource(3).unwrap(), None, Some(&uav_d), heap.cpu(13));
         }
-        let log = d.make_bindless_log(log_slot, heap.cpu(log_slot)).unwrap();
+        let log = d.make_bindless_log(log_slot, heap.cpu(log_slot), false).unwrap();
         unsafe {
             d.list
                 .CopyBufferRegion(&log.gpu_buf, 0, &log.zero_buf, 0, log.bytes);
@@ -5639,7 +5672,7 @@ mod tests {
             d.device
                 .CreateShaderResourceView(&b11, Some(&srv_d), heap.cpu(11));
         }
-        let log = d.make_bindless_log(log_slot, heap.cpu(log_slot)).unwrap();
+        let log = d.make_bindless_log(log_slot, heap.cpu(log_slot), false).unwrap();
         let vp = D3D12_VIEWPORT {
             Width: 8.0,
             Height: 8.0,
@@ -5739,7 +5772,7 @@ mod tests {
         }
         let c = crate::open::open(&p1.to_string_lossy(), None).unwrap();
         let mut d = D3d12::new(true, super::super::Validation::Gpu).unwrap();
-        d.enable_bindless_trace();
+        d.enable_bindless_trace(false);
         let args: Value = serde_json::json!([1247, 1, 6250, 34768, 0, 0]);
         d.draw(
             &c,
@@ -5885,7 +5918,7 @@ mod tests {
             d.device
                 .CreateUnorderedAccessView(&d.resource(3).unwrap(), None, Some(&uav_d), heap.cpu(9));
         }
-        let log = d.make_bindless_log(log_slot, heap.cpu(log_slot)).unwrap();
+        let log = d.make_bindless_log(log_slot, heap.cpu(log_slot), false).unwrap();
 
         let run_once = |d: &mut D3d12| -> Vec<(u32, bool)> {
             unsafe {
@@ -5959,6 +5992,182 @@ mod tests {
         let _ = std::fs::remove_file(&seed_path);
 
         assert_eq!(run_once(&mut d), vec![(5, false), (9, true)]);
+        assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
+    }
+
+    /// End-to-end WARP proof of `rawBufferLoad` 4 KiB-page address tracing: instruments an SM 6.6 compute shader
+    /// reading root UAV `u0` at byte offset `0x1040` and bindless `ResourceDescriptorHeap[4]` at `0x20040`, runs it
+    /// under the D3D12 debug layer, and verifies exact 4 KiB page ranges are decoded for both sources.
+    #[test]
+    fn runtime_raw_buffer_load_trace_discovers_exact_page_ranges_on_warp() {
+        let mut d = D3d12::new(true, super::super::Validation::Layer).unwrap();
+        let src = r#"
+            RWByteAddressBuffer rootBuf : register(u0);
+            [numthreads(1,1,1)]
+            void main() {
+                uint a = rootBuf.Load(0x1040);
+                RWByteAddressBuffer heapBuf = ResourceDescriptorHeap[4];
+                uint b = heapBuf.Load(0x20040);
+                rootBuf.Store(0, a + b + 1);
+            }
+        "#;
+        let log_slot: u32 = 63;
+        let (_, raw_base) = crate::dxil::bindless_log_layout(log_slot, true);
+        let raw_cs = crate::dxil::compile(src, "cs_6_6").unwrap();
+        let patched_cs = crate::dxil::instrument_bindless_with_raw_loads(
+            &raw_cs,
+            log_slot,
+            log_slot,
+            Some(raw_base as u32),
+        )
+        .unwrap()
+        .unwrap();
+        let param = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                },
+            },
+        };
+        let root_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 1,
+                    pParameters: &param,
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
+                    ..Default::default()
+                },
+            },
+        };
+        let mut sig_blob = None;
+        unsafe { D3D12SerializeVersionedRootSignature(&root_desc, &mut sig_blob, None) }.unwrap();
+        let sig_blob = sig_blob.unwrap();
+        let sig_bytes = unsafe {
+            core::slice::from_raw_parts(sig_blob.GetBufferPointer().cast::<u8>(), sig_blob.GetBufferSize())
+        };
+        let root_sig: ID3D12RootSignature = unsafe { d.device.CreateRootSignature(0, sig_bytes) }.unwrap();
+        let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: ManuallyDrop::new(Some(root_sig.clone())),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: patched_cs.as_ptr().cast(),
+                BytecodeLength: patched_cs.len(),
+            },
+            ..Default::default()
+        };
+        let pso: ID3D12PipelineState = unsafe { d.device.CreateComputePipelineState(&pso_desc) }.unwrap();
+
+        let mk_buf = |d: &mut D3d12, id: i64, width: u64| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: width,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            unsafe {
+                d.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        COMMON,
+                        None,
+                        &mut r,
+                    )
+                    .unwrap();
+            }
+            d.adopt(id, r.unwrap(), Heap::Default, 0, layout::buffer(width as u32))
+                .unwrap();
+        };
+        mk_buf(&mut d, 1, 0x4000);
+        mk_buf(&mut d, 2, 0x40000);
+        let heap = mirror(&d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 64, true).unwrap();
+        let uav_d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 0x40000 / 4,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        unsafe {
+            d.device
+                .CreateUnorderedAccessView(&d.resource(2).unwrap(), None, Some(&uav_d), heap.cpu(4));
+        }
+        let log = d.make_bindless_log(log_slot, heap.cpu(log_slot), true).unwrap();
+        unsafe {
+            d.list
+                .CopyBufferRegion(&log.gpu_buf, 0, &log.zero_buf, 0, log.bytes);
+            d.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: borrowed(&log.gpu_buf),
+                        Subresource: ALL,
+                        StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                        StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    }),
+                },
+            }]);
+            d.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+            d.list.SetComputeRootSignature(&root_sig);
+            d.list.SetPipelineState(&pso);
+            d.list.SetComputeRootUnorderedAccessView(0, d.address(1, 0));
+            d.list.Dispatch(1, 1, 1);
+            d.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: borrowed(&log.gpu_buf),
+                        Subresource: ALL,
+                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    }),
+                },
+            }]);
+            d.list
+                .CopyBufferRegion(&log.readback_buf, 0, &log.gpu_buf, 0, log.bytes);
+            d.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: borrowed(&log.gpu_buf),
+                        Subresource: ALL,
+                        StateBefore: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        StateAfter: COMMON,
+                    }),
+                },
+            }]);
+        }
+        d.flush().unwrap();
+        let slice = unsafe { core::slice::from_raw_parts(log.readback_ptr, log.bytes as usize) };
+        assert_eq!(crate::dxil::decode_bindless_log(slice, log_slot), vec![(4, true)]);
+        assert_eq!(
+            crate::dxil::decode_raw_load_log(slice, raw_base),
+            vec![
+                (crate::dxil::RawLoadSource::HeapSlot(4), 0x20000, 0x21000),
+                (crate::dxil::RawLoadSource::RootUav(0), 0x1000, 0x2000),
+            ]
+        );
         assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
     }
 }

@@ -211,6 +211,45 @@ pub fn assemble_and_validate(ir: &str) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
+/// Number of `ResourceDescriptorHeap` slots (`0..32`) given dedicated 4 KiB-page bitmasks for `rawBufferLoad` tracing.
+pub const RAW_LOAD_HEAP_SLOTS: u32 = 32;
+/// Number of root/bound UAV (`u0..u7`) and SRV (`t0..t7`) registers each given 4 KiB-page bitmasks.
+pub const RAW_LOAD_ROOT_REGS: u32 = 8;
+/// Total 4 KiB-page bitmask buckets: 32 heap slots + 8 root UAVs + 8 root SRVs = 48.
+pub const RAW_LOAD_BUCKETS: u32 = RAW_LOAD_HEAP_SLOTS + RAW_LOAD_ROOT_REGS * 2;
+/// Bytes per 4 KiB-page bitmask bucket across a 4 GiB address space: `(4 GiB / 4 KiB) / 8 = 128 KiB`.
+pub const RAW_LOAD_BUCKET_BYTES: u64 = 131_072;
+/// Total bytes reserved for the raw-buffer-load trace section (48 buckets + 64-byte sentinel/padding).
+pub const RAW_LOAD_SECTION_BYTES: u64 = RAW_LOAD_BUCKETS as u64 * RAW_LOAD_BUCKET_BYTES + 64;
+
+/// Which buffer binding a traced `rawBufferLoad` read from.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum RawLoadSource {
+    /// `ResourceDescriptorHeap[slot]` (`slot < 32`).
+    HeapSlot(u32),
+    /// Space-0 bound UAV register `u{reg}` (`reg < 8`).
+    RootUav(u32),
+    /// Space-0 bound SRV register `t{reg}` (`reg < 8`).
+    RootSrv(u32),
+}
+
+/// Returns `(total_bytes, raw_base_offset)` for the bindless trace `RWByteAddressBuffer`.
+/// When `raw_loads` is false, allocates only the 2-region descriptor-slot bitmask.
+pub fn bindless_log_layout(max_slots: u32, raw_loads: bool) -> (u64, u64) {
+    let slot_bytes = bindless_log_bytes(max_slots);
+    if !raw_loads {
+        return (slot_bytes, 0);
+    }
+    let raw_base = slot_bytes.next_multiple_of(64);
+    (raw_base + RAW_LOAD_SECTION_BYTES, raw_base)
+}
+
+#[derive(Clone)]
+enum HandleOrigin {
+    HeapSlot(String),
+    Root { is_uav: bool, reg: u32 },
+}
+
 /// Instruments a SM 6.6+ DXIL shader so every dynamic `dx.op.createHandleFromHeap(..., i1 false, ...)`
 /// (CBV/SRV/UAV `ResourceDescriptorHeap` access) atomically sets a bit in a 2-region bitmask `RWByteAddressBuffer`
 /// bound at `ResourceDescriptorHeap[log_slot]`:
@@ -220,39 +259,107 @@ pub fn assemble_and_validate(ir: &str) -> Result<Vec<u8>, String> {
 /// Here `half_bytes = ((max_slots / 32) + 2) * 4` (extra sentinel word at index `max_slots` avoids branches).
 ///
 /// Returns `Ok(None)` if the shader has no `ResourceDescriptorHeap` `createHandleFromHeap` calls.
+#[cfg(test)]
 pub fn instrument_bindless(code: &[u8], log_slot: u32, max_slots: u32) -> Result<Option<Vec<u8>>, String> {
+    instrument_bindless_with_raw_loads(code, log_slot, max_slots, None)
+}
+
+/// Like [`instrument_bindless`], and when `raw_base` is `Some(base)`, also instruments every
+/// `dx.op.rawBufferLoad.*(i32 139, handle, byte_offset, i32 undef, ...)` on `ResourceDescriptorHeap[0..32]`
+/// and root/bound `u0..u7`/`t0..t7` handles to set the 4 KiB-page bit in the 48-bucket bitmask at `base`.
+pub fn instrument_bindless_with_raw_loads(
+    code: &[u8],
+    log_slot: u32,
+    max_slots: u32,
+    raw_base: Option<u32>,
+) -> Result<Option<Vec<u8>>, String> {
     if !is_dxil(code) {
         return Ok(None);
     }
     let ir = disassemble(code)?;
-    if !ir.contains("@dx.op.createHandleFromHeap(") {
+    let has_heap_calls = ir.contains("@dx.op.createHandleFromHeap(");
+    let has_raw_loads = raw_base.is_some() && ir.contains("@dx.op.rawBufferLoad.");
+    if !has_heap_calls && !has_raw_loads {
         return Ok(None);
     }
-    // Pre-scan `annotateHandle` lines to classify which `createHandleFromHeap` handles are UAVs (ResourceProperties
-    // kind & 0x1000 != 0, or kind == 10..=11 / TypedUAV / RawBuffer UAV / StructuredBuffer UAV: bit 12 = 4096 is
-    // `IsUAV` in DXIL `ResourceProperties.Basic.ResourceKind` flags).
+    // Pre-scan `createHandleFromHeap`, `createHandleFromBinding`, and `annotateHandle` lines to classify UAVs and
+    // resolve each handle's source for raw-buffer-load address tracing.
     let mut uav_handles = std::collections::HashSet::<String>::new();
+    let mut handle_origin = std::collections::HashMap::<String, HandleOrigin>::new();
     for line in ir.lines() {
-        if let Some(rest) = line.split_once("@dx.op.annotateHandle(i32 216, %dx.types.Handle ") {
-            let after_handle = rest.1;
-            if let Some((handle_name, tail)) = after_handle.split_once(',') {
-                let handle_name = handle_name.trim();
-                if let Some((_, props_tail)) = tail.split_once("ResourceProperties { i32 ")
-                    && let Some((num_str, _)) = props_tail.split_once(',')
-                    && let Ok(props) = num_str.trim().parse::<u32>()
-                    && (props & 0x1000) != 0
+        if let Some((lhs, rhs)) = line.split_once(" = call %dx.types.Handle @dx.op.createHandleFromHeap(")
+            && let Some((args_str, _)) = rhs.split_once(')')
+        {
+            let parts: Vec<&str> = args_str.split(',').map(str::trim).collect();
+            if parts.len() == 4 && parts[2] == "i1 false" {
+                let idx_expr = parts[1].strip_prefix("i32 ").unwrap_or(parts[1]).trim();
+                handle_origin.insert(
+                    lhs.trim().to_string(),
+                    HandleOrigin::HeapSlot(idx_expr.to_string()),
+                );
+            }
+        } else if let Some((lhs, rhs)) =
+            line.split_once(" = call %dx.types.Handle @dx.op.createHandleFromBinding(")
+            && let Some((_, after_rb)) = rhs.split_once("ResBind {")
+            && let Some((rb_fields, tail)) = after_rb.split_once('}')
+            && let Some((rest_args, _)) = tail.split_once(')')
+        {
+            // ResBind { i32 lower, i32 upper, i32 space, i8 class }, i32 index, i1 nonUniform
+            let rb: Vec<&str> = rb_fields.split(',').map(str::trim).collect();
+            let extra: Vec<&str> = rest_args
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if rb.len() == 4 && extra.len() >= 2 {
+                let space = rb[2]
+                    .strip_prefix("i32 ")
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                let class = rb[3]
+                    .strip_prefix("i8 ")
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                let reg = extra[0]
+                    .strip_prefix("i32 ")
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                if space == Some(0)
+                    && let (Some(c), Some(r)) = (class, reg)
+                    && (c == 0 || c == 1)
+                    && r < RAW_LOAD_ROOT_REGS
                 {
-                    uav_handles.insert(handle_name.to_string());
+                    handle_origin.insert(
+                        lhs.trim().to_string(),
+                        HandleOrigin::Root {
+                            is_uav: c == 1,
+                            reg: r,
+                        },
+                    );
                 }
+            }
+        } else if let Some((lhs, rest)) =
+            line.split_once(" = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle ")
+            && let Some((handle_name, tail)) = rest.split_once(',')
+        {
+            let handle_name = handle_name.trim();
+            if let Some(orig) = handle_origin.get(handle_name).cloned() {
+                handle_origin.insert(lhs.trim().to_string(), orig);
+            }
+            if let Some((_, props_tail)) = tail.split_once("ResourceProperties { i32 ")
+                && let Some((num_str, _)) = props_tail.split_once(',')
+                && let Ok(props) = num_str.trim().parse::<u32>()
+                && (props & 0x1000) != 0
+            {
+                uav_handles.insert(handle_name.to_string());
             }
         }
     }
 
     let half_bytes: u32 = ((max_slots / 32) + 2) * 4;
+    let has_heap_decl = ir.contains("declare %dx.types.Handle @dx.op.createHandleFromHeap(");
     let has_atomic_decl = ir.contains("declare i32 @dx.op.atomicBinOp.i32(");
     let has_annotate_decl = ir.contains("declare %dx.types.Handle @dx.op.annotateHandle(");
-    let mut out = String::with_capacity(ir.len() + 8192);
+    let mut out = String::with_capacity(ir.len() + 16384);
     let mut injected = 0usize;
+    let mut raw_injected = 0usize;
     let mut decl_inserted = false;
 
     for line in ir.lines() {
@@ -285,9 +392,74 @@ pub fn instrument_bindless(code: &[u8], log_slot: u32, max_slots: u32) -> Result
                 );
             }
         }
-        if !decl_inserted && line.starts_with("declare ") && line.contains("@dx.op.createHandleFromHeap(") {
+        // Match: `call %dx.types.ResRet.<ty> @dx.op.rawBufferLoad.<ty>(i32 139, %dx.types.Handle <h>, i32 <byte_off>, i32 undef, ...)`
+        if let Some(base) = raw_base
+            && let Some((_, after_fn)) = line.split_once("@dx.op.rawBufferLoad.")
+            && let Some((_, after_open)) = after_fn.split_once('(')
+            && let Some((args_str, _)) = after_open.split_once(')')
+        {
+            let parts: Vec<&str> = args_str.split(',').map(str::trim).collect();
+            if parts.len() >= 4
+                && parts[0] == "i32 139"
+                && parts[3] == "i32 undef"
+                && let Some(h_name) = parts[1].strip_prefix("%dx.types.Handle ").map(str::trim)
+                && let Some(byte_off) = parts[2].strip_prefix("i32 ").map(str::trim)
+                && let Some(origin) = handle_origin.get(h_name)
+            {
+                let r = raw_injected;
+                raw_injected += 1;
+                let sentinel = base + RAW_LOAD_BUCKETS * (RAW_LOAD_BUCKET_BYTES as u32);
+                use std::fmt::Write;
+                match origin {
+                    HandleOrigin::HeapSlot(idx_expr) => {
+                        let _ = writeln!(
+                            out,
+                            "  %__locum_rb_ok_{r} = icmp ult i32 {idx_expr}, {RAW_LOAD_HEAP_SLOTS}\n\
+                             \x20 %__locum_rb_pg_{r} = lshr i32 {byte_off}, 12\n\
+                             \x20 %__locum_rb_w_{r} = lshr i32 %__locum_rb_pg_{r}, 5\n\
+                             \x20 %__locum_rb_b_{r} = shl i32 %__locum_rb_w_{r}, 2\n\
+                             \x20 %__locum_rb_bk_{r} = shl i32 {idx_expr}, 17\n\
+                             \x20 %__locum_rb_ra_{r} = add i32 %__locum_rb_bk_{r}, %__locum_rb_b_{r}\n\
+                             \x20 %__locum_rb_ra2_{r} = add i32 %__locum_rb_ra_{r}, {base}\n\
+                             \x20 %__locum_rb_off_{r} = select i1 %__locum_rb_ok_{r}, i32 %__locum_rb_ra2_{r}, i32 {sentinel}\n\
+                             \x20 %__locum_rb_sh_{r} = and i32 %__locum_rb_pg_{r}, 31\n\
+                             \x20 %__locum_rb_bit_{r} = shl i32 1, %__locum_rb_sh_{r}\n\
+                             \x20 %__locum_rb_h_{r} = call %dx.types.Handle @dx.op.createHandleFromHeap(i32 218, i32 {log_slot}, i1 false, i1 false)\n\
+                             \x20 %__locum_rb_a_{r} = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle %__locum_rb_h_{r}, %dx.types.ResourceProperties {{ i32 4107, i32 0 }})\n\
+                             \x20 %__locum_rb_old_{r} = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %__locum_rb_a_{r}, i32 2, i32 %__locum_rb_off_{r}, i32 undef, i32 undef, i32 %__locum_rb_bit_{r})"
+                        );
+                    }
+                    HandleOrigin::Root { is_uav, reg } => {
+                        let bucket = if *is_uav {
+                            RAW_LOAD_HEAP_SLOTS + *reg
+                        } else {
+                            RAW_LOAD_HEAP_SLOTS + RAW_LOAD_ROOT_REGS + *reg
+                        };
+                        let bucket_off = base + bucket * (RAW_LOAD_BUCKET_BYTES as u32);
+                        let _ = writeln!(
+                            out,
+                            "  %__locum_rb_pg_{r} = lshr i32 {byte_off}, 12\n\
+                             \x20 %__locum_rb_w_{r} = lshr i32 %__locum_rb_pg_{r}, 5\n\
+                             \x20 %__locum_rb_b_{r} = shl i32 %__locum_rb_w_{r}, 2\n\
+                             \x20 %__locum_rb_off_{r} = add i32 %__locum_rb_b_{r}, {bucket_off}\n\
+                             \x20 %__locum_rb_sh_{r} = and i32 %__locum_rb_pg_{r}, 31\n\
+                             \x20 %__locum_rb_bit_{r} = shl i32 1, %__locum_rb_sh_{r}\n\
+                             \x20 %__locum_rb_h_{r} = call %dx.types.Handle @dx.op.createHandleFromHeap(i32 218, i32 {log_slot}, i1 false, i1 false)\n\
+                             \x20 %__locum_rb_a_{r} = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle %__locum_rb_h_{r}, %dx.types.ResourceProperties {{ i32 4107, i32 0 }})\n\
+                             \x20 %__locum_rb_old_{r} = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %__locum_rb_a_{r}, i32 2, i32 %__locum_rb_off_{r}, i32 undef, i32 undef, i32 %__locum_rb_bit_{r})"
+                        );
+                    }
+                }
+            }
+        }
+        if !decl_inserted && line.starts_with("declare ") {
             out.push_str(line);
             out.push('\n');
+            if !has_heap_decl {
+                out.push_str(
+                    "declare %dx.types.Handle @dx.op.createHandleFromHeap(i32, i32, i1, i1) nounwind readnone\n",
+                );
+            }
             if !has_atomic_decl {
                 out.push_str(
                     "declare i32 @dx.op.atomicBinOp.i32(i32, %dx.types.Handle, i32, i32, i32, i32, i32) nounwind\n",
@@ -305,11 +477,55 @@ pub fn instrument_bindless(code: &[u8], log_slot: u32, max_slots: u32) -> Result
         out.push('\n');
     }
 
-    if injected == 0 {
+    if injected == 0 && raw_injected == 0 {
         return Ok(None);
     }
     let patched = assemble_and_validate(&out)?;
     Ok(Some(patched))
+}
+
+/// Decodes the 48-bucket 4 KiB-page bitmask section starting at `raw_base` into coalesced
+/// `(source, byte_start, byte_end)` ranges.
+pub fn decode_raw_load_log(bytes: &[u8], raw_base: u64) -> Vec<(RawLoadSource, u64, u64)> {
+    let base = raw_base as usize;
+    let bucket_bytes = RAW_LOAD_BUCKET_BYTES as usize;
+    let mut out = Vec::new();
+    for b in 0..RAW_LOAD_BUCKETS {
+        let off = base + (b as usize) * bucket_bytes;
+        let Some(region) = bytes.get(off..off + bucket_bytes) else {
+            break;
+        };
+        let source = if b < RAW_LOAD_HEAP_SLOTS {
+            RawLoadSource::HeapSlot(b)
+        } else if b < RAW_LOAD_HEAP_SLOTS + RAW_LOAD_ROOT_REGS {
+            RawLoadSource::RootUav(b - RAW_LOAD_HEAP_SLOTS)
+        } else {
+            RawLoadSource::RootSrv(b - RAW_LOAD_HEAP_SLOTS - RAW_LOAD_ROOT_REGS)
+        };
+        let mut cur: Option<(u64, u64)> = None;
+        for (word_idx, &chunk) in region.as_chunks::<4>().0.iter().enumerate() {
+            let mut w = u32::from_le_bytes(chunk);
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                let page = (word_idx as u64) * 32 + u64::from(bit);
+                let start = page * 4096;
+                let end = start + 4096;
+                match &mut cur {
+                    Some((_, cur_end)) if *cur_end == start => *cur_end = end,
+                    Some((cur_start, cur_end)) => {
+                        out.push((source, *cur_start, *cur_end));
+                        cur = Some((start, end));
+                    }
+                    None => cur = Some((start, end)),
+                }
+                w &= w - 1;
+            }
+        }
+        if let Some((cur_start, cur_end)) = cur {
+            out.push((source, cur_start, cur_end));
+        }
+    }
+    out
 }
 
 /// Byte size required for the 2-region bindless trace bitmask buffer for a heap of `max_slots` descriptors.
@@ -591,6 +807,26 @@ mod tests {
                 let patched = instrument_bindless(&orig, 999_999, 999_999)
                     .expect(prefix)
                     .expect(prefix);
+                assert!(is_dxil(&patched));
+                let (_, raw_base) = bindless_log_layout(999_999, true);
+                let patched_raw =
+                    instrument_bindless_with_raw_loads(&orig, 999_999, 999_999, Some(raw_base as u32))
+                        .expect("raw load instrument")
+                        .expect("raw load hits");
+                assert!(is_dxil(&patched_raw));
+            }
+            // Also verify 42a6ebb1 (VS with root u0 + bindless rawBufferLoad) validates with raw-load tracing.
+            if let Some(k) = cap.row(
+                "SELECT blob FROM shaders WHERE hash LIKE '42a6ebb1%' LIMIT 1",
+                [],
+                |r| r.get::<_, String>(0),
+            ) {
+                let orig = cap.blob(&k).expect("42a6ebb1");
+                let (_, raw_base) = bindless_log_layout(999_999, true);
+                let patched =
+                    instrument_bindless_with_raw_loads(&orig, 999_999, 999_999, Some(raw_base as u32))
+                        .expect("42a6ebb1 raw")
+                        .expect("42a6ebb1 raw hits");
                 assert!(is_dxil(&patched));
             }
         }

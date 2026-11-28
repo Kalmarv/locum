@@ -332,6 +332,12 @@ impl Memory {
         self.written_before_target = plan.written_before_target.iter().copied().collect();
         self.heap_tiles = None;
         self.touched_tiles.clear();
+        for (&id, tiles) in &plan.extra_tiles {
+            self.touched_tiles
+                .entry(id)
+                .or_default()
+                .extend(tiles.iter().copied());
+        }
         self.shared_content_heaps.clear();
         self.upload_versioned.clear();
 
