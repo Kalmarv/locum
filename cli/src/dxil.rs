@@ -86,6 +86,263 @@ fn buffer(code: &[u8]) -> DxcBuffer {
     }
 }
 
+fn load_dxil_create() -> Result<Create, String> {
+    static CREATE: OnceLock<Result<Create, String>> = OnceLock::new();
+    let create = CREATE
+        .get_or_init(|| {
+            use std::os::windows::ffi::OsStrExt;
+            let load = |path: &std::ffi::OsStr| {
+                let wide: Vec<_> = path.encode_wide().chain(Some(0)).collect();
+                unsafe { LoadLibraryW(PCWSTR(wide.as_ptr())) }.map_err(|e| e.to_string())
+            };
+            let sibling = std::env::var_os("LOCUM_DXCOMPILER")
+                .map(std::path::PathBuf::from)
+                .or_else(sdk_dxcompiler)
+                .map(|p| p.with_file_name("dxil.dll"))
+                .filter(|p| p.is_file());
+            let module = match sibling {
+                Some(path) => load(path.as_os_str()).map_err(|e| format!("load {}: {e}", path.display()))?,
+                None => load("dxil.dll".as_ref()).map_err(|e| format!("no dxil.dll: {e}"))?,
+            };
+            let address = unsafe { GetProcAddress(module, s!("DxcCreateInstance")) }
+                .ok_or("dxil.dll has no DxcCreateInstance")?;
+            Ok(unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Create>(address) })
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+    Ok(*create)
+}
+
+fn create_validator() -> Result<IDxcValidator, String> {
+    let create = load_dxil_create()?;
+    let mut result = std::ptr::null_mut();
+    unsafe { create(&CLSID_DxcValidator, &IDxcValidator::IID, &mut result).ok() }
+        .map_err(|e| format!("DxcValidator: {e}"))?;
+    if result.is_null() {
+        return Err("DxcValidator returned null".into());
+    }
+    Ok(unsafe { IDxcValidator::from_raw(result) })
+}
+
+/// Queries the loaded `IDxcValidator`'s `(major, minor)` version and clamps `!dx.valver` in `ir` when the
+/// original shader was validated by a newer `dxil.dll` (e.g. 1.9 on a machine with SDK 1.7).
+fn clamp_valver(ir: &str, validator: &IDxcValidator) -> String {
+    let (mut maj, mut min) = (0u32, 0u32);
+    if let Ok(info) = validator.cast::<IDxcVersionInfo>()
+        && unsafe { info.GetVersion(&mut maj, &mut min) }.is_ok()
+        && maj > 0
+    {
+        // Find `!dx.valver = !{!<id>}`
+        let node = ir.lines().find_map(|line| {
+            let rest = line.trim().strip_prefix("!dx.valver = !{")?;
+            let id = rest.strip_suffix('}')?.trim();
+            id.starts_with('!').then(|| id.to_string())
+        });
+        if let Some(node) = node {
+            let prefix = format!("{node} = !{{i32 ");
+            let mut changed = false;
+            let mut out = String::with_capacity(ir.len());
+            for line in ir.lines() {
+                if let Some(rest) = line.strip_prefix(&prefix)
+                    && let Some(inner) = rest.strip_suffix('}')
+                    && let Some((a, b)) = inner.split_once(", i32 ")
+                    && let (Ok(smaj), Ok(smin)) = (a.trim().parse::<u32>(), b.trim().parse::<u32>())
+                    && (smaj, smin) > (maj, min)
+                {
+                    out.push_str(&format!("{node} = !{{i32 {maj}, i32 {min}}}\n"));
+                    changed = true;
+                    continue;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            if changed {
+                return out;
+            }
+        }
+    }
+    ir.to_string()
+}
+
+/// Assembles textual DXIL LLVM IR back into a signed DXIL container using `IDxcAssembler` + `IDxcValidator`.
+pub fn assemble_and_validate(ir: &str) -> Result<Vec<u8>, String> {
+    let utils: IDxcUtils = create(&CLSID_DxcUtils)?;
+    let assembler: IDxcAssembler = create(&CLSID_DxcAssembler)?;
+    let validator = create_validator()?;
+    let ir = clamp_valver(ir, &validator);
+    let src_blob: IDxcBlobEncoding =
+        unsafe { utils.CreateBlobFromPinned(ir.as_ptr().cast(), ir.len() as u32, DXC_CP_UTF8) }
+            .map_err(|e| format!("CreateBlobFromPinned: {e}"))?;
+    let asm_res: IDxcOperationResult = unsafe { assembler.AssembleToContainer(&src_blob) }
+        .map_err(|e| format!("AssembleToContainer: {e}"))?;
+    let status = unsafe { asm_res.GetStatus() }.map_err(|e| format!("Assemble status: {e}"))?;
+    if status.is_err() {
+        let msg = unsafe { asm_res.GetErrorBuffer() }
+            .ok()
+            .map(|b| {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+                };
+                String::from_utf8_lossy(bytes).trim_end_matches('\0').to_string()
+            })
+            .unwrap_or_default();
+        return Err(format!("DXIL assemble failed ({status:?}): {msg}"));
+    }
+    let container = unsafe { asm_res.GetResult() }.map_err(|e| format!("Assemble GetResult: {e}"))?;
+    let val_res: IDxcOperationResult =
+        unsafe { validator.Validate(&container, DxcValidatorFlags_InPlaceEdit) }
+            .map_err(|e| format!("Validate: {e}"))?;
+    let vstatus = unsafe { val_res.GetStatus() }.map_err(|e| format!("Validate status: {e}"))?;
+    if vstatus.is_err() {
+        let msg = unsafe { val_res.GetErrorBuffer() }
+            .ok()
+            .map(|b| {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(b.GetBufferPointer().cast::<u8>(), b.GetBufferSize())
+                };
+                String::from_utf8_lossy(bytes).trim_end_matches('\0').to_string()
+            })
+            .unwrap_or_default();
+        return Err(format!("DXIL validate failed ({vstatus:?}): {msg}"));
+    }
+    let signed = unsafe { val_res.GetResult() }.ok().unwrap_or(container);
+    let bytes =
+        unsafe { std::slice::from_raw_parts(signed.GetBufferPointer().cast::<u8>(), signed.GetBufferSize()) };
+    Ok(bytes.to_vec())
+}
+
+/// Instruments a SM 6.6+ DXIL shader so every dynamic `dx.op.createHandleFromHeap(..., i1 false, ...)`
+/// (CBV/SRV/UAV `ResourceDescriptorHeap` access) atomically sets a bit in a 2-region bitmask `RWByteAddressBuffer`
+/// bound at `ResourceDescriptorHeap[log_slot]`:
+/// - bytes `0..half_bytes`: slots read (SRV/CBV/unknown)
+/// - bytes `half_bytes..2*half_bytes`: slots written/accessed as UAV (`ResourceProperties` bit `0x1000`)
+///
+/// Here `half_bytes = ((max_slots / 32) + 2) * 4` (extra sentinel word at index `max_slots` avoids branches).
+///
+/// Returns `Ok(None)` if the shader has no `ResourceDescriptorHeap` `createHandleFromHeap` calls.
+pub fn instrument_bindless(code: &[u8], log_slot: u32, max_slots: u32) -> Result<Option<Vec<u8>>, String> {
+    if !is_dxil(code) {
+        return Ok(None);
+    }
+    let ir = disassemble(code)?;
+    if !ir.contains("@dx.op.createHandleFromHeap(") {
+        return Ok(None);
+    }
+    // Pre-scan `annotateHandle` lines to classify which `createHandleFromHeap` handles are UAVs (ResourceProperties
+    // kind & 0x1000 != 0, or kind == 10..=11 / TypedUAV / RawBuffer UAV / StructuredBuffer UAV: bit 12 = 4096 is
+    // `IsUAV` in DXIL `ResourceProperties.Basic.ResourceKind` flags).
+    let mut uav_handles = std::collections::HashSet::<String>::new();
+    for line in ir.lines() {
+        if let Some(rest) = line.split_once("@dx.op.annotateHandle(i32 216, %dx.types.Handle ") {
+            let after_handle = rest.1;
+            if let Some((handle_name, tail)) = after_handle.split_once(',') {
+                let handle_name = handle_name.trim();
+                if let Some((_, props_tail)) = tail.split_once("ResourceProperties { i32 ")
+                    && let Some((num_str, _)) = props_tail.split_once(',')
+                    && let Ok(props) = num_str.trim().parse::<u32>()
+                    && (props & 0x1000) != 0
+                {
+                    uav_handles.insert(handle_name.to_string());
+                }
+            }
+        }
+    }
+
+    let half_bytes: u32 = ((max_slots / 32) + 2) * 4;
+    let has_atomic_decl = ir.contains("declare i32 @dx.op.atomicBinOp.i32(");
+    let has_annotate_decl = ir.contains("declare %dx.types.Handle @dx.op.annotateHandle(");
+    let mut out = String::with_capacity(ir.len() + 8192);
+    let mut injected = 0usize;
+    let mut decl_inserted = false;
+
+    for line in ir.lines() {
+        // Match: `<indent>%<res> = call %dx.types.Handle @dx.op.createHandleFromHeap(i32 218, i32 <idx>, i1 false, ...)`
+        if let Some((lhs, rhs)) = line.split_once(" = call %dx.types.Handle @dx.op.createHandleFromHeap(")
+            && let Some((args_str, _)) = rhs.split_once(')')
+        {
+            let parts: Vec<&str> = args_str.split(',').map(str::trim).collect();
+            if parts.len() == 4 && parts[2] == "i1 false" {
+                let res_name = lhs.trim();
+                let idx_expr = parts[1].strip_prefix("i32 ").unwrap_or(parts[1]).trim();
+                let is_uav = uav_handles.contains(res_name);
+                let region_off = if is_uav { half_bytes } else { 0 };
+                let k = injected;
+                injected += 1;
+                // All inserted SSA values are named (`%__locum_*`) so existing unnamed `%N` numbering is untouched.
+                use std::fmt::Write;
+                let _ = writeln!(
+                    out,
+                    "  %__locum_ok_{k} = icmp ult i32 {idx_expr}, {max_slots}\n\
+                     \x20 %__locum_idx_{k} = select i1 %__locum_ok_{k}, i32 {idx_expr}, i32 {max_slots}\n\
+                     \x20 %__locum_w_{k} = lshr i32 %__locum_idx_{k}, 5\n\
+                     \x20 %__locum_b_{k} = shl i32 %__locum_w_{k}, 2\n\
+                     \x20 %__locum_off_{k} = add i32 %__locum_b_{k}, {region_off}\n\
+                     \x20 %__locum_sh_{k} = and i32 %__locum_idx_{k}, 31\n\
+                     \x20 %__locum_bit_{k} = shl i32 1, %__locum_sh_{k}\n\
+                     \x20 %__locum_h_{k} = call %dx.types.Handle @dx.op.createHandleFromHeap(i32 218, i32 {log_slot}, i1 false, i1 false)\n\
+                     \x20 %__locum_a_{k} = call %dx.types.Handle @dx.op.annotateHandle(i32 216, %dx.types.Handle %__locum_h_{k}, %dx.types.ResourceProperties {{ i32 4107, i32 0 }})\n\
+                     \x20 %__locum_old_{k} = call i32 @dx.op.atomicBinOp.i32(i32 78, %dx.types.Handle %__locum_a_{k}, i32 2, i32 %__locum_off_{k}, i32 undef, i32 undef, i32 %__locum_bit_{k})"
+                );
+            }
+        }
+        if !decl_inserted && line.starts_with("declare ") && line.contains("@dx.op.createHandleFromHeap(") {
+            out.push_str(line);
+            out.push('\n');
+            if !has_atomic_decl {
+                out.push_str(
+                    "declare i32 @dx.op.atomicBinOp.i32(i32, %dx.types.Handle, i32, i32, i32, i32, i32) nounwind\n",
+                );
+            }
+            if !has_annotate_decl {
+                out.push_str(
+                    "declare %dx.types.Handle @dx.op.annotateHandle(i32, %dx.types.Handle, %dx.types.ResourceProperties) nounwind readnone\n",
+                );
+            }
+            decl_inserted = true;
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    if injected == 0 {
+        return Ok(None);
+    }
+    let patched = assemble_and_validate(&out)?;
+    Ok(Some(patched))
+}
+
+/// Byte size required for the 2-region bindless trace bitmask buffer for a heap of `max_slots` descriptors.
+pub fn bindless_log_bytes(max_slots: u32) -> u64 {
+    let half_bytes: u64 = ((u64::from(max_slots) / 32) + 2) * 4;
+    half_bytes * 2
+}
+
+/// Decodes a bindless trace bitmask buffer read back from the GPU into sorted `(slot, is_write)` pairs.
+pub fn decode_bindless_log(bytes: &[u8], max_slots: u32) -> Vec<(u32, bool)> {
+    let half_bytes = (((max_slots / 32) + 2) * 4) as usize;
+    let mut out = Vec::new();
+    for (is_write, region) in [
+        (false, bytes.get(..half_bytes).unwrap_or(&[])),
+        (true, bytes.get(half_bytes..half_bytes * 2).unwrap_or(&[])),
+    ] {
+        for (word_idx, &chunk) in region.as_chunks::<4>().0.iter().enumerate() {
+            let mut w = u32::from_le_bytes(chunk);
+            while w != 0 {
+                let bit = w.trailing_zeros();
+                let slot = (word_idx as u32) * 32 + bit;
+                if slot < max_slots {
+                    out.push((slot, is_write));
+                }
+                w &= w - 1;
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 pub fn is_dxil(code: &[u8]) -> bool {
     dxcontainer::chunks(code).is_ok_and(|chunks| chunks.iter().any(|c| &c.kind == b"DXIL"))
 }
@@ -273,4 +530,69 @@ pub fn lift(code: &[u8]) -> Result<iridia_ir::Program, String> {
 /// Readable WGSL of a DXIL or DXBC program from iridia's IR, in naga's dialect: resources keep their D3D registers.
 pub fn wgsl(code: &[u8]) -> Result<String, String> {
     iridia_naga::wgsl(&lift(code)?, &iridia_naga::Profile::NAGA).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instrument_bindless_round_trips_sm66_shader() {
+        let src = r#"
+            cbuffer Params : register(b0) { uint srvIdx; uint uavIdx; };
+            [numthreads(1,1,1)]
+            void main() {
+                ByteAddressBuffer s = ResourceDescriptorHeap[srvIdx];
+                RWByteAddressBuffer u = ResourceDescriptorHeap[uavIdx];
+                u.Store(0, s.Load(0) + 1);
+            }
+        "#;
+        let compiled = compile(src, "cs_6_6").expect("compile cs_6_6");
+        let patched = instrument_bindless(&compiled, 1024, 1024)
+            .expect("instrument_bindless")
+            .expect("shader uses ResourceDescriptorHeap");
+        assert!(is_dxil(&patched));
+        let dis = disassemble(&patched).expect("disassemble patched");
+        assert!(dis.contains("@dx.op.atomicBinOp.i32"), "{dis}");
+        // Verify bitmask decoder round-trip.
+        let mut buf = vec![0u8; bindless_log_bytes(1024) as usize];
+        let half = (((1024u32 / 32) + 2) * 4) as usize;
+        buf[0] = 1 << 5; // read slot 5
+        buf[half + 4] = 1 << 3; // write slot 35
+        assert_eq!(decode_bindless_log(&buf, 1024), vec![(5, false), (35, true)]);
+
+        // Also test against the real P1LEVEL 67-sampleLevel CS 4fa9c207 if present on this machine.
+        let p1 = std::path::Path::new(
+            r"C:\Users\kalmarv\modding\.targets\xcl-sky-captures\P1LEVEL\captures\depth-plane\capture.db",
+        );
+        if p1.is_file() {
+            let cap = crate::open::open(&p1.to_string_lossy(), None).expect("open P1LEVEL");
+            let key: String = cap
+                .row(
+                    "SELECT blob FROM shaders WHERE hash LIKE '4fa9c207%' LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("4fa9c207 in P1LEVEL");
+            let code = cap.blob(&key).expect("4fa9c207 blob");
+            let patched = instrument_bindless(&code, 1_000_000, 1_000_000)
+                .expect("instrument P1LEVEL 4fa9c207")
+                .expect("4fa9c207 uses ResourceDescriptorHeap");
+            assert!(is_dxil(&patched));
+            for prefix in ["5b12b481", "28ac858f"] {
+                let k: String = cap
+                    .row(
+                        &format!("SELECT blob FROM shaders WHERE hash LIKE '{prefix}%' LIMIT 1"),
+                        [],
+                        |r| r.get(0),
+                    )
+                    .expect(prefix);
+                let orig = cap.blob(&k).expect(prefix);
+                let patched = instrument_bindless(&orig, 999_999, 999_999)
+                    .expect(prefix)
+                    .expect(prefix);
+                assert!(is_dxil(&patched));
+            }
+        }
+    }
 }

@@ -192,8 +192,9 @@ pub fn named(
     }
 
     // Resources that have captured contents (or tile events / AS builds) are worth materializing for bindless access.
-    // Heap-only resources with no contents and not written by any planned event are left null (reads 0, same as empty).
-    let with_content: HashSet<i64> = c
+    // Any resource explicitly recorded in `d12_bindless_usage` for a planned event is ALSO materialized even when its
+    // initial contents are missing in the capture (e.g. unmapped reserved textures under bindless SRVs).
+    let mut with_content: HashSet<i64> = c
         .rows(
             "SELECT id FROM resources WHERE content IS NOT NULL \
              OR coalesce(content_source, '') IN ('tile-events', 'acceleration-structure-builds')",
@@ -202,6 +203,18 @@ pub fn named(
         )
         .into_iter()
         .collect();
+    if c.has_table("d12_bindless_usage") {
+        for (ev, res) in c.rows(
+            "SELECT event, resource FROM d12_bindless_usage WHERE resource IS NOT NULL AND resource > 0",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        ) {
+            if events.contains(&ev) {
+                with_content.insert(res);
+                result.resources.insert(res);
+            }
+        }
+    }
 
     // Each submission's descriptors are the changes it brought: the heaps' slots as each wanted one found them.
     let order: Vec<i64> = c.rows("SELECT id FROM d12_submissions ORDER BY cpu_seq, id", [], |r| {

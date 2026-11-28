@@ -28,6 +28,12 @@ use crate::out;
 pub trait Backend {
     /// Called before resource creation with the replay plan so backends can scope caches and shared heaps.
     fn prepare(&mut self, _c: &Capture, _plan: &Plan) {}
+    /// Enables runtime GPU/WARP bindless `ResourceDescriptorHeap` slot tracing (D3D12 SM 6.6+).
+    fn enable_bindless_trace(&mut self) {}
+    /// Takes collected runtime bindless hits: `(draw, event, heap, slot, is_write)`.
+    fn take_bindless_trace(&mut self) -> Vec<(i64, i64, i64, u32, bool)> {
+        Vec::new()
+    }
     /// Makes resource `id` as the capture describes it, holding `contents` (the canonical layout) if given.
     fn create(&mut self, c: &Capture, id: i64, contents: Option<&[u8]>) -> Result<(), String>;
     /// Makes resource `id` from blob `key` in `c.blobs` (or empty if `None`), allowing streaming without
@@ -1493,6 +1499,172 @@ pub struct Options {
     pub out: PathBuf,
     pub range: Range,
     pub strict_self_check: bool,
+    pub trace_bindless: bool,
+    pub include_bindless: Vec<String>,
+}
+
+/// Runs a DXIL-instrumented runtime trace of `plan` to discover every `ResourceDescriptorHeap` slot
+/// dynamically accessed by shaders on the GPU/WARP, resolving each `(heap, slot)` at the event's submission
+/// into `(kind, resource)` rows ready for `d12_bindless_usage`.
+pub fn trace_bindless(
+    c: &Capture,
+    plan: &Plan,
+    warp: bool,
+    validation: Validation,
+) -> Result<(Vec<locum_capture::d3d12::BindlessUsage>, Vec<String>), String> {
+    if c.meta("api").as_deref() != Some("d3d12") {
+        return Err("bindless runtime tracing is only supported for Direct3D 12 captures".into());
+    }
+    let mut b = backend(c, warp, validation)?;
+    b.enable_bindless_trace();
+    b.prepare(c, plan);
+    for &id in &plan.resources {
+        let key: Option<String> = c
+            .row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))
+            .flatten();
+        b.create_blob(c, id, key.as_deref())
+            .map_err(|e| format!("resource #{id}: {e}"))?;
+    }
+    for &seq in &plan.events {
+        b.run(c, seq, &[]).map_err(|e| format!("event {seq}: {e}"))?;
+    }
+    let raw_hits = b.take_bindless_trace();
+    let mut warnings = b.warnings();
+    warnings.extend(b.notes());
+    warnings.extend(b.validation());
+
+    // Resolve each `(event, heap, slot)` to the descriptor version active at that event's submission.
+    let order: Vec<i64> = c.rows("SELECT id FROM d12_submissions ORDER BY cpu_seq, id", [], |r| {
+        r.get(0)
+    });
+    let ev_sub: HashMap<i64, i64> = c
+        .rows(
+            "SELECT l.event, x.submission FROM d12_event_locations l JOIN d12_executions x ON x.id = l.execution",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .into_iter()
+        .collect();
+    type RawHit = (i64, i64, i64, u32, bool);
+    let mut by_sub: BTreeMap<usize, Vec<RawHit>> = BTreeMap::new();
+    let sub_pos: HashMap<i64, usize> = order.iter().enumerate().map(|(i, &s)| (s, i)).collect();
+    let mut needed_heaps: HashSet<i64> = HashSet::new();
+    for hit in raw_hits {
+        needed_heaps.insert(hit.2);
+        if let Some(&sub) = ev_sub.get(&hit.1)
+            && let Some(&pos) = sub_pos.get(&sub)
+        {
+            by_sub.entry(pos).or_default().push(hit);
+        }
+    }
+    let max_pos = by_sub.keys().next_back().copied().unwrap_or(0);
+    let mut slots: HashMap<(i64, u32), (String, i64)> = HashMap::new();
+    let mut seen: HashSet<(i64, i64, u32, &'static str)> = HashSet::new();
+    let mut resolved = Vec::new();
+    if !by_sub.is_empty() {
+        for (pos, &sub) in order.iter().enumerate().take(max_pos + 1) {
+            for (heap, slot, kind, resource) in c.rows(
+                "SELECT v.heap, v.slot, v.kind, v.resource FROM d12_submission_descriptors d \
+                 JOIN d12_descriptor_versions v ON v.id = d.version WHERE d.submission = ?1 ORDER BY v.id",
+                [sub],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)? as u32,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                    ))
+                },
+            ) {
+                if !needed_heaps.contains(&heap) {
+                    continue;
+                }
+                if kind == "empty" {
+                    slots.remove(&(heap, slot));
+                } else {
+                    slots.insert((heap, slot), (kind, resource));
+                }
+            }
+            if let Some(hits) = by_sub.get(&pos) {
+                for &(draw, event, heap, slot, is_write) in hits {
+                    let (kind, resource) = slots
+                        .get(&(heap, slot))
+                        .cloned()
+                        .unwrap_or_else(|| ("unknown".into(), 0));
+                    let access = if is_write || kind == "uav" {
+                        "write"
+                    } else {
+                        "read"
+                    };
+                    if seen.insert((draw, heap, slot, access)) {
+                        resolved.push(locum_capture::d3d12::BindlessUsage {
+                            draw: draw as u64,
+                            event: event as u64,
+                            heap: heap as u64,
+                            slot,
+                            kind,
+                            resource: resource.max(0) as u64,
+                            access,
+                            source: "gpu-trace",
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok((resolved, warnings))
+}
+
+/// Resolves `--include-bindless <SPEC>` items (`res:1,2,3` or `slots:10,20..30`) into resource IDs to force into
+/// `plan.resources` even when `content IS NULL`.
+fn resolve_include_bindless(c: &Capture, specs: &[String]) -> Result<BTreeSet<i64>, String> {
+    let mut out = BTreeSet::new();
+    for spec in specs {
+        if let Some(rest) = spec.strip_prefix("res:") {
+            for tok in rest.split(',').filter(|s| !s.is_empty()) {
+                let id: i64 = tok
+                    .strip_prefix('#')
+                    .unwrap_or(tok)
+                    .parse()
+                    .map_err(|_| format!("--include-bindless {spec:?}: invalid resource id {tok:?}"))?;
+                out.insert(id);
+            }
+        } else if let Some(rest) = spec.strip_prefix("slots:") {
+            let mut want_slots = BTreeSet::new();
+            for tok in rest.split(',').filter(|s| !s.is_empty()) {
+                if let Some((a, b)) = tok.split_once("..") {
+                    let lo: i64 = a
+                        .parse()
+                        .map_err(|_| format!("--include-bindless {spec:?}: bad range {tok:?}"))?;
+                    let hi: i64 = b
+                        .parse()
+                        .map_err(|_| format!("--include-bindless {spec:?}: bad range {tok:?}"))?;
+                    for s in lo..=hi {
+                        want_slots.insert(s);
+                    }
+                } else {
+                    let s: i64 = tok
+                        .parse()
+                        .map_err(|_| format!("--include-bindless {spec:?}: invalid slot {tok:?}"))?;
+                    want_slots.insert(s);
+                }
+            }
+            for (slot, res) in c.rows(
+                "SELECT slot, resource FROM d12_descriptor_versions WHERE resource IS NOT NULL AND resource > 0",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            ) {
+                if want_slots.contains(&slot) {
+                    out.insert(res);
+                }
+            }
+        } else {
+            return Err(format!(
+                "--include-bindless {spec:?}: expected `res:ID,...` or `slots:S,A..B,...`"
+            ));
+        }
+    }
+    Ok(out)
 }
 
 /// Outcome of validating the unmodified baseline replay against the capture's saved RT/depth pixels.
@@ -1611,6 +1783,40 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         .map(|s| parse_readback(c, s))
         .collect::<Result<_, _>>()?;
     let mut plan = plan_scoped(c, target, o.mode, o.from_event, o.only_list);
+    if !o.include_bindless.is_empty() {
+        let extra = resolve_include_bindless(c, &o.include_bindless)?;
+        if !extra.is_empty() {
+            out!(
+                "  include-bindless: added {} resource(s) to replay plan",
+                extra.len()
+            );
+            plan.resources.extend(extra);
+        }
+    }
+    if o.trace_bindless {
+        let t_trace = std::time::Instant::now();
+        let (traced, trace_warnings) = trace_bindless(c, &plan, o.warp, Validation::Off)?;
+        let mut added = 0usize;
+        for u in &traced {
+            if u.resource > 0 && plan.resources.insert(u.resource as i64) {
+                added += 1;
+            }
+        }
+        out!(
+            "  bindless trace: {} hit(s) across {} unique slot(s) in {:.2} s -> added {} resource(s) to replay plan",
+            traced.len(),
+            traced
+                .iter()
+                .map(|u| (u.heap, u.slot))
+                .collect::<BTreeSet<_>>()
+                .len(),
+            t_trace.elapsed().as_secs_f64(),
+            added
+        );
+        for w in trace_warnings {
+            out!("  trace warning: {w}");
+        }
+    }
     // Ensure any resources referenced by replay state/API rules or explicit readbacks are created.
     for rule in &parsed {
         for r in rule.referenced_resources() {

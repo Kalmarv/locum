@@ -2962,6 +2962,34 @@ pub fn parse_annotations_jsonl(text: &str) -> Vec<Annotation> {
     out
 }
 
+/// Appends bindless usage rows into `d12_bindless_usage` of an existing capture database (creating the table if
+/// absent). Uses `INSERT OR REPLACE` so re-running a runtime GPU trace updates any prior heuristic rows.
+pub fn append_bindless_usage(db_path: &std::path::Path, rows: &[BindlessUsage]) -> rusqlite::Result<()> {
+    let mut conn = rusqlite::Connection::open(db_path)?;
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS d12_bindless_usage(draw INTEGER NOT NULL,event INTEGER NOT NULL,\
+         heap INTEGER NOT NULL,slot INTEGER NOT NULL,kind TEXT NOT NULL,resource INTEGER NOT NULL,\
+         access TEXT NOT NULL,source TEXT NOT NULL,PRIMARY KEY(draw,heap,slot,access));",
+    )?;
+    for u in rows {
+        tx.execute(
+            "INSERT OR REPLACE INTO d12_bindless_usage VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![
+                integer(u.draw)?,
+                integer(u.event)?,
+                integer(u.heap)?,
+                u.slot,
+                u.kind,
+                integer(u.resource)?,
+                u.access,
+                u.source
+            ],
+        )?;
+    }
+    tx.commit()
+}
+
 /// Appends annotations into `d12_annotations` of an existing capture database (creating the table if absent).
 pub fn append_annotations(db_path: &std::path::Path, rows: &[Annotation]) -> rusqlite::Result<()> {
     let mut conn = rusqlite::Connection::open(db_path)?;

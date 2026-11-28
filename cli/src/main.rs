@@ -808,11 +808,43 @@ struct ReplayArgs {
     /// capture's saved RT/depth target pixels (or if no saved target exists for this draw).
     #[arg(long)]
     strict_self_check: bool,
+    /// Two-pass replay: first run a DXIL-instrumented runtime trace to discover every `ResourceDescriptorHeap` slot
+    /// dynamically read/written by the planned draws/dispatches, materialize those resources (even if uncaptured),
+    /// and then execute the replay (e.g. with `--rule "map all-unmapped"`).
+    #[arg(long)]
+    trace_bindless: bool,
+    /// Force specific bindless heap resources or slots into the replay plan even if uncaptured:
+    /// `res:ID,ID,...` or `slots:S,A..B,...` (may be repeated).
+    #[arg(long)]
+    include_bindless: Vec<String>,
 }
 
 #[derive(clap::Args)]
 struct BindlessArgs {
     capture: String,
+    /// Run a live GPU/WARP DXIL-instrumented runtime trace for draw `<DRAW>` (`N`, `last`, or `presented`) to
+    /// discover every `ResourceDescriptorHeap` slot dynamically read/written via `createHandleFromHeap`.
+    #[arg(long)]
+    trace: Option<String>,
+    /// Replay plan mode for `--trace`: `slice` (default), `frame`, or `draw`.
+    #[arg(long, default_value = "slice")]
+    mode: String,
+    /// Restrict `--trace` events to `seq >= FROM_EVENT`.
+    #[arg(long)]
+    from_event: Option<i64>,
+    /// Restrict `--trace` events to command list `ONLY_LIST` (plus the target draw).
+    #[arg(long)]
+    only_list: Option<i64>,
+    /// Run `--trace` on WARP instead of the GPU.
+    #[arg(long)]
+    warp: bool,
+    /// Enable the D3D12 debug layer during `--trace`.
+    #[arg(long)]
+    debug: bool,
+    /// Persist `--trace` results into the capture's `d12_bindless_usage` table so subsequent `replay` calls
+    /// automatically materialize the discovered bindless resources.
+    #[arg(long)]
+    write_db: bool,
     /// Filter to a specific draw number.
     #[arg(long)]
     draw: Option<i64>,
@@ -1315,6 +1347,8 @@ fn run(cli: Cli) -> Result<(), String> {
                 range: r,
                 times,
                 strict_self_check,
+                trace_bindless,
+                include_bindless,
             } = *a;
             if let Some(t) = times {
                 replay::time_to(t);
@@ -1348,6 +1382,8 @@ fn run(cli: Cli) -> Result<(), String> {
                     out,
                     range: range(&r)?,
                     strict_self_check,
+                    trace_bindless,
+                    include_bindless,
                 },
             )
         }
@@ -1503,14 +1539,97 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Bindless(a) => {
             let BindlessArgs {
                 capture,
+                trace,
+                mode,
+                from_event,
+                only_list,
+                warp,
+                debug,
+                write_db,
                 draw,
                 resource,
                 access,
                 json,
             } = *a;
             let c = open(&capture)?;
+            if let Some(target_draw) = trace {
+                let mode = replay::Mode::parse(&mode)
+                    .ok_or_else(|| format!("--mode {mode}: expected slice, frame or draw"))?;
+                let draw_n = replay::draw_number(&c, &target_draw)?;
+                let target_seq: i64 = c
+                    .row("SELECT event FROM draws WHERE n = ?1", [draw_n], |r| r.get(0))
+                    .ok_or_else(|| format!("no draw {draw_n}"))?;
+                let plan = replay::plan_scoped(&c, target_seq, mode, from_event, only_list);
+                let validation = if debug {
+                    replay::Validation::Gpu
+                } else {
+                    replay::Validation::Off
+                };
+                let (rows, warnings) = replay::trace_bindless(&c, &plan, warp, validation)?;
+                for w in &warnings {
+                    eprintln!("warning: {w}");
+                }
+                if write_db {
+                    locum_capture::d3d12::append_bindless_usage(&c.path, &rows)
+                        .map_err(|e| format!("append_bindless_usage: {e}"))?;
+                    eprintln!(
+                        "wrote {} bindless usage row(s) into {}",
+                        rows.len(),
+                        c.path.display()
+                    );
+                }
+                for u in rows {
+                    if let Some(fd) = draw
+                        && u.draw as i64 != fd
+                    {
+                        continue;
+                    }
+                    if let Some(fr) = resource
+                        && u.resource as i64 != fr
+                    {
+                        continue;
+                    }
+                    if let Some(fa) = &access
+                        && u.access != fa
+                    {
+                        continue;
+                    }
+                    if json {
+                        out!(
+                            "{}",
+                            serde_json::json!({
+                                "draw": u.draw,
+                                "event": u.event,
+                                "heap": u.heap,
+                                "slot": u.slot,
+                                "kind": u.kind,
+                                "resource": u.resource,
+                                "access": u.access,
+                                "source": u.source
+                            })
+                        );
+                    } else {
+                        out!(
+                            "draw {}\tevent {}\theap #{}[{}]\t{}\t#{}\t{}\t{}",
+                            u.draw,
+                            u.event,
+                            u.heap,
+                            u.slot,
+                            u.kind,
+                            u.resource,
+                            u.access,
+                            u.source
+                        );
+                    }
+                }
+                return Ok(());
+            }
             if !c.has_table("d12_bindless_usage") {
-                return Err("capture has no d12_bindless_usage table".into());
+                return Err(
+                    "capture has no d12_bindless_usage table (run with `--trace <draw> --write-db` to discover \
+                     runtime bindless slots on this capture)"
+                        .into(),
+                );
             }
             type BindlessRow = (i64, i64, i64, i64, String, i64, String, String);
             let rows: Vec<BindlessRow> = c.rows(
