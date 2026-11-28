@@ -417,6 +417,24 @@ pub fn counts() -> (usize, usize, usize) {
     })
 }
 
+/// Returns `(max_version, initialized_slots)` across the given descriptor heap ids as of this moment.
+pub fn heap_versions(heaps: &[u64]) -> (u64, usize) {
+    read(|index| {
+        let mut max_ver = 0u64;
+        let mut init = 0usize;
+        for &id in heaps {
+            let Some(heap) = index.heaps.get(&id) else {
+                continue;
+            };
+            init += heap.initialized.load(Ordering::Relaxed);
+            for entry in heap.slots.iter() {
+                max_ver = max_ver.max(entry.version.load(Ordering::Acquire));
+            }
+        }
+        (max_ver, init)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::descriptors::Description;

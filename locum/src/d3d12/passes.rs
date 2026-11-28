@@ -78,10 +78,6 @@ pub fn recorded() -> u64 {
 /// Readback memory the live copies hold, and the most they may.
 static BYTES: AtomicU64 = AtomicU64::new(0);
 const BUDGET: u64 = 3 << 30;
-/// What outputs may hold of it: the rest is kept for pass-end targets.
-const OUTPUT_BUDGET: u64 = 2 << 30;
-/// The most one output's copy may be.
-const OUTPUT_BYTES: u64 = 64 << 20;
 const RENDER_TARGET: i32 = 0x4;
 const DEPTH_WRITE: i32 = 0x10;
 const ALL_SUBRESOURCES: u64 = 0xFFFF_FFFF;
@@ -1443,8 +1439,9 @@ impl Pass {
     /// records it may run and its count are copied.
     unsafe fn copy_arguments(&mut self, list: &ID3D12GraphicsCommandList, a: &Value, at: usize) {
         let u = |i: usize| a[i].as_u64().unwrap_or(0);
+        let capture_all = super::select::capture_indirect_args();
         let layout = match signatures().get(&u(0)) {
-            Some(Ok(l)) if l.addresses.is_empty() => return,
+            Some(Ok(l)) if l.addresses.is_empty() && !capture_all => return,
             Some(Ok(l)) => Ok(l.clone()),
             Some(Err(why)) => Err(format!("its command signature has {why}")),
             None => Err("locum did not see its command signature made".to_string()),
@@ -1453,6 +1450,12 @@ impl Pass {
         let mut arguments = model::Arguments {
             id,
             command: at,
+            signature: u(0),
+            max_count: u(1),
+            arg_buffer: u(2),
+            arg_offset: u(3),
+            count_buffer: u(4),
+            count_offset: u(5),
             counted: u(4) != 0,
             ..Default::default()
         };
@@ -1994,13 +1997,14 @@ unsafe fn output_into(
 ) -> Result<Readback, String> {
     let buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
     let (offset, _) = range.unwrap_or_default();
+    let max_output = super::select::output_cap();
     let (layout, footprints, bytes) = if buffer {
         let bytes = range.map_or(desc.Width, |(_, bytes)| bytes);
-        if bytes > OUTPUT_BYTES {
+        if bytes > max_output {
             return Err(format!(
                 "{} MiB of a buffer through its view, more than one output's {} MiB",
                 bytes >> 20,
-                OUTPUT_BYTES >> 20
+                max_output >> 20
             ));
         }
         (locum_capture::layout::buffer_of(bytes), Vec::new(), bytes)
@@ -2024,11 +2028,11 @@ unsafe fn output_into(
         )
         .ok_or_else(|| format!("format {format} has no canonical layout"))?;
         let size = locum_capture::layout::total(&layout);
-        if size > OUTPUT_BYTES {
+        if size > max_output {
             return Err(format!(
                 "a subresource of {} MiB, more than one output's {} MiB",
                 size >> 20,
-                OUTPUT_BYTES >> 20
+                max_output >> 20
             ));
         }
         let (mut f, mut rows, mut row_bytes) = (D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(), 0u32, 0u64);
@@ -2063,7 +2067,7 @@ unsafe fn output_into(
         barriers(real, &subs, false, written)?,
     );
     to_copy.possible(list)?;
-    let readback = unsafe { readback_buffer(device, bytes, OUTPUT_BUDGET) }?;
+    let readback = unsafe { readback_buffer(device, bytes, super::select::output_budget()) }?;
     unsafe {
         if predicate.is_some() {
             list.SetPredication(None, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
@@ -2114,16 +2118,17 @@ unsafe fn ranges_into(
     predicate: Option<(super::Real<ID3D12Resource>, u64, i32)>,
 ) -> Result<(Readback, Vec<u64>), String> {
     let bytes: u64 = ranges.iter().map(|r| r.bytes).sum();
-    if bytes > OUTPUT_BYTES {
+    let max_output = super::select::output_cap();
+    if bytes > max_output {
         return Err(format!(
             "{} MiB of records, more than one copy's {} MiB",
             bytes >> 20,
-            OUTPUT_BYTES >> 20
+            max_output >> 20
         ));
     }
     // Made first: dropped, it gives its bytes back to the budget.
     let made = Readback {
-        readback: unsafe { readback_buffer(device, bytes, OUTPUT_BUDGET) }?,
+        readback: unsafe { readback_buffer(device, bytes, super::select::output_budget()) }?,
         footprints: Vec::new(),
         layout: locum_capture::layout::buffer(bytes as u32),
         joined: None,

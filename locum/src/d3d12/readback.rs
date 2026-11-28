@@ -37,6 +37,8 @@ pub struct Copy {
     pub offset: u64,
     pub len: u64,
     pub whole: bool,
+    /// When true (selected complete pass), never silently drop this copy on `readback_budget` timeout.
+    pub guaranteed: bool,
 }
 
 /// A resource to copy whole, as the submission about to use it first will find it.
@@ -57,6 +59,11 @@ pub struct Snapshot {
     pub mapped_tiles: Option<Vec<u32>>,
     /// How the copy may differ from the contents the frame began with.
     pub note: Option<String>,
+    /// When true (selected complete pass), never silently drop this snapshot on `readback_budget` timeout.
+    pub guaranteed: bool,
+    /// When `Some((cpu_seq, pages_json))`, this is a post-remap resident-tile snapshot routed to `d12_tile_snapshots`
+    /// rather than overwriting `d12_first_use`.
+    pub tile_snapshot: Option<(u64, Option<String>)>,
 }
 
 /// What one chunk of a submission's copies gave.
@@ -65,6 +72,8 @@ pub struct Batch {
     pub submission: u64,
     pub uploads: Vec<(u64, Value)>,
     pub contents: Vec<(u64, FirstUse)>,
+    /// Post-remap resident tile snapshots for selected passes.
+    pub tile_snapshots: Vec<locum_capture::d3d12::TileSnapshot>,
     /// Pass-end checkpoints read back (see [`super::passes`]).
     pub checkpoints: Vec<(u64, Result<String, String>)>,
     /// Checkpoints whose pass the next list continued.
@@ -114,6 +123,16 @@ enum Item {
         offset: u64,
         index: usize,
     },
+}
+
+impl Item {
+    fn guaranteed(&self) -> bool {
+        match self {
+            Item::Upload { copy, .. } => copy.guaranteed,
+            Item::Contents { snapshot, .. } => snapshot.guaranteed,
+            Item::Piece { snapshot, .. } => snapshot.guaranteed,
+        }
+    }
 }
 
 struct Placed {
@@ -218,7 +237,7 @@ pub unsafe fn submit(
             };
         }
     }
-    if !failed.uploads.is_empty() || !failed.contents.is_empty() {
+    if !failed.uploads.is_empty() || !failed.contents.is_empty() || !failed.tile_snapshots.is_empty() {
         results.lock().unwrap_or_else(|e| e.into_inner()).push(failed);
     }
 }
@@ -267,9 +286,12 @@ unsafe fn place(
             }
             Err(Err(err)) => {
                 let (snapshot, reason) = *err;
-                failed
-                    .contents
-                    .push(first_use(submission, &snapshot, Err(reason)));
+                push_snapshot(
+                    failed,
+                    submission,
+                    &snapshot,
+                    first_use(submission, &snapshot, Err(reason)),
+                );
                 continue;
             }
         };
@@ -284,7 +306,7 @@ unsafe fn place(
                 let segments = segments(bytes, chunk, snapshot.mapped_tiles.as_deref());
                 let snapshot = Arc::new(snapshot);
                 if let Some(done) = pieces::expect(submission, &snapshot, &segments) {
-                    failed.contents.push(done);
+                    push_snapshot(failed, submission, &snapshot, done);
                 }
                 for (index, &(offset, len, copied)) in segments.iter().enumerate() {
                     if !copied {
@@ -463,8 +485,9 @@ unsafe fn run(
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+        let guaranteed = placed.iter().any(|p| p.item.guaranteed());
         let in_flight = IN_FLIGHT.load(Ordering::Acquire);
-        if in_flight != 0 && in_flight + bytes > budget() {
+        if in_flight != 0 && in_flight + bytes > budget() && !guaranteed {
             let reason = format!(
                 "readback budget: {in_flight} bytes of earlier copies still waited for the GPU after {} s",
                 PATIENCE.as_secs()
@@ -473,6 +496,13 @@ unsafe fn run(
                 fail_item(failed, p.item, &reason);
             }
             continue;
+        }
+        if guaranteed && in_flight != 0 && in_flight + bytes > budget() {
+            log!(
+                "D3D12 readback: submission {submission} guaranteed chunk ({} MiB) bypassing readback budget ({} MiB in flight)",
+                bytes >> 20,
+                in_flight >> 20
+            );
         }
         match unsafe { record(queue, device, kind, submission, placed, bytes) } {
             Ok(pending) => {
@@ -923,7 +953,7 @@ fn collect(pending: Pending) -> Batch {
                 let key = locum_capture::hash::key(&bytes);
                 locum_capture::writer::blob(&crate::settings::settings().blobs, key.clone(), bytes, true);
                 if let Some(done) = pieces::arrived(submission, &snapshot, index, Ok((key, p.bytes))) {
-                    batch.contents.push(done);
+                    push_snapshot(&mut batch, submission, &snapshot, done);
                 }
             }
             Item::Contents {
@@ -950,7 +980,12 @@ fn collect(pending: Pending) -> Batch {
                             (key, subs)
                         },
                     );
-                batch.contents.push(first_use(submission, &snapshot, content));
+                push_snapshot(
+                    &mut batch,
+                    submission,
+                    &snapshot,
+                    first_use(submission, &snapshot, content),
+                );
             }
         }
     }
@@ -1000,12 +1035,29 @@ fn first_use(
     )
 }
 
+fn push_snapshot(batch: &mut Batch, submission: u64, snapshot: &Snapshot, done: (u64, FirstUse)) {
+    if let Some((cpu_seq, pages_json)) = &snapshot.tile_snapshot {
+        batch.tile_snapshots.push(locum_capture::d3d12::TileSnapshot {
+            submission,
+            resource: snapshot.resource,
+            cpu_seq: *cpu_seq,
+            pages_json: pages_json.clone(),
+            blob: done.1.content.as_ref().ok().map(|(k, _)| k.clone()),
+            diagnostic: done.1.content.as_ref().err().cloned(),
+        });
+    } else {
+        batch.contents.push(done);
+    }
+}
+
 fn fail(batch: &mut Batch, item: Result<Copy, Snapshot>, reason: &str) {
     match item {
         Ok(c) => batch.uploads.push(upload_failed(c, reason)),
-        Err(s) => batch
-            .contents
-            .push(first_use(batch.submission, &s, Err(reason.into()))),
+        Err(s) => {
+            let sub = batch.submission;
+            let done = first_use(sub, &s, Err(reason.into()));
+            push_snapshot(batch, sub, &s, done);
+        }
     }
 }
 
@@ -1013,14 +1065,15 @@ fn fail_item(batch: &mut Batch, item: Item, reason: &str) {
     match item {
         Item::Upload { copy, .. } => batch.uploads.push(upload_failed(copy, reason)),
         Item::Piece { snapshot, index, .. } => {
-            if let Some(done) = pieces::arrived(batch.submission, &snapshot, index, Err(reason.into())) {
-                batch.contents.push(done);
+            let sub = batch.submission;
+            if let Some(done) = pieces::arrived(sub, &snapshot, index, Err(reason.into())) {
+                push_snapshot(batch, sub, &snapshot, done);
             }
         }
         Item::Contents { snapshot, .. } => {
-            batch
-                .contents
-                .push(first_use(batch.submission, &snapshot, Err(reason.into())))
+            let sub = batch.submission;
+            let done = first_use(sub, &snapshot, Err(reason.into()));
+            push_snapshot(batch, sub, &snapshot, done);
         }
     }
 }

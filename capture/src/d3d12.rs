@@ -163,6 +163,12 @@ pub struct Output {
 pub struct Arguments {
     pub id: u64,
     pub command: usize,
+    pub signature: u64,
+    pub max_count: u64,
+    pub arg_buffer: u64,
+    pub arg_offset: u64,
+    pub count_buffer: u64,
+    pub count_offset: u64,
     pub layout: indirect::Layout,
     pub bytes: u64,
     pub counted: bool,
@@ -405,6 +411,77 @@ pub struct AccelerationStructure {
     pub inputs: Result<Value, String>,
 }
 
+/// A submission selected for complete pass capture, with its active bindless heap versions and referenced resources.
+#[derive(Clone, Debug)]
+pub struct SelectedPass {
+    pub submission: u64,
+    pub queue: u64,
+    pub cpu_seq: u64,
+    pub reason: String,
+    pub bindless_heaps: Value,
+    pub bindless_max_version: u64,
+    pub resources: Value,
+}
+
+/// Captured ExecuteIndirect argument buffer bytes and optional count value for one event.
+#[derive(Clone, Debug)]
+pub struct IndirectArguments {
+    pub event: u64,
+    pub submission: u64,
+    pub queue: u64,
+    pub signature: u64,
+    pub max_count: u64,
+    pub arg_buffer: u64,
+    pub arg_offset: u64,
+    pub arg_bytes: u64,
+    pub count_buffer: u64,
+    pub count_offset: u64,
+    pub count_value: Option<u32>,
+    pub stride: u32,
+    pub blob: Option<String>,
+    pub diagnostic: Option<String>,
+}
+
+/// Live fence state snapshot (at capture arming or at a submission), recording completed value and last producer.
+#[derive(Clone, Debug)]
+pub struct FenceState {
+    pub phase: &'static str,
+    pub submission: Option<u64>,
+    pub cpu_seq: u64,
+    pub fence: u64,
+    pub completed: u64,
+    pub producer_queue: Option<u64>,
+    pub producer_submission: Option<u64>,
+    pub producer_value: Option<u64>,
+    pub producer_cpu_seq: Option<u64>,
+}
+
+/// Producer queue/fence wait dependency observed when a submission is queued.
+#[derive(Clone, Debug)]
+pub struct SubmissionSync {
+    pub submission: u64,
+    pub queue: u64,
+    pub cpu_seq: u64,
+    pub fence: u64,
+    pub wait_value: u64,
+    pub completed_value: Option<u64>,
+    pub producer_queue: Option<u64>,
+    pub producer_submission: Option<u64>,
+    pub producer_value: Option<u64>,
+    pub satisfied: bool,
+}
+
+/// Post-remap resident tile bytes and page-table snapshot for a reserved buffer referenced by a selected pass.
+#[derive(Clone, Debug)]
+pub struct TileSnapshot {
+    pub submission: u64,
+    pub resource: u64,
+    pub cpu_seq: u64,
+    pub pages_json: Option<String>,
+    pub blob: Option<String>,
+    pub diagnostic: Option<String>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Frame {
     pub objects: Vec<Object>,
@@ -413,6 +490,11 @@ pub struct Frame {
     pub tile_pages: Vec<TilePages>,
     pub tile_mappings: Vec<TileMapping>,
     pub acceleration_structures: Vec<AccelerationStructure>,
+    pub selected_passes: Vec<SelectedPass>,
+    pub indirect_arguments: Vec<IndirectArguments>,
+    pub fence_states: Vec<FenceState>,
+    pub submission_syncs: Vec<SubmissionSync>,
+    pub tile_snapshots: Vec<TileSnapshot>,
     pub diagnostics: Vec<String>,
 }
 
@@ -597,6 +679,12 @@ impl Prepared {
     /// A resource's contents before its first use.
     pub fn set_first_use(&mut self, resource: u64, first_use: FirstUse) {
         self.first_use.insert(resource, first_use);
+    }
+    pub fn set_indirect_arguments(&mut self, arguments: IndirectArguments) {
+        self.frame.indirect_arguments.push(arguments);
+    }
+    pub fn add_tile_snapshot(&mut self, snapshot: TileSnapshot) {
+        self.frame.tile_snapshots.push(snapshot);
     }
     /// The frame's ExecuteIndirect events whose argument records were copied.
     pub fn indirect(&self) -> &[Indirect] {
@@ -1750,6 +1838,90 @@ impl Frame {
                 )?;
             }
         }
+        for p in &self.selected_passes {
+            tx.execute(
+                "INSERT INTO d12_selected_passes VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    integer(p.submission)?,
+                    integer(p.queue)?,
+                    integer(p.cpu_seq)?,
+                    p.reason,
+                    p.bindless_heaps.to_string(),
+                    integer(p.bindless_max_version)?,
+                    p.resources.to_string()
+                ],
+            )?;
+        }
+        for a in &self.indirect_arguments {
+            tx.execute(
+                "INSERT OR REPLACE INTO d12_indirect_arguments VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                params![
+                    integer(a.event)?,
+                    integer(a.submission)?,
+                    integer(a.queue)?,
+                    integer(a.signature)?,
+                    integer(a.max_count)?,
+                    integer(a.arg_buffer)?,
+                    integer(a.arg_offset)?,
+                    integer(a.arg_bytes)?,
+                    integer(a.count_buffer)?,
+                    integer(a.count_offset)?,
+                    a.count_value.map(i64::from),
+                    i64::from(a.stride),
+                    a.blob,
+                    a.diagnostic
+                ],
+            )?;
+        }
+        for f in &self.fence_states {
+            tx.execute(
+                "INSERT INTO d12_fence_state(phase,submission,cpu_seq,fence,completed_u64,producer_queue,\
+                 producer_submission,producer_value_u64,producer_cpu_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    f.phase,
+                    f.submission.map(integer).transpose()?,
+                    integer(f.cpu_seq)?,
+                    integer(f.fence)?,
+                    f.completed.to_le_bytes().as_slice(),
+                    f.producer_queue.map(integer).transpose()?,
+                    f.producer_submission.map(integer).transpose()?,
+                    f.producer_value.map(|v| v.to_le_bytes().to_vec()),
+                    f.producer_cpu_seq.map(integer).transpose()?
+                ],
+            )?;
+        }
+        for s in &self.submission_syncs {
+            tx.execute(
+                "INSERT INTO d12_submission_sync(submission,queue,cpu_seq,fence,wait_value_u64,\
+                 completed_value_u64,producer_queue,producer_submission,producer_value_u64,satisfied) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                params![
+                    integer(s.submission)?,
+                    integer(s.queue)?,
+                    integer(s.cpu_seq)?,
+                    integer(s.fence)?,
+                    s.wait_value.to_le_bytes().as_slice(),
+                    s.completed_value.map(|v| v.to_le_bytes().to_vec()),
+                    s.producer_queue.map(integer).transpose()?,
+                    s.producer_submission.map(integer).transpose()?,
+                    s.producer_value.map(|v| v.to_le_bytes().to_vec()),
+                    s.satisfied
+                ],
+            )?;
+        }
+        for t in &self.tile_snapshots {
+            tx.execute(
+                "INSERT OR REPLACE INTO d12_tile_snapshots VALUES(?1,?2,?3,?4,?5,?6)",
+                params![
+                    integer(t.submission)?,
+                    integer(t.resource)?,
+                    integer(t.cpu_seq)?,
+                    t.pages_json,
+                    t.blob,
+                    t.diagnostic
+                ],
+            )?;
+        }
         Ok(())
     }
 }
@@ -2465,6 +2637,21 @@ CREATE TABLE d12_first_use(resource INTEGER PRIMARY KEY,submission INTEGER NOT N
  diagnostic TEXT);
 CREATE TABLE d12_upload_versions(submission INTEGER NOT NULL,resource INTEGER NOT NULL,whole INTEGER NOT NULL,
  offset INTEGER NOT NULL,content_json TEXT NOT NULL,PRIMARY KEY(submission,resource,whole,offset));
+CREATE TABLE d12_selected_passes(submission INTEGER PRIMARY KEY,queue INTEGER NOT NULL,cpu_seq INTEGER NOT NULL,
+ reason TEXT NOT NULL,bindless_heaps_json TEXT NOT NULL,bindless_max_version INTEGER NOT NULL,resources_json TEXT NOT NULL);
+CREATE TABLE d12_indirect_arguments(event INTEGER PRIMARY KEY,submission INTEGER NOT NULL,queue INTEGER NOT NULL,
+ signature INTEGER NOT NULL,max_count INTEGER NOT NULL,arg_buffer INTEGER NOT NULL,arg_offset INTEGER NOT NULL,
+ arg_bytes INTEGER NOT NULL,count_buffer INTEGER NOT NULL,count_offset INTEGER NOT NULL,count_value INTEGER,
+ stride INTEGER NOT NULL,blob TEXT,diagnostic TEXT);
+CREATE TABLE d12_fence_state(id INTEGER PRIMARY KEY,phase TEXT NOT NULL,submission INTEGER,cpu_seq INTEGER NOT NULL,
+ fence INTEGER NOT NULL,completed_u64 BLOB NOT NULL CHECK(length(completed_u64)=8),producer_queue INTEGER,
+ producer_submission INTEGER,producer_value_u64 BLOB,producer_cpu_seq INTEGER);
+CREATE TABLE d12_submission_sync(id INTEGER PRIMARY KEY,submission INTEGER NOT NULL,queue INTEGER NOT NULL,
+ cpu_seq INTEGER NOT NULL,fence INTEGER NOT NULL,wait_value_u64 BLOB NOT NULL CHECK(length(wait_value_u64)=8),
+ completed_value_u64 BLOB,producer_queue INTEGER,producer_submission INTEGER,producer_value_u64 BLOB,
+ satisfied INTEGER NOT NULL);
+CREATE TABLE d12_tile_snapshots(submission INTEGER NOT NULL,resource INTEGER NOT NULL,cpu_seq INTEGER NOT NULL,
+ pages_json TEXT,blob TEXT,diagnostic TEXT,PRIMARY KEY(submission,resource));
 "#;
 
 fn integer(value: u64) -> rusqlite::Result<i64> {
@@ -3058,5 +3245,128 @@ mod tests {
         let mut bytes = vec![0u8; 52];
         bytes[48..].copy_from_slice(&1u32.to_le_bytes());
         assert_eq!(a.records(&bytes), 1);
+    }
+
+    #[test]
+    fn complete_pass_tables_round_trip() {
+        let dir = std::env::temp_dir().join(format!("locum-d12-tables-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("capture.db");
+
+        let mut frame = Frame::default();
+        frame.selected_passes.push(SelectedPass {
+            submission: 5,
+            queue: 81,
+            cpu_seq: 11,
+            reason: "shader=0c29154c".into(),
+            bindless_heaps: json!([100, 101]),
+            bindless_max_version: 42,
+            resources: json!([18, 1548]),
+        });
+        frame.fence_states.push(FenceState {
+            phase: "arm",
+            submission: None,
+            cpu_seq: 10,
+            fence: 61887,
+            completed: 1709,
+            producer_queue: Some(80),
+            producer_submission: Some(4),
+            producer_value: Some(1710),
+            producer_cpu_seq: Some(9),
+        });
+        frame.submission_syncs.push(SubmissionSync {
+            submission: 5,
+            queue: 81,
+            cpu_seq: 11,
+            fence: 61887,
+            wait_value: 1710,
+            completed_value: Some(1709),
+            producer_queue: Some(80),
+            producer_submission: Some(4),
+            producer_value: Some(1710),
+            satisfied: false,
+        });
+
+        let mut cap = crate::db::Capture::default();
+        let proj = Projection::new(&[]);
+        let mut prepared = frame.finish(&mut cap, proj);
+        prepared.set_indirect_arguments(IndirectArguments {
+            event: 77,
+            submission: 5,
+            queue: 81,
+            signature: 500,
+            max_count: 16,
+            arg_buffer: 1548,
+            arg_offset: 256,
+            arg_bytes: 64,
+            count_buffer: 1549,
+            count_offset: 0,
+            count_value: Some(3),
+            stride: 16,
+            blob: Some("deadbeef".into()),
+            diagnostic: None,
+        });
+        prepared.add_tile_snapshot(TileSnapshot {
+            submission: 5,
+            resource: 18,
+            cpu_seq: 12,
+            pages_json: Some("[[0,4,1,0]]".into()),
+            blob: Some("cafe01".into()),
+            diagnostic: None,
+        });
+        cap.d3d12 = Some(prepared);
+        crate::db::write(&db_path, &cap).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let sel: (i64, String, i64, String) = conn
+            .query_row(
+                "SELECT submission, reason, bindless_max_version, resources_json FROM d12_selected_passes",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(sel, (5, "shader=0c29154c".into(), 42, "[18,1548]".into()));
+
+        let ind: (i64, i64, Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT event, arg_buffer, count_value, blob FROM d12_indirect_arguments",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(ind, (77, 1548, Some(3), Some("deadbeef".into())));
+
+        let fence: (String, i64, Vec<u8>, Option<i64>) = conn
+            .query_row(
+                "SELECT phase, fence, completed_u64, producer_queue FROM d12_fence_state",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            fence,
+            ("arm".into(), 61887, 1709u64.to_le_bytes().to_vec(), Some(80))
+        );
+
+        let sync: (i64, i64, Vec<u8>, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT submission, fence, wait_value_u64, producer_submission, satisfied FROM d12_submission_sync",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(sync, (5, 61887, 1710u64.to_le_bytes().to_vec(), Some(4), 0));
+
+        let snap: (i64, i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT resource, submission, pages_json, blob FROM d12_tile_snapshots",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(snap, (18, 5, Some("[[0,4,1,0]]".into()), Some("cafe01".into())));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

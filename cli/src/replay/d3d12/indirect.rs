@@ -123,6 +123,29 @@ impl D3d12 {
             }
         };
         if layout.addresses.is_empty() {
+            // If the capture saved exact ExecuteIndirect argument bytes (e.g. from complete-pass / indirect-args),
+            // and the argument buffer had no captured contents, replay from the captured argument bytes directly.
+            if c.has_table("d12_indirect_arguments")
+                && let Some((blob_key, arg_bytes)) = c.row(
+                    "SELECT blob, arg_bytes FROM d12_indirect_arguments WHERE event = ?1 AND blob IS NOT NULL",
+                    [seq],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)),
+                )
+            {
+                let has_buf_content = c
+                    .row("SELECT content IS NOT NULL FROM resources WHERE id = ?1", [buffer], |r| {
+                        r.get::<_, bool>(0)
+                    })
+                    .unwrap_or(false);
+                if !has_buf_content && arg_bytes > 0 {
+                    let bytes = c.blob(&blob_key)?;
+                    if !bytes.is_empty() {
+                        let (copy, p) = self.staging(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64)?;
+                        unsafe { core::slice::from_raw_parts_mut(p, bytes.len()) }.copy_from_slice(&bytes);
+                        return Ok(Arguments::Patched(copy));
+                    }
+                }
+            }
             return Ok(Arguments::AsRecorded);
         }
         self.patched(c, seq, &layout, (max, buffer, offset, count, count_offset))

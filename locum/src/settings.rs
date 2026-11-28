@@ -54,6 +54,17 @@ pub struct Settings {
     pub heap_indexed_bytes: u64,
     /// Optional dispatch-scoped compute buffer probes (`dispatch-probe <shader> [binding=srv:0] [row-stride=0x200] [row=0] [desc-offset=0x120] [bytes=4096] [alias-map=PATH]`).
     pub dispatch_probes: Vec<String>,
+    /// Selected-pass completeness filters (`complete-pass <selector>`): `all`, `shader=<hex>`, `pso=<id>`,
+    /// `resource=<id>`, `target=<id>`, `draw=<n|a..b>`, `pass=<n|a..b>`, `marker=<text>`. Matching submissions
+    /// capture exact bindless descriptor versions, referenced buffer ranges (without silent budget drops),
+    /// resident tile bytes/mappings, indirect args, and producer queue/fence state.
+    pub complete_passes: Vec<String>,
+    /// Capture ExecuteIndirect argument/count buffers even when the command signature has no GPU addresses
+    /// (`indirect-args on|off`; also enabled automatically whenever `complete-pass` is configured).
+    pub indirect_args: bool,
+    /// Per-output / per-indirect-record readback cap for selected complete passes (`complete-pass-output-mb`,
+    /// 1024 MiB by default).
+    pub complete_output_bytes: u64,
 }
 
 pub fn settings() -> &'static Settings {
@@ -74,6 +85,9 @@ pub fn settings() -> &'static Settings {
             heap_indexed: true,
             heap_indexed_bytes: 32768 << 20,
             dispatch_probes: Vec::new(),
+            complete_passes: Vec::new(),
+            indirect_args: false,
+            complete_output_bytes: 1024 << 20,
         };
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.txt")) {
             for (n, line) in text.lines().enumerate() {
@@ -148,6 +162,22 @@ pub fn settings() -> &'static Settings {
                         ),
                     },
                     "dispatch-probe" => s.dispatch_probes.push(value.to_string()),
+                    "complete-pass" => s.complete_passes.push(value.to_string()),
+                    "indirect-args" => match value {
+                        "on" => s.indirect_args = true,
+                        "off" => s.indirect_args = false,
+                        other => log!(
+                            "settings.txt line {}: indirect-args {other:?} is not on or off: ignored",
+                            n + 1
+                        ),
+                    },
+                    "complete-pass-output-mb" => match value.parse::<u64>() {
+                        Ok(mb @ 1..=16384) => s.complete_output_bytes = mb << 20,
+                        _ => log!(
+                            "settings.txt line {}: complete-pass-output-mb {value:?} is not 1 to 16384: ignored",
+                            n + 1
+                        ),
+                    },
                     other => log!("settings.txt line {}: unknown setting {other:?}: ignored", n + 1),
                 }
             }

@@ -249,6 +249,22 @@ pub unsafe fn after_frame(
                 let into = if i.arguments.pointers > 0 {
                     &mut pointer_gaps
                 } else if i.arguments.tables.is_empty() {
+                    prepared.set_indirect_arguments(model::IndirectArguments {
+                        event: i.event,
+                        submission: i.submission,
+                        queue: i.queue,
+                        signature: i.arguments.signature,
+                        max_count: i.arguments.max_count,
+                        arg_buffer: i.arguments.arg_buffer,
+                        arg_offset: i.arguments.arg_offset,
+                        arg_bytes: i.arguments.bytes,
+                        count_buffer: i.arguments.count_buffer,
+                        count_offset: i.arguments.count_offset,
+                        count_value: None,
+                        stride: i.arguments.layout.stride as u32,
+                        blob: None,
+                        diagnostic: Some(why.clone()),
+                    });
                     &mut gaps
                 } else {
                     &mut table_gaps
@@ -257,6 +273,24 @@ pub unsafe fn after_frame(
                 continue;
             }
             None => {
+                if i.arguments.pointers == 0 && i.arguments.tables.is_empty() {
+                    prepared.set_indirect_arguments(model::IndirectArguments {
+                        event: i.event,
+                        submission: i.submission,
+                        queue: i.queue,
+                        signature: i.arguments.signature,
+                        max_count: i.arguments.max_count,
+                        arg_buffer: i.arguments.arg_buffer,
+                        arg_offset: i.arguments.arg_offset,
+                        arg_bytes: i.arguments.bytes,
+                        count_buffer: i.arguments.count_buffer,
+                        count_offset: i.arguments.count_offset,
+                        count_value: None,
+                        stride: i.arguments.layout.stride as u32,
+                        blob: None,
+                        diagnostic: Some("its copy was not kept".into()),
+                    });
+                }
                 *gaps.entry("its copy was not kept".into()).or_default() += 1;
                 continue;
             }
@@ -280,6 +314,41 @@ pub unsafe fn after_frame(
                 &mut table_gaps,
             );
             prepared.named_by_arguments(capture, i, &reads, &writes);
+            continue;
+        }
+        // Persist the raw captured ExecuteIndirect argument records (and count value) into the blob store and DB.
+        let arg_len = (i.arguments.bytes as usize).min(bytes.len());
+        let arg_slice = &bytes[..arg_len];
+        let count_value = i
+            .arguments
+            .counted
+            .then(|| bytes.get(arg_len..arg_len + 4))
+            .flatten()
+            .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")));
+        let blob_key = locum_capture::hash::key(arg_slice);
+        locum_capture::writer::blob(
+            &crate::settings::settings().blobs,
+            blob_key.clone(),
+            arg_slice.to_vec(),
+            true,
+        );
+        prepared.set_indirect_arguments(model::IndirectArguments {
+            event: i.event,
+            submission: i.submission,
+            queue: i.queue,
+            signature: i.arguments.signature,
+            max_count: i.arguments.max_count,
+            arg_buffer: i.arguments.arg_buffer,
+            arg_offset: i.arguments.arg_offset,
+            arg_bytes: arg_len as u64,
+            count_buffer: i.arguments.count_buffer,
+            count_offset: i.arguments.count_offset,
+            count_value,
+            stride: i.arguments.layout.stride as u32,
+            blob: Some(blob_key),
+            diagnostic: None,
+        });
+        if i.arguments.layout.addresses.is_empty() {
             continue;
         }
         let records = i.arguments.records(bytes);
@@ -369,6 +438,8 @@ pub unsafe fn after_frame(
                 joined: None,
                 mapped_tiles: super::tiles::mapped_buffer_tiles(copy.resource),
                 note: None,
+                guaranteed: super::select::capture_indirect_args(),
+                tile_snapshot: None,
             });
     }
     for ((submission, queue), snapshots) in by_queue {

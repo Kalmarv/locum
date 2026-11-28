@@ -196,6 +196,15 @@ impl Data {
     }
 }
 
+/// Last known queue signal that produced a fence value.
+#[derive(Clone, Copy, Debug)]
+struct ProducerSignal {
+    queue: u64,
+    submission: Option<u64>,
+    cpu_seq: u64,
+    value: u64,
+}
+
 #[derive(Default)]
 struct State {
     objects: BTreeMap<u64, model::Object>,
@@ -208,6 +217,8 @@ struct State {
     descriptors: super::slots::Known,
     /// The armed frame's constant-buffer views as of its latest submission: (heap, slot) to (resource, begin, end).
     constant_buffers: BTreeMap<(u64, u32), (u64, u64, u64)>,
+    /// The armed frame's buffer SRV/UAV views pointing into upload buffers: (heap, slot) to (resource, begin, end).
+    upload_views: BTreeMap<(u64, u32), (u64, u64, u64)>,
     /// Every texture's state as the next submission will find it.
     states: super::states::Tracker,
     /// The series the armed frame belongs to (`frames N` in the request): the next frame is armed as it closes.
@@ -223,6 +234,10 @@ struct State {
     submitting: u32,
     /// The highest value submitted to signal each fence, by fence.
     signals: HashMap<u64, u64>,
+    /// Last producer queue/submission known to signal each fence.
+    producers: HashMap<u64, ProducerSignal>,
+    /// Most recent submission id on each queue.
+    last_submission_on_queue: HashMap<u64, u64>,
 }
 
 /// Consecutive frames one request asked for, each a capture of its own.
@@ -233,6 +248,10 @@ struct Series {
     /// The armed frame's place in the series, from 1.
     index: u32,
     frames: u32,
+    /// Per-request `complete-pass` selectors merged with `settings.txt`.
+    complete_passes: Vec<String>,
+    /// Per-request `indirect-args` override.
+    indirect_args: Option<bool>,
 }
 
 /// The most frames one request captures.
@@ -263,6 +282,10 @@ struct Live {
     rays: Vec<(super::rays::Key, Arc<super::rays::Build>)>,
     /// What the frame's first-use copies take, and those given up for room.
     room: Room,
+    /// Active selected-pass completeness filters for this capture.
+    selection: super::select::Selection,
+    /// Reserved buffers whose tile mappings changed in-frame since their last resident-tile snapshot.
+    remapped_since_copy: HashSet<u64>,
 }
 /// What a capture leaves free on the blob store's drive: its first-use copies stop short of it.
 const DISK_KEPT: u64 = 8 << 30;
@@ -608,11 +631,17 @@ pub unsafe fn submit(
                 ),
                 _ => s.constant_buffers.remove(&(d.heap, d.slot)),
             };
+            if let Some((begin, end)) = buffer_view_range(d) {
+                s.upload_views.insert((d.heap, d.slot), (d.resource, begin, end));
+            } else {
+                s.upload_views.remove(&(d.heap, d.slot));
+            }
         }
         changes
     } else {
         Vec::new()
     };
+    s.last_submission_on_queue.insert(queue.id, id);
     // Every submission's lists, armed or not: the state tracker follows them all.
     let mut lists = Vec::new();
     let mut ordinals = Vec::new();
@@ -648,8 +677,10 @@ pub unsafe fn submit(
         s.submitting += 1;
         let State {
             capture,
+            objects,
             waits,
             signals,
+            producers,
             ..
         } = &mut *s;
         let live = capture.as_mut().expect("armed");
@@ -667,7 +698,9 @@ pub unsafe fn submit(
         });
         let submission = live.frame.submissions.last().expect("pushed");
         let from = live.projection.indirect().len();
+        let draws_before = live.capture.draws.len() as u64;
         let mut touched = live.projection.submit(&mut live.capture, submission);
+        let draws_after = live.capture.draws.len() as u64;
         // What its programs may read through a heap they index directly, besides what its events name.
         let mut heap = HashSet::new();
         let named = live.projection.heap_indexed();
@@ -678,7 +711,53 @@ pub unsafe fn submit(
                 touched.push(r);
             }
         }
-        let unknown = unsafe { unknown_wait(waits.entry(queue.id).or_default(), signals) };
+        // Any resource explicitly pinned by `complete-pass resource=<id>` is pulled in on the first submission while
+        // live so it is never missed when referenced only indirectly.
+        for pinned in live.selection.explicit_resources() {
+            if !live.used.contains(&pinned) && objects.contains_key(&pinned) && !touched.contains(&pinned) {
+                touched.push(pinned);
+            }
+        }
+        let draw_range = (draws_after > draws_before).then_some((draws_before + 1, draws_after));
+        let selected_reason = live
+            .selection
+            .matches_submission(&lists, objects, &touched, draw_range, None);
+        let selected = selected_reason.is_some();
+        if let Some(reason) = selected_reason {
+            let bindless_heaps = super::select::bound_descriptor_heaps(&lists);
+            let (bindless_max_version, _) = super::slots::heap_versions(&bindless_heaps);
+            live.frame.selected_passes.push(model::SelectedPass {
+                submission: id,
+                queue: queue.id,
+                cpu_seq,
+                reason,
+                bindless_heaps: json!(bindless_heaps),
+                bindless_max_version,
+                resources: json!(touched),
+            });
+        }
+        // Snapshot producer queue/fence wait state before pruning so both satisfied and blocking waits are recorded.
+        let queue_waits = waits.entry(queue.id).or_default();
+        for &(fence, wait_value) in queue_waits.iter() {
+            let completed_value = super::real::<windows::Win32::Graphics::Direct3D12::ID3D12Fence>(fence)
+                .map(|f| unsafe { f.GetCompletedValue() });
+            let signalled = signals.get(&fence).is_some_and(|&v| v >= wait_value);
+            let satisfied = signalled || completed_value.is_some_and(|c| c >= wait_value);
+            let prod = producers.get(&fence).copied();
+            live.frame.submission_syncs.push(model::SubmissionSync {
+                submission: id,
+                queue: queue.id,
+                cpu_seq,
+                fence,
+                wait_value,
+                completed_value,
+                producer_queue: prod.map(|p| p.queue),
+                producer_submission: prod.and_then(|p| p.submission),
+                producer_value: prod.map(|p| p.value),
+                satisfied,
+            });
+        }
+        let unknown = unsafe { unknown_wait(queue_waits, signals) };
         // What its DispatchRays' shader tables name, read now: the queue runs everything submitted before first.
         let real_queue = unsafe { ID3D12CommandQueue::from_raw_borrowed(&real) };
         let mut reads = match (&unknown, real_queue) {
@@ -695,7 +774,10 @@ pub unsafe fn submit(
                 Some(live) if Some(live.number) == number => touched
                     .iter()
                     .copied()
-                    .filter(|r| !tiles.contains_key(r) && !live.used.contains(r))
+                    .filter(|r| {
+                        !tiles.contains_key(r)
+                            && (!live.used.contains(r) || (selected && live.remapped_since_copy.contains(r)))
+                    })
                     .filter(|r| {
                         s.objects.get(r).is_some_and(|o| {
                             o.description["dimension"].is_u64() && o.description["heap_properties"].is_null()
@@ -738,6 +820,7 @@ pub unsafe fn submit(
             objects,
             uploads,
             constant_buffers,
+            upload_views,
             states,
             ..
         } = &mut *s;
@@ -752,8 +835,16 @@ pub unsafe fn submit(
                 unknown.as_deref(),
                 cpu_seq,
                 &tiles,
+                selected,
             );
-            let copies = upload_copies(uploads, first, &lists, constant_buffers.values());
+            let copies = upload_copies(
+                uploads,
+                first,
+                &lists,
+                constant_buffers.values().chain(upload_views.values()),
+                selected,
+                &live.selection,
+            );
             if !copies.is_empty() || !snapshots.is_empty() {
                 before = Some((copies, snapshots, live.results.clone()));
             }
@@ -924,11 +1015,38 @@ fn first_uses(
     unknown: Option<&str>,
     cpu_seq: u64,
     tiles: &HashMap<u64, Tiles>,
+    selected: bool,
 ) -> Vec<super::readback::Snapshot> {
     let mut snapshots = Vec::new();
     let mut failed = Vec::new();
     for resource in touched {
-        if !live.used.insert(resource) {
+        let pinned = selected || live.selection.pins_resource(resource);
+        let first_time = live.used.insert(resource);
+        if !first_time {
+            // For a selected pass, if a reserved buffer's tile mappings changed since its last copy, capture a fresh
+            // resident-tile snapshot of its current mapped tiles without dropping for budget.
+            if pinned
+                && live.remapped_since_copy.remove(&resource)
+                && let Some(d) = objects.get(&resource).map(|o| &o.description)
+                && d["dimension"] == 1
+                && d["heap_properties"].is_null()
+                && let Some(layout) = model::layout(d)
+                && let Some(tile) = tiles.get(&resource)
+                && tile.unreadable.is_none()
+            {
+                let pages_json = tile.pages.as_ref().ok().map(|(_, p)| p.to_string());
+                snapshots.push(super::readback::Snapshot {
+                    resource,
+                    subresources: 1,
+                    joined: None,
+                    states: Vec::new(),
+                    layout,
+                    mapped_tiles: tile.mapped_buffer_tiles.clone(),
+                    note: None,
+                    guaranteed: true,
+                    tile_snapshot: Some((cpu_seq, pages_json)),
+                });
+            }
             continue;
         }
         // Every resource an event names gets a copy or a reason: none is skipped unsaid.
@@ -1020,7 +1138,9 @@ fn first_uses(
         } else {
             super::readback::buffer_copy_bytes(locum_capture::layout::total(&layout), mapped_tiles.as_deref())
         };
-        if let Err(why) = live.room.take(planned_bytes, heap_only) {
+        // Selected complete passes bypass the heap-indexed cap (still honoring the disk safety reserve).
+        let charge_heap = heap_only && !pinned;
+        if let Err(why) = live.room.take(planned_bytes, charge_heap) {
             let named = if heap_only {
                 ", named only by a descriptor heap its root signature indexes directly"
             } else {
@@ -1040,6 +1160,7 @@ fn first_uses(
         // A multisampled texture's layout has an image a sample; its samples are drawn out joined (see
         // `locum_capture::d3d12::samples`).
         let samples = n("sample_count").max(1);
+        live.remapped_since_copy.remove(&resource);
         snapshots.push(super::readback::Snapshot {
             resource,
             subresources: if texture {
@@ -1052,6 +1173,8 @@ fn first_uses(
             states,
             layout,
             mapped_tiles,
+            guaranteed: pinned,
+            tile_snapshot: None,
             note: unknown
                 .map(|why| {
                     format!(
@@ -1081,20 +1204,45 @@ fn first_uses(
     snapshots
 }
 
+/// Byte range `[begin, end)` covered by a buffer SRV or UAV descriptor, if described.
+fn buffer_view_range(d: &model::Descriptor) -> Option<(u64, u64)> {
+    if !matches!(d.kind, "srv" | "uav") || d.resource == 0 || d.description["dimension"] != 1 {
+        return None;
+    }
+    let p = &d.description["payload"];
+    let first = p["FirstElement"].as_u64()?;
+    let count = p["NumElements"].as_u64()?;
+    if count == 0 {
+        return None;
+    }
+    let stride = p["StructureByteStride"].as_u64().unwrap_or(0);
+    let elem_bytes = if stride > 0 {
+        stride
+    } else if p["Flags"].as_u64().unwrap_or(0) & 1 != 0 {
+        4
+    } else {
+        let fmt = d.description["format"].as_u64().unwrap_or(0) as u32;
+        u64::from(locum_capture::format::layout(fmt).map_or(4, |l| l.block_bytes))
+    };
+    let begin = first.saturating_mul(elem_bytes);
+    let end = begin.saturating_add(count.saturating_mul(elem_bytes));
+    Some((begin, end))
+}
+
 /// D3D12's largest constant buffer view: 4096 constants of 16 bytes.
 const CONSTANT_BUFFER_BYTES: u64 = 65536;
 
 /// The upload bytes an armed submission's work reads: every upload buffer whole at the frame's first submission
-/// (marked `whole`, the contents its resources began the frame with), then at each submission only the
-/// constant-buffer ranges its lists' root CBVs and the descriptor heaps' CBVs name, and the ranges its buffer copies
-/// read (a constant buffer in a default heap is filled that way), merged into runs per buffer.
-/// The GPU copies them (see [`super::readback`]). Runs closer than [`CONSTANT_BUFFER_BYTES`] are copied as one:
-/// Elden Ring's 128k CBVs left 23.7k runs of ~540 bytes per submission, which merge into about three.
+/// (marked `whole`, the contents its resources began the frame with), then at each submission all referenced
+/// ranges: constant buffers, buffer SRVs/UAVs, vertex/index buffers, indirect args/counts, root SRVs/UAVs, and
+/// buffer/texture copy sources, merged into runs per buffer.
 fn upload_copies<'a>(
     uploads: &BTreeMap<u64, Upload>,
     first: bool,
     lists: &[Arc<model::List>],
-    constant_buffers: impl Iterator<Item = &'a (u64, u64, u64)>,
+    view_ranges: impl Iterator<Item = &'a (u64, u64, u64)>,
+    selected: bool,
+    selection: &super::select::Selection,
 ) -> Vec<super::readback::Copy> {
     let mut out = Vec::new();
     if first {
@@ -1104,6 +1252,7 @@ fn upload_copies<'a>(
                 offset: 0,
                 len: u.bytes as u64,
                 whole: true,
+                guaranteed: selected || selection.pins_resource(resource),
             });
         }
     }
@@ -1111,7 +1260,7 @@ fn upload_copies<'a>(
     for list in lists {
         read_ranges(list, uploads, &mut ranges);
     }
-    ranges.extend(constant_buffers.filter(|(resource, _, _)| uploads.contains_key(resource)));
+    ranges.extend(view_ranges.filter(|(resource, _, _)| uploads.contains_key(resource)));
     for (resource, begin, end) in runs(ranges, CONSTANT_BUFFER_BYTES) {
         let end = end.min(uploads[&resource].bytes as u64);
         if begin < end {
@@ -1120,15 +1269,15 @@ fn upload_copies<'a>(
                 offset: begin,
                 len: end - begin,
                 whole: false,
+                guaranteed: selected || selection.pins_resource(resource),
             });
         }
     }
     out
 }
 
-/// The upload bytes this list and the bundles it executes read, as (resource, begin, end): root constant-buffer
-/// views at the largest size a constant buffer can have (the bytes a shader reads are not known until reflection), and
-/// the sources of buffer copies.
+/// The upload bytes this list and the bundles it executes read, as (resource, begin, end): copy sources, root
+/// CBV/SRV/UAV views, vertex/index buffer views, and ExecuteIndirect argument/count buffers.
 fn read_ranges(list: &model::List, uploads: &BTreeMap<u64, Upload>, ranges: &mut Vec<(u64, u64, u64)>) {
     for c in &list.commands {
         if let Some(bundle) = &c.bundle {
@@ -1148,18 +1297,73 @@ fn read_ranges(list: &model::List, uploads: &BTreeMap<u64, Upload>, ranges: &mut
                     ranges.push((resource, 0, uploads[&resource].bytes as u64));
                 }
             }
-            _ => {}
-        }
-        if matches!(
-            c.call,
-            "SetGraphicsRootConstantBufferView" | "SetComputeRootConstantBufferView"
-        ) {
-            let at = &c.args[1];
-            if let (Some(resource), Some(offset)) = (at["resource"].as_u64(), at["offset"].as_u64())
-                && uploads.contains_key(&resource)
-            {
-                ranges.push((resource, offset, offset.saturating_add(CONSTANT_BUFFER_BYTES)));
+            "CopyTextureRegion" => {
+                let src = &c.args[4];
+                if let Some(resource) = upload(&src["resource"]) {
+                    let f = &src["footprint"];
+                    let offset = f["offset"].as_u64().unwrap_or(0);
+                    let row_pitch = f["row_pitch"].as_u64().unwrap_or(0);
+                    let height = f["height"].as_u64().unwrap_or(1);
+                    let depth = f["depth"].as_u64().unwrap_or(1);
+                    let est = row_pitch.saturating_mul(height).saturating_mul(depth);
+                    let end = if est > 0 {
+                        offset.saturating_add(est)
+                    } else {
+                        uploads[&resource].bytes as u64
+                    };
+                    ranges.push((resource, offset, end));
+                }
             }
+            "IASetVertexBuffers" => {
+                for vb in c.args[1].as_array().into_iter().flatten() {
+                    if let (Some(resource), Some(offset), Some(bytes)) = (
+                        upload(&vb["buffer"]["resource"]),
+                        vb["buffer"]["offset"].as_u64(),
+                        vb["bytes"].as_u64(),
+                    ) {
+                        ranges.push((resource, offset, offset.saturating_add(bytes)));
+                    }
+                }
+            }
+            "IASetIndexBuffer" => {
+                let ib = &c.args[0];
+                if let (Some(resource), Some(offset), Some(bytes)) = (
+                    upload(&ib["buffer"]["resource"]),
+                    ib["buffer"]["offset"].as_u64(),
+                    ib["bytes"].as_u64(),
+                ) {
+                    ranges.push((resource, offset, offset.saturating_add(bytes)));
+                }
+            }
+            "ExecuteIndirect" => {
+                if let (Some(resource), Some(offset)) = (upload(&c.args[2]), c.args[3].as_u64()) {
+                    ranges.push((resource, offset, uploads[&resource].bytes as u64));
+                }
+                if let (Some(resource), Some(offset)) = (upload(&c.args[4]), c.args[5].as_u64()) {
+                    ranges.push((resource, offset, offset.saturating_add(4)));
+                }
+            }
+            "SetGraphicsRootConstantBufferView" | "SetComputeRootConstantBufferView" => {
+                let at = &c.args[1];
+                if let (Some(resource), Some(offset)) = (at["resource"].as_u64(), at["offset"].as_u64())
+                    && uploads.contains_key(&resource)
+                {
+                    ranges.push((resource, offset, offset.saturating_add(CONSTANT_BUFFER_BYTES)));
+                }
+            }
+            "SetGraphicsRootShaderResourceView"
+            | "SetComputeRootShaderResourceView"
+            | "SetGraphicsRootUnorderedAccessView"
+            | "SetComputeRootUnorderedAccessView" => {
+                let at = &c.args[1];
+                if let (Some(resource), Some(offset)) = (at["resource"].as_u64(), at["offset"].as_u64())
+                    && uploads.contains_key(&resource)
+                {
+                    // Root SRV/UAV has no explicit size in D3D12: cover from offset to the upload buffer's end.
+                    ranges.push((resource, offset, uploads[&resource].bytes as u64));
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1223,6 +1427,7 @@ pub fn tile_mapping(
     s.cpu_seq += 1;
     let cpu_seq = s.cpu_seq;
     if let Some(live) = s.capture.as_mut() {
+        live.remapped_since_copy.insert(resource);
         live.frame.tile_mappings.push(model::TileMapping {
             queue,
             queue_seq,
@@ -1244,10 +1449,20 @@ pub fn sync(queue: &Data, sequence: u64, kind: &'static str, fence: *mut c_void,
     let mut s = state();
     s.cpu_seq += 1;
     let cpu_seq = s.cpu_seq;
+    let last_sub = s.last_submission_on_queue.get(&queue.id).copied();
     match kind {
         "Signal" => {
             let v = s.signals.entry(fence).or_default();
             *v = (*v).max(value);
+            s.producers.insert(
+                fence,
+                ProducerSignal {
+                    queue: queue.id,
+                    submission: last_sub,
+                    cpu_seq,
+                    value,
+                },
+            );
             for waits in s.waits.values_mut() {
                 waits.retain(|&(f, v)| f != fence || v > value);
             }
@@ -1407,6 +1622,13 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         // threads reset meanwhile, the next frame's, are instrumented as in a lead.
         if series.as_ref().is_some_and(|s| s.index < s.frames) {
             super::passes::EARLY.store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            let settings = crate::settings::settings();
+            super::select::configure(
+                settings.indirect_args,
+                !settings.complete_passes.is_empty(),
+                settings.complete_output_bytes,
+            );
         }
         super::passes::ARMED.store(false, std::sync::atomic::Ordering::Release);
         log!(
@@ -1488,6 +1710,9 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                     prepared.add_uploads(batch.submission, batch.uploads);
                     for (resource, first) in batch.contents {
                         prepared.set_first_use(resource, first);
+                    }
+                    for snap in batch.tile_snapshots {
+                        prepared.add_tile_snapshot(snap);
                     }
                     for (id, content) in batch.checkpoints {
                         prepared.set_checkpoint(id, content);
@@ -1578,10 +1803,26 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                 }
             },
         };
+        let complete_passes: Vec<String> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("complete-pass "))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        let indirect_args = text
+            .lines()
+            .find_map(|l| l.strip_prefix("indirect-args "))
+            .and_then(|v| match v.trim() {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            });
         let series = Series {
             label: (!label.is_empty()).then_some(label),
             index: 1,
             frames,
+            complete_passes,
+            indirect_args,
         };
         let early = match text.lines().find_map(|l| l.strip_prefix("early ")) {
             None => 0,
@@ -1643,9 +1884,50 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
     // Asked before the state is taken: a drive can be slow to answer.
     let settings = crate::settings::settings();
     let disk = free_bytes(settings.blobs.root());
+    let mut specs = settings.complete_passes.clone();
+    specs.extend(series.complete_passes.iter().cloned());
+    let (selection, sel_errors) = super::select::Selection::from_specs(&specs);
+    for err in sel_errors {
+        log!("D3D12 complete-pass selector error: {err}");
+    }
+    let indirect_args = series.indirect_args.unwrap_or(settings.indirect_args);
+    super::select::configure(
+        indirect_args,
+        !selection.is_empty(),
+        settings.complete_output_bytes,
+    );
     let mut s = state();
     s.descriptors.clear();
     s.constant_buffers.clear();
+    s.upload_views.clear();
+    // Snapshot live fence state at arming (every fence with pending waits or known signals).
+    let mut fence_ids: std::collections::BTreeSet<u64> = s.signals.keys().copied().collect();
+    fence_ids.extend(s.producers.keys().copied());
+    for waits in s.waits.values() {
+        for &(f, _) in waits {
+            fence_ids.insert(f);
+        }
+    }
+    let arm_cpu_seq = s.cpu_seq;
+    let fence_states: Vec<model::FenceState> = fence_ids
+        .into_iter()
+        .filter_map(|fence| {
+            let real = super::real::<windows::Win32::Graphics::Direct3D12::ID3D12Fence>(fence)?;
+            let completed = unsafe { real.GetCompletedValue() };
+            let prod = s.producers.get(&fence).copied();
+            Some(model::FenceState {
+                phase: "arm",
+                submission: None,
+                cpu_seq: arm_cpu_seq,
+                fence,
+                completed,
+                producer_queue: prod.map(|p| p.queue),
+                producer_submission: prod.and_then(|p| p.submission),
+                producer_value: prod.map(|p| p.value),
+                producer_cpu_seq: prod.map(|p| p.cpu_seq),
+            })
+        })
+        .collect();
     let objects: Vec<_> = s.objects.values().cloned().collect();
     s.armings += 1;
     s.capture = Some(Live {
@@ -1655,6 +1937,7 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         projection: model::Projection::new(&objects),
         frame: model::Frame {
             objects,
+            fence_states,
             ..model::Frame::default()
         },
         capture: db::Capture::default(),
@@ -1668,6 +1951,8 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
             disk,
             ..Room::default()
         },
+        selection,
+        remapped_since_copy: HashSet::new(),
     });
     s.series = Some(series.clone());
     super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
@@ -1811,6 +2096,8 @@ pub(super) fn arm_now(root: &std::path::Path, frames: u32) {
             label: None,
             index: 1,
             frames,
+            complete_passes: Vec::new(),
+            indirect_args: None,
         },
     );
 }
@@ -1862,6 +2149,8 @@ mod tests {
             paged: HashSet::new(),
             rays: Vec::new(),
             room,
+            selection: super::super::select::Selection::default(),
+            remapped_since_copy: HashSet::new(),
         }
     }
 
@@ -1974,6 +2263,7 @@ mod tests {
             None,
             1,
             &tiles,
+            false,
         );
         assert_eq!(snapshots.len(), 2);
         assert_eq!(snapshots[0].resource, 10);
@@ -2037,6 +2327,7 @@ mod tests {
             None,
             2,
             &nine_tiles,
+            false,
         );
         assert_eq!(nine_snaps.len(), 9);
         assert_eq!(nine_live.room.planned, 9 * MIB);
@@ -2062,7 +2353,8 @@ mod tests {
                 &HashSet::new(),
                 None,
                 3,
-                &tiles
+                &tiles,
+                false,
             )
             .is_empty()
         );
@@ -2086,10 +2378,158 @@ mod tests {
                 &HashSet::new(),
                 None,
                 4,
-                &tiles
+                &tiles,
+                false,
             )
             .is_empty()
         );
         assert_eq!(tight_reserve.room.uncopied.get("disk"), Some(&(1, TILE)));
+    }
+
+    #[test]
+    fn selected_pass_bypasses_heap_cap_and_snapshots_remapped_tiles() {
+        const TILE: u64 = 65536;
+        const MIB: u64 = 1 << 20;
+        let mut objects = BTreeMap::new();
+        objects.insert(18, reserved_buffer(18, 4 * MIB));
+        let states = super::super::states::Tracker::default();
+        let mut tiles = HashMap::new();
+        tiles.insert(
+            18,
+            Tiles {
+                pages: Ok((json!({}), json!([[0, 4, 1, 0]]))),
+                unreadable: None,
+                mapped_buffer_tiles: Some(vec![0, 1, 2, 3]),
+            },
+        );
+        // Tight heap cap (only 64 KiB) would drop a 256 KiB heap-only resource normally, but selected=true bypasses it.
+        let mut live = test_live(
+            &objects,
+            Room {
+                heap: Some(TILE),
+                disk: Some(DISK_KEPT + 16 * MIB),
+                ..Room::default()
+            },
+        );
+        let heap = HashSet::from([18u64]);
+        let snaps = first_uses(
+            &mut live,
+            1,
+            &objects,
+            &states,
+            vec![18],
+            &heap,
+            None,
+            10,
+            &tiles,
+            true,
+        );
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].resource, 18);
+        assert!(snaps[0].guaranteed);
+        assert!(snaps[0].tile_snapshot.is_none());
+        assert_eq!(live.room.heap_bytes, 0);
+
+        // After a tile remap on #18, a subsequent selected submission takes a post-remap tile snapshot.
+        live.remapped_since_copy.insert(18);
+        tiles.insert(
+            18,
+            Tiles {
+                pages: Ok((json!({}), json!([[4, 2, 2, 10]]))),
+                unreadable: None,
+                mapped_buffer_tiles: Some(vec![4, 5]),
+            },
+        );
+        let snaps2 = first_uses(
+            &mut live,
+            2,
+            &objects,
+            &states,
+            vec![18],
+            &heap,
+            None,
+            20,
+            &tiles,
+            true,
+        );
+        assert_eq!(snaps2.len(), 1);
+        assert_eq!(snaps2[0].resource, 18);
+        assert!(snaps2[0].guaranteed);
+        assert_eq!(snaps2[0].mapped_tiles.as_deref(), Some(&[4, 5][..]));
+        assert!(snaps2[0].tile_snapshot.is_some());
+        assert!(!live.remapped_since_copy.contains(&18));
+    }
+
+    #[test]
+    fn expanded_upload_ranges_cover_vb_ib_root_indirect_and_srv() {
+        use super::{Upload, buffer_view_range, read_ranges};
+        let mut uploads = BTreeMap::new();
+        uploads.insert(
+            1548,
+            Upload {
+                pointer: 0,
+                maps: 0,
+                bytes: 64 << 20,
+            },
+        );
+        let list = model::List {
+            id: 1,
+            generation: 1,
+            commands: vec![
+                model::Command {
+                    call: "IASetVertexBuffers",
+                    args: json!([0, [{"buffer": {"resource": 1548, "offset": 1024}, "bytes": 512, "stride": 32}]]),
+                    bundle: None,
+                    diagnostic: None,
+                },
+                model::Command {
+                    call: "IASetIndexBuffer",
+                    args: json!([{"buffer": {"resource": 1548, "offset": 4096}, "bytes": 256, "format": 42}]),
+                    bundle: None,
+                    diagnostic: None,
+                },
+                model::Command {
+                    call: "SetComputeRootShaderResourceView",
+                    args: json!([0, {"resource": 1548, "offset": 8192}]),
+                    bundle: None,
+                    diagnostic: None,
+                },
+                model::Command {
+                    call: "ExecuteIndirect",
+                    args: json!([10, 4, 1548, 16384, 1548, 32768]),
+                    bundle: None,
+                    diagnostic: None,
+                },
+            ],
+            ..model::List::default()
+        };
+        let mut ranges = Vec::new();
+        read_ranges(&list, &uploads, &mut ranges);
+        assert!(ranges.contains(&(1548, 1024, 1536)), "{ranges:?}");
+        assert!(ranges.contains(&(1548, 4096, 4352)), "{ranges:?}");
+        assert!(
+            ranges.iter().any(|&(r, b, e)| r == 1548 && b == 8192 && e > b),
+            "{ranges:?}"
+        );
+        assert!(
+            ranges.iter().any(|&(r, b, e)| r == 1548 && b == 16384 && e > b),
+            "{ranges:?}"
+        );
+        assert!(ranges.contains(&(1548, 32768, 32772)), "{ranges:?}");
+
+        let srv = model::Descriptor {
+            id: 1,
+            heap: 5,
+            slot: 7,
+            kind: "srv",
+            resource: 1548,
+            counter: 0,
+            description: json!({
+                "dimension": 1,
+                "format": 0,
+                "payload": {"FirstElement": 10, "NumElements": 20, "StructureByteStride": 64, "Flags": 0}
+            }),
+        };
+        assert_eq!(buffer_view_range(&srv), Some((640, 1920)));
     }
 }

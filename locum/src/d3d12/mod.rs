@@ -25,6 +25,7 @@ mod promoted;
 mod ranges;
 pub mod rays;
 mod readback;
+pub mod select;
 pub mod shaders;
 mod slots;
 pub mod states;
