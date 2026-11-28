@@ -252,6 +252,68 @@ pub fn resource(c: &Capture, id: i64) -> Result<(), String> {
     for line in reserved_tiles(c, id) {
         out!("{line}");
     }
+    if c.has_table("d12_range_snapshots") {
+        type RangeRow = (
+            String,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+        );
+        let snaps: Vec<RangeRow> = c.rows(
+            "SELECT phase, submission, event, draw, offset, bytes, blob, diagnostic FROM d12_range_snapshots \
+             WHERE resource = ?1 ORDER BY id",
+            [id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                ))
+            },
+        );
+        if !snaps.is_empty() {
+            let total_bytes: u64 = snaps
+                .iter()
+                .filter(|r| r.6.is_some())
+                .map(|r| r.5.max(0) as u64)
+                .sum();
+            out!(
+                "{} range snapshot(s) ({} captured):",
+                snaps.len(),
+                mib(total_bytes)
+            );
+            for (phase, sub, ev, draw, off, len, blob, diag) in snaps.iter().take(24) {
+                let off = *off as u64;
+                let end = off.saturating_add(*len as u64);
+                let where_at = match (draw, ev) {
+                    (Some(d), Some(e)) => format!("draw {d} (event {e}, sub {sub})"),
+                    (Some(d), None) => format!("draw {d} (sub {sub})"),
+                    (None, Some(e)) => format!("event {e} (sub {sub})"),
+                    (None, None) => format!("sub {sub}"),
+                };
+                match (blob, diag) {
+                    (Some(k), _) => out!(
+                        "  {phase:<14} {where_at:<26} {off:#x}..{end:#x} ({len} bytes) {}",
+                        short(k)
+                    ),
+                    (None, Some(d)) => out!("  {phase:<14} {where_at:<26} {off:#x}..{end:#x} [{d}]"),
+                    (None, None) => out!("  {phase:<14} {where_at:<26} {off:#x}..{end:#x} [no blob]"),
+                }
+            }
+            if snaps.len() > 24 {
+                out!("  ... ({} more in d12_range_snapshots)", snaps.len() - 24);
+            }
+        }
+    }
     let subs: Vec<(i64, Option<String>)> = c.rows(
         "SELECT sub, hash FROM subresources WHERE resource = ?1 ORDER BY sub",
         [id],

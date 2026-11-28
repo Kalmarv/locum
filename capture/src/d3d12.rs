@@ -90,6 +90,10 @@ pub struct List {
     /// right before each.
     #[serde(skip)]
     pub arguments: Vec<Arguments>,
+    /// Buffer byte ranges copied inside this generation right before a target draw/dispatch (`snapshot-ranges` /
+    /// `snapshot-traced`).
+    #[serde(skip)]
+    pub range_snapshots: Vec<ListRangeSnapshot>,
     /// The targets (resource, subresource) this generation draws to before writing them any other way, with the
     /// views bound at the first such draw: where an earlier list left the copy of a pass with the same views
     /// waiting, this one continues the pass.
@@ -178,6 +182,17 @@ pub struct Arguments {
     pub pointers: u32,
     pub pointers_at: u64,
     /// Why no copy was made.
+    pub gap: Option<String>,
+}
+
+/// Buffer byte ranges copied inside an instrumented list immediately before command `command` (a target draw or
+/// dispatch configured via `snapshot-ranges` / `snapshot-traced`).
+#[derive(Clone, Debug, Default)]
+pub struct ListRangeSnapshot {
+    pub id: u64,
+    pub command: usize,
+    /// Concatenated `(resource, offset, bytes)` ranges in the copy's readback buffer.
+    pub ranges: Vec<(u64, u64, u64)>,
     pub gap: Option<String>,
 }
 
@@ -274,6 +289,10 @@ impl Recording {
 
     pub fn arguments(&mut self, arguments: Arguments) {
         Arc::make_mut(&mut self.current).arguments.push(arguments);
+    }
+
+    pub fn range_snapshot(&mut self, snapshot: ListRangeSnapshot) {
+        Arc::make_mut(&mut self.current).range_snapshots.push(snapshot);
     }
 
     /// A copy of locum's read buffer `resource` by implicit promotion (see [`Promoted`]).
@@ -482,6 +501,21 @@ pub struct TileSnapshot {
     pub diagnostic: Option<String>,
 }
 
+/// Byte range of a buffer copied at capture start (`phase = "start"`) or immediately before a target draw /
+/// submission (`phase = "draw"` or `"pre-submission"`), configured via `snapshot-ranges` / `snapshot-traced`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeSnapshot {
+    pub phase: String,
+    pub submission: u64,
+    pub event: Option<u64>,
+    pub draw: Option<u64>,
+    pub resource: u64,
+    pub offset: u64,
+    pub bytes: u64,
+    pub blob: Option<String>,
+    pub diagnostic: Option<String>,
+}
+
 /// Bindless descriptor heap slot referenced by a draw or dispatch (via root constants or descriptor tables
 /// on a directly-indexed root signature).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -520,6 +554,7 @@ pub struct Frame {
     pub fence_states: Vec<FenceState>,
     pub submission_syncs: Vec<SubmissionSync>,
     pub tile_snapshots: Vec<TileSnapshot>,
+    pub range_snapshots: Vec<RangeSnapshot>,
     pub bindless_usage: Vec<BindlessUsage>,
     pub annotations: Vec<Annotation>,
     pub diagnostics: Vec<String>,
@@ -631,6 +666,9 @@ pub fn named_by_tables<'d>(
     }
 }
 
+/// Readback result for one in-list [`ListRangeSnapshot`]: per-range `(resource, offset, bytes, blob_key)` or error.
+pub type ListRangeResult = Result<Vec<(u64, u64, u64, String)>, String>;
+
 /// The database extension and the common-table projection share this one prepared plan.
 pub struct Prepared {
     frame: Frame,
@@ -638,6 +676,8 @@ pub struct Prepared {
     first_use: BTreeMap<u64, FirstUse>,
     /// Checkpoint copies read back: the key of each target's bytes, or why there are none.
     checkpoints: BTreeMap<u64, Result<String, String>>,
+    /// In-list range snapshot copies read back, keyed by [`ListRangeSnapshot::id`].
+    list_range_results: BTreeMap<u64, ListRangeResult>,
     /// Checkpoints a list's Close made whose pass the next list submitted with it continued: no copy, and no gap.
     continued: BTreeSet<u64>,
     /// What ExecuteIndirect argument records named (see [`Prepared::named_by_arguments`]).
@@ -712,6 +752,12 @@ impl Prepared {
     }
     pub fn add_tile_snapshot(&mut self, snapshot: TileSnapshot) {
         self.frame.tile_snapshots.push(snapshot);
+    }
+    pub fn add_range_snapshot(&mut self, snapshot: RangeSnapshot) {
+        self.frame.range_snapshots.push(snapshot);
+    }
+    pub fn set_list_range_snapshot(&mut self, id: u64, result: ListRangeResult) {
+        self.list_range_results.insert(id, result);
     }
     pub fn add_annotations(&mut self, rows: Vec<Annotation>) {
         self.frame.annotations.extend(rows);
@@ -975,8 +1021,83 @@ impl Prepared {
             s.uploads.extend(uploads);
         }
     }
-    /// Populate CPU upload contents and per-draw constant bytes after queued blobs are durable.
-    pub fn contents(&self, capture: &mut db::Capture, blobs: &crate::blobs::Blobs) {
+    /// Populate CPU upload contents, range snapshots, and per-draw constant bytes after queued blobs are durable.
+    pub fn contents(&mut self, capture: &mut db::Capture, blobs: &crate::blobs::Blobs) {
+        // Materialize in-list target-draw range snapshots collected from instrumented command lists.
+        for proj in &self.projection.list_range_snapshots {
+            if let Some(why) = &proj.gap {
+                for &(resource, offset, bytes) in &proj.ranges {
+                    self.frame.range_snapshots.push(RangeSnapshot {
+                        phase: "draw".into(),
+                        submission: proj.submission,
+                        event: Some(proj.event),
+                        draw: proj.draw,
+                        resource,
+                        offset,
+                        bytes,
+                        blob: None,
+                        diagnostic: Some(why.clone()),
+                    });
+                }
+                continue;
+            }
+            match self.list_range_results.get(&proj.id) {
+                Some(Ok(slices)) => {
+                    for (resource, offset, bytes, key) in slices {
+                        self.frame.range_snapshots.push(RangeSnapshot {
+                            phase: "draw".into(),
+                            submission: proj.submission,
+                            event: Some(proj.event),
+                            draw: proj.draw,
+                            resource: *resource,
+                            offset: *offset,
+                            bytes: *bytes,
+                            blob: Some(key.clone()),
+                            diagnostic: None,
+                        });
+                    }
+                }
+                Some(Err(why)) => {
+                    for &(resource, offset, bytes) in &proj.ranges {
+                        self.frame.range_snapshots.push(RangeSnapshot {
+                            phase: "draw".into(),
+                            submission: proj.submission,
+                            event: Some(proj.event),
+                            draw: proj.draw,
+                            resource,
+                            offset,
+                            bytes,
+                            blob: None,
+                            diagnostic: Some(why.clone()),
+                        });
+                    }
+                }
+                None => {
+                    for &(resource, offset, bytes) in &proj.ranges {
+                        self.frame.range_snapshots.push(RangeSnapshot {
+                            phase: "draw".into(),
+                            submission: proj.submission,
+                            event: Some(proj.event),
+                            draw: proj.draw,
+                            resource,
+                            offset,
+                            bytes,
+                            blob: None,
+                            diagnostic: Some("in-list range snapshot copy not read back".into()),
+                        });
+                    }
+                }
+            }
+        }
+        // Group capture-start range snapshots (with fallback to earliest phase if no start snapshot exists) by
+        // resource so buffers whose full first-use failed or was skipped still get a pieced `resources.content`.
+        let mut range_by_res: BTreeMap<u64, Vec<&RangeSnapshot>> = BTreeMap::new();
+        for rs in &self.frame.range_snapshots {
+            if rs.blob.is_some() && rs.bytes > 0 {
+                range_by_res.entry(rs.resource).or_default().push(rs);
+            }
+        }
+        let mut synthesized_first_use: Vec<(u64, u64, String)> = Vec::new();
         // Per submission, runs of upload bytes keyed by where they begin; and each upload buffer whole as the frame
         // began.
         let runs: BTreeMap<_, _> = self
@@ -1134,6 +1255,21 @@ impl Prepared {
                 resource.content_note = Some(why.clone());
                 *missing.entry(why).or_default() += 1;
             }
+            if resource.content.is_none()
+                && resource.kind == "buffer"
+                && resource.bytes > 0
+                && let Some(snaps) = range_by_res.get(&resource.id)
+                && let Some((key, sub_id, count, covered)) =
+                    synthesize_range_blob(resource.bytes, snaps, blobs)
+            {
+                resource.content = Some(key.clone());
+                resource.content_source = Some("range-snapshot");
+                resource.content_note = Some(format!(
+                    "captured {count} range(s) ({covered} bytes) via snapshot-ranges; uncaptured bytes are zero"
+                ));
+                hashes = vec![key.clone()];
+                synthesized_first_use.push((resource.id, sub_id, key));
+            }
             if resource.used || resource.content.is_some() {
                 let subs = descriptions
                     .get(&resource.id)
@@ -1146,6 +1282,20 @@ impl Prepared {
                         hash: hashes.get(i).filter(|h| !h.is_empty()).cloned(),
                     });
                 }
+            }
+        }
+        for (res_id, sub_id, key) in synthesized_first_use {
+            let need_insert = self.first_use.get(&res_id).is_none_or(|f| f.content.is_err());
+            if need_insert {
+                self.first_use.insert(
+                    res_id,
+                    FirstUse {
+                        submission: sub_id,
+                        states: serde_json::json!([]),
+                        content: Ok((key.clone(), vec![key])),
+                        note: None,
+                    },
+                );
             }
         }
         capture.subresources.extend(subresources);
@@ -1446,6 +1596,84 @@ fn indirect(signature: Option<&Value>) -> &'static str {
 /// the bytes (offset, length) of it (a buffer's, None for all of it).
 type Copied = (u64, u64, u64, Option<u32>, Option<(u64, u64)>);
 
+/// One projected in-list range snapshot, bound to its submission, event and draw number.
+struct ProjectedRangeSnapshot {
+    id: u64,
+    submission: u64,
+    event: u64,
+    draw: Option<u64>,
+    ranges: Vec<(u64, u64, u64)>,
+    gap: Option<String>,
+}
+
+/// Synthesizes a full-width pieced blob from captured [`RangeSnapshot`]s of a buffer (`phase == "start"` preferred,
+/// falling back to the earliest available phase). Uncaptured regions are filled with [`crate::blobs::ZEROS`].
+/// Returns `(pieced_key, min_submission, range_count, covered_bytes)`.
+fn synthesize_range_blob(
+    width: u64,
+    snaps: &[&RangeSnapshot],
+    blobs: &crate::blobs::Blobs,
+) -> Option<(String, u64, usize, u64)> {
+    let start_snaps: Vec<&RangeSnapshot> = snaps.iter().copied().filter(|s| s.phase == "start").collect();
+    let chosen: &[&RangeSnapshot] = if !start_snaps.is_empty() {
+        &start_snaps
+    } else {
+        snaps
+    };
+    let mut sorted: Vec<(u64, u64, &str, u64)> = chosen
+        .iter()
+        .filter_map(|s| {
+            let key = s.blob.as_deref()?;
+            let start = s.offset.min(width);
+            let end = s.offset.saturating_add(s.bytes).min(width);
+            (start < end).then_some((start, end, key, s.submission))
+        })
+        .collect();
+    if sorted.is_empty() {
+        return None;
+    }
+    sorted.sort_by_key(|&(start, end, _, _)| (start, std::cmp::Reverse(end)));
+    let min_sub = sorted.iter().map(|s| s.3).min().unwrap_or(1);
+    let mut pieces: Vec<(String, u64)> = Vec::new();
+    let mut cursor = 0u64;
+    let mut count = 0usize;
+    let mut covered = 0u64;
+    for (start, end, key, _) in sorted {
+        if end <= cursor {
+            continue;
+        }
+        if start > cursor {
+            pieces.push((crate::blobs::ZEROS.to_string(), start - cursor));
+            cursor = start;
+        }
+        let len = end - cursor;
+        let piece_key = if cursor == start {
+            key.to_string()
+        } else {
+            // Overlap tail: slice `[cursor - start, end - start)` out of the captured range blob.
+            let Ok(tail) = blobs.read(key, cursor - start, Some(len)) else {
+                continue;
+            };
+            let tk = crate::hash::key(&tail);
+            let _ = blobs.put(&tk, &tail);
+            tk
+        };
+        pieces.push((piece_key, len));
+        cursor = end;
+        count += 1;
+        covered = covered.saturating_add(len);
+    }
+    if count == 0 {
+        return None;
+    }
+    if cursor < width {
+        pieces.push((crate::blobs::ZEROS.to_string(), width - cursor));
+    }
+    let key = crate::blobs::pieces_key(&pieces);
+    blobs.put_pieces(&key, &pieces).ok()?;
+    Some((key, min_sub, count, covered))
+}
+
 pub struct Projection {
     next_execution: u64,
     executions: Vec<Execution>,
@@ -1482,6 +1710,8 @@ pub struct Projection {
     bindless_usage: Vec<BindlessUsage>,
     /// Structured annotations extracted from in-stream SetMarker/BeginEvent payloads.
     annotations: Vec<Annotation>,
+    /// Projected in-list target-draw range snapshots.
+    list_range_snapshots: Vec<ProjectedRangeSnapshot>,
 }
 
 /// Counts of the frame's direct-list executions and their checkpoints.
@@ -1676,6 +1906,7 @@ impl Frame {
             projection,
             first_use: BTreeMap::new(),
             checkpoints: BTreeMap::new(),
+            list_range_results: BTreeMap::new(),
             continued: Default::default(),
             named: Named::default(),
         }
@@ -1972,6 +2203,23 @@ impl Frame {
                 ],
             )?;
         }
+        for rs in &self.range_snapshots {
+            tx.execute(
+                "INSERT INTO d12_range_snapshots(phase,submission,event,draw,resource,offset,bytes,blob,diagnostic) \
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![
+                    rs.phase,
+                    integer(rs.submission)?,
+                    rs.event.map(integer).transpose()?,
+                    rs.draw.map(integer).transpose()?,
+                    integer(rs.resource)?,
+                    integer(rs.offset)?,
+                    integer(rs.bytes)?,
+                    rs.blob,
+                    rs.diagnostic
+                ],
+            )?;
+        }
         for u in self.bindless_usage.iter().chain(&p.bindless_usage) {
             tx.execute(
                 "INSERT OR IGNORE INTO d12_bindless_usage VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -2026,6 +2274,40 @@ impl Projection {
             heap_named: std::collections::BTreeSet::new(),
             bindless_usage: Vec::new(),
             annotations: Vec::new(),
+            list_range_snapshots: Vec::new(),
+        }
+    }
+
+    /// Projects in-list target-draw range snapshots recorded before specific commands in `list`.
+    fn range_snapshots(
+        &mut self,
+        list: &List,
+        seqs: &[u64],
+        draws: &[Option<u64>],
+        submission: u64,
+        first: bool,
+    ) {
+        for rs in &list.range_snapshots {
+            let Some(&event) = seqs.get(rs.command) else {
+                continue;
+            };
+            let draw = draws.get(rs.command).copied().flatten();
+            let gap = if first {
+                rs.gap.clone()
+            } else {
+                Some(
+                    "the list was executed again in the frame: its range snapshot holds the first execution's bytes"
+                        .into(),
+                )
+            };
+            self.list_range_snapshots.push(ProjectedRangeSnapshot {
+                id: rs.id,
+                submission,
+                event,
+                draw,
+                ranges: rs.ranges.clone(),
+                gap,
+            });
         }
     }
 
@@ -2297,6 +2579,7 @@ impl Projection {
             pipeline.graphics.begin_bundle();
         }
         let mut seqs = Vec::with_capacity(list.commands.len());
+        let mut cmd_draws = Vec::with_capacity(list.commands.len());
         // The raytracing state object each command ran with: a DispatchRays' tables identify its exports.
         let mut state_objects = Vec::with_capacity(list.commands.len());
         for (index, command) in list.commands.iter().enumerate() {
@@ -2549,6 +2832,7 @@ impl Projection {
             } else {
                 None
             };
+            cmd_draws.push(draw);
             capture.events.push(db::Event {
                 seq,
                 kind,
@@ -2601,6 +2885,7 @@ impl Projection {
         self.checkpoints(capture, list, list.commands.len(), first);
         self.outputs(list, list.commands.len(), &seqs, first);
         self.arguments(list, &seqs, &state_objects, submission);
+        self.range_snapshots(list, &seqs, &cmd_draws, submission.id, first);
         if depth == 0 && list.kind == 0 && last_draw.is_some() {
             if list.instrumented {
                 self.pass_ends.lists_instrumented += 1;
@@ -2856,6 +3141,10 @@ CREATE TABLE d12_submission_sync(id INTEGER PRIMARY KEY,submission INTEGER NOT N
  satisfied INTEGER NOT NULL);
 CREATE TABLE d12_tile_snapshots(submission INTEGER NOT NULL,resource INTEGER NOT NULL,cpu_seq INTEGER NOT NULL,
  pages_json TEXT,blob TEXT,diagnostic TEXT,PRIMARY KEY(submission,resource));
+CREATE TABLE d12_range_snapshots(id INTEGER PRIMARY KEY,phase TEXT NOT NULL,submission INTEGER NOT NULL,
+ event INTEGER,draw INTEGER,resource INTEGER NOT NULL,offset INTEGER NOT NULL,bytes INTEGER NOT NULL,
+ blob TEXT,diagnostic TEXT);
+CREATE INDEX d12_range_snapshots_res ON d12_range_snapshots(resource,phase,event);
 CREATE TABLE d12_bindless_usage(draw INTEGER NOT NULL,event INTEGER NOT NULL,heap INTEGER NOT NULL,
  slot INTEGER NOT NULL,kind TEXT NOT NULL,resource INTEGER NOT NULL,access TEXT NOT NULL,source TEXT NOT NULL,
  PRIMARY KEY(draw,heap,slot,access));
@@ -3869,6 +4158,149 @@ mod tests {
             .query_row("SELECT count(*) FROM d12_annotations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(ann_count2, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn range_snapshots_synthesize_pieced_content_and_persist_draw_ranges() {
+        let dir = std::env::temp_dir().join(format!("locum_range_snap_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blobs = crate::blobs::Blobs::new(dir.join("blobs"));
+        let db_path = dir.join("capture.db");
+
+        let gib4: u64 = 1u64 << 32;
+        let objects = vec![Object {
+            id: 27,
+            kind: "ID3D12Resource",
+            device: 1,
+            description: json!({
+                "dimension": 1,
+                "width": gib4,
+                "height": 1,
+                "depth_or_array_size": 1,
+                "mips": 1,
+                "format": 0,
+                "sample_count": 1,
+                "layout": 1,
+                "flags": 4,
+                "heap": 0,
+                "heap_offset": 0,
+                "heap_properties": null
+            }),
+        }];
+        let mut list = Recording::new(10, 0, 20, 0, false);
+        list.instrument();
+        list.range_snapshot(ListRangeSnapshot {
+            id: 77,
+            command: 0,
+            ranges: vec![(27, 0x1256_1000, 0x1000)],
+            gap: None,
+        });
+        list.record(Command {
+            call: "Dispatch",
+            args: json!([1, 1, 1]),
+            bundle: None,
+            diagnostic: None,
+        });
+        list.close();
+
+        let start_a = vec![0xA5u8; 0x1000];
+        let start_b = vec![0x5Au8; 0x1000];
+        let draw_bytes = vec![0xCCu8; 0x1000];
+        let ka = crate::hash::key(&start_a);
+        let kb = crate::hash::key(&start_b);
+        let kd = crate::hash::key(&draw_bytes);
+        blobs.put(&ka, &start_a).unwrap();
+        blobs.put(&kb, &start_b).unwrap();
+        blobs.put(&kd, &draw_bytes).unwrap();
+
+        let frame = Frame {
+            objects,
+            submissions: vec![Submission {
+                id: 1,
+                queue: 80,
+                queue_seq: 1,
+                cpu_seq: 1,
+                lists: vec![list.snapshot()],
+                descriptors: Vec::new(),
+                uploads: Vec::new(),
+            }],
+            ..Frame::default()
+        };
+        let mut cap = crate::db::Capture::default();
+        let mut prepared = frame.prepare(&mut cap);
+        // Simulate full first-use failing on readback budget while range snapshots succeeded.
+        prepared.set_first_use(
+            27,
+            FirstUse {
+                submission: 1,
+                states: json!([]),
+                content: Err("readback budget timeout".into()),
+                note: None,
+            },
+        );
+        prepared.add_range_snapshot(RangeSnapshot {
+            phase: "start".into(),
+            submission: 1,
+            event: None,
+            draw: None,
+            resource: 27,
+            offset: 0x1256_1000,
+            bytes: 0x1000,
+            blob: Some(ka.clone()),
+            diagnostic: None,
+        });
+        prepared.add_range_snapshot(RangeSnapshot {
+            phase: "start".into(),
+            submission: 1,
+            event: None,
+            draw: None,
+            resource: 27,
+            offset: 0x1256_2000,
+            bytes: 0x1000,
+            blob: Some(kb.clone()),
+            diagnostic: None,
+        });
+        prepared.set_list_range_snapshot(77, Ok(vec![(27, 0x1256_1000, 0x1000, kd.clone())]));
+        prepared.contents(&mut cap, &blobs);
+        cap.d3d12 = Some(prepared);
+        crate::db::write(&db_path, &cap).unwrap();
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (content, src): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT content, content_source FROM resources WHERE id = 27",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        let pieced_key = content.expect("synthesized pieced content");
+        assert_eq!(src.as_deref(), Some("range-snapshot"));
+        assert_eq!(blobs.size(&pieced_key), Some(gib4));
+        assert_eq!(blobs.read(&pieced_key, 0, Some(64)).unwrap(), vec![0u8; 64]);
+        assert_eq!(
+            blobs.read(&pieced_key, 0x1256_1000, Some(0x1000)).unwrap(),
+            start_a
+        );
+        assert_eq!(
+            blobs.read(&pieced_key, 0x1256_2000, Some(0x1000)).unwrap(),
+            start_b
+        );
+
+        type SnapRow = (String, Option<i64>, i64, i64, Option<String>);
+        let rows: Vec<SnapRow> = conn
+            .prepare("SELECT phase, draw, offset, bytes, blob FROM d12_range_snapshots WHERE resource = 27 ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, "start");
+        assert_eq!(rows[1].0, "start");
+        assert_eq!(rows[2], ("draw".into(), Some(1), 0x1256_1000, 0x1000, Some(kd)));
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

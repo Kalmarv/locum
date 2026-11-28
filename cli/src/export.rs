@@ -186,6 +186,85 @@ pub struct Which {
 
 pub fn export(c: &Capture, id: i64, out_path: &Path, which: &Which, picture: &Picture) -> Result<(), String> {
     let s = shape(c, id).ok_or_else(|| format!("no resource #{id}"))?;
+    let kind = kind_of(out_path);
+    if s.kind == "buffer" && kind != Kind::Raw {
+        return Err("a buffer exports as raw bytes (give a file name without .dds or .png)".into());
+    }
+    // Streaming offline fast path for buffer `--bytes A..B`: reads only the requested slice from pieced blobs or
+    // `d12_range_snapshots` without materializing a 4 GiB buffer in RAM.
+    if s.kind == "buffer"
+        && let Some((a, b)) = which.bytes
+    {
+        let total = s.bytes;
+        let from = a.max(0) as u64;
+        let to = (b.max(0) as u64).min(total);
+        if from >= to {
+            return Err(format!("--bytes {from}..{to}: nothing of #{id}'s {total} bytes"));
+        }
+        let len = to - from;
+        if let Some(event) = which.at {
+            if c.has_table("d12_range_snapshots") {
+                let sub: Option<i64> = c.row(
+                    "SELECT x.submission FROM d12_event_locations l JOIN d12_executions x ON x.id = l.execution \
+                     WHERE l.event = ?1",
+                    [event],
+                    |r| r.get(0),
+                );
+                let hit: Option<(String, u64, String)> = c
+                    .row(
+                        "SELECT phase, offset, blob FROM d12_range_snapshots \
+                         WHERE resource = ?1 AND blob IS NOT NULL AND offset <= ?2 AND offset + bytes >= ?3 \
+                         AND ((phase = 'draw' AND event = ?4) OR (phase = 'pre-submission' AND submission = ?5)) \
+                         ORDER BY CASE phase WHEN 'draw' THEN 0 ELSE 1 END, id DESC LIMIT 1",
+                        rusqlite::params![id, from as i64, to as i64, event, sub.unwrap_or(-1)],
+                        |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?)),
+                    );
+                if let Some((phase, snap_off, key)) = hit {
+                    let slice = c
+                        .blobs
+                        .read(&key, from - snap_off, Some(len))
+                        .map_err(|e| format!("range snapshot blob {key}: {e}"))?;
+                    write(out_path, &slice)?;
+                    told!(
+                        out_path,
+                        "{}: {len} bytes of #{id} ({from:#x}..{to:#x}, {phase} range snapshot {key} at event {event})",
+                        out_path.display()
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            let column = if which.upload { "upload" } else { "content" };
+            let key: String = c
+                .row(
+                    &format!("SELECT {column} FROM resources WHERE id = ?1"),
+                    [id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .flatten()
+                .ok_or_else(|| format!("#{id} has no {column} in this capture"))?;
+            let blob_size = c
+                .blobs
+                .size(&key)
+                .ok_or_else(|| format!("blob {key} is not in {}", c.blobs.root().display()))?;
+            if blob_size != total {
+                return Err(format!(
+                    "contents ({key}) have {blob_size} bytes, {total} expected for {s}"
+                ));
+            }
+            let slice = c
+                .blobs
+                .read(&key, from, Some(len))
+                .map_err(|e| format!("blob {key} at {from:#x}..{to:#x}: {e}"))?;
+            write(out_path, &slice)?;
+            told!(
+                out_path,
+                "{}: {len} bytes of #{id} ({from:#x}..{to:#x}, {key})",
+                out_path.display()
+            );
+            return Ok(());
+        }
+    }
     let (bytes, key) = match which.at {
         Some(event) => {
             let (bytes, events, warnings) = crate::replay::contents_at(c, id, event, which.warp)?;

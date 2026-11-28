@@ -120,7 +120,8 @@ impl Data {
         checkpoints: Vec<model::Checkpoint>,
         pass: &mut super::passes::Pass,
     ) {
-        let (outputs, arguments) = (pass.outputs(), pass.arguments());
+        let (outputs, arguments, range_snapshots) =
+            (pass.outputs(), pass.arguments(), pass.range_snapshots());
         for resource in pass.promoted() {
             recording.promote(resource);
         }
@@ -130,7 +131,8 @@ impl Data {
                 .iter()
                 .map(|c| c.id)
                 .chain(outputs.iter().map(|o| o.id))
-                .chain(arguments.iter().map(|a| a.id)),
+                .chain(arguments.iter().map(|a| a.id))
+                .chain(range_snapshots.iter().map(|r| r.id)),
         );
         for c in checkpoints {
             recording.checkpoint(c);
@@ -140,6 +142,9 @@ impl Data {
         }
         for a in arguments {
             recording.arguments(a);
+        }
+        for r in range_snapshots {
+            recording.range_snapshot(r);
         }
     }
     /// Before Close is forwarded to the real list `real`: what its last command wrote is copied, a pass still open
@@ -256,6 +261,12 @@ struct Series {
     snapshot_reserved: Option<bool>,
     /// Per-request `annotations` sidecar path override.
     annotations: Option<PathBuf>,
+    /// Per-request `snapshot-ranges` specs merged with `settings.txt`.
+    snapshot_ranges: Vec<String>,
+    /// Per-request `snapshot-traced` file paths merged with `settings.txt`.
+    snapshot_traced: Vec<String>,
+    /// Per-request `snapshot-draw` selectors merged with `settings.txt`.
+    snapshot_draws: Vec<String>,
 }
 
 /// The most frames one request captures.
@@ -299,6 +310,8 @@ struct Live {
     initial_reserved: Vec<u64>,
     /// Path to external JSONL annotation sidecar to ingest at capture close.
     annotations_path: PathBuf,
+    /// Configured capture-start and target-draw buffer range snapshots (`snapshot-ranges` / `snapshot-traced`).
+    range_snapshots: Arc<super::range_snap::RangeSnapshotConfig>,
 }
 /// What a capture leaves free on the blob store's drive: its first-use copies stop short of it.
 const DISK_KEPT: u64 = 8 << 30;
@@ -798,19 +811,35 @@ pub unsafe fn submit(
         let mut tiles = HashMap::new();
         loop {
             let pages: Vec<u64> = match &s.capture {
-                Some(live) if Some(live.number) == number => touched
-                    .iter()
-                    .copied()
-                    .filter(|r| {
-                        !tiles.contains_key(r)
-                            && (!live.used.contains(r) || (selected && live.remapped_since_copy.contains(r)))
-                    })
-                    .filter(|r| {
-                        s.objects.get(r).is_some_and(|o| {
-                            o.description["dimension"].is_u64() && o.description["heap_properties"].is_null()
+                Some(live) if Some(live.number) == number => {
+                    let mut want_pages: Vec<u64> = touched
+                        .iter()
+                        .copied()
+                        .filter(|r| {
+                            !tiles.contains_key(r)
+                                && (!live.used.contains(r)
+                                    || (selected && live.remapped_since_copy.contains(r)))
                         })
-                    })
-                    .collect(),
+                        .collect();
+                    if !live.range_snapshots.is_empty()
+                        && (first || (draws_after > draws_before && live.range_snapshots.has_draw_targets()))
+                    {
+                        for &r in live.range_snapshots.ranges.keys() {
+                            if !tiles.contains_key(&r) && !want_pages.contains(&r) {
+                                want_pages.push(r);
+                            }
+                        }
+                    }
+                    want_pages
+                        .into_iter()
+                        .filter(|r| {
+                            s.objects.get(r).is_some_and(|o| {
+                                o.description["dimension"].is_u64()
+                                    && o.description["heap_properties"].is_null()
+                            })
+                        })
+                        .collect()
+                }
                 _ => break,
             };
             if reads.is_empty() && pages.is_empty() {
@@ -852,6 +881,17 @@ pub unsafe fn submit(
             ..
         } = &mut *s;
         if let Some(live) = capture.as_mut().filter(|live| Some(live.number) == number) {
+            let range_copies = plan_range_copies(
+                live,
+                id,
+                first,
+                cpu_seq,
+                draws_before,
+                draws_after,
+                &lists,
+                objects,
+                &tiles,
+            );
             let snapshots = first_uses(
                 live,
                 id,
@@ -873,8 +913,8 @@ pub unsafe fn submit(
                 selected,
                 &live.selection,
             );
-            if !copies.is_empty() || !snapshots.is_empty() {
-                before = Some((copies, snapshots, live.results.clone()));
+            if !range_copies.is_empty() || !copies.is_empty() || !snapshots.is_empty() {
+                before = Some((range_copies, copies, snapshots, live.results.clone()));
             }
         }
     }
@@ -896,7 +936,13 @@ pub unsafe fn submit(
     for (at, list) in ordinals.into_iter().zip(&lists).filter(|(_, l)| l.instrumented) {
         let copied = list.checkpoints.iter().filter(|c| c.gap.is_none()).map(|c| c.id);
         let copied = copied.chain(list.outputs.iter().filter(|o| o.gap.is_none()).map(|o| o.id));
+        let range_ids = list
+            .range_snapshots
+            .iter()
+            .filter(|r| r.gap.is_none())
+            .map(|r| r.id);
         submitted.all.extend(copied.clone());
+        submitted.all.extend(range_ids);
         if capture.is_some() {
             let arguments = list.arguments.iter().filter(|a| a.gap.is_none()).map(|a| a.id);
             submitted.all.extend(arguments.clone());
@@ -907,6 +953,12 @@ pub unsafe fn submit(
             .is_some_and(|live| live.executed.insert((list.id, list.generation)));
         if first {
             submitted.read.extend(copied);
+            submitted.range_snapshots.extend(
+                list.range_snapshots
+                    .iter()
+                    .filter(|r| r.gap.is_none())
+                    .map(|r| (r.id, r.ranges.clone())),
+            );
         }
         executed.push(super::passes::Executed {
             at,
@@ -919,8 +971,8 @@ pub unsafe fn submit(
     // Everything from here on records locum's own lists on the real device, or runs them on the real queue: without
     // the state, as above. The Present that closes the capture waits for this submission (see [`present`]).
     drop(s);
-    if let Some((copies, snapshots, results)) = before {
-        unsafe { super::readback::submit(queue.id, real, id, copies, snapshots, &results) };
+    if let Some((range_copies, copies, snapshots, results)) = before {
+        unsafe { super::readback::submit(queue.id, real, id, range_copies, copies, snapshots, &results) };
     }
     if armed {
         UPLOAD_COST.add(upload_start, 0);
@@ -1027,6 +1079,159 @@ unsafe fn prune(waits: &mut Vec<(u64, u64)>, signals: &HashMap<u64, u64>) {
             super::real::<ID3D12Fence>(fence).is_none_or(|f| unsafe { f.GetCompletedValue() } >= value);
         !(signalled || completed)
     });
+}
+
+/// Threshold above which a buffer explicitly covered by `snapshot-ranges` (or marked `uncaptured` in
+/// `snapshot-traced`) skips full-buffer `first_uses` readback so multi-GiB UMA windows do not time out the readback
+/// budget; `Prepared::contents` synthesizes its pieced `resources.content` from the capture-start range snapshots.
+const RANGE_ONLY_SKIP_BYTES: u64 = 64 << 20;
+
+/// Plans capture-start (`phase = "start"`) and pre-submission target-draw fallback (`phase = "pre-submission"`)
+/// buffer range copies for `submission`, recording initial tile page tables for reserved targets and diagnostics
+/// for unresolvable/unmapped ranges.
+#[allow(clippy::too_many_arguments)]
+fn plan_range_copies(
+    live: &mut Live,
+    submission: u64,
+    first: bool,
+    cpu_seq: u64,
+    draws_before: u64,
+    draws_after: u64,
+    lists: &[Arc<model::List>],
+    objects: &BTreeMap<u64, model::Object>,
+    tiles: &HashMap<u64, Tiles>,
+) -> Vec<super::readback::RangeCopy> {
+    if live.range_snapshots.is_empty() {
+        return Vec::new();
+    }
+    let cfg = live.range_snapshots.clone();
+    let mut out = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    let mut enqueue_map = |live: &mut Live,
+                           phase: &'static str,
+                           event: Option<u64>,
+                           draw: Option<u64>,
+                           by_res: &BTreeMap<u64, Vec<(u64, u64)>>| {
+        for (&res, intervals) in by_res {
+            let Some(obj) = objects.get(&res) else {
+                for &(start, end) in intervals {
+                    diagnostics.push(model::RangeSnapshot {
+                        phase: phase.into(),
+                        submission,
+                        event,
+                        draw,
+                        resource: res,
+                        offset: start,
+                        bytes: end.saturating_sub(start),
+                        blob: None,
+                        diagnostic: Some(format!("no live resource #{res} at {phase}")),
+                    });
+                }
+                continue;
+            };
+            let d = &obj.description;
+            if d["dimension"].as_u64() != Some(1) {
+                for &(start, end) in intervals {
+                    diagnostics.push(model::RangeSnapshot {
+                        phase: phase.into(),
+                        submission,
+                        event,
+                        draw,
+                        resource: res,
+                        offset: start,
+                        bytes: end.saturating_sub(start),
+                        blob: None,
+                        diagnostic: Some(format!("#{res} is not a buffer")),
+                    });
+                }
+                continue;
+            }
+            let width = d["width"].as_u64().unwrap_or(0);
+            let reserved = d["heap_properties"].is_null();
+            let mapped = if reserved {
+                if let Some(t) = tiles.get(&res) {
+                    page(live, res, cpu_seq, t.pages.clone());
+                    t.mapped_buffer_tiles.clone()
+                } else {
+                    super::tiles::mapped_buffer_tiles(res)
+                }
+            } else {
+                None
+            };
+            let resolved = super::range_snap::resolve_buffer_ranges(intervals, width, mapped.as_deref());
+            if resolved.is_empty() {
+                for &(start, end) in intervals {
+                    diagnostics.push(model::RangeSnapshot {
+                        phase: phase.into(),
+                        submission,
+                        event,
+                        draw,
+                        resource: res,
+                        offset: start,
+                        bytes: end.saturating_sub(start),
+                        blob: None,
+                        diagnostic: Some(if reserved {
+                            format!("all requested tiles of reserved #{res} were unmapped at {phase}")
+                        } else {
+                            format!("range past end of #{res} ({width} bytes)")
+                        }),
+                    });
+                }
+                continue;
+            }
+            for (start, end) in resolved {
+                out.push(super::readback::RangeCopy {
+                    phase,
+                    event,
+                    draw,
+                    resource: res,
+                    offset: start,
+                    len: end - start,
+                });
+            }
+        }
+    };
+
+    if first {
+        enqueue_map(live, "start", None, None, &cfg.ranges);
+    }
+
+    // Pre-submission fallback for target draws when no in-list range snapshot was recorded in `lists` (e.g. lists
+    // recorded before arming, compute-queue lists, or out-of-order recording).
+    if draws_after > draws_before && cfg.has_draw_targets() {
+        let already_in_list = lists.iter().any(|l| !l.range_snapshots.is_empty());
+        if !already_in_list {
+            let new_draws = &live.capture.draws[draws_before as usize..draws_after as usize];
+            let mut matched: Option<(u64, u64, &super::range_snap::ResourceRanges)> = None;
+            for d in new_draws {
+                if let Some(by_res) = cfg.ranges_for_draw_number(d.n) {
+                    matched = Some((d.event, d.n, by_res));
+                    break;
+                }
+                let shaders: Vec<String> = d.shaders.iter().flatten().cloned().collect();
+                if cfg.matches_pipeline(0, &shaders, &[]) {
+                    matched = Some((d.event, d.n, &cfg.ranges));
+                    break;
+                }
+            }
+            if let Some((ev, dn, by_res)) = matched {
+                enqueue_map(live, "pre-submission", Some(ev), Some(dn), by_res);
+            }
+        }
+    }
+
+    if !diagnostics.is_empty() {
+        live.results
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(super::readback::Batch {
+                submission,
+                range_snapshots: diagnostics,
+                ..Default::default()
+            });
+    }
+    out
 }
 
 /// The snapshots to copy before a submission's lists: each resource it touches that no earlier submission of the
@@ -1168,6 +1373,16 @@ fn first_uses(
         } else {
             super::readback::buffer_copy_bytes(locum_capture::layout::total(&layout), mapped_tiles.as_deref())
         };
+        if !texture
+            && !pinned
+            && planned_bytes > RANGE_ONLY_SKIP_BYTES
+            && live.range_snapshots.prefer_range_only.contains(&resource)
+        {
+            // Large UMA/window buffer explicitly covered by `snapshot-ranges` / uncaptured `snapshot-traced`:
+            // skip doomed multi-GiB full copy; `Prepared::contents` synthesizes its pieced content from the
+            // capture-start range snapshots.
+            continue;
+        }
         let is_initial_reserved = initial_reserved.contains(&resource);
         if is_initial_reserved
             && !pinned
@@ -1685,6 +1900,7 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
             );
         }
         super::passes::ARMED.store(false, std::sync::atomic::Ordering::Release);
+        super::passes::configure_range_snapshots(None);
         log!(
             "D3D12 capture closing: {} copies recorded so far",
             super::passes::recorded()
@@ -1768,6 +1984,12 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                     }
                     for snap in batch.tile_snapshots {
                         prepared.add_tile_snapshot(snap);
+                    }
+                    for snap in batch.range_snapshots {
+                        prepared.add_range_snapshot(snap);
+                    }
+                    for (id, res) in batch.list_range_snapshots {
+                        prepared.set_list_range_snapshot(id, res);
                     }
                     for (id, content) in batch.checkpoints {
                         prepared.set_checkpoint(id, content);
@@ -1901,6 +2123,24 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
             .map(|v| v.trim())
             .filter(|v| !v.is_empty())
             .map(PathBuf::from);
+        let snapshot_ranges: Vec<String> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("snapshot-ranges "))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        let snapshot_traced: Vec<String> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("snapshot-traced "))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
+        let snapshot_draws: Vec<String> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("snapshot-draw "))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect();
         let series = Series {
             label: (!label.is_empty()).then_some(label),
             index: 1,
@@ -1909,6 +2149,9 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
             indirect_args,
             snapshot_reserved,
             annotations,
+            snapshot_ranges,
+            snapshot_traced,
+            snapshot_draws,
         };
         let early = match text.lines().find_map(|l| l.strip_prefix("early ")) {
             None => 0,
@@ -1976,6 +2219,29 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
     for err in sel_errors {
         log!("D3D12 complete-pass selector error: {err}");
     }
+    let mut range_specs = settings.snapshot_ranges.clone();
+    range_specs.extend(series.snapshot_ranges.iter().cloned());
+    let mut traced_paths = settings.snapshot_traced.clone();
+    traced_paths.extend(series.snapshot_traced.iter().cloned());
+    let mut draw_specs = settings.snapshot_draws.clone();
+    draw_specs.extend(series.snapshot_draws.iter().cloned());
+    let (range_snap_cfg, rs_errors) =
+        super::range_snap::RangeSnapshotConfig::load(root, &range_specs, &traced_paths, &draw_specs, &specs);
+    for err in rs_errors {
+        log!("D3D12 snapshot-ranges error: {err}");
+    }
+    if !range_snap_cfg.is_empty() {
+        log!(
+            "D3D12 snapshot-ranges active: {} resource(s), {} merged range(s), {} KiB total, {} target selector(s), {} auto draw(s)",
+            range_snap_cfg.ranges.len(),
+            range_snap_cfg.range_count(),
+            range_snap_cfg.total_bytes().div_ceil(1024),
+            range_snap_cfg.targets.len(),
+            range_snap_cfg.per_draw.len()
+        );
+    }
+    let range_snapshots = Arc::new(range_snap_cfg);
+    super::passes::configure_range_snapshots(Some(range_snapshots.clone()));
     let indirect_args = series.indirect_args.unwrap_or(settings.indirect_args);
     super::select::configure(
         indirect_args,
@@ -2089,6 +2355,7 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         snapshot_reserved_bytes: settings.snapshot_reserved_bytes,
         initial_reserved,
         annotations_path,
+        range_snapshots,
     });
     s.series = Some(series.clone());
     super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
@@ -2236,6 +2503,9 @@ pub(super) fn arm_now(root: &std::path::Path, frames: u32) {
             indirect_args: None,
             snapshot_reserved: None,
             annotations: None,
+            snapshot_ranges: Vec::new(),
+            snapshot_traced: Vec::new(),
+            snapshot_draws: Vec::new(),
         },
     );
 }
@@ -2244,6 +2514,7 @@ pub(super) fn arm_now(root: &std::path::Path, frames: u32) {
 mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     use locum_capture::{d3d12 as model, db};
     use serde_json::json;
@@ -2293,6 +2564,7 @@ mod tests {
             snapshot_reserved_bytes: 4096 << 20,
             initial_reserved: Vec::new(),
             annotations_path: PathBuf::new(),
+            range_snapshots: Arc::default(),
         }
     }
 
@@ -2729,5 +3001,77 @@ mod tests {
             }),
         };
         assert_eq!(buffer_view_range(&srv), Some((640, 1920)));
+    }
+
+    #[test]
+    fn snapshot_ranges_plans_start_and_pre_submission_and_skips_giant_full_first_use() {
+        use super::plan_range_copies;
+        let gib4: u64 = 1u64 << 32;
+        let mut objects = BTreeMap::new();
+        objects.insert(27, reserved_buffer(27, gib4));
+        let mut live = test_live(
+            &objects,
+            Room {
+                heap: Some(512 << 20),
+                disk: Some(64 << 30),
+                ..Room::default()
+            },
+        );
+        let (cfg, errs) = super::super::range_snap::RangeSnapshotConfig::load(
+            std::path::Path::new("."),
+            &["draw=1 #27:0x12561000..0x12563000".into()],
+            &[],
+            &[],
+            &[],
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        live.range_snapshots = Arc::new(cfg);
+        // Simulate 2000 mapped tiles (~125 MiB > RANGE_ONLY_SKIP_BYTES) including tile 4694 (0x12560000..0x12570000).
+        let mapped: Vec<u32> = (4000..6000).collect();
+        let mut tiles = HashMap::new();
+        tiles.insert(
+            27,
+            Tiles {
+                pages: Ok((json!({}), json!([[4000, 2000, 5, 0]]))),
+                unreadable: None,
+                mapped_buffer_tiles: Some(mapped),
+            },
+        );
+        live.capture.draws.push(db::Draw {
+            n: 1,
+            event: 42,
+            call: "Dispatch",
+            ..db::Draw::default()
+        });
+        let copies = plan_range_copies(&mut live, 1, true, 1, 0, 1, &[], &objects, &tiles);
+        assert_eq!(copies.len(), 2);
+        assert_eq!(copies[0].phase, "start");
+        assert_eq!(
+            (copies[0].resource, copies[0].offset, copies[0].len),
+            (27, 0x1256_1000, 0x2000)
+        );
+        assert_eq!(copies[1].phase, "pre-submission");
+        assert_eq!((copies[1].draw, copies[1].event), (Some(1), Some(42)));
+
+        // Full first_uses must skip giant #27 instead of queuing 125 MiB of pieces.
+        let states = super::super::states::Tracker::default();
+        let snaps = first_uses(
+            &mut live,
+            1,
+            &objects,
+            &states,
+            vec![27],
+            &HashSet::from([27]),
+            &HashSet::new(),
+            None,
+            1,
+            &tiles,
+            false,
+        );
+        assert!(
+            snaps.is_empty(),
+            "expected giant range-only buffer to skip full first_use"
+        );
+        assert_eq!(live.room.planned, 0);
     }
 }

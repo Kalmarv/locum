@@ -77,6 +77,15 @@ pub struct Settings {
     /// Optional external JSONL annotation sidecar ingested into `d12_annotations` at capture close
     /// (`annotations PATH`, default `<locum_dir>/annotations.jsonl`).
     pub annotations: PathBuf,
+    /// Explicit buffer byte ranges to snapshot at capture start and at target draws
+    /// (`snapshot-ranges <res>:<start>..<end>[,...] [draw=...]`).
+    pub snapshot_ranges: Vec<String>,
+    /// Trace output files (`locum-cli bindless --trace ... --raw-loads`) whose traced buffer ranges are
+    /// snapshotted at capture start and at the target draw (`snapshot-traced PATH`).
+    pub snapshot_traced: Vec<String>,
+    /// Target draw/shader/PSO/marker selectors for draw-time range snapshots
+    /// (`snapshot-draw <n|a..b|draw=...|shader=...|pso=...|marker=...>`).
+    pub snapshot_draws: Vec<String>,
 }
 
 pub fn settings() -> &'static Settings {
@@ -104,6 +113,9 @@ pub fn settings() -> &'static Settings {
             snapshot_reserved_bytes: 4096 << 20,
             capture_frames: 1,
             annotations: dir.join("annotations.jsonl"),
+            snapshot_ranges: Vec::new(),
+            snapshot_traced: Vec::new(),
+            snapshot_draws: Vec::new(),
         };
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.txt")) {
             for (n, line) in text.lines().enumerate() {
@@ -217,6 +229,9 @@ pub fn settings() -> &'static Settings {
                         ),
                     },
                     "annotations" => s.annotations = PathBuf::from(value),
+                    "snapshot-ranges" => s.snapshot_ranges.push(value.to_string()),
+                    "snapshot-traced" => s.snapshot_traced.push(value.to_string()),
+                    "snapshot-draw" => s.snapshot_draws.push(value.to_string()),
                     other => log!("settings.txt line {}: unknown setting {other:?}: ignored", n + 1),
                 }
             }

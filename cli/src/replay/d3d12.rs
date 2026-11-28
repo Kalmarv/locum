@@ -897,6 +897,7 @@ impl D3d12 {
             // them when it ran.
             self.remap_before(c, cpu_seq, seq, rules)?;
             self.first_uses(s)?;
+            self.apply_range_snapshots(c, "pre-submission", Some(s), None)?;
             if !visible.is_empty() {
                 for (id, heap, slot, kind, resource, counter, desc) in c.rows(
                     "SELECT v.id, v.heap, v.slot, v.kind, v.resource, v.counter_resource, v.description \
@@ -977,6 +978,81 @@ impl D3d12 {
                     .unwrap_or(Value::Null),
             };
             self.descriptor(c, &v);
+        }
+        Ok(())
+    }
+
+    /// Uploads any captured buffer ranges from `d12_range_snapshots` matching `(phase, submission, event)` into
+    /// their replay buffers (skipping resources not made in this plan).
+    fn apply_range_snapshots(
+        &mut self,
+        c: &Capture,
+        phase: &str,
+        submission: Option<i64>,
+        event: Option<i64>,
+    ) -> Result<(), String> {
+        if !c.has_table("d12_range_snapshots") {
+            return Ok(());
+        }
+        let rows: Vec<(i64, u64, String)> = match (submission, event) {
+            (Some(sub), _) => c.rows(
+                "SELECT resource, offset, blob FROM d12_range_snapshots \
+                 WHERE phase = ?1 AND submission = ?2 AND blob IS NOT NULL ORDER BY id",
+                rusqlite::params![phase, sub],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?)),
+            ),
+            (None, Some(ev)) => c.rows(
+                "SELECT resource, offset, blob FROM d12_range_snapshots \
+                 WHERE phase = ?1 AND event = ?2 AND blob IS NOT NULL ORDER BY id",
+                rusqlite::params![phase, ev],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?)),
+            ),
+            (None, None) => return Ok(()),
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut any_gpu_copy = false;
+        for (res, offset, key) in rows {
+            let Some((width, mapped, is_buffer)) = self
+                .resources
+                .get(&res)
+                .map(|m| (m.desc.Width, m.heap.mapped(), m.buffer()))
+            else {
+                continue;
+            };
+            if !is_buffer || offset >= width {
+                continue;
+            }
+            let bytes = c.blob(&key)?;
+            let len = (bytes.len() as u64).min(width - offset);
+            if len == 0 {
+                continue;
+            }
+            let slice = &bytes[..len as usize];
+            if mapped {
+                self.map_write(res, offset, slice)?;
+            } else {
+                let mut done = 0u64;
+                while done < len {
+                    let step = (len - done).min(self.limit);
+                    let (upload, p) = self.staging(D3D12_HEAP_TYPE_UPLOAD, step)?;
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(slice.as_ptr().add(done as usize), p, step as usize);
+                    }
+                    self.copy_to_buffer(res, offset + done, &upload, 0, step)?;
+                    done += step;
+                    if done < len {
+                        self.flush()?;
+                    } else {
+                        any_gpu_copy = true;
+                    }
+                }
+            }
+            self.populated.insert(res);
+        }
+        if any_gpu_copy {
+            self.flush()?;
         }
         Ok(())
     }
@@ -3489,6 +3565,7 @@ impl Backend for D3d12 {
         if let Some(s) = Self::submission_of(c, seq) {
             self.enter(c, s, Some(seq), rules)?;
         }
+        self.apply_range_snapshots(c, "draw", None, Some(seq))?;
         let clear_target = if kind == "clear" {
             match call.as_str() {
                 "ClearRenderTargetView" | "ClearDepthStencilView" => a[0]["definition"]["resource"].as_i64(),
@@ -3647,10 +3724,10 @@ impl Backend for D3d12 {
     }
 
     fn reach(&mut self, c: &Capture, seq: i64) -> Result<(), String> {
-        match Self::submission_of(c, seq) {
-            Some(s) => self.enter(c, s, Some(seq), &[]),
-            None => Ok(()),
+        if let Some(s) = Self::submission_of(c, seq) {
+            self.enter(c, s, Some(seq), &[])?;
         }
+        self.apply_range_snapshots(c, "draw", None, Some(seq))
     }
 
     fn read(&mut self, id: i64) -> Result<Vec<u8>, String> {
@@ -6169,5 +6246,231 @@ mod tests {
             ]
         );
         assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
+    }
+
+    #[test]
+    fn range_snapshots_populate_sparse_reserved_buffer_and_draw_override_on_warp() {
+        use super::super::Backend as _;
+        use locum_capture::d3d12::{Command, Frame, Object, RangeSnapshot, Recording, Submission};
+        use serde_json::json;
+        let dir = std::env::temp_dir().join(format!("locum_replay_range_snap_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blobs = locum_capture::blobs::Blobs::new(dir.join("blobs"));
+        let db_path = dir.join("capture.db");
+
+        // 256 MiB reserved buffer with 4096 mapped tiles; only one 4 KiB range at 0x12561000 is captured.
+        let buf_width: u64 = 256 << 20;
+        let off: u64 = 0x0256_1000;
+        let start_data: Vec<u8> = (0..0x1000usize).map(|i| ((i * 7 + 3) & 0xFF) as u8).collect();
+        let draw_data: Vec<u8> = (0..0x1000usize).map(|i| ((i * 13 + 9) & 0xFF) as u8).collect();
+        let ks = locum_capture::hash::key(&start_data);
+        let kd = locum_capture::hash::key(&draw_data);
+        blobs.put(&ks, &start_data).unwrap();
+        blobs.put(&kd, &draw_data).unwrap();
+
+        let objects = vec![
+            Object {
+                id: 5,
+                kind: "ID3D12Heap",
+                device: 1,
+                description: json!({
+                    "size": buf_width,
+                    "alignment": 65536,
+                    "flags": 64,
+                    "properties": {"type": 1, "cpu_page": 0, "memory_pool": 0}
+                }),
+            },
+            Object {
+                id: 27,
+                kind: "ID3D12Resource",
+                device: 1,
+                description: json!({
+                    "dimension": 1,
+                    "alignment": 65536,
+                    "width": buf_width,
+                    "height": 1,
+                    "depth_or_array_size": 1,
+                    "mips": 1,
+                    "format": 0,
+                    "sample_count": 1,
+                    "sample_quality": 0,
+                    "layout": 1,
+                    "flags": 4,
+                    "heap": 0,
+                    "heap_offset": 0,
+                    "heap_properties": null,
+                    "initial_state": 0
+                }),
+            },
+        ];
+        let mut list = Recording::new(10, 0, 20, 0, false);
+        list.record(Command {
+            call: "Dispatch",
+            args: json!([1, 1, 1]),
+            bundle: None,
+            diagnostic: None,
+        });
+        list.close();
+        // Query exact D3D12 buffer tile layout from WARP (same as capture does).
+        let mut d = D3d12::new(true, super::super::Validation::Layer).unwrap();
+        let probe_layout = {
+            let mut tmp: Option<ID3D12Resource> = None;
+            unsafe {
+                d.device
+                    .CreateReservedResource(
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: buf_width,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                            ..Default::default()
+                        },
+                        COMMON,
+                        None,
+                        &mut tmp,
+                    )
+                    .unwrap();
+            }
+            locum_capture::tiles::d3d12(&tmp.unwrap()).unwrap()
+        };
+        let frame = Frame {
+            objects,
+            submissions: vec![Submission {
+                id: 1,
+                queue: 80,
+                queue_seq: 1,
+                cpu_seq: 1,
+                lists: vec![list.snapshot()],
+                descriptors: Vec::new(),
+                uploads: Vec::new(),
+            }],
+            tile_pages: vec![locum_capture::d3d12::TilePages {
+                resource: 27,
+                cpu_seq: 1,
+                pages: Ok((
+                    probe_layout.json(),
+                    json!([[0, (buf_width / 65536) as u32, 5, 0]]),
+                )),
+            }],
+            ..Frame::default()
+        };
+        let mut cap = locum_capture::db::Capture::default();
+        cap.meta("api", "d3d12");
+        cap.meta("blobs", blobs.root().display());
+        let mut prepared = frame.prepare(&mut cap);
+        let draw_event = cap.draws[0].event;
+        prepared.add_range_snapshot(RangeSnapshot {
+            phase: "start".into(),
+            submission: 1,
+            event: None,
+            draw: None,
+            resource: 27,
+            offset: off,
+            bytes: 0x1000,
+            blob: Some(ks),
+            diagnostic: None,
+        });
+        prepared.add_range_snapshot(RangeSnapshot {
+            phase: "draw".into(),
+            submission: 1,
+            event: Some(draw_event),
+            draw: Some(1),
+            resource: 27,
+            offset: off,
+            bytes: 0x1000,
+            blob: Some(kd),
+            diagnostic: None,
+        });
+        prepared.contents(&mut cap, &blobs);
+        cap.d3d12 = Some(prepared);
+        locum_capture::db::write(&db_path, &cap).unwrap();
+
+        let opened = crate::open::open(&db_path.to_string_lossy(), None).unwrap();
+        let pieced_key: String = opened
+            .row("SELECT content FROM resources WHERE id = 27", [], |r| r.get(0))
+            .unwrap();
+        let mut plan = super::super::Plan {
+            events: vec![draw_event as i64],
+            resources: std::collections::BTreeSet::from([27]),
+            written_before_target: std::collections::BTreeSet::new(),
+            until: None,
+            skipped_empty_heap: 0,
+            extra_tiles: HashMap::new(),
+        };
+        d.memory.prepare_plan(&opened, &plan);
+        assert!(d.memory.range_snapshot_buffers.contains(&27));
+        d.create_blob(&opened, 27, Some(&pieced_key)).unwrap();
+        assert!(
+            d.memory.warnings().is_empty(),
+            "unexpected memory warnings: {:?}",
+            d.memory.warnings()
+        );
+        assert!(
+            d.memory.sparse_buffers.contains(&27),
+            "256 MiB range-snapshot buffer must stay sparse"
+        );
+        // Deferred first-use upload populates the capture-start bytes when entering submission 1.
+        d.enter(&opened, 1, Some(draw_event as i64), &[]).unwrap();
+        assert_eq!(d.read_bytes(27, off, 0x1000).unwrap(), start_data);
+        // Draw-phase range snapshot overrides with the exact bytes captured right before draw 1.
+        d.apply_range_snapshots(&opened, "draw", None, Some(draw_event as i64))
+            .unwrap();
+        assert_eq!(d.read_bytes(27, off, 0x1000).unwrap(), draw_data);
+
+        // Offline streaming export reads capture-start and draw-time slices without materializing 256 MiB.
+        let out_start = dir.join("start.bin");
+        let out_draw = dir.join("draw.bin");
+        let pic = crate::export::Picture {
+            range: locum_capture::texels::Range::Clamp,
+            channel: None,
+            rect: None,
+            crop: false,
+            alpha: false,
+        };
+        crate::export::export(
+            &opened,
+            27,
+            &out_start,
+            &crate::export::Which {
+                sub: None,
+                mip: 0,
+                slice: 0,
+                z: 0,
+                upload: false,
+                at: None,
+                warp: true,
+                bytes: Some((off as i64, (off + 0x1000) as i64)),
+            },
+            &pic,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out_start).unwrap(), start_data);
+        crate::export::export(
+            &opened,
+            27,
+            &out_draw,
+            &crate::export::Which {
+                sub: None,
+                mip: 0,
+                slice: 0,
+                z: 0,
+                upload: false,
+                at: Some(draw_event as i64),
+                warp: true,
+                bytes: Some((off as i64, (off + 0x1000) as i64)),
+            },
+            &pic,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&out_draw).unwrap(), draw_data);
+
+        plan.events.clear();
+        drop(opened);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -63,6 +63,50 @@ use super::states::{Access, COPY_DEST, COPY_SOURCE, Read};
 pub static ARMED: AtomicBool = AtomicBool::new(false);
 /// Whether a request's lead is running (`early N`): from the Present that read the request to the one that arms it.
 pub static EARLY: AtomicBool = AtomicBool::new(false);
+/// Fast-path gate for in-list target-draw range snapshots (`snapshot-ranges` / `snapshot-traced`).
+static RANGE_SNAP_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Running count of draw/dispatch commands recorded while `ARMED` is true (reset at `arm()`).
+static FRAME_DRAWS: AtomicU64 = AtomicU64::new(0);
+
+fn active_range_snap() -> MutexGuard<'static, Option<Arc<super::range_snap::RangeSnapshotConfig>>> {
+    static ACTIVE: OnceLock<Mutex<Option<Arc<super::range_snap::RangeSnapshotConfig>>>> = OnceLock::new();
+    ACTIVE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+fn pso_shaders() -> MutexGuard<'static, HashMap<u64, Vec<String>>> {
+    static SHADERS: OnceLock<Mutex<HashMap<u64, Vec<String>>>> = OnceLock::new();
+    SHADERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Records the shader blob hashes belonging to pipeline `id` so in-list target-draw range snapshots can match
+/// `shader=<hex>` selectors while recording a command list.
+pub fn register_pso_shaders(id: u64, description: &Value) {
+    let hashes: Vec<String> = description["shaders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["blob"].as_str().map(|h| h.to_ascii_lowercase()))
+        .collect();
+    if !hashes.is_empty() {
+        pso_shaders().insert(id, hashes);
+    }
+}
+
+/// Configures or clears in-list target-draw range snapshotting when a capture is armed or closed.
+pub fn configure_range_snapshots(cfg: Option<Arc<super::range_snap::RangeSnapshotConfig>>) {
+    let enabled = cfg
+        .as_ref()
+        .is_some_and(|c| !c.is_empty() && c.has_draw_targets());
+    FRAME_DRAWS.store(0, Ordering::Release);
+    *active_range_snap() = cfg;
+    RANGE_SNAP_ACTIVE.store(enabled, Ordering::Release);
+}
 
 /// Whether lists reset or created now are instrumented: while a capture is armed, in a request's lead, and from the
 /// process's start with `arm-early on`, so that lists recorded before the captured frame copy their passes too.
@@ -231,6 +275,7 @@ pub fn destroyed(id: u64) {
     retire(id);
     layouts().remove(&id);
     signatures().remove(&id);
+    pso_shaders().remove(&id);
 }
 
 /// An armed frame's copy of argument records, and the fence value locum signalled after the latest execution of its
@@ -352,6 +397,9 @@ pub fn sweep() {
     });
 }
 
+/// One in-list target-draw range snapshot readback: `(copy_id, [(resource, offset, len)])`.
+pub type SubmittedRangeSnapshot = (u64, Vec<(u64, u64, u64)>);
+
 /// A submission's executions of instrumented lists: every checkpoint they copy into, those whose bytes the armed
 /// capture reads, and the lists locum adds after closed lists to copy the passes they left open.
 #[derive(Default)]
@@ -360,6 +408,8 @@ pub struct Submitted {
     pub read: Vec<u64>,
     /// The copies of argument records in lists the armed frame executes (also in `all`).
     pub arguments: Vec<u64>,
+    /// In-list target-draw range snapshots `(copy_id, [(resource, offset, len)])` to read back on first execution.
+    pub range_snapshots: Vec<SubmittedRangeSnapshot>,
     pub results: Option<super::readback::Results>,
     pub submission: u64,
     /// Locum's copy lists, each with the position in the application's array of the list it follows.
@@ -451,7 +501,10 @@ impl Submitted {
 
     /// Whether the capture has anything to read from this submission's copies.
     pub fn reads(&self) -> bool {
-        !self.read.is_empty() || !self.reads.is_empty() || !self.gaps.is_empty()
+        !self.read.is_empty()
+            || !self.reads.is_empty()
+            || !self.gaps.is_empty()
+            || !self.range_snapshots.is_empty()
     }
 }
 
@@ -653,6 +706,7 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
         all,
         read: wanted,
         arguments,
+        range_snapshots,
         results,
         submission,
         inserted,
@@ -662,6 +716,7 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
         ..
     } = s;
     let mut read = Vec::new();
+    let mut read_ranges = Vec::new();
     {
         let mut c = copies();
         for id in &all {
@@ -672,6 +727,11 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
         for id in &wanted {
             if let Some(copy) = c.get(id) {
                 read.push((*id, copy.data.clone()));
+            }
+        }
+        for (id, specs) in range_snapshots {
+            if let Some(copy) = c.get(&id) {
+                read_ranges.push((id, specs, copy.data.clone()));
             }
         }
         // A list executed again copies its records again: the latest execution's are read.
@@ -696,7 +756,8 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
         _lists: inserted,
         _allocator: allocator,
     };
-    let Some(results) = results.filter(|_| !read.is_empty() || !gaps.is_empty()) else {
+    let Some(results) = results.filter(|_| !read.is_empty() || !gaps.is_empty() || !read_ranges.is_empty())
+    else {
         if !idle {
             super::readback::collector(Box::new(move || {
                 let _ = unsafe {
@@ -732,12 +793,48 @@ pub unsafe fn submitted(queue_id: u64, queue: *mut c_void, s: Submitted) {
             })
             .chain(gaps.into_iter().map(|(id, why)| (id, Err(why))))
             .collect();
+        let list_range_snapshots = read_ranges
+            .into_iter()
+            .map(|(id, specs, readback)| {
+                let res = wait
+                    .as_ref()
+                    .map_err(|e| format!("range snapshot wait: {e}"))
+                    .and_then(|()| unsafe { readback.read() })
+                    .and_then(|data| {
+                        let mut out = Vec::with_capacity(specs.len());
+                        let mut pos = 0usize;
+                        for (resource, offset, len) in specs {
+                            let n = usize::try_from(len)
+                                .map_err(|_| format!("range length {len} exceeds usize"))?;
+                            let end = pos.checked_add(n).filter(|&e| e <= data.len()).ok_or_else(|| {
+                                format!(
+                                    "range snapshot #{resource} {offset:#x}+{len}: short readback ({} bytes)",
+                                    data.len()
+                                )
+                            })?;
+                            let slice = data[pos..end].to_vec();
+                            let key = locum_capture::hash::key(&slice);
+                            locum_capture::writer::blob(
+                                &crate::settings::settings().blobs,
+                                key.clone(),
+                                slice,
+                                true,
+                            );
+                            out.push((resource, offset, len, key));
+                            pos = end;
+                        }
+                        Ok(out)
+                    });
+                (id, res)
+            })
+            .collect();
         results
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(super::readback::Batch {
                 submission,
                 checkpoints,
+                list_range_snapshots,
                 ..Default::default()
             });
     }));
@@ -879,6 +976,12 @@ pub struct Pass {
     outputs: Vec<model::Output>,
     /// The argument records copied, taken at each command (see [`Pass::arguments`]).
     arguments: Vec<model::Arguments>,
+    /// Target-draw buffer range snapshots copied inside this list, taken at each command.
+    range_snapshots: Vec<model::ListRangeSnapshot>,
+    /// Active PIX/D3D12 event marker stack (lowercase) for `marker=` draw-target matching.
+    active_markers: Vec<String>,
+    /// Most recent `SetMarker` text (lowercase) in this list.
+    last_marker: Option<String>,
     /// The buffers those copies read by implicit promotion, taken at each command (see [`super::promoted`]).
     promoted: Vec<u64>,
 }
@@ -941,6 +1044,9 @@ impl Pass {
             enhanced: false,
             outputs: Vec::new(),
             arguments: Vec::new(),
+            range_snapshots: Vec::new(),
+            active_markers: Vec::new(),
+            last_marker: None,
             promoted: Vec::new(),
         })
     }
@@ -953,6 +1059,11 @@ impl Pass {
     /// The argument records copied since last asked.
     pub fn arguments(&mut self) -> Vec<model::Arguments> {
         std::mem::take(&mut self.arguments)
+    }
+
+    /// The target-draw buffer range snapshots copied since last asked.
+    pub fn range_snapshots(&mut self) -> Vec<model::ListRangeSnapshot> {
+        std::mem::take(&mut self.range_snapshots)
     }
 
     /// The buffers copies read by implicit promotion since last asked.
@@ -1045,13 +1156,31 @@ impl Pass {
                 unsafe { self.end_pass(list, at, false, &mut out) };
                 self.predicate = None;
             }
-            "DispatchRays" => unsafe { self.copy_tables(list, a, at) },
+            "BeginEvent" => {
+                if let Some(m) = decode_marker_text(a) {
+                    self.active_markers.push(m);
+                }
+            }
+            "EndEvent" => {
+                self.active_markers.pop();
+            }
+            "SetMarker" => {
+                self.last_marker = decode_marker_text(a);
+            }
+            "Dispatch" => unsafe { self.copy_range_snapshots(list, at) },
+            "DispatchRays" => unsafe {
+                self.copy_range_snapshots(list, at);
+                self.copy_tables(list, a, at);
+            },
             "BuildRaytracingAccelerationStructure" => unsafe { self.copy_pointers(list, a, at) },
             "DrawInstanced"
             | "DrawIndexedInstanced"
             | "DispatchMesh"
             | "ExecuteIndirect"
             | "ExecuteBundle" => {
+                if call != "ExecuteBundle" {
+                    unsafe { self.copy_range_snapshots(list, at) };
+                }
                 if call == "ExecuteIndirect" {
                     unsafe { self.copy_arguments(list, a, at) };
                 }
@@ -1664,6 +1793,149 @@ impl Pass {
             .map(|&(_, access)| access);
         Read::of(known, self.enhanced, real)
     }
+
+    /// Before a draw or dispatch at command index `at`: when `snapshot-ranges` / `snapshot-traced` is active and
+    /// this draw matches a configured target (draw number, PSO, shader hash, or marker), copies the configured
+    /// buffer byte ranges right before the command inside `list`.
+    unsafe fn copy_range_snapshots(&mut self, list: &ID3D12GraphicsCommandList, at: usize) {
+        if !RANGE_SNAP_ACTIVE.load(Ordering::Acquire) || !ARMED.load(Ordering::Acquire) {
+            return;
+        }
+        let draw_n = FRAME_DRAWS.fetch_add(1, Ordering::AcqRel) + 1;
+        let Some(cfg) = active_range_snap().clone() else {
+            return;
+        };
+        let matched = if let Some(by_res) = cfg.ranges_for_draw_number(draw_n) {
+            Some(by_res)
+        } else {
+            let pso = self.bound.pso();
+            let shaders = if pso != 0 {
+                pso_shaders().get(&pso).cloned().unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let mut markers = self.active_markers.clone();
+            if let Some(m) = &self.last_marker {
+                markers.push(m.clone());
+            }
+            cfg.matches_pipeline(pso, &shaders, &markers)
+                .then_some(&cfg.ranges)
+        };
+        let Some(by_res) = matched else {
+            return;
+        };
+        let cap = super::select::output_cap().max(1);
+        let mut pending_sources: Vec<Source> = Vec::new();
+        let mut pending_specs: Vec<(u64, u64, u64)> = Vec::new();
+        let mut pending_bytes: u64 = 0;
+
+        let flush_chunk = |this: &mut Self,
+                           sources: &mut Vec<Source>,
+                           specs: &mut Vec<(u64, u64, u64)>,
+                           bytes: &mut u64| {
+            if sources.is_empty() {
+                return;
+            }
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let specs_taken = std::mem::take(specs);
+            let sources_taken = std::mem::take(sources);
+            *bytes = 0;
+            // Flush prior in-list UAV writes to UMA/buffer windows before reading them with CopyBufferRegion.
+            if !this.enhanced {
+                let uav_barrier = D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                            pResource: ManuallyDrop::new(None),
+                        }),
+                    },
+                };
+                unsafe { list.ResourceBarrier(&[uav_barrier]) };
+            }
+            let copied = unsafe {
+                ranges_into(
+                    &this.device,
+                    list,
+                    &sources_taken,
+                    D3D12_BARRIER_ACCESS_SHADER_RESOURCE | D3D12_BARRIER_ACCESS_UNORDERED_ACCESS,
+                    this.predication(),
+                )
+            };
+            let gap = match copied {
+                Ok((readback, promoted)) => {
+                    keep(id, readback);
+                    this.promoted.extend(promoted);
+                    None
+                }
+                Err(why) => Some(why),
+            };
+            this.range_snapshots.push(model::ListRangeSnapshot {
+                id,
+                command: at,
+                ranges: specs_taken,
+                gap,
+            });
+        };
+
+        for (&res, intervals) in by_res {
+            let Some(real) = super::real::<ID3D12Resource>(res) else {
+                continue;
+            };
+            let desc = unsafe { real.GetDesc() };
+            if desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER {
+                continue;
+            }
+            let mapped = super::tiles::mapped_buffer_tiles(res);
+            let resolved = super::range_snap::resolve_buffer_ranges(intervals, desc.Width, mapped.as_deref());
+            let read = self.read_access(res, &real);
+            for (start, end) in resolved {
+                let mut cur = start;
+                while cur < end {
+                    let step = (end - cur).min(cap);
+                    if pending_bytes > 0 && pending_bytes.saturating_add(step) > cap {
+                        flush_chunk(self, &mut pending_sources, &mut pending_specs, &mut pending_bytes);
+                    }
+                    pending_sources.push(Source {
+                        resource: res,
+                        real: real.clone(),
+                        offset: cur,
+                        bytes: step,
+                        read,
+                    });
+                    pending_specs.push((res, cur, step));
+                    pending_bytes = pending_bytes.saturating_add(step);
+                    cur += step;
+                }
+            }
+        }
+        flush_chunk(self, &mut pending_sources, &mut pending_specs, &mut pending_bytes);
+    }
+}
+
+/// Decodes a PIX/D3D12 SetMarker/BeginEvent byte payload (UTF-16LE or UTF-8) into a lowercase string.
+fn decode_marker_text(args: &Value) -> Option<String> {
+    let bytes: Vec<u8> = args
+        .get(1)?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_u64().map(|n| n as u8))
+        .collect();
+    if bytes.is_empty() {
+        return None;
+    }
+    if bytes.len() >= 2 && bytes.len().is_multiple_of(2) && bytes[1] == 0 {
+        let u16s: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&w| w != 0)
+            .collect();
+        return Some(String::from_utf16_lossy(&u16s).to_ascii_lowercase());
+    }
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Some(String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase())
 }
 
 /// Keeps a copy's readback memory until its list is retired and the GPU is done with it.

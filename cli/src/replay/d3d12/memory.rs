@@ -245,6 +245,9 @@ pub(super) struct Memory {
     pub(super) shared_content_heaps: HashSet<i64>,
     /// Planned resources that receive `d12_upload_versions` CPU map writes (never converted to non-mappable reserved).
     pub(super) upload_versioned: HashSet<i64>,
+    /// Planned buffers whose `resources.content` is a sparse `range-snapshot` pieced blob (keep sparse tile backing
+    /// for their touched/captured tiles instead of committing all recorded game heaps).
+    pub(super) range_snapshot_buffers: HashSet<i64>,
     /// Buffer ids backed sparsely (selective tile backing instead of committing all recorded heaps / full buffer).
     pub(super) sparse_buffers: HashSet<i64>,
     /// Compact sparse tile pool: maps `(game_heap_id, game_heap_tile)` -> `(pool_heap_id, pool_tile)` so shared
@@ -340,6 +343,7 @@ impl Memory {
         }
         self.shared_content_heaps.clear();
         self.upload_versioned.clear();
+        self.range_snapshot_buffers.clear();
 
         let planned_events: HashSet<i64> = plan.events.iter().copied().collect();
         let planned_res = self.planned.as_ref().expect("set above");
@@ -546,6 +550,42 @@ impl Memory {
                 }
             }
         }
+        if c.has_table("d12_range_snapshots") {
+            for (res, off, bytes) in c.rows(
+                "SELECT resource, offset, bytes FROM d12_range_snapshots WHERE blob IS NOT NULL",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)? as u64,
+                        r.get::<_, i64>(2)? as u64,
+                    ))
+                },
+            ) {
+                if planned_res.contains(&res) {
+                    add_touched_range(&mut self.touched_tiles, res, off, bytes, 65536);
+                }
+            }
+        }
+        for (res, key) in c.rows(
+            "SELECT id, content FROM resources WHERE content_source = 'range-snapshot' AND content IS NOT NULL",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        ) {
+            if !planned_res.contains(&res) {
+                continue;
+            }
+            self.range_snapshot_buffers.insert(res);
+            if let Ok(Some(pieces)) = c.blobs.pieces(&key) {
+                let mut at = 0u64;
+                for (k, len) in pieces {
+                    if k != locum_capture::blobs::ZEROS && len > 0 {
+                        add_touched_range(&mut self.touched_tiles, res, at, len, 65536);
+                    }
+                    at = at.saturating_add(len);
+                }
+            }
+        }
 
         // 4. Identify game heaps needed by planned placed resources (shared or non-sparse) and by planned
         // captured reserved resources (e.g. `#24`'s heaps shared with `#25`/`#26`).
@@ -596,7 +636,7 @@ impl Memory {
             let captured_reserved: HashSet<i64> = planned_res
                 .iter()
                 .copied()
-                .filter(|id| has_content_set.contains(id))
+                .filter(|id| has_content_set.contains(id) && !self.range_snapshot_buffers.contains(id))
                 .collect();
             for (rid, pages) in page_tables(c, Some(&captured_reserved)) {
                 if !pages.tiles.is_empty() && has_content_set.contains(&rid) {
@@ -1173,7 +1213,7 @@ impl D3d12 {
                 // - tiles covered by explicit touched ranges in the plan are backed 64 KiB at a time from the compact
                 //   sparse tile pool, keyed by `(game_heap, game_tile)` so shared tiles across #25/#26 still alias;
                 // - untouched private tiles stay unmapped (0 bytes committed; D3D12 reads return 0).
-                let sparse_mode = !has_content
+                let sparse_mode = (!has_content || self.memory.range_snapshot_buffers.contains(&id))
                     && is_buffer
                     && (!self.memory.written_before_target.contains(&id)
                         || make_desc.Width >= SPARSE_RESERVED_BUFFER_BYTES)

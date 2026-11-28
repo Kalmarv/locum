@@ -463,8 +463,9 @@ enum Command {
         /// A .dds (all of it), a .png (one mip), anything else raw bytes; `-` writes the raw bytes to stdout.
         #[arg(short, long)]
         out: PathBuf,
-        /// Of a buffer, only bytes `A..B` (raw): the range a draw bound (`bindings` gives each one's offset and size).
-        #[arg(long, value_parser = parse_draws)]
+        /// Of a buffer, only bytes `A..B` (raw, hex `0x...` or decimal, also `A-B` or `A+LEN`): the range a draw
+        /// bound (`bindings` gives each one's offset and size).
+        #[arg(long, value_parser = parse_byte_range)]
         bytes: Option<(i64, i64)>,
         #[arg(long)]
         sub: Option<u32>,
@@ -928,6 +929,31 @@ fn parse_draws(s: &str) -> Result<(i64, i64), String> {
     match s.split_once("..") {
         Some((a, b)) => Ok((n(a)?, n(b.trim_start_matches('='))?)),
         None => n(s).map(|v| (v, v)),
+    }
+}
+
+fn parse_byte_range(s: &str) -> Result<(i64, i64), String> {
+    let n = |v: &str| -> Result<i64, String> {
+        let v = v.trim();
+        if let Some(hex) = v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+            i64::from_str_radix(hex, 16).map_err(|e| format!("{v:?}: {e}"))
+        } else {
+            v.parse::<i64>().map_err(|e| format!("{v:?}: {e}"))
+        }
+    };
+    if let Some((a, b)) = s.split_once("..=") {
+        Ok((n(a)?, n(b)?.saturating_add(1)))
+    } else if let Some((a, b)) = s.split_once("..") {
+        Ok((n(a)?, n(b)?))
+    } else if let Some((a, b)) = s.split_once('+') {
+        let start = n(a)?;
+        Ok((start, start.saturating_add(n(b)?)))
+    } else if let Some((a, b)) = s.split_once('-') {
+        Ok((n(a)?, n(b)?))
+    } else {
+        Err(format!(
+            "{s:?}: expected byte range A..B, A-B, or A+LEN (decimal or 0x hex)"
+        ))
     }
 }
 

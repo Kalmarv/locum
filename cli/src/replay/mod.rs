@@ -1844,8 +1844,9 @@ fn resolve_draw_root_buffers(
 /// first-use/upload blobs so replay knows which ranges can be pulled vs flagged as uncaptured/unmapped.
 fn classify_raw_loads(c: &Capture, rows: &[(i64, i64, String, i64, u64, u64)]) -> Vec<TracedRawLoad> {
     const TILE_BYTES: u64 = 65_536;
-    let mut content_cache: HashMap<i64, Option<String>> = HashMap::new();
+    let mut content_cache: HashMap<i64, (Option<String>, Option<String>)> = HashMap::new();
     let mut reserved_tiles_cache: HashMap<i64, Option<BTreeSet<u32>>> = HashMap::new();
+    let mut range_snaps_cache: HashMap<i64, Vec<(u64, u64, String)>> = HashMap::new();
     let mut upload_ranges_cache: HashMap<i64, Vec<(u64, u64)>> = HashMap::new();
     let mut out = Vec::with_capacity(rows.len());
     for (draw, event, source, resource, start, end) in rows {
@@ -1891,13 +1892,43 @@ fn classify_raw_loads(c: &Capture, rows: &[(i64, i64, String, i64, u64, u64)]) -
             if !any_mapped {
                 "unmapped"
             } else {
-                let key = content_cache.entry(resource).or_insert_with(|| {
-                    c.row("SELECT content FROM resources WHERE id = ?1", [resource], |r| {
-                        r.get::<_, Option<String>>(0)
-                    })
-                    .flatten()
+                let (key, src) = content_cache.entry(resource).or_insert_with(|| {
+                    c.row(
+                        "SELECT content, content_source FROM resources WHERE id = ?1",
+                        [resource],
+                        |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+                    )
+                    .unwrap_or((None, None))
                 });
-                if let Some(blob_key) = key.as_deref() {
+                let range_snaps = range_snaps_cache.entry(resource).or_insert_with(|| {
+                    if !c.has_table("d12_range_snapshots") {
+                        return Vec::new();
+                    }
+                    c.rows(
+                        "SELECT offset, bytes, blob FROM d12_range_snapshots \
+                         WHERE resource = ?1 AND blob IS NOT NULL",
+                        [resource],
+                        |r| {
+                            let off = r.get::<_, i64>(0)? as u64;
+                            let len = r.get::<_, i64>(1)? as u64;
+                            Ok((off, off.saturating_add(len), r.get::<_, String>(2)?))
+                        },
+                    )
+                });
+                let is_range_only = src.as_deref() == Some("range-snapshot");
+                let snap_hit = range_snaps.iter().find(|&&(r0, r1, _)| r0 < end && r1 > start);
+                if let Some(&(r0, r1, ref snap_key)) = snap_hit
+                    && (is_range_only || key.is_none())
+                {
+                    let lo = start.max(r0);
+                    let hi = end.min(r1);
+                    let check_len = (hi - lo).min(1 << 20);
+                    match c.blobs.read(snap_key, lo - r0, Some(check_len)) {
+                        Ok(bytes) if bytes.iter().any(|&b| b != 0) => "captured-nonzero",
+                        Ok(_) => "captured-zero",
+                        Err(_) => "uncaptured",
+                    }
+                } else if !is_range_only && let Some(blob_key) = key.as_deref() {
                     let check_len = (end - start).min(1 << 20);
                     match c.blobs.read(blob_key, start, Some(check_len)) {
                         Ok(bytes) if bytes.iter().any(|&b| b != 0) => "captured-nonzero",

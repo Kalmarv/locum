@@ -78,6 +78,7 @@ pub fn program(key: &str, code: &[u8]) {
 
 /// A pipeline made, from its description: its programs, by stage.
 pub fn pipeline(id: u64, description: &Value) {
+    super::passes::register_pso_shaders(id, description);
     let stages: Vec<(&'static str, Option<Registers>)> = {
         let p = programs();
         description["shaders"]
@@ -264,6 +265,11 @@ impl Bound {
                 }
             }
         }
+    }
+
+    /// Currently bound pipeline state object id (0 if none).
+    pub fn pso(&self) -> u64 {
+        self.pso
     }
 
     /// The initial pipeline a Reset names.

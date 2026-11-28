@@ -468,6 +468,16 @@ pub unsafe fn after_frame(
                 });
             continue;
         };
-        unsafe { super::readback::submit(queue, real.as_raw(), submission, Vec::new(), snapshots, results) };
+        unsafe {
+            super::readback::submit(
+                queue,
+                real.as_raw(),
+                submission,
+                Vec::new(),
+                Vec::new(),
+                snapshots,
+                results,
+            )
+        };
     }
 }

@@ -30,6 +30,18 @@ use windows::core::Interface;
 use super::states::{Access, COMMON, COPY_SOURCE, UNDEFINED};
 use crate::log::log;
 
+/// One explicit byte range of any buffer copied at capture start (`phase = "start"`) or before a target
+/// submission (`phase = "pre-submission"`). Always guaranteed (never dropped on `readback_budget` timeout).
+#[derive(Clone, Debug)]
+pub struct RangeCopy {
+    pub phase: &'static str,
+    pub event: Option<u64>,
+    pub draw: Option<u64>,
+    pub resource: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
 /// One range of an upload buffer to copy: `whole` marks the copy of a whole upload buffer at the frame's first
 /// submission.
 pub struct Copy {
@@ -74,6 +86,10 @@ pub struct Batch {
     pub contents: Vec<(u64, FirstUse)>,
     /// Post-remap resident tile snapshots for selected passes.
     pub tile_snapshots: Vec<locum_capture::d3d12::TileSnapshot>,
+    /// Capture-start or pre-submission buffer range snapshots (`snapshot-ranges` / `snapshot-traced`).
+    pub range_snapshots: Vec<locum_capture::d3d12::RangeSnapshot>,
+    /// In-list target-draw buffer range snapshots collected by `passes::submitted`.
+    pub list_range_snapshots: Vec<(u64, locum_capture::d3d12::ListRangeResult)>,
     /// Pass-end checkpoints read back (see [`super::passes`]).
     pub checkpoints: Vec<(u64, Result<String, String>)>,
     /// Checkpoints whose pass the next list continued.
@@ -103,6 +119,10 @@ const ALIGN: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
 // Items live only while one submission's copies are laid out and collected.
 #[allow(clippy::large_enum_variant)]
 enum Item {
+    Range {
+        copy: RangeCopy,
+        resource: super::Real<ID3D12Resource>,
+    },
     Upload {
         copy: Copy,
         resource: super::Real<ID3D12Resource>,
@@ -128,6 +148,7 @@ enum Item {
 impl Item {
     fn guaranteed(&self) -> bool {
         match self {
+            Item::Range { .. } => true,
             Item::Upload { copy, .. } => copy.guaranteed,
             Item::Contents { snapshot, .. } => snapshot.guaranteed,
             Item::Piece { snapshot, .. } => snapshot.guaranteed,
@@ -153,9 +174,15 @@ struct Pending {
     _allocator: ID3D12CommandAllocator,
 }
 
-/// Records `copies` and `snapshots` for `submission` on lists of the queue's type and executes them on the real
-/// queue `queue`, each chunk then signalling a fence of our own; the collector reads them into `results`. Copies that
-/// cannot be made are in `results` at once, with the reason.
+enum SubmitItem {
+    Range(RangeCopy),
+    Upload(Copy),
+    Snapshot(Snapshot),
+}
+
+/// Records `range_copies`, `copies` and `snapshots` for `submission` on lists of the queue's type and executes them on
+/// the real queue `queue`, each chunk then signalling a fence of our own; the collector reads them into `results`.
+/// Copies that cannot be made are in `results` at once, with the reason.
 ///
 /// # Safety
 /// `queue` is the application's real queue (number `queue_id`), called from its ExecuteCommandLists before the
@@ -164,6 +191,7 @@ pub unsafe fn submit(
     queue_id: u64,
     queue: *mut c_void,
     submission: u64,
+    range_copies: Vec<RangeCopy>,
     copies: Vec<Copy>,
     snapshots: Vec<Snapshot>,
     results: &Results,
@@ -172,11 +200,12 @@ pub unsafe fn submit(
         submission,
         ..Batch::default()
     };
-    let items = copies
+    let items: Vec<SubmitItem> = range_copies
         .into_iter()
-        .map(Ok)
-        .chain(snapshots.into_iter().map(Err))
-        .collect::<Vec<_>>();
+        .map(SubmitItem::Range)
+        .chain(copies.into_iter().map(SubmitItem::Upload))
+        .chain(snapshots.into_iter().map(SubmitItem::Snapshot))
+        .collect();
     let context = unsafe { ID3D12CommandQueue::from_raw_borrowed(&queue) }.ok_or("no queue".to_string());
     let context = context.and_then(|queue| {
         let mut device: Option<ID3D12Device> = None;
@@ -195,8 +224,8 @@ pub unsafe fn submit(
     };
     let kind = unsafe { queue.GetDesc() }.Type;
     let (here, direct): (Vec<_>, Vec<_>) = items.into_iter().partition(|item| match item {
-        Ok(_) => true,
-        Err(snapshot) => !needs_direct(snapshot, kind),
+        SubmitItem::Range(_) | SubmitItem::Upload(_) => true,
+        SubmitItem::Snapshot(snapshot) => !needs_direct(snapshot, kind),
     });
     let start = Instant::now();
     let chunks = unsafe { place(&device, kind, here, submission, &mut failed) };
@@ -237,7 +266,11 @@ pub unsafe fn submit(
             };
         }
     }
-    if !failed.uploads.is_empty() || !failed.contents.is_empty() || !failed.tile_snapshots.is_empty() {
+    if !failed.uploads.is_empty()
+        || !failed.contents.is_empty()
+        || !failed.tile_snapshots.is_empty()
+        || !failed.range_snapshots.is_empty()
+    {
         results.lock().unwrap_or_else(|e| e.into_inner()).push(failed);
     }
 }
@@ -260,7 +293,7 @@ fn needs_direct(snapshot: &Snapshot, kind: D3D12_COMMAND_LIST_TYPE) -> bool {
 unsafe fn place(
     device: &ID3D12Device,
     kind: D3D12_COMMAND_LIST_TYPE,
-    items: Vec<Result<Copy, Snapshot>>,
+    items: Vec<SubmitItem>,
     submission: u64,
     failed: &mut Batch,
 ) -> Vec<Vec<Placed>> {
@@ -268,32 +301,69 @@ unsafe fn place(
     let mut chunk_bytes = 0;
     let chunk = chunk();
     for item in items {
-        let placed = match item {
-            Ok(copy) => match super::real::<ID3D12Resource>(copy.resource) {
+        let (item, bytes) = match item {
+            SubmitItem::Range(copy) => {
+                let Some(resource) = super::real::<ID3D12Resource>(copy.resource) else {
+                    failed
+                        .range_snapshots
+                        .push(range_failed(submission, &copy, "no live resource"));
+                    continue;
+                };
+                if copy.len == 0 {
+                    continue;
+                }
+                // Split a coarse range larger than `chunk` into sub-ranges so it always fits one readback buffer.
+                if copy.len > chunk {
+                    let mut done = 0u64;
+                    while done < copy.len {
+                        let step = chunk.min(copy.len - done);
+                        let sub = RangeCopy {
+                            offset: copy.offset + done,
+                            len: step,
+                            ..copy
+                        };
+                        if chunk_bytes > 0 {
+                            chunks.push(Vec::new());
+                        }
+                        chunks.last_mut().unwrap().push(Placed {
+                            item: Item::Range {
+                                copy: sub,
+                                resource: resource.clone(),
+                            },
+                            at: 0,
+                            bytes: step,
+                        });
+                        chunk_bytes = step.next_multiple_of(ALIGN);
+                        done += step;
+                    }
+                    continue;
+                }
+                let len = copy.len;
+                (Item::Range { copy, resource }, len)
+            }
+            SubmitItem::Upload(copy) => match super::real::<ID3D12Resource>(copy.resource) {
                 Some(resource) => {
                     let len = copy.len;
-                    Ok((Item::Upload { copy, resource }, len))
+                    (Item::Upload { copy, resource }, len)
                 }
-                None => Err(Ok(copy)),
+                None => {
+                    failed.uploads.push(upload_failed(copy, "no live upload buffer"));
+                    continue;
+                }
             },
-            Err(snapshot) => unsafe { contents(device, kind, snapshot) }.map_err(Err),
-        };
-        let (item, bytes) = match placed {
-            Ok(placed) => placed,
-            Err(Ok(copy)) => {
-                failed.uploads.push(upload_failed(copy, "no live upload buffer"));
-                continue;
-            }
-            Err(Err(err)) => {
-                let (snapshot, reason) = *err;
-                push_snapshot(
-                    failed,
-                    submission,
-                    &snapshot,
-                    first_use(submission, &snapshot, Err(reason)),
-                );
-                continue;
-            }
+            SubmitItem::Snapshot(snapshot) => match unsafe { contents(device, kind, snapshot) } {
+                Ok(placed) => placed,
+                Err(err) => {
+                    let (snapshot, reason) = *err;
+                    push_snapshot(
+                        failed,
+                        submission,
+                        &snapshot,
+                        first_use(submission, &snapshot, Err(reason)),
+                    );
+                    continue;
+                }
+            },
         };
         let item = match item {
             Item::Contents {
@@ -823,6 +893,9 @@ unsafe fn record(
     }
     for p in &placed {
         match &p.item {
+            Item::Range { copy, resource } => unsafe {
+                list.CopyBufferRegion(&readback, p.at, &**resource, copy.offset, copy.len)
+            },
             Item::Upload { copy, resource } => unsafe {
                 list.CopyBufferRegion(&readback, p.at, &**resource, copy.offset, copy.len)
             },
@@ -938,6 +1011,22 @@ fn collect(pending: Pending) -> Batch {
     for p in placed {
         let data = unsafe { base.add(p.at as usize) };
         match p.item {
+            Item::Range { copy, .. } => {
+                let bytes = unsafe { core::slice::from_raw_parts(data, copy.len as usize) }.to_vec();
+                let key = locum_capture::hash::key(&bytes);
+                locum_capture::writer::blob(&crate::settings::settings().blobs, key.clone(), bytes, true);
+                batch.range_snapshots.push(locum_capture::d3d12::RangeSnapshot {
+                    phase: copy.phase.into(),
+                    submission,
+                    event: copy.event,
+                    draw: copy.draw,
+                    resource: copy.resource,
+                    offset: copy.offset,
+                    bytes: copy.len,
+                    blob: Some(key),
+                    diagnostic: None,
+                });
+            }
             Item::Upload { copy: c, .. } => {
                 let start = Instant::now();
                 let mut content = unsafe { super::pipelines::bytes(data.cast(), c.len as usize) };
@@ -1050,10 +1139,28 @@ fn push_snapshot(batch: &mut Batch, submission: u64, snapshot: &Snapshot, done: 
     }
 }
 
-fn fail(batch: &mut Batch, item: Result<Copy, Snapshot>, reason: &str) {
+fn range_failed(submission: u64, copy: &RangeCopy, reason: &str) -> locum_capture::d3d12::RangeSnapshot {
+    locum_capture::d3d12::RangeSnapshot {
+        phase: copy.phase.into(),
+        submission,
+        event: copy.event,
+        draw: copy.draw,
+        resource: copy.resource,
+        offset: copy.offset,
+        bytes: copy.len,
+        blob: None,
+        diagnostic: Some(reason.into()),
+    }
+}
+
+fn fail(batch: &mut Batch, item: SubmitItem, reason: &str) {
     match item {
-        Ok(c) => batch.uploads.push(upload_failed(c, reason)),
-        Err(s) => {
+        SubmitItem::Range(c) => {
+            let sub = batch.submission;
+            batch.range_snapshots.push(range_failed(sub, &c, reason));
+        }
+        SubmitItem::Upload(c) => batch.uploads.push(upload_failed(c, reason)),
+        SubmitItem::Snapshot(s) => {
             let sub = batch.submission;
             let done = first_use(sub, &s, Err(reason.into()));
             push_snapshot(batch, sub, &s, done);
@@ -1063,6 +1170,10 @@ fn fail(batch: &mut Batch, item: Result<Copy, Snapshot>, reason: &str) {
 
 fn fail_item(batch: &mut Batch, item: Item, reason: &str) {
     match item {
+        Item::Range { copy, .. } => {
+            let sub = batch.submission;
+            batch.range_snapshots.push(range_failed(sub, &copy, reason));
+        }
         Item::Upload { copy, .. } => batch.uploads.push(upload_failed(copy, reason)),
         Item::Piece { snapshot, index, .. } => {
             let sub = batch.submission;

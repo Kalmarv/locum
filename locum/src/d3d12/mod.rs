@@ -22,6 +22,7 @@ pub mod passes;
 pub mod pipelines;
 mod portable;
 mod promoted;
+pub mod range_snap;
 mod ranges;
 pub mod rays;
 mod readback;
