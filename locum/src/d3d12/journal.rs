@@ -252,6 +252,10 @@ struct Series {
     complete_passes: Vec<String>,
     /// Per-request `indirect-args` override.
     indirect_args: Option<bool>,
+    /// Per-request `snapshot-reserved` override.
+    snapshot_reserved: Option<bool>,
+    /// Per-request `annotations` sidecar path override.
+    annotations: Option<PathBuf>,
 }
 
 /// The most frames one request captures.
@@ -286,6 +290,15 @@ struct Live {
     selection: super::select::Selection,
     /// Reserved buffers whose tile mappings changed in-frame since their last resident-tile snapshot.
     remapped_since_copy: HashSet<u64>,
+    /// Whether initial tile mappings and mapped tile contents of live reserved resources are snapshotted at frame start.
+    snapshot_reserved: bool,
+    /// Byte budget for capture-start reserved resource mapped-tile content snapshots.
+    snapshot_reserved_bytes: u64,
+    /// Live reserved resources with non-empty mapped tiles recorded at arming (pinned first, then buffers, then textures),
+    /// queued for mapped-tile content readback on the frame's first submission before any command list runs.
+    initial_reserved: Vec<u64>,
+    /// Path to external JSONL annotation sidecar to ingest at capture close.
+    annotations_path: PathBuf,
 }
 /// What a capture leaves free on the blob store's drive: its first-use copies stop short of it.
 const DISK_KEPT: u64 = 8 << 30;
@@ -718,6 +731,20 @@ pub unsafe fn submit(
                 touched.push(pinned);
             }
         }
+        // When `snapshot-reserved on` is enabled, pull live reserved resources with mapped tiles recorded at capture
+        // start into the frame's first submission so their initial mapped tile contents are copied on the GPU before
+        // any command list of the frame executes.
+        let mut initial_reserved_set = HashSet::new();
+        if first && live.snapshot_reserved && !live.initial_reserved.is_empty() {
+            for rid in std::mem::take(&mut live.initial_reserved) {
+                if !live.used.contains(&rid) && objects.contains_key(&rid) {
+                    initial_reserved_set.insert(rid);
+                    if !touched.contains(&rid) {
+                        touched.push(rid);
+                    }
+                }
+            }
+        }
         let draw_range = (draws_after > draws_before).then_some((draws_before + 1, draws_after));
         let selected_reason = live
             .selection
@@ -832,6 +859,7 @@ pub unsafe fn submit(
                 states,
                 touched,
                 &heap,
+                &initial_reserved_set,
                 unknown.as_deref(),
                 cpu_seq,
                 &tiles,
@@ -1012,6 +1040,7 @@ fn first_uses(
     states: &super::states::Tracker,
     touched: Vec<u64>,
     heap: &HashSet<u64>,
+    initial_reserved: &HashSet<u64>,
     unknown: Option<&str>,
     cpu_seq: u64,
     tiles: &HashMap<u64, Tiles>,
@@ -1019,6 +1048,7 @@ fn first_uses(
 ) -> Vec<super::readback::Snapshot> {
     let mut snapshots = Vec::new();
     let mut failed = Vec::new();
+    let mut reserved_snapshot_planned: u64 = 0;
     for resource in touched {
         let pinned = selected || live.selection.pins_resource(resource);
         let first_time = live.used.insert(resource);
@@ -1138,8 +1168,29 @@ fn first_uses(
         } else {
             super::readback::buffer_copy_bytes(locum_capture::layout::total(&layout), mapped_tiles.as_deref())
         };
-        // Selected complete passes bypass the heap-indexed cap (still honoring the disk safety reserve).
-        let charge_heap = heap_only && !pinned;
+        let is_initial_reserved = initial_reserved.contains(&resource);
+        if is_initial_reserved
+            && !pinned
+            && reserved_snapshot_planned.saturating_add(planned_bytes) > live.snapshot_reserved_bytes
+        {
+            failed.push((
+                resource,
+                model::FirstUse {
+                    submission,
+                    states: json!([]),
+                    content: Err(format!(
+                        "not copied at capture start: past `snapshot-reserved-mb` {} ({} MiB already queued)",
+                        live.snapshot_reserved_bytes >> 20,
+                        reserved_snapshot_planned >> 20
+                    )),
+                    note: None,
+                },
+            ));
+            continue;
+        }
+        // Selected complete passes and capture-start reserved snapshots bypass the heap-indexed cap (still honoring
+        // the disk safety reserve).
+        let charge_heap = heap_only && !pinned && !is_initial_reserved;
         if let Err(why) = live.room.take(planned_bytes, charge_heap) {
             let named = if heap_only {
                 ", named only by a descriptor heap its root signature indexes directly"
@@ -1156,6 +1207,9 @@ fn first_uses(
                 },
             ));
             continue;
+        }
+        if is_initial_reserved {
+            reserved_snapshot_planned = reserved_snapshot_planned.saturating_add(planned_bytes);
         }
         // A multisampled texture's layout has an image a sample; its samples are drawn out joined (see
         // `locum_capture::d3d12::samples`).
@@ -1646,6 +1700,7 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
         used,
         rays,
         room,
+        annotations_path,
         ..
     }) = finished
     {
@@ -1729,18 +1784,18 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                 for (key, b) in &rays {
                     prepared.add_acceleration_structure(super::rays::record(*key, b));
                 }
-                let ann_path = &crate::settings::settings().annotations;
-                if let Ok(text) = std::fs::read_to_string(ann_path) {
+                if let Ok(text) = std::fs::read_to_string(&annotations_path) {
                     let rows = model::parse_annotations_jsonl(&text);
                     if !rows.is_empty() {
                         log!(
                             "D3D12 annotations: ingested {} row(s) from {}",
                             rows.len(),
-                            ann_path.display()
+                            annotations_path.display()
                         );
                         prepared.add_annotations(rows);
                     }
                 }
+                prepared.resolve_annotation_draws(&capture.draws);
                 prepared.contents(&mut capture, &crate::settings::settings().blobs);
                 capture.d3d12 = Some(prepared);
                 if let Some((from, sidecar)) = crate::sidecar::captured(&crate::settings::settings().blobs) {
@@ -1805,13 +1860,16 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || "-_".contains(*c))
             .collect();
+        let default_frames = crate::settings::settings().capture_frames.clamp(1, MAX_FRAMES);
         let frames = match text.lines().find_map(|l| l.strip_prefix("frames ")) {
-            None => 1,
+            None => default_frames,
             Some(n) => match n.trim().parse::<u32>() {
                 Ok(n @ 1..=MAX_FRAMES) => n,
                 _ => {
-                    log!("D3D12 capture request: frames {n:?} is not 1 to {MAX_FRAMES}; one frame");
-                    1
+                    log!(
+                        "D3D12 capture request: frames {n:?} is not 1 to {MAX_FRAMES}; {default_frames} frame(s)"
+                    );
+                    default_frames
                 }
             },
         };
@@ -1829,12 +1887,28 @@ pub fn present(frame_number: u64, presented: Option<u64>) {
                 "off" => Some(false),
                 _ => None,
             });
+        let snapshot_reserved = text
+            .lines()
+            .find_map(|l| l.strip_prefix("snapshot-reserved "))
+            .and_then(|v| match v.trim() {
+                "on" => Some(true),
+                "off" => Some(false),
+                _ => None,
+            });
+        let annotations = text
+            .lines()
+            .find_map(|l| l.strip_prefix("annotations "))
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from);
         let series = Series {
             label: (!label.is_empty()).then_some(label),
             index: 1,
             frames,
             complete_passes,
             indirect_args,
+            snapshot_reserved,
+            annotations,
         };
         let early = match text.lines().find_map(|l| l.strip_prefix("early ")) {
             None => 0,
@@ -1941,18 +2015,39 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         })
         .collect();
     let objects: Vec<_> = s.objects.values().cloned().collect();
-    // Optional capture-start snapshot of all live reserved resources' initial tile mappings (`snapshot-reserved on`
-    // or whenever `complete-pass` is active), so bindless-only reserved buffers still have initial page tables.
+    // Optional capture-start snapshot of all live reserved resources' initial tile mappings and mapped tile contents
+    // (`snapshot-reserved on` in settings.txt or capture request, or whenever `complete-pass` is active), so
+    // bindless-only reserved resources still have initial page tables and mapped bytes at capture start.
+    let snapshot_reserved = series
+        .snapshot_reserved
+        .unwrap_or(settings.snapshot_reserved || !selection.is_empty());
+    let annotations_path = series
+        .annotations
+        .clone()
+        .unwrap_or_else(|| settings.annotations.clone());
     let mut initial_tile_pages = Vec::new();
     let mut initial_paged = HashSet::new();
-    if settings.snapshot_reserved || !selection.is_empty() {
-        let reserved_ids: Vec<u64> = objects
+    let mut initial_reserved_pinned = Vec::new();
+    let mut initial_reserved_buffers = Vec::new();
+    let mut initial_reserved_textures = Vec::new();
+    if snapshot_reserved {
+        let reserved_objs: Vec<(u64, bool)> = objects
             .iter()
             .filter(|o| o.kind.starts_with("ID3D12Resource") && !o.description["heap_properties"].is_object())
-            .map(|o| o.id)
+            .map(|o| (o.id, o.description["dimension"].as_u64() == Some(1)))
             .collect();
-        for rid in reserved_ids {
+        for (rid, is_buffer) in reserved_objs {
             if let Ok((layout, pages)) = super::tiles::pages(rid) {
+                let has_mapped = pages.as_array().is_some_and(|runs| !runs.is_empty());
+                if has_mapped {
+                    if selection.pins_resource(rid) {
+                        initial_reserved_pinned.push(rid);
+                    } else if is_buffer {
+                        initial_reserved_buffers.push(rid);
+                    } else {
+                        initial_reserved_textures.push(rid);
+                    }
+                }
                 initial_tile_pages.push(model::TilePages {
                     resource: rid,
                     cpu_seq: arm_cpu_seq,
@@ -1962,6 +2057,9 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
             }
         }
     }
+    let mut initial_reserved = initial_reserved_pinned;
+    initial_reserved.extend(initial_reserved_buffers);
+    initial_reserved.extend(initial_reserved_textures);
     s.armings += 1;
     s.capture = Some(Live {
         number: s.armings,
@@ -1987,6 +2085,10 @@ fn arm(root: &std::path::Path, frame_number: u64, series: Series) {
         },
         selection,
         remapped_since_copy: HashSet::new(),
+        snapshot_reserved,
+        snapshot_reserved_bytes: settings.snapshot_reserved_bytes,
+        initial_reserved,
+        annotations_path,
     });
     s.series = Some(series.clone());
     super::passes::ARMED.store(true, std::sync::atomic::Ordering::Release);
@@ -2132,6 +2234,8 @@ pub(super) fn arm_now(root: &std::path::Path, frames: u32) {
             frames,
             complete_passes: Vec::new(),
             indirect_args: None,
+            snapshot_reserved: None,
+            annotations: None,
         },
     );
 }
@@ -2185,6 +2289,10 @@ mod tests {
             room,
             selection: super::super::select::Selection::default(),
             remapped_since_copy: HashSet::new(),
+            snapshot_reserved: false,
+            snapshot_reserved_bytes: 4096 << 20,
+            initial_reserved: Vec::new(),
+            annotations_path: PathBuf::new(),
         }
     }
 
@@ -2294,6 +2402,7 @@ mod tests {
             &states,
             vec![10, 11, 12],
             &heap,
+            &HashSet::new(),
             None,
             1,
             &tiles,
@@ -2358,6 +2467,7 @@ mod tests {
             &states,
             nine_ids,
             &nine_heap,
+            &HashSet::new(),
             None,
             2,
             &nine_tiles,
@@ -2385,6 +2495,7 @@ mod tests {
                 &states,
                 vec![11],
                 &HashSet::new(),
+                &HashSet::new(),
                 None,
                 3,
                 &tiles,
@@ -2409,6 +2520,7 @@ mod tests {
                 &objects,
                 &states,
                 vec![10],
+                &HashSet::new(),
                 &HashSet::new(),
                 None,
                 4,
@@ -2453,6 +2565,7 @@ mod tests {
             &states,
             vec![18],
             &heap,
+            &HashSet::new(),
             None,
             10,
             &tiles,
@@ -2481,6 +2594,7 @@ mod tests {
             &states,
             vec![18],
             &heap,
+            &HashSet::new(),
             None,
             20,
             &tiles,
@@ -2492,6 +2606,56 @@ mod tests {
         assert_eq!(snaps2[0].mapped_tiles.as_deref(), Some(&[4, 5][..]));
         assert!(snaps2[0].tile_snapshot.is_some());
         assert!(!live.remapped_since_copy.contains(&18));
+
+        // Capture-start reserved snapshot (`initial_reserved`) snapshots mapped tiles up to `snapshot_reserved_bytes`
+        // while bypassing the heap-indexed cap.
+        let mut init_objects = BTreeMap::new();
+        init_objects.insert(24, reserved_buffer(24, 4 * MIB));
+        init_objects.insert(25, reserved_buffer(25, 4 * MIB));
+        let mut init_tiles = HashMap::new();
+        init_tiles.insert(
+            24,
+            Tiles {
+                pages: Ok((json!({}), json!([[0, 2, 1, 0]]))),
+                unreadable: None,
+                mapped_buffer_tiles: Some(vec![0, 1]),
+            },
+        );
+        init_tiles.insert(
+            25,
+            Tiles {
+                pages: Ok((json!({}), json!([[0, 4, 2, 0]]))),
+                unreadable: None,
+                mapped_buffer_tiles: Some(vec![0, 1, 2, 3]),
+            },
+        );
+        let mut init_live = test_live(
+            &init_objects,
+            Room {
+                heap: Some(0), // heap-indexed cap 0; initial_reserved bypasses it
+                disk: Some(DISK_KEPT + 16 * MIB),
+                ..Room::default()
+            },
+        );
+        init_live.snapshot_reserved = true;
+        init_live.snapshot_reserved_bytes = 3 * TILE; // fits #24 (2 tiles), caps out before #25 (4 tiles)
+        let init_set = HashSet::from([24u64, 25u64]);
+        let init_snaps = first_uses(
+            &mut init_live,
+            1,
+            &init_objects,
+            &states,
+            vec![24, 25],
+            &init_set,
+            &init_set,
+            None,
+            1,
+            &init_tiles,
+            false,
+        );
+        assert_eq!(init_snaps.len(), 1);
+        assert_eq!(init_snaps[0].resource, 24);
+        assert_eq!(init_snaps[0].mapped_tiles.as_deref(), Some(&[0, 1][..]));
     }
 
     #[test]

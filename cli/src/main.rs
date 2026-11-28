@@ -819,6 +819,9 @@ struct BindlessArgs {
     /// Filter to a specific resource id.
     #[arg(long)]
     resource: Option<i64>,
+    /// Filter to a specific access kind (`read` or `write`).
+    #[arg(long)]
+    access: Option<String>,
     /// Output as JSON lines.
     #[arg(long)]
     json: bool,
@@ -1502,6 +1505,7 @@ fn run(cli: Cli) -> Result<(), String> {
                 capture,
                 draw,
                 resource,
+                access,
                 json,
             } = *a;
             let c = open(&capture)?;
@@ -1512,8 +1516,9 @@ fn run(cli: Cli) -> Result<(), String> {
             let rows: Vec<BindlessRow> = c.rows(
                 "SELECT draw, event, heap, slot, kind, resource, access, source FROM d12_bindless_usage \
                  WHERE (?1 IS NULL OR draw = ?1) AND (?2 IS NULL OR resource = ?2) \
+                   AND (?3 IS NULL OR access = ?3) \
                  ORDER BY draw, heap, slot",
-                (draw, resource),
+                (draw, resource, access.as_deref()),
                 |r| {
                     Ok((
                         r.get(0)?,

@@ -716,6 +716,22 @@ impl Prepared {
     pub fn add_annotations(&mut self, rows: Vec<Annotation>) {
         self.frame.annotations.extend(rows);
     }
+    /// Resolves sidecar annotations that carry `payload["draw"]` (without an explicit `seq`) to the corresponding
+    /// event sequence number in `draws`.
+    pub fn resolve_annotation_draws(&mut self, draws: &[db::Draw]) {
+        if self.frame.annotations.is_empty() || draws.is_empty() {
+            return;
+        }
+        let draw_to_event: HashMap<u64, u64> = draws.iter().map(|d| (d.n, d.event)).collect();
+        for ann in &mut self.frame.annotations {
+            if ann.seq.is_none()
+                && let Some(draw_n) = ann.payload["draw"].as_u64()
+                && let Some(&ev) = draw_to_event.get(&draw_n)
+            {
+                ann.seq = Some(ev);
+            }
+        }
+    }
     /// The frame's ExecuteIndirect events whose argument records were copied.
     pub fn indirect(&self) -> &[Indirect] {
         &self.projection.indirect
@@ -2334,6 +2350,8 @@ impl Projection {
             }
             // The bindings this event's draw adds, which say what it reads and writes.
             let bound = capture.bindings.len();
+            let mut bindless_reads: Vec<u64> = Vec::new();
+            let mut bindless_writes: Vec<u64> = Vec::new();
             let draw = if matches!(kind, "draw" | "dispatch" | "indirect") {
                 let n = capture.draws.len() as u64 + 1;
                 let mut shaders = std::array::from_fn(|_| None);
@@ -2363,6 +2381,8 @@ impl Projection {
                     "dispatch" => [pipeline.compute_root, 0],
                     _ => [pipeline.graphics_root, pipeline.compute_root],
                 };
+                let mut bindless_table_reads: Vec<u64> = Vec::new();
+                let mut bindless_table_writes: Vec<u64> = Vec::new();
                 if roots
                     .iter()
                     .any(|r| self.objects.get(r).is_some_and(directly_indexed))
@@ -2381,13 +2401,22 @@ impl Projection {
                         }
                     }
                     // Track bindless descriptor indices passed via 32-bit root constants or descriptor tables.
+                    let active_root_id = if kind == "dispatch" {
+                        pipeline.compute_root
+                    } else {
+                        pipeline.graphics_root
+                    };
+                    let decoded_params = self
+                        .objects
+                        .get(&active_root_id)
+                        .and_then(|o| o["decoded"]["parameters"].as_array());
                     let active_args = if kind == "dispatch" {
                         &pipeline.compute_args
                     } else {
                         &pipeline.graphics_args
                     };
                     let mut seen_usage = std::collections::HashSet::new();
-                    for arg in active_args.values() {
+                    for (&param_idx, arg) in active_args {
                         match arg["kind"].as_str() {
                             Some("constants") => {
                                 for w in arg["words"]
@@ -2420,23 +2449,61 @@ impl Projection {
                             }
                             Some("DescriptorTable") => {
                                 let heap = arg["value"]["heap"].as_u64().unwrap_or(0);
-                                let slot = arg["value"]["slot"].as_u64().unwrap_or(0) as u32;
-                                if direct_heaps.contains(&heap)
-                                    && let Some(d) = self.descriptors.get(&(heap, slot))
-                                    && d.resource != 0
+                                let base_slot = arg["value"]["slot"].as_u64().unwrap_or(0) as u32;
+                                if !direct_heaps.contains(&heap) {
+                                    continue;
+                                }
+                                // Expand bounded descriptor ranges declared by the root signature (capped at 256 per
+                                // range); unbounded (-1 / u32::MAX) or unknown ranges inspect the base slot.
+                                let mut slots_to_check: Vec<u32> = Vec::new();
+                                if let Some(ranges) = decoded_params
+                                    .and_then(|ps| ps.get(param_idx as usize))
+                                    .and_then(|p| p["ranges"].as_array())
                                 {
-                                    let access = if d.kind == "uav" { "write" } else { "read" };
-                                    if seen_usage.insert((heap, slot, access)) {
-                                        self.bindless_usage.push(BindlessUsage {
-                                            draw: n,
-                                            event: seq,
-                                            heap,
-                                            slot,
-                                            kind: d.kind.to_string(),
-                                            resource: d.resource,
-                                            access,
-                                            source: "descriptor-table",
-                                        });
+                                    let mut running = 0u32;
+                                    for range in ranges {
+                                        let off = range["OffsetInDescriptorsFromTableStart"]
+                                            .as_u64()
+                                            .or_else(|| range["offset"].as_u64())
+                                            .unwrap_or(u64::from(u32::MAX))
+                                            as u32;
+                                        let start = if off == u32::MAX { running } else { off };
+                                        let count = range["NumDescriptors"]
+                                            .as_u64()
+                                            .or_else(|| range["count"].as_u64())
+                                            .unwrap_or(1)
+                                            as u32;
+                                        let capped = if count == u32::MAX { 1 } else { count.min(256) };
+                                        for k in 0..capped {
+                                            slots_to_check.push(base_slot.saturating_add(start + k));
+                                        }
+                                        running = start.saturating_add(capped);
+                                    }
+                                }
+                                if slots_to_check.is_empty() {
+                                    slots_to_check.push(base_slot);
+                                }
+                                for slot in slots_to_check {
+                                    if let Some(d) = self.descriptors.get(&(heap, slot))
+                                        && d.resource != 0
+                                    {
+                                        let access = if d.kind == "uav" { "write" } else { "read" };
+                                        if seen_usage.insert((heap, slot, access)) {
+                                            self.bindless_usage.push(BindlessUsage {
+                                                draw: n,
+                                                event: seq,
+                                                heap,
+                                                slot,
+                                                kind: d.kind.to_string(),
+                                                resource: d.resource,
+                                                access,
+                                                source: "descriptor-table",
+                                            });
+                                            bindless_table_reads.push(d.resource);
+                                            if access == "write" {
+                                                bindless_table_writes.push(d.resource);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -2476,6 +2543,8 @@ impl Projection {
                     }
                 }
                 self.draw_states.push((n, submission.id, pipeline.clone()));
+                bindless_reads = bindless_table_reads;
+                bindless_writes = bindless_table_writes;
                 Some(n)
             } else {
                 None
@@ -2503,6 +2572,8 @@ impl Projection {
                     event.reads.push(resource);
                 }
             }
+            event.reads.extend(bindless_reads);
+            event.writes.extend(bindless_writes);
             event.reads.sort_unstable();
             event.reads.dedup();
             event.writes.sort_unstable();
@@ -3709,10 +3780,12 @@ mod tests {
         let mut cap = crate::db::Capture::default();
         let mut prepared = frame.prepare(&mut cap);
         let sidecar = parse_annotations_jsonl(
-            "# comment\n{\"seq\":5,\"category\":\"xcl.placement\",\"payload\":{\"res\":999,\"unmapped\":true}}\n",
+            "# comment\n{\"seq\":5,\"category\":\"xcl.placement\",\"payload\":{\"res\":999,\"unmapped\":true}}\n\
+             {\"draw\":1,\"category\":\"xcl.barrier\",\"group\":3}\n",
         );
-        assert_eq!(sidecar.len(), 1);
+        assert_eq!(sidecar.len(), 2);
         prepared.add_annotations(sidecar);
+        prepared.resolve_annotation_draws(&cap.draws);
         cap.d3d12 = Some(prepared);
         crate::db::write(&db_path, &cap).unwrap();
 
@@ -3749,7 +3822,15 @@ mod tests {
         let ann_count: i64 = conn
             .query_row("SELECT count(*) FROM d12_annotations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ann_count, 2);
+        assert_eq!(ann_count, 3);
+        let resolved_seq: Option<i64> = conn
+            .query_row(
+                "SELECT seq FROM d12_annotations WHERE category = 'xcl.barrier'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(resolved_seq, Some(cap.draws[0].event as i64));
         drop(conn);
 
         // Offline append_annotations adds rows to existing DB cleanly.
@@ -3759,7 +3840,7 @@ mod tests {
         let ann_count2: i64 = conn
             .query_row("SELECT count(*) FROM d12_annotations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(ann_count2, 3);
+        assert_eq!(ann_count2, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

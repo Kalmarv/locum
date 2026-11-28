@@ -216,6 +216,21 @@ pub unsafe fn float_bits(p: *const f32, n: usize) -> Value {
 pub fn f32_bits(v: f32) -> u32 {
     v.to_bits()
 }
+/// Raw IEEE-754 64-bit bit patterns of `n` doubles at `p` (preserves NaN, Inf, and -0.0 payloads).
+#[allow(dead_code)]
+pub unsafe fn double_bits(p: *const f64, n: usize) -> Value {
+    json!(
+        unsafe { slice(p, n) }
+            .iter()
+            .map(|&f| f.to_bits())
+            .collect::<Vec<u64>>()
+    )
+}
+/// Raw IEEE-754 64-bit bit pattern of a single double.
+#[allow(dead_code)]
+pub fn f64_bits(v: f64) -> u64 {
+    v.to_bits()
+}
 pub unsafe fn viewports(p: *const D3D12_VIEWPORT, n: u32) -> Value {
     json!(
         unsafe { slice(p, n as usize) }
@@ -338,9 +353,11 @@ pub unsafe fn sample_positions(p: *const D3D12_SAMPLE_POSITION, samples: u32, pi
 unsafe fn clear_value(v: &D3D12_CLEAR_VALUE, depth: bool) -> Value {
     if depth {
         let d = unsafe { v.Anonymous.DepthStencil };
-        json!({"format":v.Format.0,"depth":d.Depth,"stencil":d.Stencil})
+        json!({"format":v.Format.0,"depth":d.Depth,"depth_bits":d.Depth.to_bits(),"stencil":d.Stencil})
     } else {
-        json!({"format":v.Format.0,"color":unsafe { v.Anonymous.Color }})
+        let c = unsafe { v.Anonymous.Color };
+        let bits = c.map(f32::to_bits);
+        json!({"format":v.Format.0,"color":c,"color_bits":bits})
     }
 }
 unsafe fn beginning(b: &D3D12_RENDER_PASS_BEGINNING_ACCESS, depth: bool) -> Value {
@@ -562,5 +579,31 @@ mod tests {
             json!([0x7fc0_1234u32, 0x8000_0000u32, 0x3f80_0000u32, 0x7f80_0000u32])
         );
         assert_eq!(f32_bits(vals[0]), 0x7fc0_1234);
+        let dvals = [f64::from_bits(0x7ff8_0000_dead_beef), -0.0f64];
+        let dbits = unsafe { double_bits(dvals.as_ptr(), 2) };
+        assert_eq!(dbits, json!([0x7ff8_0000_dead_beefu64, 0x8000_0000_0000_0000u64]));
+        assert_eq!(f64_bits(dvals[0]), 0x7ff8_0000_dead_beef);
+
+        let cv_color = D3D12_CLEAR_VALUE {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_FLOAT,
+            Anonymous: D3D12_CLEAR_VALUE_0 { Color: vals },
+        };
+        let cv_json = unsafe { clear_value(&cv_color, false) };
+        assert_eq!(
+            cv_json["color_bits"],
+            json!([0x7fc0_1234u32, 0x8000_0000u32, 0x3f80_0000u32, 0x7f80_0000u32])
+        );
+        let cv_depth = D3D12_CLEAR_VALUE {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT,
+            Anonymous: D3D12_CLEAR_VALUE_0 {
+                DepthStencil: D3D12_DEPTH_STENCIL_VALUE {
+                    Depth: f32::from_bits(0x7fc0_cafe),
+                    Stencil: 7,
+                },
+            },
+        };
+        let cv_djson = unsafe { clear_value(&cv_depth, true) };
+        assert_eq!(cv_djson["depth_bits"], json!(0x7fc0_cafeu32));
+        assert_eq!(cv_djson["stencil"], json!(7));
     }
 }

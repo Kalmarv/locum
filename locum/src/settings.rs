@@ -65,9 +65,15 @@ pub struct Settings {
     /// Per-output / per-indirect-record readback cap for selected complete passes (`complete-pass-output-mb`,
     /// 1024 MiB by default).
     pub complete_output_bytes: u64,
-    /// Snapshot initial tile mappings of all live reserved resources at capture arming (`snapshot-reserved on|off`;
-    /// also enabled automatically when `complete-pass` is configured).
+    /// Snapshot initial tile mappings and initial mapped tile contents of live reserved resources at capture start
+    /// (`snapshot-reserved on|off`; also enabled automatically when `complete-pass` is configured).
     pub snapshot_reserved: bool,
+    /// Byte cap for capture-start reserved resource mapped-tile content snapshots (`snapshot-reserved-mb`,
+    /// 4096 MiB by default, 1 to 65536).
+    pub snapshot_reserved_bytes: u64,
+    /// Default number of consecutive frames to capture when a capture request omits `frames N`
+    /// (`frames`, 1 by default, 1 to 64).
+    pub capture_frames: u32,
     /// Optional external JSONL annotation sidecar ingested into `d12_annotations` at capture close
     /// (`annotations PATH`, default `<locum_dir>/annotations.jsonl`).
     pub annotations: PathBuf,
@@ -95,6 +101,8 @@ pub fn settings() -> &'static Settings {
             indirect_args: false,
             complete_output_bytes: 1024 << 20,
             snapshot_reserved: false,
+            snapshot_reserved_bytes: 4096 << 20,
+            capture_frames: 1,
             annotations: dir.join("annotations.jsonl"),
         };
         if let Ok(text) = std::fs::read_to_string(dir.join("settings.txt")) {
@@ -191,6 +199,20 @@ pub fn settings() -> &'static Settings {
                         "off" => s.snapshot_reserved = false,
                         other => log!(
                             "settings.txt line {}: snapshot-reserved {other:?} is not on or off: ignored",
+                            n + 1
+                        ),
+                    },
+                    "snapshot-reserved-mb" => match value.parse::<u64>() {
+                        Ok(mb @ 1..=65536) => s.snapshot_reserved_bytes = mb << 20,
+                        _ => log!(
+                            "settings.txt line {}: snapshot-reserved-mb {value:?} is not 1 to 65536: ignored",
+                            n + 1
+                        ),
+                    },
+                    "frames" => match value.parse::<u32>() {
+                        Ok(f @ 1..=64) => s.capture_frames = f,
+                        _ => log!(
+                            "settings.txt line {}: frames {value:?} is not 1 to 64: ignored",
                             n + 1
                         ),
                     },

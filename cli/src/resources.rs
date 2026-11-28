@@ -337,6 +337,36 @@ pub fn resource(c: &Capture, id: i64) -> Result<(), String> {
             out!("  ... ({} more; `events --resource {id}`)", events.len() - 40);
         }
     }
+    if c.has_table("d12_bindless_usage") {
+        type BindlessHit = (i64, i64, i64, i64, String, String, String);
+        let hits: Vec<BindlessHit> = c.rows(
+            "SELECT draw, event, heap, slot, kind, access, source FROM d12_bindless_usage \
+             WHERE resource = ?1 ORDER BY draw, heap, slot",
+            [id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            },
+        );
+        if !hits.is_empty() {
+            let mut draws: Vec<i64> = hits.iter().map(|h| h.0).collect();
+            draws.dedup();
+            out!("{} bindless references in {} draws:", hits.len(), draws.len());
+            for (d, ev, heap, slot, kind, access, src) in hits.iter().take(24) {
+                out!("  draw {d} (event {ev}): heap #{heap}[{slot}] {kind} ({access}, {src})");
+            }
+            if hits.len() > 24 {
+                out!("  ... ({} more; `bindless --resource {id}`)", hits.len() - 24);
+            }
+        }
+    }
     Ok(())
 }
 
