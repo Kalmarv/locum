@@ -82,6 +82,27 @@ pub(super) enum Arguments {
     Rays(D3D12_DISPATCH_RAYS_DESC),
 }
 
+/// Returns true when every indirect record in `raw` (for a single-argument Draw=0, DrawIndexed=1, Dispatch=2, or
+/// DispatchMesh=10 command signature) has a zero vertex/index/instance/group count.
+fn all_simple_indirect_zero(raw: &[u8], stride: usize, arg_ty: u64) -> bool {
+    if stride == 0 || raw.len() < stride {
+        return false;
+    }
+    let word = |rec: &[u8], at: usize| -> u32 {
+        rec.get(at..at + 4)
+            .and_then(|s| s.try_into().ok())
+            .map_or(0, u32::from_le_bytes)
+    };
+    raw.chunks_exact(stride).all(|rec| match arg_ty {
+        // D3D12_DRAW_ARGUMENTS: VertexCountPerInstance, InstanceCount, ...
+        // D3D12_DRAW_INDEXED_ARGUMENTS: IndexCountPerInstance, InstanceCount, ...
+        0 | 1 => word(rec, 0) == 0 || word(rec, 4) == 0,
+        // D3D12_DISPATCH_ARGUMENTS / D3D12_DISPATCH_MESH_ARGUMENTS: ThreadGroupCountX, Y, Z
+        2 | 10 => word(rec, 0) == 0 || word(rec, 4) == 0 || word(rec, 8) == 0,
+        _ => false,
+    })
+}
+
 impl D3d12 {
     /// The game's buffers by address.
     pub(super) fn addresses_of(&mut self, c: &Capture) -> Rc<Addresses> {
@@ -122,6 +143,9 @@ impl D3d12 {
                 return Ok(Arguments::Skip);
             }
         };
+        if max == 0 {
+            return Ok(Arguments::Skip);
+        }
         if layout.addresses.is_empty() {
             // If the capture saved exact ExecuteIndirect argument bytes (e.g. from complete-pass / indirect-args),
             // and the argument buffer had no captured contents, replay from the captured argument bytes directly.
@@ -143,6 +167,65 @@ impl D3d12 {
                         let (copy, p) = self.staging(D3D12_HEAP_TYPE_UPLOAD, bytes.len() as u64)?;
                         unsafe { core::slice::from_raw_parts_mut(p, bytes.len()) }.copy_from_slice(&bytes);
                         return Ok(Arguments::Patched(copy));
+                    }
+                }
+            }
+            // Check count buffer when unpopulated or on WARP (avoids WARP/GBV eagerly JIT-crashing on 0-count calls).
+            let mut effective_max = max;
+            if count != 0
+                && (!self.populated.contains(&count) || self.warp)
+                && self.resources.contains_key(&count)
+            {
+                let n = self.read_range(count, count_offset, 4)?;
+                let cval = u64::from(u32::from_le_bytes(n[..4].try_into().expect("4 bytes")));
+                effective_max = max.min(cval);
+                if effective_max == 0 {
+                    if !self.populated.contains(&count) {
+                        self.warn(format!(
+                            "ExecuteIndirect (event {seq}): count buffer #{count} (+{count_offset}) has no captured \
+                             contents and read 0; skipping 0-count indirect call"
+                        ));
+                    }
+                    return Ok(Arguments::Skip);
+                }
+            }
+            // Check argument buffer when unpopulated (missing contents in capture and no prior writer in this plan),
+            // or on WARP for simple Draw/DrawIndexed/Dispatch/DispatchMesh signatures whose records are all zero.
+            if self.resources.contains_key(&buffer) {
+                let width = self.made(buffer)?.desc.Width;
+                let stride = layout.stride.max(1) as u64;
+                let bytes = (effective_max.saturating_mul(stride)).min(width.saturating_sub(offset));
+                if bytes == 0 {
+                    self.warn(format!(
+                        "ExecuteIndirect (event {seq}): argument buffer #{buffer} (+{offset}) has 0 bytes \
+                         available; skipping"
+                    ));
+                    return Ok(Arguments::Skip);
+                }
+                let unpopulated = !self.populated.contains(&buffer);
+                let simple_arg_type = desc["arguments"]
+                    .as_array()
+                    .filter(|arr| arr.len() == 1)
+                    .and_then(|arr| arr[0]["type"].as_u64())
+                    .filter(|t| matches!(t, 0 | 1 | 2 | 10));
+                if unpopulated || (self.warp && simple_arg_type.is_some() && bytes <= 65536) {
+                    let check_len = bytes.min(65536);
+                    let raw = self.read_range(buffer, offset, check_len)?;
+                    if unpopulated && raw.iter().all(|&b| b == 0) {
+                        self.warn(format!(
+                            "ExecuteIndirect (event {seq}): argument buffer #{buffer} (+{offset}) has no captured \
+                             contents and read all zeros; skipping 0-argument indirect call (replay with earlier \
+                             writers in slice/frame mode, --rule \"seed {buffer} ...\", or recapture with \
+                             indirect-args)"
+                        ));
+                        return Ok(Arguments::Skip);
+                    }
+                    if self.warp
+                        && let Some(arg_ty) = simple_arg_type
+                        && bytes <= 65536
+                        && all_simple_indirect_zero(&raw, stride as usize, arg_ty)
+                    {
+                        return Ok(Arguments::Skip);
                     }
                 }
             }
@@ -178,9 +261,23 @@ impl D3d12 {
         let bytes = (max * layout.stride as u64).min(width.saturating_sub(offset));
         let records = records.min(bytes / layout.stride.max(1) as u64);
         if records == 0 {
-            return Ok(Arguments::AsRecorded);
+            if count != 0 && !self.populated.contains(&count) {
+                self.warn(format!(
+                    "ExecuteIndirect (event {seq}): count buffer #{count} (+{count_offset}) has no captured \
+                     contents and read 0; skipping 0-count indirect call"
+                ));
+            }
+            return Ok(Arguments::Skip);
         }
         let mut records_bytes = self.read_range(buffer, offset, bytes)?;
+        if !self.populated.contains(&buffer) && records_bytes.iter().all(|&b| b == 0) {
+            self.warn(format!(
+                "ExecuteIndirect (event {seq}): argument buffer #{buffer} (+{offset}) has no captured contents \
+                 and read all zeros; skipping 0-argument indirect call (replay with earlier writers in \
+                 slice/frame mode, --rule \"seed {buffer} ...\", or recapture with indirect-args)"
+            ));
+            return Ok(Arguments::Skip);
+        }
         // Every address the records hold, placed: the game's buffer and offset, and that buffer as replay made it.
         let mut placed: HashMap<u64, u64> = HashMap::new();
         let mut unplaced = None;

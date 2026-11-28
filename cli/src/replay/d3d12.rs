@@ -305,6 +305,12 @@ pub struct D3d12 {
     timing: Option<timing::Timing>,
     /// Optional runtime DXIL `createHandleFromHeap` bindless slot tracer.
     bindless_tracer: Option<BindlessTracer>,
+    /// True when GPU-based validation (`Validation::Gpu`) is enabled on this device.
+    gbv: bool,
+    /// Large directly-indexed shader (`(blob_key, bytes)`) in the open command list on WARP, for removal hints.
+    large_bindless_shader: Option<(String, u64)>,
+    /// Resources that have received initial contents, CPU upload bytes, a rule write, or an in-plan GPU write.
+    populated: std::collections::HashSet<i64>,
 }
 
 /// The resources each resource of a Direct3D 12 capture shares memory with (see [`memory`]).
@@ -527,6 +533,9 @@ impl D3d12 {
                 debug,
                 timing,
                 bindless_tracer: None,
+                gbv: validation == super::Validation::Gpu,
+                large_bindless_shader: None,
+                populated: std::collections::HashSet::new(),
             })
         }
     }
@@ -577,11 +586,22 @@ impl D3d12 {
                 .Reset(&self.allocator, None)
                 .map_err(|e| format!("command list Reset: {e}"))?;
         }
+        let large_shader = self.large_bindless_shader.take();
         removed.map_err(|e| {
-            let hint = if self.warp && self.debug.is_none() && e.code().0 as u32 == 0x887A_0005 {
-                " [WARP removed the device without GBV; retry with --debug or without --warp]"
+            let hint = if self.warp && e.code().0 as u32 == 0x887A_0005 {
+                if let Some((key, size)) = &large_shader {
+                    format!(
+                        " [WARP removed the device on large directly-indexed shader {key} ({size} bytes); \
+                         WARP+GBV (--debug) also crashes d3d10warp.dll on shaders this size — retry without --warp \
+                         on the hardware GPU]"
+                    )
+                } else if self.debug.is_none() {
+                    " [WARP removed the device without GBV; retry with --debug or without --warp]".into()
+                } else {
+                    String::new()
+                }
             } else {
-                ""
+                String::new()
             };
             format!(
                 "the device was removed: {e}{}{}{hint}",
@@ -918,6 +938,7 @@ impl D3d12 {
                 let bytes = c.blob(key)?;
                 let offset = j["offset"].as_u64().unwrap_or(0);
                 self.map_write(id, offset, &bytes)?;
+                self.populated.insert(id);
                 if j["whole"] == true {
                     self.resources.get_mut(&id).expect("made").from = Some(key.to_string());
                 }
@@ -1670,7 +1691,8 @@ impl D3d12 {
             .iter()
             .filter(|r| r.applies(compute) && r.holds(bound))
             .collect();
-        if applying.iter().any(|r| r.action == Action::Skip) {
+        if applying.iter().any(|r| r.action == Action::Skip) || matches!(arguments, indirect::Arguments::Skip)
+        {
             return Ok(());
         }
         // Shader rules, as code for the pipeline's own kind of bytecode.
@@ -1700,13 +1722,51 @@ impl D3d12 {
             self.warn(format!("draws with root signature #{root_id} were not run"));
             return Ok(());
         };
+        let directly_indexed = decoded["flags"].as_u64().is_some_and(|f| f & 0x400 != 0);
+        let pso_desc: Option<Value> =
+            if pso_id != 0 && directly_indexed && (self.warp || self.bindless_tracer.is_some()) {
+                c.row("SELECT description FROM d12_psos WHERE id = ?1", [pso_id], |r| {
+                    r.get::<_, String>(0)
+                })
+                .and_then(|d| serde_json::from_str::<Value>(&d).ok())
+            } else {
+                None
+            };
+        // Guard against a native d3d10warp.dll access violation / heap corruption (0xc0000005 / 0xc0000374 in
+        // d3d10warp.dll) when WARP executes large SM 6.6 directly-indexed shaders under GPU-based validation.
+        if self.warp
+            && let Some(pso_desc) = &pso_desc
+        {
+            const WARP_GBV_MAX_BINDLESS_SHADER_BYTES: u64 = 65_536;
+            let large = pipelines::subobjects(pso_desc)
+                .into_iter()
+                .find_map(|(sub_ty, val)| {
+                    if !matches!(sub_ty, 1 | 2 | 3 | 4 | 5 | 6 | 24 | 25) {
+                        return None;
+                    }
+                    if replaced.iter().any(|&(t, _)| t == sub_ty) {
+                        return None;
+                    }
+                    let key = val["blob"].as_str()?;
+                    let size = val["size"].as_u64().unwrap_or(0);
+                    (size >= WARP_GBV_MAX_BINDLESS_SHADER_BYTES).then(|| (key.to_string(), size))
+                });
+            if let Some((key, size)) = large {
+                if self.gbv {
+                    self.warn(format!(
+                        "draw {n} (event {seq}): skipped on WARP with --debug (GBV): directly-indexed shader \
+                         {key} ({size} bytes) triggers an access violation / heap corruption inside d3d10warp.dll \
+                         under GPU-based validation; run without --warp on the hardware GPU"
+                    ));
+                    return Ok(());
+                }
+                self.large_bindless_shader = Some((key, size));
+            }
+        }
         // Runtime GPU/WARP bindless slot tracing: if enabled and this draw uses a directly-indexed root signature,
         // instrument its DXIL shaders' `createHandleFromHeap` calls to log into the active CBV/SRV/UAV heap's log slot.
         let mut trace_clear: Option<(i64, u32)> = None;
-        if self.bindless_tracer.is_some()
-            && pso_id != 0
-            && decoded["flags"].as_u64().is_some_and(|f| f & 0x400 != 0)
-        {
+        if self.bindless_tracer.is_some() && pso_id != 0 && directly_indexed {
             let heap_ids: Vec<i64> = state["descriptor_heaps"]
                 .as_array()
                 .into_iter()
@@ -1722,14 +1782,10 @@ impl D3d12 {
                 }
             }
             if let Some((trace_heap, log_slot, max_slots)) = active_trace_heap
-                && let Some(pso_desc) = c
-                    .row("SELECT description FROM d12_psos WHERE id = ?1", [pso_id], |r| {
-                        r.get::<_, String>(0)
-                    })
-                    .and_then(|d| serde_json::from_str::<Value>(&d).ok())
+                && let Some(pso_desc) = &pso_desc
             {
                 let mut patched_any = false;
-                for (sub_ty, val) in pipelines::subobjects(&pso_desc) {
+                for (sub_ty, val) in pipelines::subobjects(pso_desc) {
                     if !matches!(sub_ty, 1 | 2 | 3 | 4 | 5 | 6 | 24 | 25) {
                         continue;
                     }
@@ -3194,6 +3250,7 @@ impl D3d12 {
                         self.flush()?;
                     }
                     self.rule_seed(*resource, *sub, *plane, source)?;
+                    self.populated.insert(*resource);
                     ran_any = true;
                 }
                 Action::DescriptorOverride {
@@ -3424,9 +3481,11 @@ impl Backend for D3d12 {
                     "DispatchRays" => self.dispatch_rays(c, seq, &a)?,
                     _ => indirect::Arguments::AsRecorded,
                 };
-                self.count_begin(list)?;
-                self.draw(c, seq, &kind, &call, &a, rules, arguments)?;
-                self.count_end()?;
+                if !matches!(arguments, indirect::Arguments::Skip) {
+                    self.count_begin(list)?;
+                    self.draw(c, seq, &kind, &call, &a, rules, arguments)?;
+                    self.count_end()?;
+                }
             }
             "copy" if call == "ResolveQueryData" => self.resolve_queries(&a)?,
             "copy" if call == "BuildRaytracingAccelerationStructure" => self.build(c, &a)?,
@@ -3520,6 +3579,15 @@ impl Backend for D3d12 {
             }
         }
         let ran = self.flush().and_then(|()| self.collect_queries());
+        if ran.is_ok() {
+            for w in c.rows(
+                "SELECT resource FROM event_resources WHERE event = ?1 AND access = 'write'",
+                [seq],
+                |r| r.get::<_, i64>(0),
+            ) {
+                self.populated.insert(w);
+            }
+        }
         if ran.is_ok()
             && let Some((draw_n, ev_seq, trace_heap, max_slots)) = pending_trace
             && let Some(t) = &mut self.bindless_tracer
@@ -4013,6 +4081,9 @@ impl D3d12 {
                 }
             }
             None => {}
+        }
+        if source.is_some() {
+            self.populated.insert(id);
         }
         if heap.mapped() {
             self.resources.get_mut(&id).expect("made").from = key_hint.map(str::to_string).or_else(|| {
@@ -5625,6 +5696,67 @@ mod tests {
         assert_eq!(
             crate::dxil::decode_bindless_log(log_slice, log_slot),
             vec![(5, false), (11, false)]
+        );
+        assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
+    }
+
+    /// Verifies that `ExecuteIndirect` whose argument buffer had no captured contents (and was not written earlier in
+    /// the plan) skips cleanly with a diagnostic warning instead of dispatching a zeroed buffer that crashes WARP/GBV.
+    #[test]
+    fn execute_indirect_missing_args_skips_gracefully_on_warp() {
+        let p1 = std::path::Path::new(
+            r"C:\Users\kalmarv\modding\.targets\xcl-sky-captures\P1LEVEL\captures\depth-plane\capture.db",
+        );
+        if !p1.is_file() {
+            return;
+        }
+        let c = crate::open::open(&p1.to_string_lossy(), None).unwrap();
+        let mut d = D3d12::new(true, super::super::Validation::Gpu).unwrap();
+        // Create #6250 with no contents (as in P1LEVEL draw 16068 / event 135295).
+        d.create_blob(&c, 6250, None).unwrap();
+        let args: Value = serde_json::json!([1247, 1, 6250, 34768, 0, 0]);
+        let resolved = d.indirect_arguments(&c, 135295, &args).unwrap();
+        assert!(matches!(resolved, indirect::Arguments::Skip));
+        assert!(
+            d.warnings
+                .iter()
+                .any(|w| w.contains("#6250 (+34768)") && w.contains("all zeros")),
+            "expected missing indirect-arg warning, got {:?}",
+            d.warnings
+        );
+        assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
+    }
+
+    /// Verifies that WARP+GBV skips large directly-indexed shaders (like P1LEVEL draw 16068's 193 KiB PS `43b649be`)
+    /// cleanly with an actionable warning instead of crashing inside `d3d10warp.dll` with `0xc0000005`.
+    #[test]
+    fn warp_gbv_skips_large_bindless_shader_without_crashing() {
+        let p1 = std::path::Path::new(
+            r"C:\Users\kalmarv\modding\.targets\xcl-sky-captures\P1LEVEL\captures\depth-plane\capture.db",
+        );
+        if !p1.is_file() {
+            return;
+        }
+        let c = crate::open::open(&p1.to_string_lossy(), None).unwrap();
+        let mut d = D3d12::new(true, super::super::Validation::Gpu).unwrap();
+        d.enable_bindless_trace();
+        let args: Value = serde_json::json!([1247, 1, 6250, 34768, 0, 0]);
+        d.draw(
+            &c,
+            135295,
+            "draw",
+            "ExecuteIndirect",
+            &args,
+            &[],
+            indirect::Arguments::AsRecorded,
+        )
+        .unwrap();
+        assert!(
+            d.warnings
+                .iter()
+                .any(|w| w.contains("43b649bed15f98568c4f613872d6ac4f") && w.contains("d3d10warp.dll")),
+            "expected WARP+GBV guard warning, got {:?}",
+            d.warnings
         );
         assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
     }
