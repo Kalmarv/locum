@@ -5760,4 +5760,205 @@ mod tests {
         );
         assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
     }
+
+    /// Verifies that a `seed` rule applied before an instrumented bindless dispatch populates a gate buffer so a
+    /// dynamically gated `ResourceDescriptorHeap` slot becomes reachable during bindless tracing.
+    #[test]
+    fn seed_rule_unlocks_gated_bindless_slot_during_trace_on_warp() {
+        let mut d = D3d12::new(true, super::super::Validation::Layer).unwrap();
+        let src = r#"
+            cbuffer Gate : register(b0) { uint enabled; uint srvIdx; };
+            [numthreads(1,1,1)]
+            void main() {
+                if (enabled != 0) {
+                    ByteAddressBuffer s = ResourceDescriptorHeap[srvIdx];
+                    RWByteAddressBuffer u = ResourceDescriptorHeap[9];
+                    u.Store(0, s.Load(0));
+                }
+            }
+        "#;
+        let log_slot: u32 = 31;
+        let raw_cs = crate::dxil::compile(src, "cs_6_6").unwrap();
+        let patched_cs = crate::dxil::instrument_bindless(&raw_cs, log_slot, log_slot)
+            .unwrap()
+            .unwrap();
+        let param = D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_CBV,
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                },
+            },
+        };
+        let root_desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+            Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+            Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+                Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                    NumParameters: 1,
+                    pParameters: &param,
+                    Flags: D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
+                    ..Default::default()
+                },
+            },
+        };
+        let mut sig_blob = None;
+        unsafe { D3D12SerializeVersionedRootSignature(&root_desc, &mut sig_blob, None) }.unwrap();
+        let sig_blob = sig_blob.unwrap();
+        let sig_bytes = unsafe {
+            core::slice::from_raw_parts(sig_blob.GetBufferPointer().cast::<u8>(), sig_blob.GetBufferSize())
+        };
+        let root_sig: ID3D12RootSignature = unsafe { d.device.CreateRootSignature(0, sig_bytes) }.unwrap();
+        let pso_desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: ManuallyDrop::new(Some(root_sig.clone())),
+            CS: D3D12_SHADER_BYTECODE {
+                pShaderBytecode: patched_cs.as_ptr().cast(),
+                BytecodeLength: patched_cs.len(),
+            },
+            ..Default::default()
+        };
+        let pso: ID3D12PipelineState = unsafe { d.device.CreateComputePipelineState(&pso_desc) }.unwrap();
+
+        let mk_buf = |d: &mut D3d12, id: i64| {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut r: Option<ID3D12Resource> = None;
+            unsafe {
+                d.device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES {
+                            Type: D3D12_HEAP_TYPE_DEFAULT,
+                            ..Default::default()
+                        },
+                        D3D12_HEAP_FLAG_NONE,
+                        &desc,
+                        COMMON,
+                        None,
+                        &mut r,
+                    )
+                    .unwrap();
+            }
+            d.adopt(id, r.unwrap(), Heap::Default, 0, layout::buffer(256))
+                .unwrap();
+        };
+        mk_buf(&mut d, 1); // gate CBV (starts all zeros -> branch disabled)
+        mk_buf(&mut d, 2); // SRV at slot 5
+        mk_buf(&mut d, 3); // UAV at slot 9
+        let heap = mirror(&d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 32, true).unwrap();
+        let srv_d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    NumElements: 64,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        let uav_d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    NumElements: 64,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        unsafe {
+            d.device
+                .CreateShaderResourceView(&d.resource(2).unwrap(), Some(&srv_d), heap.cpu(5));
+            d.device
+                .CreateUnorderedAccessView(&d.resource(3).unwrap(), None, Some(&uav_d), heap.cpu(9));
+        }
+        let log = d.make_bindless_log(log_slot, heap.cpu(log_slot)).unwrap();
+
+        let run_once = |d: &mut D3d12| -> Vec<(u32, bool)> {
+            unsafe {
+                d.list
+                    .CopyBufferRegion(&log.gpu_buf, 0, &log.zero_buf, 0, log.bytes);
+                d.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: borrowed(&log.gpu_buf),
+                            Subresource: ALL,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_DEST,
+                            StateAfter: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        }),
+                    },
+                }]);
+                d.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
+                d.list.SetComputeRootSignature(&root_sig);
+                d.list.SetPipelineState(&pso);
+                d.list.SetComputeRootConstantBufferView(0, d.address(1, 0));
+                d.list.Dispatch(1, 1, 1);
+                d.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: borrowed(&log.gpu_buf),
+                            Subresource: ALL,
+                            StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        }),
+                    },
+                }]);
+                d.list
+                    .CopyBufferRegion(&log.readback_buf, 0, &log.gpu_buf, 0, log.bytes);
+                d.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                    Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                        Transition: ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                            pResource: borrowed(&log.gpu_buf),
+                            Subresource: ALL,
+                            StateBefore: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                            StateAfter: COMMON,
+                        }),
+                    },
+                }]);
+            }
+            d.flush().unwrap();
+            let slice = unsafe { core::slice::from_raw_parts(log.readback_ptr, log.bytes as usize) };
+            crate::dxil::decode_bindless_log(slice, log_slot)
+        };
+
+        // Without seed rule: gate CBV is 0 -> 0 slots discovered.
+        assert_eq!(run_once(&mut d), vec![]);
+
+        // With `seed 1 from <file> before 100` rule: gate CBV gets enabled=1, srvIdx=5 -> slots (5, read) & (9, write)!
+        let seed_path = std::env::temp_dir().join("locum_test_seed_bindless_gate.bin");
+        let mut seed_data = vec![0u8; 256];
+        seed_data[0..4].copy_from_slice(&1u32.to_le_bytes());
+        seed_data[4..8].copy_from_slice(&5u32.to_le_bytes());
+        std::fs::write(&seed_path, &seed_data).unwrap();
+        let rule = rules::parse(
+            &format!("seed 1 from {} before 100", seed_path.display()),
+            std::path::Path::new("."),
+            &|_, _| Err(String::new()),
+        )
+        .unwrap();
+        d.apply_state_rules(None, 100, None, &[rule], false).unwrap();
+        let _ = std::fs::remove_file(&seed_path);
+
+        assert_eq!(run_once(&mut d), vec![(5, false), (9, true)]);
+        assert!(d.messages().is_empty(), "D3D12 debug errors: {:?}", d.messages());
+    }
 }

@@ -841,6 +841,16 @@ struct BindlessArgs {
     /// Enable the D3D12 debug layer during `--trace`.
     #[arg(long)]
     debug: bool,
+    /// Replay rule to apply during `--trace` (e.g. `seed <res> from <file|res> before <seq>`, `map all-unmapped`,
+    /// `clear`, `copy`, `root`, `descriptor`); repeatable.
+    #[arg(long)]
+    rule: Vec<String>,
+    /// File of replay rules to apply during `--trace` (one per line).
+    #[arg(long)]
+    rules: Option<PathBuf>,
+    /// Force-include extra bindless resources during `--trace` (`res:ID,...` or `slots:A..B`); repeatable.
+    #[arg(long)]
+    include_bindless: Vec<String>,
     /// Persist `--trace` results into the capture's `d12_bindless_usage` table so subsequent `replay` calls
     /// automatically materialize the discovered bindless resources.
     #[arg(long)]
@@ -1545,6 +1555,9 @@ fn run(cli: Cli) -> Result<(), String> {
                 only_list,
                 warp,
                 debug,
+                rule,
+                rules,
+                include_bindless,
                 write_db,
                 draw,
                 resource,
@@ -1559,13 +1572,23 @@ fn run(cli: Cli) -> Result<(), String> {
                 let target_seq: i64 = c
                     .row("SELECT event FROM draws WHERE n = ?1", [draw_n], |r| r.get(0))
                     .ok_or_else(|| format!("no draw {draw_n}"))?;
-                let plan = replay::plan_scoped(&c, target_seq, mode, from_event, only_list);
+                let parsed_rules = replay::parse_rules(&c, &rule, rules.as_deref())?;
+                let mut plan = replay::plan_scoped(&c, target_seq, mode, from_event, only_list);
+                if !include_bindless.is_empty() {
+                    plan.resources
+                        .extend(replay::resolve_include_bindless(&c, &include_bindless)?);
+                }
+                for r in &parsed_rules {
+                    for res in r.referenced_resources() {
+                        plan.resources.insert(res);
+                    }
+                }
                 let validation = if debug {
                     replay::Validation::Gpu
                 } else {
                     replay::Validation::Off
                 };
-                let (rows, warnings) = replay::trace_bindless(&c, &plan, warp, validation)?;
+                let (rows, warnings) = replay::trace_bindless(&c, &plan, &parsed_rules, warp, validation)?;
                 for w in &warnings {
                     eprintln!("warning: {w}");
                 }

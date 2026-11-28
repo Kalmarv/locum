@@ -1503,30 +1503,87 @@ pub struct Options {
     pub include_bindless: Vec<String>,
 }
 
+/// Parses inline `--rule` texts and an optional `--rules` file against capture `c` (resolving shader names and
+/// `before draw N` / `after draw N` draw numbers).
+pub fn parse_rules(
+    c: &Capture,
+    rule_texts: &[String],
+    rules_file: Option<&Path>,
+) -> Result<Vec<Rule>, String> {
+    let resolve_draw = |n: i64| -> Result<i64, String> {
+        c.row("SELECT event FROM draws WHERE n = ?1", [n], |r| r.get(0))
+            .ok_or_else(|| format!("no draw {n} in capture"))
+    };
+    let mut parsed = Vec::new();
+    if let Some(file) = rules_file {
+        let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let dir = file.parent().unwrap_or(Path::new("."));
+        let (r, errors) = rules::parse_all_with(
+            &text,
+            dir,
+            &|stage, hash| shader_named(c, stage, hash),
+            &resolve_draw,
+        );
+        if let Some((line, e)) = errors.first() {
+            return Err(format!("{} line {line}: {e}", file.display()));
+        }
+        parsed.extend(r);
+    }
+    for text in rule_texts {
+        parsed.push(rules::parse_with(
+            text,
+            Path::new("."),
+            &|stage, hash| shader_named(c, stage, hash),
+            &resolve_draw,
+        )?);
+    }
+    Ok(parsed)
+}
+
 /// Runs a DXIL-instrumented runtime trace of `plan` to discover every `ResourceDescriptorHeap` slot
 /// dynamically accessed by shaders on the GPU/WARP, resolving each `(heap, slot)` at the event's submission
-/// into `(kind, resource)` rows ready for `d12_bindless_usage`.
+/// into `(kind, resource)` rows ready for `d12_bindless_usage`. Replay rules (including `seed`, `map`, `alias`,
+/// `clear`, `copy`, `root`, `descriptor`, `skip-event`) are applied during the trace prepass.
 pub fn trace_bindless(
     c: &Capture,
     plan: &Plan,
+    rules: &[Rule],
     warp: bool,
     validation: Validation,
 ) -> Result<(Vec<locum_capture::d3d12::BindlessUsage>, Vec<String>), String> {
     if c.meta("api").as_deref() != Some("d3d12") {
         return Err("bindless runtime tracing is only supported for Direct3D 12 captures".into());
     }
+    let mut effective_resources = plan.resources.clone();
+    for rule in rules {
+        for r in rule.referenced_resources() {
+            effective_resources.insert(r);
+        }
+    }
+    let effective_plan = Plan {
+        events: plan.events.clone(),
+        resources: effective_resources,
+        written_before_target: plan.written_before_target.clone(),
+        until: plan.until,
+        skipped_empty_heap: plan.skipped_empty_heap,
+    };
     let mut b = backend(c, warp, validation)?;
     b.enable_bindless_trace();
-    b.prepare(c, plan);
-    for &id in &plan.resources {
+    b.prepare(c, &effective_plan);
+    for &id in &effective_plan.resources {
         let key: Option<String> = c
             .row("SELECT content FROM resources WHERE id = ?1", [id], |r| r.get(0))
             .flatten();
         b.create_blob(c, id, key.as_deref())
             .map_err(|e| format!("resource #{id}: {e}"))?;
     }
-    for &seq in &plan.events {
-        b.run(c, seq, &[]).map_err(|e| format!("event {seq}: {e}"))?;
+    for &seq in &effective_plan.events {
+        if rules.iter().any(
+            |r| matches!(r.action, rules::Action::SkipEvent { start, end } if seq >= start && seq <= end),
+        ) {
+            continue;
+        }
+        b.run(c, seq, rules).map_err(|e| format!("event {seq}: {e}"))?;
     }
     let raw_hits = b.take_bindless_trace();
     let mut warnings = b.warnings();
@@ -1617,7 +1674,7 @@ pub fn trace_bindless(
 
 /// Resolves `--include-bindless <SPEC>` items (`res:1,2,3` or `slots:10,20..30`) into resource IDs to force into
 /// `plan.resources` even when `content IS NULL`.
-fn resolve_include_bindless(c: &Capture, specs: &[String]) -> Result<BTreeSet<i64>, String> {
+pub fn resolve_include_bindless(c: &Capture, specs: &[String]) -> Result<BTreeSet<i64>, String> {
     let mut out = BTreeSet::new();
     for spec in specs {
         if let Some(rest) = spec.strip_prefix("res:") {
@@ -1745,33 +1802,7 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
     let target: i64 = c
         .row("SELECT event FROM draws WHERE n = ?1", [draw], |r| r.get(0))
         .ok_or_else(|| format!("no draw {draw}"))?;
-    let resolve_draw = |n: i64| -> Result<i64, String> {
-        c.row("SELECT event FROM draws WHERE n = ?1", [n], |r| r.get(0))
-            .ok_or_else(|| format!("no draw {n} in capture"))
-    };
-    let mut parsed = Vec::new();
-    if let Some(file) = &o.rules_file {
-        let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
-        let dir = file.parent().unwrap_or(Path::new("."));
-        let (r, errors) = rules::parse_all_with(
-            &text,
-            dir,
-            &|stage, hash| shader_named(c, stage, hash),
-            &resolve_draw,
-        );
-        if let Some((line, e)) = errors.first() {
-            return Err(format!("{} line {line}: {e}", file.display()));
-        }
-        parsed.extend(r);
-    }
-    for text in &o.rules {
-        parsed.push(rules::parse_with(
-            text,
-            Path::new("."),
-            &|stage, hash| shader_named(c, stage, hash),
-            &resolve_draw,
-        )?);
-    }
+    let parsed = parse_rules(c, &o.rules, o.rules_file.as_deref())?;
     let readbacks_after: Vec<ReadbackSpec> = o
         .readback
         .iter()
@@ -1793,9 +1824,19 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
             plan.resources.extend(extra);
         }
     }
+    // Ensure any resources referenced by replay state/API rules or explicit readbacks are created (before any
+    // `--trace-bindless` prepass so seeded/mapped/aliased resources are live during bindless discovery too).
+    for rule in &parsed {
+        for r in rule.referenced_resources() {
+            plan.resources.insert(r);
+        }
+    }
+    for rb in readbacks_after.iter().chain(&readbacks_before) {
+        plan.resources.insert(rb.resource);
+    }
     if o.trace_bindless {
         let t_trace = std::time::Instant::now();
-        let (traced, trace_warnings) = trace_bindless(c, &plan, o.warp, Validation::Off)?;
+        let (traced, trace_warnings) = trace_bindless(c, &plan, &parsed, o.warp, o.validation)?;
         let mut added = 0usize;
         for u in &traced {
             if u.resource > 0 && plan.resources.insert(u.resource as i64) {
@@ -1816,15 +1857,6 @@ pub fn replay(c: &Capture, draw: i64, o: &Options) -> Result<(), String> {
         for w in trace_warnings {
             out!("  trace warning: {w}");
         }
-    }
-    // Ensure any resources referenced by replay state/API rules or explicit readbacks are created.
-    for rule in &parsed {
-        for r in rule.referenced_resources() {
-            plan.resources.insert(r);
-        }
-    }
-    for rb in readbacks_after.iter().chain(&readbacks_before) {
-        plan.resources.insert(rb.resource);
     }
     if let Some(spec) = &o.buffer_probe {
         let rb = parse_readback(c, spec)?;
